@@ -17,8 +17,9 @@ const callTimeout = 5 * time.Second
 
 // Process 是一个进程外插件子进程的句柄（Tier 1 执行骨架）。
 //
-// 并发模型：Call 内部单飞锁串行化「写请求 + 读一行响应」；OnExit 由唯一的
-// Wait goroutine 在进程退出时调用恰好一次（须在 Launch 返回后立即接线）。
+// 并发模型：Call 内部单飞锁串行化「写请求 + 读一行响应」；OnExit 在 Launch
+// 参数中传入（spawn 前接线），由唯一的 Wait goroutine 在进程退出时调用
+// 恰好一次——事后赋值与 Wait goroutine 的读取构成数据竞争。
 type Process struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -28,8 +29,9 @@ type Process struct {
 	mu         sync.Mutex // 串行化 write+read 配对
 	nextID     int
 	onExitOnce sync.Once
-	// OnExit 在进程退出后被调用一次，参数为 Wait 的返回值；
+	// OnExit 在进程退出后被调用恰好一次，参数为 Wait 的返回值；
 	// 宿主用它接入 Manager.RecordCrash 实现崩溃循环遏制。
+	// 只能在 Launch 时设置（spawn 前接线，见 Launch 文档）。
 	OnExit func(err error)
 }
 
@@ -51,7 +53,7 @@ type helloFrame struct {
 // TODO(协议完整版)：当前为行分隔 JSON-RPC 骨架。升级路径：id 关联多路复用、
 // 并发请求、notification 广播、Content-Length 头分帧、优雅 shutdown（plugin/shutdown
 // + plugin/exit）、以及按方法到能力的映射把能力门下沉到 Call 级别。
-func Launch(ctx context.Context, m Manifest, grant Grant) (*Process, error) {
+func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*Process, error) {
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("plugin: launch 前置完整性校验: %w", err)
 	}
@@ -80,6 +82,7 @@ func Launch(ctx context.Context, m Manifest, grant Grant) (*Process, error) {
 		stdin:  stdin,
 		stdout: bufio.NewReader(stdout),
 		grant:  grant,
+		OnExit: onExit,
 	}
 	go func() {
 		werr := cmd.Wait()
