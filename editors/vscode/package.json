@@ -1,0 +1,42 @@
+{
+  "name": "omnilsp",
+  "displayName": "OmniLSP",
+  "description": "OmniLSP language intelligence platform client — grounded, explainable semantics via the omnilsp binary.",
+  "version": "0.2.0",
+  "publisher": "omnilsp",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages", "Other"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "OmniLSP",
+      "properties": {
+        "omnilsp.path": {
+          "type": "string",
+          "default": "omnilsp",
+          "description": "Path to the omnilsp binary."
+        },
+        "omnilsp.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace LSP communication with the omnilsp server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "omnilsp.explain",
+        "title": "OmniLSP: Explain Last Result",
+        "description": "Ask omnilsp why the last semantic result is trustworthy (evidence chain)."
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

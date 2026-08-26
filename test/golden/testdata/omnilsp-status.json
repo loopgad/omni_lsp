@@ -1,0 +1,79 @@
+[
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "completionProvider": {
+          "triggerCharacters": [
+            ".",
+            ":",
+            ">",
+            "\""
+          ]
+        },
+        "definitionProvider": true,
+        "documentSymbolProvider": true,
+        "hoverProvider": true,
+        "positionEncoding": "utf-16",
+        "referencesProvider": true,
+        "renameProvider": true,
+        "semanticTokensProvider": {
+          "full": true,
+          "incremental": true,
+          "legend": {
+            "tokenModifiers": [
+              "declaration",
+              "definition",
+              "readonly"
+            ],
+            "tokenTypes": [
+              "variable",
+              "function",
+              "type",
+              "string",
+              "number",
+              "comment"
+            ]
+          }
+        },
+        "textDocumentSync": {
+          "change": "<n>",
+          "openClose": true,
+          "save": {
+            "includeText": true
+          }
+        },
+        "workspaceSymbolProvider": true
+      }
+    }
+  },
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": {
+      "CacheHits": "<n>",
+      "CacheMisses": "<n>",
+      "InFlight": "<n>",
+      "MetricBackendFails": "<n>",
+      "MetricRequests": "<n>",
+      "QueueLen": "<n>",
+      "SnapshotEpochs": "<n>",
+      "State": "running",
+      "SyncRejects": "<n>",
+      "TotalEnq": "<n>",
+      "TotalExec": "<n>",
+      "TotalJoined": "<n>",
+      "TotalRej": "<n>"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "textDocument/publishDiagnostics",
+    "params": {
+      "diagnostics": [],
+      "uri": "file:///w/demo.rs",
+      "version": "<n>"
+    }
+  }
+]

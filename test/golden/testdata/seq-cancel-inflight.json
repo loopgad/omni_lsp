@@ -1,0 +1,111 @@
+[
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "completionProvider": {
+          "triggerCharacters": [
+            ".",
+            ":",
+            ">",
+            "\""
+          ]
+        },
+        "definitionProvider": true,
+        "documentSymbolProvider": true,
+        "hoverProvider": true,
+        "positionEncoding": "utf-16",
+        "referencesProvider": true,
+        "renameProvider": true,
+        "semanticTokensProvider": {
+          "full": true,
+          "incremental": true,
+          "legend": {
+            "tokenModifiers": [
+              "declaration",
+              "definition",
+              "readonly"
+            ],
+            "tokenTypes": [
+              "variable",
+              "function",
+              "type",
+              "string",
+              "number",
+              "comment"
+            ]
+          }
+        },
+        "textDocumentSync": {
+          "change": 2,
+          "openClose": true,
+          "save": {
+            "includeText": true
+          }
+        },
+        "workspaceSymbolProvider": true
+      }
+    }
+  },
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": [
+      {
+        "range": {
+          "end": {
+            "character": 5,
+            "line": 4
+          },
+          "start": {
+            "character": 4,
+            "line": 4
+          }
+        },
+        "uri": "file:///w/demo.rs"
+      },
+      {
+        "range": {
+          "end": {
+            "character": 7,
+            "line": 2
+          },
+          "start": {
+            "character": 3,
+            "line": 2
+          }
+        },
+        "uri": "file:///w/demo.rs"
+      }
+    ]
+  },
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": [
+      {
+        "range": {
+          "end": {
+            "character": 11,
+            "line": 3
+          },
+          "start": {
+            "character": 7,
+            "line": 3
+          }
+        },
+        "uri": "file:///w/demo.rs"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "textDocument/publishDiagnostics",
+    "params": {
+      "diagnostics": [],
+      "uri": "file:///w/demo.rs",
+      "version": 1
+    }
+  }
+]

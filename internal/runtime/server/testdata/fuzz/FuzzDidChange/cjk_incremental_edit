@@ -1,0 +1,7 @@
+go test fuzz v1
+string("中文注释\nfunc main() {}\n")
+uint32(0)
+uint32(2)
+uint32(0)
+uint32(4)
+string("文")

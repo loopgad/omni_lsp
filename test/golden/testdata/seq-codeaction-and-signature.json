@@ -1,0 +1,73 @@
+[
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "completionProvider": {
+          "triggerCharacters": [
+            ".",
+            ":",
+            ">",
+            "\""
+          ]
+        },
+        "definitionProvider": true,
+        "documentSymbolProvider": true,
+        "hoverProvider": true,
+        "positionEncoding": "utf-16",
+        "referencesProvider": true,
+        "renameProvider": true,
+        "semanticTokensProvider": {
+          "full": true,
+          "incremental": true,
+          "legend": {
+            "tokenModifiers": [
+              "declaration",
+              "definition",
+              "readonly"
+            ],
+            "tokenTypes": [
+              "variable",
+              "function",
+              "type",
+              "string",
+              "number",
+              "comment"
+            ]
+          }
+        },
+        "textDocumentSync": {
+          "change": 2,
+          "openClose": true,
+          "save": {
+            "includeText": true
+          }
+        },
+        "workspaceSymbolProvider": true
+      }
+    }
+  },
+  {
+    "id": "<id>",
+    "jsonrpc": "2.0",
+    "result": []
+  },
+  {
+    "error": {
+      "code": -32601,
+      "message": "signatureHelp not supported by backend \"rust\""
+    },
+    "id": "<id>",
+    "jsonrpc": "2.0"
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "textDocument/publishDiagnostics",
+    "params": {
+      "diagnostics": [],
+      "uri": "file:///w/demo.rs",
+      "version": 1
+    }
+  }
+]

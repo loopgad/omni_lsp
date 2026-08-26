@@ -1,0 +1,862 @@
+// Package server implements the LSP JSON-RPC server for OmniLSP.
+//
+// Responsibility:
+//
+//	Accepts JSON-RPC messages via a transport, enforces the C2 lifecycle gate,
+//	classifies priority (F3), admits queries through the scheduler (F5/F6),
+//	dispatches to registered handlers, and projects canonical results to
+//	protocol responses.
+//
+// Owned mutable state:
+//
+//	state (State enum, protected by mu), transport (set at Run), languages map,
+//	inflight table, evidence ring (both mu-protected), syncRejects (atomic).
+//
+// Concurrency model:
+//
+//	sync.RWMutex for state/transport/inflight/ring; scheduler handles request
+//	goroutines; no nested locks between server and scheduler.
+//
+// Invariants:
+//  1. Every LSP request is admitted through the C2 lifecycle gate and the
+//     scheduler (F3/F5).
+//  2. didOpen/didChange/didSave/didClose update VFS and publish Snapshot (F1).
+//  3. Every semantic request serves from exactly one captured Snapshot
+//     (INV-SNAPSHOT-002); state transitions are never dropped for staleness
+//     (PROT-SYNC-001).
+//  4. The VFS is the single source of truth for open-document content.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	stderrors "errors"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	ierrors "github.com/omnilsp/omni/internal/errors"
+	"github.com/omnilsp/omni/internal/identity"
+	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
+	"github.com/omnilsp/omni/internal/runtime/scheduler"
+	"github.com/omnilsp/omni/internal/semantic/query"
+	"github.com/omnilsp/omni/internal/telemetry"
+	"github.com/omnilsp/omni/internal/transport"
+	"github.com/omnilsp/omni/internal/workspace/snapshot"
+	"github.com/omnilsp/omni/internal/workspace/vfs"
+	"github.com/omnilsp/omni/internal/workspace/virtual"
+	"github.com/omnilsp/omni/internal/workspace/watch"
+)
+
+// State represents the server lifecycle state (goal.md §C2).
+type State int
+
+const (
+	StateUninitialized State = iota
+	StateInitializing
+	StateRunning
+	StateShuttingDown
+	StateExited
+)
+
+func (st State) String() string {
+	switch st {
+	case StateUninitialized:
+		return "uninitialized"
+	case StateInitializing:
+		return "initializing"
+	case StateRunning:
+		return "running"
+	case StateShuttingDown:
+		return "shutting_down"
+	case StateExited:
+		return "exited"
+	default:
+		return "unknown"
+	}
+}
+
+// Server is the main LSP server.
+type Server struct {
+	mu               sync.RWMutex
+	state            State
+	transport        transport.Transport
+	dispatcher       *jsonrpc.Dispatcher
+	scheduler        *scheduler.Scheduler
+	snapMgr          *snapshot.Manager
+	vfs              *vfs.VFS
+	virtualReg       *virtual.Registry            // §D12 source-map registry for virtual documents
+	languages        map[string]languages.Backend // keyed by LanguageID
+	queries          *query.Engine                // §J memo engine for semantic read paths
+	diag             *diagCoordinator             // §C11/§I17 push/pull diagnostics
+	positionEncoding string                       // §C4 negotiated: utf-8|utf-16|utf-32
+	config           Config
+	workspaceID      identity.WorkspaceID
+
+	// syncRejects counts rejected didChange notifications (invalid range or
+	// version) for observability (D6: rejection must be visible, not silent).
+	syncRejects atomic.Int64
+
+	// inflight maps JSON-RPC request IDs to scheduled requests for
+	// $/cancelRequest lookup (C7). Protected by mu.
+	inflight map[string]*scheduler.Request
+
+	// evRing is a bounded ring of recent §B4 evidence records for the
+	// omnilsp/explain API (§I25). Protected by mu.
+	evRing     [64]evidenceRecord
+	evRingNext int
+
+	// metrics are the §L telemetry counters (low-cardinality labels only).
+	metrics serverMetrics
+
+	// clientWantsDocumentChanges records the §C9 negotiation: the client
+	// declared workspace.workspaceEdit.documentChanges at initialize. Set
+	// once during handleInitialize, read-only afterwards.
+	clientWantsDocumentChanges atomic.Bool
+}
+
+// wantsDocumentChanges reports whether the client negotiated the version-aware
+// documentChanges WorkspaceEdit form (§C9).
+func (s *Server) wantsDocumentChanges() bool { return s.clientWantsDocumentChanges.Load() }
+
+// parseClientEditCapability inspects raw initialize capabilities for
+// workspace.workspaceEdit.documentChanges == true.
+func parseClientEditCapability(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var caps struct {
+		Workspace struct {
+			WorkspaceEdit struct {
+				DocumentChanges bool `json:"documentChanges"`
+			} `json:"workspaceEdit"`
+		} `json:"workspace"`
+	}
+	if err := json.Unmarshal(raw, &caps); err != nil {
+		return false // malformed capability payload: legacy form, fail safe
+	}
+	return caps.Workspace.WorkspaceEdit.DocumentChanges
+}
+
+// serverMetrics aggregates the canonical counters (§K/§L): every rejection,
+// backend failure, and snapshot epoch must be visible, never silent.
+type serverMetrics struct {
+	RequestsTotal  *telemetry.Counter // omnilsp.requests.total
+	RejectsTotal   *telemetry.Counter // admission/lifecycle rejections
+	SyncRejects    *telemetry.Counter // didChange content rejections
+	ExternalSyncs  *telemetry.Counter // workspace/didChange* external notifications
+	BackendFails   *telemetry.Counter // semantic dispatch errors by language
+	SnapshotEpochs *telemetry.Counter // publishes (D9)
+}
+
+func newServerMetrics() serverMetrics {
+	return serverMetrics{
+		RequestsTotal:  telemetry.NewCounter("omnilsp.requests.total"),
+		RejectsTotal:   telemetry.NewCounter("omnilsp.rejects.total"),
+		SyncRejects:    telemetry.NewCounter("omnilsp.sync.rejects"),
+		ExternalSyncs:  telemetry.NewCounter("omnilsp.sync.external"),
+		BackendFails:   telemetry.NewCounter("omnilsp.backend.failures"),
+		SnapshotEpochs: telemetry.NewCounter("omnilsp.snapshots.epochs"),
+	}
+}
+
+// evidenceRecord is one entry of the explain evidence ring.
+type evidenceRecord struct {
+	Method string
+	URI    string
+	Ev     []identity.Evidence
+	Diag   []string
+	At     time.Time
+}
+
+// Config holds server configuration.
+type Config struct {
+	Scheduler scheduler.Config
+	// WatchInterval > 0 enables the §D14 workspace poller (external file
+	// changes are rescanned on this cadence). Zero disables it: editors that
+	// drive didChangeWatchedFiles themselves need no second opinion.
+	WatchInterval time.Duration
+}
+
+// DefaultConfig returns default server configuration.
+func DefaultConfig() Config {
+	return Config{Scheduler: scheduler.DefaultConfig()}
+}
+
+// New creates a new LSP server.
+func New(cfg Config) *Server {
+	s := &Server{
+		state:      StateUninitialized,
+		config:     cfg,
+		dispatcher: jsonrpc.NewDispatcher(),
+		snapMgr:    snapshot.NewManager(),
+		vfs:        vfs.New(),
+		virtualReg: virtual.New(),
+		languages:  make(map[string]languages.Backend),
+		inflight:   make(map[string]*scheduler.Request),
+		metrics:    newServerMetrics(),
+		queries:    query.NewEngine(0),
+	}
+	s.diag = newDiagCoordinator(s)
+	s.positionEncoding = "utf-16" // LSP baseline default until negotiated
+	s.scheduler = scheduler.New(cfg.Scheduler)
+	s.registerHandlers()
+	return s
+}
+
+// RegisterBackend registers a language backend for the given language ID.
+// VFS exposes the virtual filesystem for tooling and tests.
+func (s *Server) VFS() *vfs.VFS { return s.vfs }
+
+// Dispatcher exposes the JSON-RPC dispatcher for tooling and tests.
+func (s *Server) Dispatcher() *jsonrpc.Dispatcher { return s.dispatcher }
+
+func (s *Server) RegisterBackend(langID string, backend languages.Backend) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.languages[langID] = backend
+}
+
+// Run runs the server with the given transport. Blocks until shutdown.
+// All incoming messages are admitted through the lifecycle gate (C2) and the
+// scheduler (F3/F5). The Running state is entered only via the initialize
+// handshake, never implicitly.
+func (s *Server) Run(ctx context.Context, t transport.Transport) error {
+	s.mu.Lock()
+	s.transport = t
+	s.mu.Unlock()
+
+	s.scheduler.Start(ctx)
+	var watcher *watch.Poller
+	if s.config.WatchInterval > 0 && s.workspaceRoot() != "" {
+		watcher = watch.New(s.workspaceRoot(), s.config.WatchInterval, nil)
+		watcher.Start()
+	}
+	defer func() {
+		if watcher != nil {
+			watcher.Close()
+		}
+		s.scheduler.Shutdown()
+		// Session teardown: stop every registered backend so nested-LSP child
+		// processes never outlive their session (TCP reconnects would
+		// otherwise leak an orphaned toolchain per cycle).
+		s.mu.RLock()
+		backends := make([]languages.Backend, 0, len(s.languages))
+		for _, be := range s.languages {
+			backends = append(backends, be)
+		}
+		s.mu.RUnlock()
+		for _, be := range backends {
+			_ = be.Close()
+		}
+		s.diag.Close()
+	}()
+
+	for {
+		// C2/Q3: transport termination must surface its cause. Done alone is
+		// not consulted here — Read reports either the stream error (e.g.
+		// truncated frame, §S13) or a clean EOF; skipping straight to nil
+		// would swallow the difference.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		msg, err := t.Read(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Clean EOF is a normal stream end (peer closed after finishing,
+			// replay drain); any other error is a transport fault that must
+			// surface — a truncated frame must never masquerade as done (S13).
+			if stderrors.Is(err, io.EOF) {
+				s.drainInflight(2 * time.Second)
+				return nil
+			}
+			s.drainInflight(2 * time.Second)
+			return err
+		}
+
+		if msg == nil {
+			continue
+		}
+
+		if msg.IsResponse() {
+			continue
+		}
+
+		// Route through scheduler for admission control and prioritization.
+		s.scheduleMessage(ctx, msg)
+	}
+}
+
+// inlineMethods are handled directly on the read-loop goroutine instead of
+// the scheduler pool (F1 single-writer). State transitions must be applied
+// strictly in arrival order and never dropped: routing them through the
+// worker pool let concurrent workers apply didChanges out of order, and the
+// VFS version-regression guard silently dropped the losers (PROT-SYNC-001).
+// They are also cheap (string splices, state flips), so inlining costs the
+// loop nothing while making cancel/lifecycle handling immediate (A3).
+var inlineMethods = map[string]bool{
+	"initialize":             true,
+	"initialized":            true,
+	"shutdown":               true,
+	"exit":                   true,
+	"$/cancelRequest":        true,
+	"textDocument/didOpen":   true,
+	"textDocument/didChange": true,
+	"textDocument/didSave":   true,
+	"textDocument/didClose":  true,
+}
+
+// scheduleMessage admits the message: lifecycle/state-transition methods run
+// inline on the caller goroutine (the read loop — a natural single writer);
+// everything else goes through the scheduler for admission control and
+// prioritization (F3/F5). The scheduler is therefore a query engine only.
+func (s *Server) scheduleMessage(parentCtx context.Context, msg *jsonrpc.Message) {
+	s.metrics.RequestsTotal.Inc(1)
+	if inlineMethods[msg.Method] {
+		s.dispatchInline(msg)
+		return
+	}
+
+	if !s.lifecycleAllows(msg.Method) {
+		s.respondLifecycleError(msg)
+		return
+	}
+	priority := s.classifyPriority(msg)
+
+	// Track in-flight requests for $/cancelRequest mapping (C7).
+	var reqID string
+	if msg.ID != nil {
+		reqID = requestIDKey(*msg.ID)
+	}
+
+	snap := s.snapMgr.Current()
+	// Preserve the client-visible wire ID: error responses must echo it, not
+	// the internal RequestID string (which is not a JSON-RPC id).
+	var origID *scheduler.ClientID
+	if msg.ID != nil {
+		origID = &scheduler.ClientID{Str: msg.ID.Str, Num: msg.ID.Num, IsStr: msg.ID.IsStr, IsNull: msg.ID.IsNull}
+	}
+	req := &scheduler.Request{
+		RequestID:   identity.RequestID(fmt.Sprintf("%s-%v", msg.Method, msg.ID)),
+		OriginalID:  origID,
+		Workspace:   s.workspaceID,
+		Priority:    priority,
+		Snapshot:    snap,
+		CoalesceKey: coalesceKeyFor(msg, snap),
+		EnqueuedAt:  time.Now(),
+		Execute: func(ctx context.Context, snap *snapshot.Snapshot) (any, error) {
+			// INV-SNAPSHOT-002: the request serves from exactly this captured
+			// snapshot. D11 staleness is NOT checked here — a queued request
+			// behind a newer edit is still valid (C6 offers ContentModified
+			// only where a mutating result must be fresh; see handleRename).
+			// Gating state transitions here would drop accepted didChange
+			// edits and violate PROT-SYNC-001.
+			return s.dispatcher.Dispatch(withSnapshot(ctx, snap), msg), nil
+		},
+	}
+
+	if reqID != "" {
+		s.mu.Lock()
+		s.inflight[reqID] = req
+		s.mu.Unlock()
+	}
+
+	switch result := s.scheduler.Submit(req); result {
+	case scheduler.Admitted:
+		// Read result in background goroutine to avoid blocking the main loop.
+		go s.drainResult(req, reqID)
+	case scheduler.RejectedQueueFull:
+		s.unregisterInflight(reqID)
+		s.respondRejected(msg, "scheduler queue full")
+	case scheduler.RejectedCancelled:
+		s.unregisterInflight(reqID)
+		s.respondRejected(msg, "scheduler cancelled")
+	default:
+		s.unregisterInflight(reqID)
+		s.respondRejected(msg, "scheduler rejected")
+	}
+}
+
+// dispatchInline executes a state-transition or lifecycle message directly
+// on the read-loop goroutine, preserving strict arrival order (F1). The C2
+// lifecycle gate still applies; responses are sent synchronously.
+func (s *Server) dispatchInline(msg *jsonrpc.Message) {
+	if !s.lifecycleAllows(msg.Method) {
+		s.respondLifecycleError(msg)
+		return
+	}
+	resp := s.dispatcher.Dispatch(context.Background(), msg)
+	if resp != nil {
+		_ = s.send(resp)
+	}
+}
+
+// coalescableMethods are read-only, idempotent queries whose result depends
+// solely on (method, document position, snapshot revision) — safe to share
+// one execution between concurrent identical requests (F11/J6). Mutating or
+// side-effecting methods are deliberately excluded.
+var coalescableMethods = map[string]bool{
+	"textDocument/hover":      true,
+	"textDocument/definition": true,
+	"textDocument/references": true,
+}
+
+// coalesceParams is the minimal params projection needed for the key.
+type coalesceParams struct {
+	TextDocument struct {
+		URI string `json:"uri"`
+	} `json:"textDocument"`
+	Position struct {
+		Line      int `json:"line"`
+		Character int `json:"character"`
+	} `json:"position"`
+}
+
+// coalesceKeyFor builds the F11 single-flight key for a coalescable query,
+// or "" when the request must never join. Unparseable params yield "" (the
+// request still executes; it just cannot share work).
+func coalesceKeyFor(msg *jsonrpc.Message, snap *snapshot.Snapshot) string {
+	if !coalescableMethods[msg.Method] || snap == nil || len(msg.Params) == 0 {
+		return ""
+	}
+	var p coalesceParams
+	if err := json.Unmarshal(msg.Params, &p); err != nil || p.TextDocument.URI == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%d|%d|%d",
+		msg.Method, p.TextDocument.URI, snap.Revision(), p.Position.Line, p.Position.Character)
+}
+
+// lifecycleAllows enforces the C2 lifecycle state machine at admission.
+// Before initialize completes only initialization-safe messages are accepted;
+// after shutdown only exit; after exit nothing.
+func (s *Server) lifecycleAllows(method string) bool {
+	s.mu.RLock()
+	st := s.state
+	s.mu.RUnlock()
+	switch st {
+	case StateUninitialized, StateInitializing:
+		switch method {
+		case "initialize", "initialized", "exit":
+			return true
+		}
+		return false
+	case StateRunning:
+		return true
+	case StateShuttingDown:
+		return method == "exit"
+	default: // StateExited and unknown states accept nothing.
+		return false
+	}
+}
+
+// respondLifecycleError rejects a request that violates lifecycle ordering.
+// Notifications are silently dropped per LSP semantics — but counted (§K).
+func (s *Server) respondLifecycleError(msg *jsonrpc.Message) {
+	s.metrics.RejectsTotal.Inc(1)
+	if !msg.IsRequest() || msg.ID == nil {
+		return
+	}
+	resp := jsonrpc.NewErrorResponse(*msg.ID, jsonrpc.InvalidRequest,
+		fmt.Sprintf("method %q not allowed in state %s", msg.Method, s.State()), nil)
+	_ = s.send(resp)
+}
+
+// drainResult reads the scheduled request result and sends the response.
+// reqID is the JSON-RPC request ID key used for $/cancelRequest mapping (C7).
+// drainInflight waits (bounded) for scheduled requests whose responses are
+// still being written back by drainResult goroutines. Without this, a client
+// that closes the stream right after its last request can race the response
+// write: the session ends before "result" hits the wire (observed as a replay
+// divergence under load). Caller gives up after the timeout regardless.
+func (s *Server) drainInflight(maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		n := len(s.inflight)
+		s.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (s *Server) drainResult(req *scheduler.Request, reqID string) {
+	// F16: a panicking result path must not kill the process; the request
+	// simply never gets a protocol response (logged below).
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: drainResult panic for %s: %v\n", reqID, r)
+		}
+	}()
+	res := <-req.Result
+	s.unregisterInflight(reqID)
+	if res.Err != nil {
+		// A cancelled request gets no protocol response per LSP semantics
+		// (the client that cancelled is not waiting for one).
+		if ierrors.IsKind(res.Err, ierrors.ErrCancelled) || ctxErr(res.Err) {
+			return
+		}
+		// Echo the client's wire ID when we captured it; fall back to the
+		// internal RequestID string only for requests that had none.
+		respID := parseRequestID(req.RequestID)
+		if req.OriginalID != nil {
+			cid := *req.OriginalID
+			respID = jsonrpc.RequestID{Str: cid.Str, Num: cid.Num, IsStr: cid.IsStr, IsNull: cid.IsNull}
+		}
+		errText := projectBackendError(s, res.Err)
+		if msg := jsonrpc.NewErrorResponse(
+			respID,
+			jsonrpc.InternalError,
+			errText,
+			nil,
+		); msg != nil {
+			_ = s.send(msg)
+		}
+		return
+	}
+	// res.Value is *jsonrpc.Message from dispatcher.Dispatch
+	if respMsg, ok := res.Value.(*jsonrpc.Message); ok && respMsg != nil {
+		_ = s.send(respMsg)
+	}
+}
+
+func ctxErr(err error) bool {
+	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
+func (s *Server) unregisterInflight(reqID string) {
+	if reqID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.inflight, reqID)
+	s.mu.Unlock()
+}
+
+// cancelRequest implements the server side of $/cancelRequest (C7): it looks
+// up the in-flight scheduled request and cancels it. Unknown IDs are ignored.
+func (s *Server) cancelRequest(id jsonrpc.RequestID) {
+	key := requestIDKey(id)
+	s.mu.RLock()
+	req := s.inflight[key]
+	s.mu.RUnlock()
+	if req != nil {
+		req.Cancel()
+	}
+}
+
+// requestIDKey builds a map key from a JSON-RPC request ID.
+func requestIDKey(id jsonrpc.RequestID) string {
+	if id.IsStr {
+		return "s:" + id.Str
+	}
+	return fmt.Sprintf("n:%d", id.Num)
+}
+
+// snapshotCtxKey carries the request's captured snapshot through the handler
+// chain (INV-SNAPSHOT-002: exactly one snapshot per request).
+type snapshotCtxKey struct{}
+
+func withSnapshot(ctx context.Context, snap *snapshot.Snapshot) context.Context {
+	return context.WithValue(ctx, snapshotCtxKey{}, snap)
+}
+
+// snapshotFromCtx returns the captured snapshot, or nil when a handler runs
+// outside the scheduler path (direct Dispatch in tests).
+func snapshotFromCtx(ctx context.Context) *snapshot.Snapshot {
+	if v, ok := ctx.Value(snapshotCtxKey{}).(*snapshot.Snapshot); ok {
+		return v
+	}
+	return nil
+}
+
+// recordEvidence appends one §B4 evidence record to the explain ring.
+// Callers: envelope-unwrapping semantic handlers.
+func (s *Server) recordEvidence(method, uri string, ev []identity.Evidence, diag []string) {
+	s.mu.Lock()
+	s.evRing[s.evRingNext] = evidenceRecord{
+		Method: method, URI: uri, Ev: ev, Diag: diag, At: time.Now().UTC(),
+	}
+	s.evRingNext = (s.evRingNext + 1) % len(s.evRing)
+	s.mu.Unlock()
+}
+
+// recentEvidence returns all live ring entries oldest-first.
+func (s *Server) recentEvidence() []evidenceRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]evidenceRecord, 0, len(s.evRing))
+	for i := 0; i < len(s.evRing); i++ {
+		idx := (s.evRingNext + i) % len(s.evRing)
+		r := s.evRing[idx]
+		if r.At.IsZero() {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// classifyPriority maps LSP methods to scheduler priority classes (F3).
+func (s *Server) classifyPriority(msg *jsonrpc.Message) scheduler.Priority {
+	switch msg.Method {
+	case "textDocument/completion", "textDocument/signatureHelp":
+		return scheduler.PriorityCompletion
+	case "textDocument/hover":
+		return scheduler.PriorityHover
+	case "textDocument/definition", "textDocument/declaration",
+		"textDocument/typeDefinition", "textDocument/implementation":
+		return scheduler.PriorityDefinition
+	case "textDocument/references", "textDocument/rename":
+		return scheduler.PriorityReferences
+	case "textDocument/diagnostics", "textDocument/codeAction":
+		return scheduler.PriorityDiagnostics
+	case "textDocument/semanticTokens/full", "textDocument/semanticTokens/range",
+		"textDocument/inlayHint":
+		return scheduler.PrioritySemanticTokens
+	case "$/progress":
+		return scheduler.PriorityMaintenance
+	default:
+		return scheduler.PriorityMaintenance
+	}
+}
+
+func (s *Server) send(msg *jsonrpc.Message) error {
+	s.mu.RLock()
+	t := s.transport
+	s.mu.RUnlock()
+	if t == nil {
+		return fmt.Errorf("no transport")
+	}
+	return t.Write(context.Background(), msg)
+}
+
+func (s *Server) respondRejected(msg *jsonrpc.Message, reason string) {
+	s.metrics.RejectsTotal.Inc(1)
+	if !msg.IsRequest() || msg.ID == nil {
+		return
+	}
+	resp := jsonrpc.NewErrorResponse(*msg.ID, jsonrpc.RequestFailed, reason, nil)
+	_ = s.send(resp)
+}
+
+func parseRequestID(id identity.RequestID) jsonrpc.RequestID {
+	return jsonrpc.RequestID{Str: string(id), IsStr: len(id) > 0}
+}
+
+// registerHandlers registers all LSP method handlers.
+func (s *Server) registerHandlers() {
+	s.dispatcher.Register("initialize", s.handleInitialize)
+	s.dispatcher.Register("initialized", s.handleInitialized)
+	s.dispatcher.Register("shutdown", s.handleShutdown)
+	s.dispatcher.Register("exit", s.handleExit)
+	s.dispatcher.Register("$/cancelRequest", s.handleCancelRequest)
+	s.dispatcher.Register("textDocument/didOpen", s.handleDidOpen)
+	s.dispatcher.Register("textDocument/didChange", s.handleDidChange)
+	s.dispatcher.Register("textDocument/didSave", s.handleDidSave)
+	s.dispatcher.Register("textDocument/didClose", s.handleDidClose)
+	s.dispatcher.Register("textDocument/hover", s.handleHover)
+	s.dispatcher.Register("textDocument/completion", s.handleCompletion)
+	s.dispatcher.Register("textDocument/definition", s.handleDefinition)
+	s.dispatcher.Register("textDocument/documentSymbol", s.handleDocumentSymbol)
+	s.dispatcher.Register("textDocument/references", s.handleReferences)
+	s.dispatcher.Register("textDocument/rename", s.handleRename)
+	s.dispatcher.Register("textDocument/semanticTokens/full", s.handleSemanticTokens)
+	s.dispatcher.Register("textDocument/prepareRename", s.handlePrepareRename)
+	s.dispatcher.Register("textDocument/diagnostic", s.handlePullDiagnostics)
+	s.dispatcher.Register("workspace/didChangeWatchedFiles", s.handleDidChangeWatchedFiles)
+	s.dispatcher.Register("workspace/didCreateFiles", s.handleDidCreateFiles)
+	s.dispatcher.Register("workspace/didRenameFiles", s.handleDidRenameFiles)
+	s.dispatcher.Register("workspace/didDeleteFiles", s.handleDidDeleteFiles)
+	s.dispatcher.Register("textDocument/codeAction", s.handleCodeAction)
+	s.dispatcher.Register("textDocument/signatureHelp", s.handleSignatureHelp)
+	s.dispatcher.Register("textDocument/formatting", s.handleFormatting)
+	s.dispatcher.Register("textDocument/inlayHint", s.handleInlayHints)
+	s.dispatcher.Register("workspace/symbol", s.handleWorkspaceSymbol)
+	// Custom extension namespace per goal.md §C12 (omnilsp/* only).
+	s.dispatcher.Register("omnilsp/status", s.handleOmnilspStatus)
+	s.dispatcher.Register("omnilsp/explain", s.handleOmnilspExplain)
+	s.dispatcher.Register("omnilsp/backendStatus", s.handleOmnilspBackendStatus)
+}
+
+// State returns the current server state.
+func (s *Server) State() State {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state
+}
+
+// facadeMutatingMethods are the VFS-mutating notifications registered in the
+// dispatcher. The CallMethod facade admits them only in the same state the C2
+// lifecycle gate would admit them over LSP — otherwise an MCP/HTTP adapter
+// could mutate the VFS from any goroutine, bypassing lifecycle ordering.
+var facadeMutatingMethods = map[string]bool{
+	"textDocument/didOpen":   true,
+	"textDocument/didChange": true,
+	"textDocument/didSave":   true,
+	"textDocument/didClose":  true,
+}
+
+// CallMethod is the canonical read-only facade for non-LSP protocol adapters
+// (MCP tools, HTTP API). It routes through the same dispatcher — lifecycle
+// gate, snapshot capture, backend resolution, evidence recording — so a
+// query over MCP/HTTP behaves exactly like the same query over LSP
+// (§C0: semantic behavior MUST NOT differ by transport; §C14: no snapshot
+// bypass). Mutating methods are gated to the Ready (Running) state with C2-gate
+// semantics; anything unregistered returns a typed method-not-found error.
+func (s *Server) CallMethod(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	if facadeMutatingMethods[method] && s.State() != StateRunning {
+		return nil, fmt.Errorf("method %q not allowed in state %s", method, s.State())
+	}
+	rawParams, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "facade", IsStr: true}, method, rawParams)
+	resp := s.dispatcher.Dispatch(ctx, msg)
+	if resp.Error != nil {
+		return nil, fmt.Errorf("%s: %s", method, resp.Error.Message)
+	}
+	return resp.Result, nil
+}
+
+// HoverEnvelope returns the raw canonical hover envelope (§B5) for adapters
+// that project evidence themselves (C14). Same routing as textDocument/hover.
+func (s *Server) HoverEnvelope(ctx context.Context, uri string, line, col uint32) (identity.SemanticResult[*languages.HoverResult], error) {
+	be, err := s.resolveBackend(uri)
+	if err != nil {
+		return identity.SemanticResult[*languages.HoverResult]{}, err
+	}
+	src := s.semanticSource(uri)
+	snapRev, bc := s.queryContext(be, uri)
+	result, err := be.Hover(ctx, languages.HoverRequest{
+		URI: uri, Content: src, SnapshotRev: snapRev, BuildContext: bc, Line: line, Column: col,
+	})
+	if err != nil {
+		return identity.SemanticResult[*languages.HoverResult]{}, err
+	}
+	s.recordEvidence("textDocument/hover", uri, result.Evidence, result.InternalDiagnostics)
+	return result, nil
+}
+
+// DefinitionEnvelope is HoverEnvelope's counterpart for definitions.
+func (s *Server) DefinitionEnvelope(ctx context.Context, uri string, line, col uint32) (identity.SemanticResult[[]languages.Location], error) {
+	be, err := s.resolveBackend(uri)
+	if err != nil {
+		return identity.SemanticResult[[]languages.Location]{}, err
+	}
+	src := s.semanticSource(uri)
+	snapRev, bc := s.queryContext(be, uri)
+	result, err := be.Definition(ctx, languages.DefinitionRequest{
+		URI: uri, Content: src, SnapshotRev: snapRev, BuildContext: bc, Line: line, Column: col,
+	})
+	if err != nil {
+		return identity.SemanticResult[[]languages.Location]{}, err
+	}
+	s.recordEvidence("textDocument/definition", uri, result.Evidence, result.InternalDiagnostics)
+	return result, nil
+}
+
+// ReferencesEnvelope is HoverEnvelope's counterpart for references.
+func (s *Server) ReferencesEnvelope(ctx context.Context, uri string, line, col uint32, includeDecl bool) (identity.SemanticResult[[]languages.Location], error) {
+	be, err := s.resolveBackend(uri)
+	if err != nil {
+		return identity.SemanticResult[[]languages.Location]{}, err
+	}
+	src := s.semanticSource(uri)
+	snapRev, bc := s.queryContext(be, uri)
+	result, err := be.References(ctx, languages.ReferencesRequest{
+		URI: uri, Content: src, SnapshotRev: snapRev, BuildContext: bc,
+		Line: line, Column: col, IncludeDecl: includeDecl,
+	})
+	if err != nil {
+		return identity.SemanticResult[[]languages.Location]{}, err
+	}
+	s.recordEvidence("textDocument/references", uri, result.Evidence, result.InternalDiagnostics)
+	return result, nil
+}
+
+// semanticSource mirrors dispatchSemanticRequest's content resolution:
+// captured snapshot document wins, then VFS overlay, then empty.
+//
+// §D12 hook: a registered virtual URI reads through to its host content so
+// semantic calls never see an empty source for a virtual document.
+// TODO(D12): full pipeline — region extraction on the way in (host content →
+// virtual slice) and reverse-mapped positions on the way out (virtual result
+// → host result) — requires coordinate projection threaded through every
+// Envelope call site and the languages request/response structs; deferred
+// until a backend actually emits virtual documents. The registry accessor
+// below is the seam those call sites will use.
+func (s *Server) semanticSource(uri string) []byte {
+	if s.virtualReg != nil {
+		if host, err := s.virtualReg.ResolveHost(uri); err == nil {
+			uri = host
+		}
+	}
+	if snap := s.snapMgr.Current(); snap != nil {
+		if doc := snap.Document(uri); doc != nil && doc.Content != nil {
+			return doc.Content
+		}
+	}
+	if src := s.vfs.Content(uri); src != nil {
+		return src
+	}
+	return []byte{}
+}
+
+// VirtualRegistry exposes the §D12 virtual-document/source-map registry so
+// adapters can register host↔virtual mappings and S3 gates can consult them.
+func (s *Server) VirtualRegistry() *virtual.Registry { return s.virtualReg }
+
+// queryContext pairs the current snapshot revision with the backend's build
+// context — the two identities every canonical request must carry.
+func (s *Server) queryContext(be languages.Backend, uri string) (uint64, identity.BuildContextID) {
+	snapRev := uint64(0)
+	if snap := s.snapMgr.Current(); snap != nil {
+		snapRev = snap.ID().Revision
+	}
+	return snapRev, backendBuildContext(be)
+}
+
+// SnapshotRevision returns the current snapshot revision for observability
+// consumers such as the §P9 session recorder. Zero before first publish.
+func (s *Server) SnapshotRevision() uint64 {
+	if snap := s.snapMgr.Current(); snap != nil {
+		return snap.Revision()
+	}
+	return 0
+}
+
+// projectBackendError enriches a failed request's error text with the
+// backend's supervisor lifecycle message (§Q2): a crash becomes "Recovery in
+// progress (crash #2, epoch 3)" instead of a bare "process terminated".
+func projectBackendError(s *Server, err error) string {
+	text := err.Error()
+	var be *ierrors.Error
+	if !errors.As(err, &be) || be.Op == "" {
+		return text
+	}
+	s.mu.RLock()
+	backend := s.languages[be.Op]
+	s.mu.RUnlock()
+	rep, ok := backend.(languages.StatusReporter)
+	if !ok {
+		return text
+	}
+	if status := rep.BackendStatusMessage(); status != "" {
+		return text + " [" + status + "]"
+	}
+	return text
+}

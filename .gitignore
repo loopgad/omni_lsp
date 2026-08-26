@@ -1,0 +1,5 @@
+omnilsp.exe
+*.exe
+*.test
+*.out
+dist/

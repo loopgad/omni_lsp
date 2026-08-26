@@ -1,0 +1,73 @@
+# Nightly verification pipeline (§T7/X9-1, docs/soak-nightly.md).
+# Form-only until this repository has a remote: the job definitions are the
+# contract; the schedule activates once pushed to GitHub.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Sustained soak (55m accelerated nightly form)
+        run: go test -tags soak -timeout 70m -count=1 ./test/soak/
+        env:
+          SOAK_DURATION: 55m
+      - name: Upload soak artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-failure
+          path: |
+            **/*.prof
+            **/triage-*.json
+          retention-days: 30
+
+  verify-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      # Full conformance verification: AUTO probes + GATE commands executed
+      # (race suite, golden scenarios, soak smoke, SBOM, build matrix).
+      - name: Conformance verify --full
+        run: go run ./cmd/omnilsp verify --full --min 90
+
+  release-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Multi-platform build matrix + sha256 + SBOM (X8-1)
+        run: bash scripts/build-multiplatform.sh "$(date -u +%Y%m%d)-nightly" dist-nightly
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-nightly
+          path: dist-nightly/
+          retention-days: 14
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: §N15 dependency vulnerability scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

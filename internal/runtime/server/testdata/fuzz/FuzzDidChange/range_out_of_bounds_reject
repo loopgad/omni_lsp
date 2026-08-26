@@ -1,0 +1,7 @@
+go test fuzz v1
+string("crlf\r\nlines\r\n")
+uint32(9)
+uint32(9)
+uint32(9)
+uint32(9)
+string("out of range")

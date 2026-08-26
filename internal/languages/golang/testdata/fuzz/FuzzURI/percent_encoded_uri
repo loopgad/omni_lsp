@@ -1,0 +1,2 @@
+go test fuzz v1
+string("file:///path%20with%20spaces/a%20b.go")
