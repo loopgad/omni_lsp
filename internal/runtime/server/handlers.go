@@ -40,16 +40,22 @@ type InitializeResult struct {
 }
 
 type ServerCapabilities struct {
-	PositionEncoding        string                   `json:"positionEncoding,omitempty"`
-	TextDocumentSync        *TextDocumentSyncOptions `json:"textDocumentSync"`
-	HoverProvider           bool                     `json:"hoverProvider"`
-	CompletionProvider      *CompletionOptions       `json:"completionProvider"`
-	DefinitionProvider      bool                     `json:"definitionProvider"`
-	ReferencesProvider      bool                     `json:"referencesProvider"`
-	DocumentSymbolProvider  bool                     `json:"documentSymbolProvider"`
-	RenameProvider          bool                     `json:"renameProvider"`
-	SemanticTokensProvider  *SemanticTokensOptions   `json:"semanticTokensProvider"`
-	WorkspaceSymbolProvider bool                     `json:"workspaceSymbolProvider"`
+	PositionEncoding           string                   `json:"positionEncoding,omitempty"`
+	TextDocumentSync           *TextDocumentSyncOptions `json:"textDocumentSync"`
+	HoverProvider              bool                     `json:"hoverProvider"`
+	CompletionProvider         *CompletionOptions       `json:"completionProvider"`
+	DefinitionProvider         bool                     `json:"definitionProvider"`
+	DeclarationProvider        bool                     `json:"declarationProvider,omitempty"`
+	ReferencesProvider         bool                     `json:"referencesProvider"`
+	DocumentSymbolProvider     bool                     `json:"documentSymbolProvider"`
+	RenameProvider             bool                     `json:"renameProvider"`
+	SemanticTokensProvider     *SemanticTokensOptions   `json:"semanticTokensProvider"`
+	WorkspaceSymbolProvider    bool                     `json:"workspaceSymbolProvider"`
+	SignatureHelpProvider      bool                     `json:"signatureHelpProvider,omitempty"`
+	CodeActionProvider         bool                     `json:"codeActionProvider,omitempty"`
+	DiagnosticProvider         bool                     `json:"diagnosticProvider,omitempty"`
+	DocumentFormattingProvider bool                     `json:"documentFormattingProvider,omitempty"`
+	InlayHintProvider          bool                     `json:"inlayHintProvider,omitempty"`
 }
 
 type TextDocumentSyncOptions struct {
@@ -235,36 +241,52 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 	s.mu.RLock()
 	negotiated = s.positionEncoding
 	s.mu.RUnlock()
-	result := InitializeResult{
-		Capabilities: ServerCapabilities{
-			PositionEncoding: negotiated,
-			TextDocumentSync: &TextDocumentSyncOptions{
-				OpenClose: true,
-				Change:    2,
-				Save:      &SaveOptions{IncludeText: true},
-			},
-			HoverProvider:          true,
-			CompletionProvider:     &CompletionOptions{TriggerCharacters: []string{".", ":", ">", "\""}},
-			DefinitionProvider:     true,
-			ReferencesProvider:     true,
-			DocumentSymbolProvider: true,
-			RenameProvider:         true, // prepareRename served (I10); plain bool keeps the typed struct honest
-			SemanticTokensProvider: &SemanticTokensOptions{
-				Legend: SemanticTokensLegend{
-					TokenTypes:     []string{"variable", "function", "type", "string", "number", "comment"},
-					TokenModifiers: []string{"declaration", "definition", "readonly"},
-				},
-				Full:        true,
-				Incremental: true,
-			},
-			WorkspaceSymbolProvider: true,
-		},
-	}
+	result := InitializeResult{Capabilities: buildCapabilities(negotiated)}
 	data, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("marshal initialize result: %w", err)
 	}
 	return data, nil
+}
+
+// buildCapabilities assembles the advertised capability set (§C3). Every
+// entry here must have a registered handler behind it and vice versa — a
+// served-but-undeclared feature is unreachable, a declared-but-unserved one
+// is a lie. TestI21_LegendMatchesEmittedTypes pins the tokens side.
+func buildCapabilities(positionEncoding string) ServerCapabilities {
+	return ServerCapabilities{
+		PositionEncoding: positionEncoding,
+		TextDocumentSync: &TextDocumentSyncOptions{
+			OpenClose: true,
+			Change:    2,
+			Save:      &SaveOptions{IncludeText: true},
+		},
+		HoverProvider:          true,
+		CompletionProvider:     &CompletionOptions{TriggerCharacters: []string{".", ":", ">", "\""}},
+		DefinitionProvider:     true,
+		DeclarationProvider:    true,
+		ReferencesProvider:     true,
+		DocumentSymbolProvider: true,
+		RenameProvider:         true, // prepareRename served (I10); plain bool keeps the typed struct honest
+		SemanticTokensProvider: &SemanticTokensOptions{
+			Legend: SemanticTokensLegend{
+				// §I21: legend indexes are the contract with backend emitters —
+				// both sides read the same slice (languages.SemanticTokenTypes).
+				TokenTypes:     languages.SemanticTokenTypes,
+				TokenModifiers: []string{"declaration", "definition", "readonly"},
+			},
+			Full: true,
+			// No delta handler is implemented; claiming incremental would
+			// make clients request semanticTokens/delta and get
+			// method-not-found (§C3 honesty).
+		},
+		WorkspaceSymbolProvider:    true,
+		SignatureHelpProvider:      true,
+		CodeActionProvider:         true,
+		DiagnosticProvider:         true, // pull + push (C11)
+		DocumentFormattingProvider: true,
+		InlayHintProvider:          true,
+	}
 }
 
 // handleInitialized transitions Initializing -> Running (C2).
@@ -727,7 +749,16 @@ func (s *Server) handleSemanticTokens(ctx context.Context, msg *jsonrpc.Message)
 			if err != nil {
 				return nil, err
 			}
-			return json.Marshal(tokens)
+			// §I21 wire format: five uint32 per token in a flat "data" array —
+			// NOT an array of objects. Marshalling the struct slice directly
+			// produces protocol-invalid responses.
+			data := make([]uint32, 0, len(tokens)*5)
+			for _, tk := range tokens {
+				data = append(data, tk.DeltaLine, tk.DeltaStart, tk.Length, tk.TokenType, tk.TokenMods)
+			}
+			return json.Marshal(struct {
+				Data []uint32 `json:"data"`
+			}{Data: data})
 		},
 	)
 }

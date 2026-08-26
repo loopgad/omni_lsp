@@ -792,17 +792,6 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 	var lastLine, lastCol uint32
 	// UTF-16 columns/lengths over the parsed content (INV-POS-001).
 	idx := position.NewIndex(content, position.UTF16)
-	const (
-		tokNamespace uint32 = iota
-		tokType
-		tokParameter
-		tokVariable
-		tokFunction
-		tokKeyword
-		tokString
-		tokNumber
-		tokComment
-	)
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -816,34 +805,34 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 		case *ast.Ident:
 			p = v.Pos()
 			end = v.End()
-			tt = tokVariable
+			tt = languages.TokVariable
 		case *ast.FuncDecl:
 			if v.Name != nil {
 				p = v.Name.Pos()
 				end = v.Name.End()
-				tt = tokFunction
+				tt = languages.TokFunction
 			}
 		case *ast.TypeSpec:
 			if v.Name != nil {
 				p = v.Name.Pos()
 				end = v.Name.End()
-				tt = tokType
+				tt = languages.TokType
 			}
 		case *ast.BasicLit:
 			p = v.Pos()
 			end = v.End()
 			switch v.Kind {
 			case token.STRING:
-				tt = tokString
+				tt = languages.TokString
 			case token.INT, token.FLOAT, token.IMAG:
-				tt = tokNumber
+				tt = languages.TokNumber
 			default:
 				return true
 			}
 		case *ast.Comment:
 			p = v.Pos()
 			end = v.End()
-			tt = tokComment
+			tt = languages.TokComment
 		default:
 			return true
 		}

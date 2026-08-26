@@ -403,24 +403,59 @@ func TestHandleWorkspaceSymbol(t *testing.T) {
 
 func TestHandleSemanticTokens(t *testing.T) {
 	s := New(DefaultConfig())
-	be := &mockBackend{langID: "go", exts: []string{".go"}, semtResult: []languages.SemanticToken{{DeltaLine: 0, DeltaStart: 5, Length: 3, TokenType: 1}}}
+	be := &mockBackend{langID: "go", exts: []string{".go"}, semtResult: []languages.SemanticToken{{DeltaLine: 0, DeltaStart: 5, Length: 3, TokenType: uint32(languages.TokFunction)}}}
 	s.RegisterBackend("go", be)
 	s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
 	params := `{"textDocument":{"uri":"file:///x.go"}}`
 	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "st", IsStr: true}, "textDocument/semanticTokens/full", json.RawMessage(params))
 	resp := s.dispatcher.Dispatch(context.Background(), msg)
-	// dispatch returns *Message, no error
 	if resp == nil || resp.Error != nil {
 		t.Fatalf("expected success")
 	}
-	var tokens []struct {
-		DeltaLine uint32 `json:"deltaLine"`
+	// §I21 wire shape lock: strict decode — the response MUST be
+	// {"data":[uint x5 per token]} and nothing else. json.Unmarshal is
+	// case-insensitive and would silently accept the old object-array bug.
+	if !json.Valid(resp.Result) {
+		t.Fatalf("invalid json: %s", resp.Result)
 	}
-	if err := json.Unmarshal(resp.Result, &tokens); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	var wire struct {
+		Data []int `json:"data"`
 	}
-	if len(tokens) != 1 || tokens[0].DeltaLine != 0 {
-		t.Errorf("tokens = %v, want [{0}]", tokens)
+	if err := json.Unmarshal(resp.Result, &wire); err != nil {
+		t.Fatalf("flat data array expected, got %s: %v", resp.Result, err)
+	}
+	if string(resp.Result[0]) != `{` {
+		t.Fatalf("response must be a single object with only \"data\", got %s", resp.Result)
+	}
+	want := []int{0, 5, 3, int(languages.TokFunction), 0}
+	if len(wire.Data) != len(want) {
+		t.Fatalf("data = %v, want %v", wire.Data, want)
+	}
+	for i := range want {
+		if wire.Data[i] != want[i] {
+			t.Fatalf("data[%d] = %d, want %d", i, wire.Data[i], want[i])
+		}
+	}
+}
+
+// TestI21_LegendMatchesEmittedTypes pins §I21: the legend advertised in
+// capabilities must interpret the exact TokenType values backends emit —
+// a mismatch colors every token as the wrong kind client-side.
+func TestI21_LegendMatchesEmittedTypes(t *testing.T) {
+	n := len(languages.SemanticTokenTypes)
+	if n != int(languages.TokComment)+1 {
+		t.Fatalf("legend has %d entries but emitter enum tops at %d", n, languages.TokComment)
+	}
+	caps := buildCapabilities("utf-16")
+	st := caps.SemanticTokensProvider
+	if st == nil {
+		t.Fatal("semanticTokensProvider not declared")
+	}
+	if st.Incremental {
+		t.Error("Incremental declared without a delta handler (§C3 honesty)")
+	}
+	if len(st.Legend.TokenTypes) != n {
+		t.Fatalf("capabilities legend %d != canonical %d", len(st.Legend.TokenTypes), n)
 	}
 }
 

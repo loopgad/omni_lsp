@@ -379,3 +379,25 @@ type StatusReporter interface {
 type IncompleteCompletionProvider interface {
 	CompletionIsIncomplete() bool
 }
+
+// SemanticTokenTypes is the canonical token-type legend (§I21). The index of
+// each name here IS the uint32 the backends emit in TokenType — server
+// capabilities and backend emitters must never diverge, so both reference
+// this slice. Extend only at the tail; reordering breaks every client.
+var SemanticTokenTypes = []string{
+	"namespace", "type", "parameter", "variable", "function",
+	"keyword", "string", "number", "comment",
+}
+
+// Semantic token type indexes — MUST stay in lockstep with SemanticTokenTypes.
+const (
+	TokNamespace uint32 = iota
+	TokType
+	TokParameter
+	TokVariable
+	TokFunction
+	TokKeyword
+	TokString
+	TokNumber
+	TokComment
+)
