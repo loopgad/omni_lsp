@@ -311,3 +311,32 @@ func TestC12_ResultMetaAndQueryTrace(t *testing.T) {
 		t.Fatalf("queryTrace bad payload: %v %s", err, qresp.Result)
 	}
 }
+
+// TestC3_CapabilitiesDeclaredEqualsServed pins §C3: every declared provider
+// flag has a registered handler behind it. A declared-but-unserved feature
+// makes clients send requests that fail; a served-but-undeclared one is dead.
+func TestC3_CapabilitiesDeclaredEqualsServed(t *testing.T) {
+	s := New(DefaultConfig())
+	caps := buildCapabilities("utf-16")
+	if caps.HoverProvider {
+		if !s.dispatcher.HasHandler("textDocument/hover") {
+			t.Error("hoverProvider declared but no handler")
+		}
+	}
+	for m, declared := range map[string]bool{
+		"textDocument/signatureHelp": caps.SignatureHelpProvider,
+		"textDocument/codeAction":    caps.CodeActionProvider,
+		"textDocument/diagnostic":    caps.DiagnosticProvider,
+		"textDocument/formatting":    caps.DocumentFormattingProvider,
+		"textDocument/inlayHint":     caps.InlayHintProvider,
+		"textDocument/declaration":   caps.DeclarationProvider,
+	} {
+		if !declared {
+			t.Errorf("%s implemented but not declared", m)
+			continue
+		}
+		if !s.dispatcher.HasHandler(m) {
+			t.Errorf("%s declared but no handler registered", m)
+		}
+	}
+}

@@ -69,6 +69,10 @@
 | UX-C8 | $/progress begin/end reported for token-bearing long queries | C8 work-done progress | `TestC8_ProgressNotifications` | AUTO |
 | UX-I9 | Heuristic completion declared IsIncomplete for client re-query | I9 completion incompleteness | `TestI9_CompletionIsIncompleteNegotiation` | AUTO |
 | UX-Q2 | Failed queries project supervisor recovery guidance to clients | Q2 error projection | `TestQ2_ErrorProjectionCarriesSupervisorGuidance` | AUTO |
+| UX-I21TOK | Legend shared with emitters; flat data-array wire shape; no false incremental claim | I21/C10 semantic tokens wire contract | `TestI21_LegendMatchesEmittedTypes`, `TestHandleSemanticTokens` | AUTO |
+| C3-CAPS | Every declared provider has a handler; every served feature is declared | C3 capability/handler bidirectional alignment | `TestC3_CapabilitiesDeclaredEqualsServed` | AUTO |
+| C12-META | Envelope metadata (status/completeness/evidence) and engine counters exposed via custom methods | C12/B5 resultMeta + queryTrace exits | `TestC12_ResultMetaAndQueryTrace` | AUTO |
+| B6-SIGHON | Syntax-layer signature results carry IncompleteKnownSubset, not zero-value Complete | B6 signature completeness honesty | `TestFeatures_GolangBridgeSyntaxTier` | AUTO |
 
 ### WORKSPACE
 
@@ -119,6 +123,7 @@
 | Y2-5 | Client compatibility matrix current (VS Code/Neovim/Emacs/Helix/Zed) | S11/X8 client matrix | `TestX8_ClientDocsPresent` | AUTO |
 | Y2-6 | MCP revision pinned | A7/§C14 | `TestInitializePinsProtocolRevision`, `TestToolsListIsFiveReadOnly` | AUTO |
 | Y2-7 | Public API schemas versioned | R4/W2/P8/P9 | `TestRenderJSON` | AUTO |
+| T2-DECL | textDocument/declaration declared and served through DeclarationProvider (ADR-0009 D2) | T2/I14 declaration served via optional capability | `TestT2_DeclarationServedAndDeclared` | AUTO |
 
 ### Y3
 
