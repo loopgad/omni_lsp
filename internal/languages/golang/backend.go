@@ -773,7 +773,7 @@ func (b *Backend) Diagnostics(ctx context.Context, uri string, content []byte) (
 		diags = append(diags, languages.Diagnostic{
 			StartLine: sl, StartChar: sc,
 			EndLine: el, EndChar: ec,
-			Severity: 1, Source: "gopls", Message: e.Msg,
+			Severity: 1, Source: "omnilsp-go", Message: e.Msg,
 		})
 	}
 	return diags, nil

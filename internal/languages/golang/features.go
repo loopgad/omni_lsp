@@ -64,9 +64,10 @@ func (b *Backend) SignatureHelp(ctx context.Context, req languages.SignatureHelp
 		ActiveParameter: activeArg(fset, call, cursor),
 	}
 	return identity.SemanticResult[*languages.SignatureHelpResult]{
-		Status:   identity.ResultPartial,
-		Value:    &languages.SignatureHelpResult{Signatures: []languages.SignatureInformation{sig}},
-		Evidence: []identity.Evidence{{Kind: identity.EvidenceSyntax, Assurance: identity.AssuranceSyntax}},
+		Status:       identity.ResultPartial,
+		Completeness: identity.IncompleteKnownSubset,
+		Value:        &languages.SignatureHelpResult{Signatures: []languages.SignatureInformation{sig}},
+		Evidence:     []identity.Evidence{{Kind: identity.EvidenceSyntax, Assurance: identity.AssuranceSyntax}},
 	}, nil
 }
 
