@@ -4,6 +4,7 @@
     "jsonrpc": "2.0",
     "result": {
       "capabilities": {
+        "codeActionProvider": true,
         "completionProvider": {
           "triggerCharacters": [
             ".",
@@ -12,15 +13,18 @@
             "\""
           ]
         },
+        "declarationProvider": true,
         "definitionProvider": true,
+        "diagnosticProvider": true,
+        "documentFormattingProvider": true,
         "documentSymbolProvider": true,
         "hoverProvider": true,
+        "inlayHintProvider": true,
         "positionEncoding": "utf-16",
         "referencesProvider": true,
         "renameProvider": true,
         "semanticTokensProvider": {
           "full": true,
-          "incremental": true,
           "legend": {
             "tokenModifiers": [
               "declaration",
@@ -28,15 +32,19 @@
               "readonly"
             ],
             "tokenTypes": [
+              "namespace",
+              "type",
+              "parameter",
               "variable",
               "function",
-              "type",
+              "keyword",
               "string",
               "number",
               "comment"
             ]
           }
         },
+        "signatureHelpProvider": true,
         "textDocumentSync": {
           "change": "<n>",
           "openClose": true,

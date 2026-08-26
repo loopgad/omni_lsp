@@ -3,3 +3,5 @@ omnilsp.exe
 *.test
 *.out
 dist/
+dist-smoke/
+sbom.cdx.json
