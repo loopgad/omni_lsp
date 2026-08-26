@@ -203,6 +203,8 @@
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | X7-1 | Out-of-process plugins: discovery/validation/capability gates/lifecycle | O0-O5 plugin platform | `TestO3_ManifestValidation`, `TestO4_QuarantineAfterCrashLoop`, `TestExecutor_LaunchHandshake` | AUTO |
+| O2-EXECGATE | Pre-spawn validate+capability gates refuse without a child; handshake grants are exactly manifest∩grant; OnExit fires once and feeds quarantine | O2/O4 plugin executor gates and crash containment | `TestLaunch_RejectsBeforeSpawn`, `TestLaunch_HandshakeGrantsFiltered`, `TestOnExit_OnceAndCrashQuarantine` | AUTO |
+| O3-DISCOVER | Only manifest dirs discovered; broken manifests surfaced per-entry without aborting; deterministic order | O3 discovery scan semantics | `TestDiscover_ScansAndToleratesBroken` | AUTO |
 
 ### TRUST
 
