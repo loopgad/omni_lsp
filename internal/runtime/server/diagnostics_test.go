@@ -258,3 +258,56 @@ func TestT2_DeclarationServedAndDeclared(t *testing.T) {
 		t.Fatalf("dispatch failed: %+v", resp)
 	}
 }
+
+// TestC12_ResultMetaAndQueryTrace pins §C12: the envelope metadata exit
+// (omnilsp/resultMeta) exposes completeness/evidence per URI+method, and
+// omnilsp/queryTrace exposes engine counters — both must respond cleanly.
+func TestC12_ResultMetaAndQueryTrace(t *testing.T) {
+	s := New(DefaultConfig())
+	be := &mockBackend{langID: "go", exts: []string{".go"}}
+	s.RegisterBackend("go", be)
+	s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
+
+	req := `{"textDocument":{"uri":"file:///x.go"},"position":{"line":0,"character":0}}`
+	for _, m := range []string{"textDocument/hover", "textDocument/definition"} {
+		msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: m, IsStr: true}, m, json.RawMessage(req))
+		if resp := s.dispatcher.Dispatch(context.Background(), msg); resp == nil || resp.Error != nil {
+			t.Fatalf("%s dispatch failed", m)
+		}
+	}
+
+	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "rm", IsStr: true}, "omnilsp/resultMeta",
+		json.RawMessage(`{"uri":"file:///x.go"}`))
+	resp := s.dispatcher.Dispatch(context.Background(), msg)
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("resultMeta failed: %+v", resp)
+	}
+	var metas []struct {
+		Method       string `json:"method"`
+		Status       string `json:"status"`
+		Completeness string `json:"completeness"`
+	}
+	if err := json.Unmarshal(resp.Result, &metas); err != nil {
+		t.Fatalf("unmarshal resultMeta: %v (%s)", err, resp.Result)
+	}
+	found := map[string]bool{}
+	for _, m := range metas {
+		found[m.Method] = true
+		if m.Status == "" || m.Completeness == "" {
+			t.Errorf("%s meta incomplete: %+v", m.Method, m)
+		}
+	}
+	if !found["textDocument/hover"] || !found["textDocument/definition"] {
+		t.Fatalf("missing methods in resultMeta: %v", found)
+	}
+
+	qmsg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "qt", IsStr: true}, "omnilsp/queryTrace", nil)
+	qresp := s.dispatcher.Dispatch(context.Background(), qmsg)
+	if qresp == nil || qresp.Error != nil {
+		t.Fatalf("queryTrace failed: %+v", qresp)
+	}
+	var stats map[string]any
+	if err := json.Unmarshal(qresp.Result, &stats); err != nil || len(stats) == 0 {
+		t.Fatalf("queryTrace bad payload: %v %s", err, qresp.Result)
+	}
+}

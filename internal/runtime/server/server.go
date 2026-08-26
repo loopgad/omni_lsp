@@ -167,11 +167,13 @@ func newServerMetrics() serverMetrics {
 
 // evidenceRecord is one entry of the explain evidence ring.
 type evidenceRecord struct {
-	Method string
-	URI    string
-	Ev     []identity.Evidence
-	Diag   []string
-	At     time.Time
+	Method       string
+	URI          string
+	Ev           []identity.Evidence
+	Diag         []string
+	At           time.Time
+	Status       identity.ResultStatus
+	Completeness identity.Completeness
 }
 
 // Config holds server configuration.
@@ -584,10 +586,11 @@ func snapshotFromCtx(ctx context.Context) *snapshot.Snapshot {
 
 // recordEvidence appends one §B4 evidence record to the explain ring.
 // Callers: envelope-unwrapping semantic handlers.
-func (s *Server) recordEvidence(method, uri string, ev []identity.Evidence, diag []string) {
+func (s *Server) recordEvidence(method, uri string, status identity.ResultStatus, completeness identity.Completeness, ev []identity.Evidence, diag []string) {
 	s.mu.Lock()
 	s.evRing[s.evRingNext] = evidenceRecord{
 		Method: method, URI: uri, Ev: ev, Diag: diag, At: time.Now().UTC(),
+		Status: status, Completeness: completeness,
 	}
 	s.evRingNext = (s.evRingNext + 1) % len(s.evRing)
 	s.mu.Unlock()
@@ -690,6 +693,8 @@ func (s *Server) registerHandlers() {
 	s.dispatcher.Register("omnilsp/status", s.handleOmnilspStatus)
 	s.dispatcher.Register("omnilsp/explain", s.handleOmnilspExplain)
 	s.dispatcher.Register("omnilsp/backendStatus", s.handleOmnilspBackendStatus)
+	s.dispatcher.Register("omnilsp/resultMeta", s.handleOmnilspResultMeta)
+	s.dispatcher.Register("omnilsp/queryTrace", s.handleOmnilspQueryTrace)
 }
 
 // State returns the current server state.
@@ -748,7 +753,7 @@ func (s *Server) HoverEnvelope(ctx context.Context, uri string, line, col uint32
 	if err != nil {
 		return identity.SemanticResult[*languages.HoverResult]{}, err
 	}
-	s.recordEvidence("textDocument/hover", uri, result.Evidence, result.InternalDiagnostics)
+	s.recordEvidence("textDocument/hover", uri, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 	return result, nil
 }
 
@@ -766,7 +771,7 @@ func (s *Server) DefinitionEnvelope(ctx context.Context, uri string, line, col u
 	if err != nil {
 		return identity.SemanticResult[[]languages.Location]{}, err
 	}
-	s.recordEvidence("textDocument/definition", uri, result.Evidence, result.InternalDiagnostics)
+	s.recordEvidence("textDocument/definition", uri, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 	return result, nil
 }
 
@@ -785,7 +790,7 @@ func (s *Server) ReferencesEnvelope(ctx context.Context, uri string, line, col u
 	if err != nil {
 		return identity.SemanticResult[[]languages.Location]{}, err
 	}
-	s.recordEvidence("textDocument/references", uri, result.Evidence, result.InternalDiagnostics)
+	s.recordEvidence("textDocument/references", uri, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 	return result, nil
 }
 

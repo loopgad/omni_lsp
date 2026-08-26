@@ -54,7 +54,7 @@ func (s *Server) handleSignatureHelp(ctx context.Context, msg *jsonrpc.Message) 
 	if err != nil {
 		return nil, err
 	}
-	s.recordEvidence("textDocument/signatureHelp", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+	s.recordEvidence("textDocument/signatureHelp", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 	if result.Value == nil {
 		return json.RawMessage("null"), nil
 	}

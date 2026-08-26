@@ -454,7 +454,7 @@ func (s *Server) handleHover(ctx context.Context, msg *jsonrpc.Message) (json.Ra
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/hover", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence("textDocument/hover", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if result.Value == nil {
 				// Exact negative or unknown: LSP projects both as null.
 				return json.RawMessage("null"), nil
@@ -536,7 +536,7 @@ func (s *Server) handleDefinition(ctx context.Context, msg *jsonrpc.Message) (js
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/definition", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence("textDocument/definition", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if len(result.Value) == 0 {
 				return json.RawMessage("null"), nil
 			}
@@ -575,7 +575,7 @@ func (s *Server) handleDeclaration(ctx context.Context, msg *jsonrpc.Message) (j
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/declaration", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence("textDocument/declaration", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if len(result.Value) == 0 {
 				return json.RawMessage("null"), nil
 			}
@@ -670,7 +670,7 @@ func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (js
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/references", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence("textDocument/references", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if len(result.Value) == 0 {
 				return json.RawMessage("[]"), nil
 			}
@@ -726,7 +726,7 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/rename", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence("textDocument/rename", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if result.Status != identity.ResultExact || !result.Value.Complete {
 				reason := "rename unavailable: completeness not proven"
 				if len(result.InternalDiagnostics) > 0 {
@@ -1134,4 +1134,68 @@ func (s *Server) handleDidRenameFiles(ctx context.Context, msg *jsonrpc.Message)
 func (s *Server) handleDidDeleteFiles(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	s.metrics.ExternalSyncs.Inc(1)
 	return nil, nil
+}
+
+// handleOmnilspResultMeta serves omnilsp/resultMeta (§C12/B5): the envelope
+// metadata (status, completeness, evidence, internal diagnostics) for recent
+// semantic results on a URI. This is the client-visible completeness channel
+// that the LSP wire projection deliberately drops — B6 promises stay auditable.
+func (s *Server) handleOmnilspResultMeta(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
+	var req struct {
+		URI    string `json:"uri"`
+		Method string `json:"method,omitempty"`
+	}
+	if msg.Params != nil {
+		if err := json.Unmarshal(msg.Params, &req); err != nil {
+			return nil, fmt.Errorf("invalid resultMeta params: %w", err)
+		}
+	}
+	type metaEntry struct {
+		Method       string              `json:"method"`
+		Status       string              `json:"status"`
+		Completeness string              `json:"completeness"`
+		Evidence     []identity.Evidence `json:"evidence,omitempty"`
+		Diag         []string            `json:"internalDiagnostics,omitempty"`
+		At           time.Time           `json:"at"`
+	}
+	var out []metaEntry
+	for _, r := range s.recentEvidence() {
+		if req.URI != "" && r.URI != req.URI {
+			continue
+		}
+		if req.Method != "" && r.Method != req.Method {
+			continue
+		}
+		out = append(out, metaEntry{
+			Method: r.Method, Status: r.Status.String(),
+			Completeness: completenessName(r.Completeness),
+			Evidence:     r.Ev, Diag: r.Diag, At: r.At,
+		})
+	}
+	if out == nil {
+		out = []metaEntry{}
+	}
+	return json.Marshal(out)
+}
+
+// handleOmnilspQueryTrace serves omnilsp/queryTrace (§C12): point-in-time
+// query.Engine counters — memo hits/misses, computations, cycle detections,
+// evictions, and stale-publish rejections.
+func (s *Server) handleOmnilspQueryTrace(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
+	st := s.queries.Stats()
+	return json.Marshal(st)
+}
+
+// completenessName renders identity.Completeness for the resultMeta wire.
+func completenessName(c identity.Completeness) string {
+	switch c {
+	case identity.Complete:
+		return "complete"
+	case identity.IncompleteKnownSubset:
+		return "incomplete-known-subset"
+	case identity.CompletenessUnknown:
+		return "completeness-unknown"
+	default:
+		return "completeness-unknown"
+	}
 }
