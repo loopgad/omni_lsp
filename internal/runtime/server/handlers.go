@@ -545,6 +545,45 @@ func (s *Server) handleDefinition(ctx context.Context, msg *jsonrpc.Message) (js
 	)
 }
 
+// handleDeclaration serves textDocument/declaration (§I14/T2) via the
+// optional DeclarationProvider capability. Backends without a declaration
+// concept get a clean MethodNotFound-style refusal, not a silent alias.
+func (s *Server) handleDeclaration(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
+	var params DefinitionParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return nil, fmt.Errorf("invalid declaration params: %w", err)
+	}
+	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+		func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+			dp, ok := be.(languages.DeclarationProvider)
+			if !ok {
+				return nil, &jsonrpc.ResponseError{Code: jsonrpc.MethodNotFound,
+					Message: "declaration not supported by backend for " + params.TextDocument.URI}
+			}
+			result, err := semanticViaEngine(s, ctx, "declaration", params.TextDocument.URI, snapRev, bc,
+				fmt.Sprintf("%d:%d", params.Position.Line, params.Position.Character),
+				func() (identity.SemanticResult[[]languages.Location], error) {
+					return dp.Declaration(ctx, languages.DefinitionRequest{
+						URI:          params.TextDocument.URI,
+						Content:      src,
+						SnapshotRev:  snapRev,
+						BuildContext: bc,
+						Line:         params.Position.Line,
+						Column:       params.Position.Character,
+					})
+				})
+			if err != nil {
+				return nil, err
+			}
+			s.recordEvidence("textDocument/declaration", params.TextDocument.URI, result.Evidence, result.InternalDiagnostics)
+			if len(result.Value) == 0 {
+				return json.RawMessage("null"), nil
+			}
+			return json.Marshal(projectLocations(result.Value))
+		},
+	)
+}
+
 // handleDocumentSymbol dispatches to the appropriate language backend.
 func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params DocumentSymbolParams

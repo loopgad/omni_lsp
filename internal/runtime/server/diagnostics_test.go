@@ -10,6 +10,7 @@ import (
 
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
+	"github.com/omnilsp/omni/internal/workspace/vfs"
 )
 
 // diagBackend serves canned diagnostics and counts invocations.
@@ -236,4 +237,24 @@ func TestI10_PrepareRenameGate(t *testing.T) {
 		resp := prep(0, 3) // inside `package` keyword — still an ident, but line 0 char 3
 		_ = resp           // either placeholder or null is protocol-valid; must not error
 	})
+}
+
+// TestT2_DeclarationServedAndDeclared pins §I14/T2: textDocument/declaration
+// is advertised in capabilities AND served through the optional
+// DeclarationProvider capability (ADR-0009 D2 — core interface stays frozen).
+func TestT2_DeclarationServedAndDeclared(t *testing.T) {
+	caps := buildCapabilities("utf-16")
+	if !caps.DeclarationProvider {
+		t.Fatal("declarationProvider not declared")
+	}
+	s := New(DefaultConfig())
+	be := &mockBackend{langID: "go", exts: []string{".go"}}
+	s.RegisterBackend("go", be)
+	s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
+	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "d1", IsStr: true},
+		"textDocument/declaration", json.RawMessage(`{"textDocument":{"uri":"file:///x.go"},"position":{"line":0,"character":0}}`))
+	resp := s.dispatcher.Dispatch(context.Background(), msg)
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("dispatch failed: %+v", resp)
+	}
 }

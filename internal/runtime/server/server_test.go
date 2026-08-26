@@ -36,6 +36,13 @@ func (m *mockBackend) Hover(_ context.Context, _ languages.HoverRequest) (identi
 func (m *mockBackend) Completion(_ context.Context, _ languages.CompletionRequest) ([]languages.CompletionItem, error) {
 	return m.compResult, nil
 }
+
+// Declaration opts the mock into the optional capability so declaration
+// tests exercise the served path, not just the clean refusal.
+func (m *mockBackend) Declaration(ctx context.Context, req languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
+	return identity.SemanticResult[[]languages.Location]{Status: identity.ResultExact}, nil
+}
+
 func (m *mockBackend) Definition(_ context.Context, _ languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
 	return identity.SemanticResult[[]languages.Location]{
 		Status: identity.ResultExact, Value: m.defResult,

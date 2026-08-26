@@ -670,6 +670,7 @@ func (s *Server) registerHandlers() {
 	s.dispatcher.Register("textDocument/hover", s.handleHover)
 	s.dispatcher.Register("textDocument/completion", s.handleCompletion)
 	s.dispatcher.Register("textDocument/definition", s.handleDefinition)
+	s.dispatcher.Register("textDocument/declaration", s.handleDeclaration)
 	s.dispatcher.Register("textDocument/documentSymbol", s.handleDocumentSymbol)
 	s.dispatcher.Register("textDocument/references", s.handleReferences)
 	s.dispatcher.Register("textDocument/rename", s.handleRename)

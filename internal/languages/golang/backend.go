@@ -1098,3 +1098,12 @@ func objKindName(o types.Object) string {
 		return "symbol"
 	}
 }
+
+// Declaration implements languages.DeclarationProvider (§I14/T2). Under
+// go/types a declaration site and a definition site coincide — obj.Pos() is
+// where the name is introduced — so this is Definition's semantics under the
+// declaration method name, served through the optional interface so backends
+// with a real distinction can override it.
+func (b *Backend) Declaration(ctx context.Context, req languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
+	return b.Definition(ctx, req)
+}

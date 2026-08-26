@@ -401,3 +401,12 @@ const (
 	TokNumber
 	TokComment
 )
+
+// DeclarationProvider is an optional backend capability (§I14/T2):
+// textDocument/declaration. Distinct from Definition where a language
+// distinguishes declaration sites from implementation sites; backends
+// without such a distinction simply do not implement it and the server
+// refuses cleanly rather than silently aliasing.
+type DeclarationProvider interface {
+	Declaration(ctx context.Context, req DefinitionRequest) (identity.SemanticResult[[]Location], error)
+}
