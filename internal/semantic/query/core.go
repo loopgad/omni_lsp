@@ -153,6 +153,7 @@ func (e *Engine) Invalidate(dep Dep) int {
 	n := 0
 	for k := range keys {
 		if en, ok := e.entries[k]; ok && (en.state == Ready || en.state == FailedStable) {
+			e.removeKeyFromDeps(k, en.deps)
 			delete(e.entries, k)
 			n++
 			e.evictions++
@@ -174,6 +175,7 @@ func (e *Engine) InvalidateSnapshot(rev uint64) int {
 			continue
 		}
 		if containsSub(k, drop) {
+			e.removeKeyFromDeps(k, en.deps)
 			delete(e.entries, k)
 			n++
 			e.evictions++
@@ -204,6 +206,7 @@ func (e *Engine) evictBounded(justInserted string) {
 			continue
 		}
 		if en, ok := e.entries[oldest]; ok && (en.state == Ready || en.state == FailedStable) {
+			e.removeKeyFromDeps(oldest, en.deps)
 			delete(e.entries, oldest)
 			e.evictions++
 		}

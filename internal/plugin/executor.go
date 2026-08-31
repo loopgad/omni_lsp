@@ -27,13 +27,20 @@ type Process struct {
 	stdout *bufio.Reader
 	grant  Grant
 
-	mu         sync.Mutex // 串行化 write+read 配对
+	writeMu    sync.Mutex // 串行化对 stdin 的写入
+	mu         sync.Mutex // 保护 nextID 与 pending 响应表
 	nextID     int
+	pending    map[int]chan response
 	onExitOnce sync.Once
 	// OnExit 在进程退出后被调用恰好一次，参数为 Wait 的返回值；
 	// 宿主用它接入 Manager.RecordCrash 实现崩溃循环遏制。
 	// 只能在 Launch 时设置（spawn 前接线，见 Launch 文档）。
 	OnExit func(err error)
+}
+
+type response struct {
+	result json.RawMessage
+	err    error
 }
 
 // helloFrame 对应首次握手：宿主 → 插件的 plugin/hello 通知帧。
@@ -83,8 +90,10 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 		stdin:  stdin,
 		stdout: bufio.NewReader(stdout),
 		grant:  grant,
+		pending: make(map[int]chan response),
 		OnExit: onExit,
 	}
+	go p.readLoop()
 	go func() {
 		werr := cmd.Wait()
 		p.onExitOnce.Do(func() {
@@ -155,51 +164,93 @@ type rpcError struct {
 
 // Call 发送一次 JSON-RPC 请求并等待单行响应，超时 callTimeout。
 // TODO(协议完整版)：见 Launch 尾注的升级路径。
+func (p *Process) readLoop() {
+	for {
+		line, err := readFrame(p.stdout)
+		if err != nil {
+			p.mu.Lock()
+			p.notifyPendingLocked(fmt.Errorf("plugin: 读响应: %w", err))
+			p.mu.Unlock()
+			return
+		}
+		if len(line) == 0 {
+			continue
+		}
+
+		var frame struct {
+			ID     int             `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  *rpcError       `json:"error"`
+		}
+		if err := json.Unmarshal(line, &frame); err != nil {
+			p.mu.Lock()
+			p.notifyPendingLocked(fmt.Errorf("plugin: 解析响应: %w", err))
+			p.mu.Unlock()
+			return
+		}
+
+		p.mu.Lock()
+		ch, ok := p.pending[frame.ID]
+		if ok {
+			delete(p.pending, frame.ID)
+		}
+		p.mu.Unlock()
+		if !ok {
+			continue
+		}
+		if frame.Error != nil {
+			ch <- response{err: fmt.Errorf("plugin: rpc 错误 %d: %s", frame.Error.Code, frame.Error.Message)}
+			continue
+		}
+		ch <- response{result: frame.Result}
+	}
+}
+
+func (p *Process) notifyPendingLocked(err error) {
+	for id, ch := range p.pending {
+		delete(p.pending, id)
+		ch <- response{err: err}
+	}
+}
+
 func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	p.nextID++
+	id := p.nextID
+	ch := make(chan response, 1)
+	p.pending[id] = ch
+	p.mu.Unlock()
+
 	req, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
-		"id":      p.nextID,
+		"id":      id,
 		"method":  method,
 		"params":  params,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("plugin: 序列化请求: %w", err)
 	}
+
+	p.writeMu.Lock()
 	if err := writeFrame(p.stdin, req); err != nil {
+		p.writeMu.Unlock()
+		p.mu.Lock()
+		delete(p.pending, id)
+		p.mu.Unlock()
 		return nil, fmt.Errorf("plugin: 写请求: %w", err)
 	}
+	p.writeMu.Unlock()
 
-	type result struct {
-		line []byte
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		line, err := readFrame(p.stdout)
-		ch <- result{line, err}
-	}()
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			return nil, fmt.Errorf("plugin: 读响应: %w", r.err)
+			return nil, r.err
 		}
-		var frame struct {
-			JSONRPC string          `json:"jsonrpc"`
-			Result  json.RawMessage `json:"result"`
-			Error   *rpcError       `json:"error"`
-		}
-		if err := json.Unmarshal(r.line, &frame); err != nil {
-			return nil, fmt.Errorf("plugin: 解析响应: %w", err)
-		}
-		if frame.Error != nil {
-			return nil, fmt.Errorf("plugin: rpc 错误 %d: %s", frame.Error.Code, frame.Error.Message)
-		}
-		return frame.Result, nil
+		return r.result, nil
 	case <-time.After(callTimeout):
+		p.mu.Lock()
+		delete(p.pending, id)
+		p.mu.Unlock()
 		return nil, fmt.Errorf("plugin: 响应超时（>%v）", callTimeout)
 	}
 }

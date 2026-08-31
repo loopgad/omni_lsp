@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestHelperProcess 分流（Go 官方 exec 测试模式）：当宿主以本测试二进制
@@ -73,6 +74,15 @@ func helperMain() {
 			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":42,\"message\":\"nope\"}}", req.ID)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "content-length":
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", req.ID, req.Args)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+		case "slow-roundtrip":
+			if req.Args != nil {
+				var payload map[string]any
+				if err := json.Unmarshal(req.Args, &payload); err == nil && payload["uri"] == "file:///slow.go" {
+					time.Sleep(300 * time.Millisecond)
+				}
+			}
 			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", req.ID, req.Args)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		default:

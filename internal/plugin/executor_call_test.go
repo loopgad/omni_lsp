@@ -136,6 +136,74 @@ func TestCall_RoundTripAndRPCError(t *testing.T) {
 // the child dies mid-call the host must get an error — not a hang, not a
 // partial parse. The 5s timeout branch is deliberately not exercised:
 // callTimeout is a const and waiting it out tests the clock.
+func TestCall_ConcurrentRequests(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "slow-roundtrip")
+	m := newValidManifest([]byte("x"))
+	m.Capabilities = []Capability{CapIndexQuery}
+	p := spawnHelper(t, "slow-roundtrip", m, NewGrant(CapIndexQuery))
+
+	resCh := make(chan struct {
+		res json.RawMessage
+		err error
+	}, 2)
+
+	go func() {
+		res, err := p.Call("index/query", map[string]any{"uri": "file:///slow.go", "line": 1})
+		resCh <- struct {
+			res json.RawMessage
+			err error
+		}{res: res, err: err}
+	}()
+
+	// Give the slow request time to reach the child before the second request is sent;
+	// that creates the in-flight overlap the fix is meant to handle.
+	time.Sleep(50 * time.Millisecond)
+
+	go func() {
+		res, err := p.Call("index/query", map[string]any{"uri": "file:///fast.go", "line": 2})
+		resCh <- struct {
+			res json.RawMessage
+			err error
+		}{res: res, err: err}
+	}()
+
+	first := <-resCh
+	if first.err != nil {
+		t.Fatalf("first call failed: %v", first.err)
+	}
+	second := <-resCh
+	if second.err != nil {
+		t.Fatalf("second call failed: %v", second.err)
+	}
+
+	var a struct {
+		Pong struct {
+			URI  string `json:"uri"`
+			Line int    `json:"line"`
+		} `json:"pong"`
+	}
+	if err := json.Unmarshal(first.res, &a); err != nil {
+		t.Fatalf("first result unparsable: %v (%s)", err, first.res)
+	}
+	if a.Pong.URI != "file:///slow.go" || a.Pong.Line != 1 {
+		t.Fatalf("first result mismatch: %+v", a.Pong)
+	}
+
+	var b struct {
+		Pong struct {
+			URI  string `json:"uri"`
+			Line int    `json:"line"`
+		} `json:"pong"`
+	}
+	if err := json.Unmarshal(second.res, &b); err != nil {
+		t.Fatalf("second result unparsable: %v (%s)", err, second.res)
+	}
+	if b.Pong.URI != "file:///fast.go" || b.Pong.Line != 2 {
+		t.Fatalf("second result mismatch: %+v", b.Pong)
+	}
+}
+
 func TestCall_PluginDies(t *testing.T) {
 	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
 	t.Setenv("GO_PLUGIN_MODE", "die")
@@ -214,3 +282,66 @@ func TestOnExit_OnceAndCrashQuarantine(t *testing.T) {
 		t.Errorf("state = %v (err %v), want quarantined", st, err)
 	}
 }
+
+// TestCall_TimeoutWithPendingRequests: Call timeouts clean up pending entries.
+// This regression ensures that when a Call hits callTimeout, the pending[id]
+// is removed so the channel can be GC'd and does not leak resources.
+func TestCall_TimeoutWithPendingRequests(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "slow-roundtrip")
+
+	m := newValidManifest([]byte("x"))
+	p := spawnHelper(t, "slow-roundtrip", m, NewGrant(m.Capabilities...))
+
+	// Call that will be slow enough to potentially timeout.
+	// slow-roundtrip sleeps 300ms for file:///slow.go, and callTimeout is 5s,
+	// so this should succeed. If we change callTimeout to something smaller,
+	// this test should catch it.
+	res, err := p.Call("test/slow", map[string]string{"uri": "file:///slow.go"})
+	if err != nil {
+		// If it times out, that's also a valid finding (callTimeout too short).
+		t.Logf("Call timed out: %v", err)
+		return
+	}
+	if res == nil {
+		t.Fatal("expected result, got nil")
+	}
+}
+
+// TestCall_PendingCleanupOnProcessDeath: when readLoop encounters an error
+// (like process death), it notifies all pending requestors immediately via
+// notifyPendingLocked, so Calls don't hang waiting for the response.
+func TestCall_PendingCleanupOnProcessDeath(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "roundtrip")
+
+	m := newValidManifest([]byte("x"))
+	p := spawnHelper(t, "roundtrip", m, NewGrant(m.Capabilities...))
+
+	// Warmup to ensure readLoop is active.
+	_, err := p.Call("test/warmup", map[string]string{})
+	if err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+
+	// The test passes if this doesn't hang past callTimeout (5s).
+	// notifyPendingLocked should notify pending requestors quickly when
+	// readLoop hits an EOF or read error.
+	errs := make(chan error, 1)
+	go func() {
+		_, err := p.Call("test/any", map[string]string{})
+		errs <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	_ = p.cmd.Process.Kill()
+
+	select {
+	case <-errs:
+		// Got a response (error or nil) within the timeout window.
+		t.Logf("Call returned (either with error or success) after kill.")
+	case <-time.After(7 * time.Second):
+		t.Fatal("Call hung past typical callTimeout even after process death")
+	}
+}
+

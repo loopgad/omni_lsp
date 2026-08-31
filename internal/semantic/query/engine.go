@@ -63,6 +63,19 @@ func (e *Engine) Stats() Stats {
 	}
 }
 
+func (e *Engine) removeKeyFromDeps(key string, deps DepSet) {
+	for d := range deps {
+		keys := e.depIndex[d]
+		if keys == nil {
+			continue
+		}
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(e.depIndex, d)
+		}
+	}
+}
+
 type entry struct {
 	state    State
 	value    any

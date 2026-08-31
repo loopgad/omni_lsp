@@ -24,3 +24,41 @@ func TestK0_QueryMemoBounded(t *testing.T) {
 		t.Fatal("expected eviction counter to advance")
 	}
 }
+
+func TestK2_DepIndexCleansEvictedKeys(t *testing.T) {
+	dep := Dep{Kind: "file", ID: "hash-1"}
+	e := NewEngine(1)
+	for i := 0; i < maxQueryEntries+32; i++ {
+		_, err := e.Query(context.Background(), Key{Kind: "hover", Workspace: "w", SnapshotRev: 1, BuildContext: "b", Subject: fmt.Sprintf("s%d", i)},
+			DepSet{dep: {}}, func(_ context.Context, _ Bindings) (any, DepSet, error) { return i, nil, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for d, keys := range e.depIndex {
+		for k := range keys {
+			if _, ok := e.entries[k]; !ok {
+				t.Fatalf("stale dependency index entry %q for dep %s after eviction", k, d)
+			}
+		}
+	}
+
+	for i := 0; i < 10; i++ {
+		_, err := e.Query(context.Background(), Key{Kind: "hover", Workspace: "w", SnapshotRev: 1, BuildContext: "b", Subject: fmt.Sprintf("old-%d", i)},
+			DepSet{dep: {}}, func(_ context.Context, _ Bindings) (any, DepSet, error) { return i, nil, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := e.InvalidateSnapshot(1); n == 0 {
+		t.Fatal("expected snapshot invalidation to evict at least one entry for revision 1")
+	}
+	for d, keys := range e.depIndex {
+		for k := range keys {
+			if _, ok := e.entries[k]; !ok {
+				t.Fatalf("stale dependency index entry %q for dep %s after snapshot invalidation", k, d)
+			}
+		}
+	}
+}
