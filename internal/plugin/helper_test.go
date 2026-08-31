@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -31,14 +33,22 @@ func helperMain() {
 	case "die":
 		return
 	}
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	reader := bufio.NewReader(os.Stdin)
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()
+
 	var helloParams json.RawMessage
 	sawHello := false
-	for sc.Scan() {
-		line := sc.Bytes()
+	for {
+		line, err := readHelperFrame(reader)
+		if err != nil {
+			return
+		}
+		if len(line) == 0 {
+			continue
+		}
+
 		if !sawHello {
 			var hf struct {
 				Params json.RawMessage `json:"params"`
@@ -48,19 +58,58 @@ func helperMain() {
 			sawHello = true
 			continue
 		}
+
 		var req struct {
 			ID   int64           `json:"id"`
 			Args json.RawMessage `json:"params"`
 		}
 		_ = json.Unmarshal(line, &req)
+
 		switch mode {
 		case "echo-hello":
-			fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}\n", req.ID, helloParams)
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", req.ID, helloParams)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "rpc-error":
-			fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":42,\"message\":\"nope\"}}\n", req.ID)
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":42,\"message\":\"nope\"}}", req.ID)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+		case "content-length":
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", req.ID, req.Args)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		default:
 			fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}\n", req.ID, req.Args)
 		}
-		w.Flush()
+		if err := w.Flush(); err != nil {
+			return
+		}
 	}
+}
+
+func readHelperFrame(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		if err == io.EOF && len(line) > 0 {
+			return []byte(line), nil
+		}
+		return nil, err
+	}
+
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
+		var size int
+		if _, err := fmt.Sscanf(trimmed, "Content-Length: %d", &size); err != nil {
+			return nil, err
+		}
+		if _, err := r.Discard(2); err != nil {
+			return nil, err
+		}
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	return []byte(strings.TrimRight(line, "\r\n")), nil
 }

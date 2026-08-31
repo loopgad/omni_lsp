@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -101,11 +102,49 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 		}
 	}
 	b, _ := json.Marshal(hf)
-	if _, err := stdin.Write(append(b, '\n')); err != nil {
+	if err := writeFrame(stdin, b); err != nil {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("plugin: 握手写入失败: %w", err)
 	}
 	return p, nil
+}
+
+func writeFrame(w io.Writer, payload []byte) error {
+	_, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(payload))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(payload)
+	return err
+}
+
+func readFrame(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
+		return []byte(strings.TrimRight(line, "\r\n")), nil
+	}
+	var size int
+	if _, err := fmt.Sscanf(trimmed, "Content-Length: %d", &size); err != nil {
+		return nil, fmt.Errorf("plugin: malformed Content-Length header: %w", err)
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("plugin: invalid Content-Length %d", size)
+	}
+	if _, err := r.Discard(2); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // rpcError 是 JSON-RPC 响应中的 error 对象。
@@ -130,7 +169,7 @@ func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("plugin: 序列化请求: %w", err)
 	}
-	if _, err := p.stdin.Write(append(req, '\n')); err != nil {
+	if err := writeFrame(p.stdin, req); err != nil {
 		return nil, fmt.Errorf("plugin: 写请求: %w", err)
 	}
 
@@ -140,7 +179,7 @@ func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		line, err := p.stdout.ReadBytes('\n')
+		line, err := readFrame(p.stdout)
 		ch <- result{line, err}
 	}()
 	select {

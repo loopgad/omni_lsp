@@ -105,6 +105,31 @@ func TestCall_RoundTripAndRPCError(t *testing.T) {
 			t.Fatalf("err = %v, want rpc 错误 42", err)
 		}
 	})
+
+	t.Run("content-length-framed", func(t *testing.T) {
+		t.Setenv("GO_PLUGIN_MODE", "content-length")
+		m := newValidManifest([]byte("x"))
+		m.Capabilities = []Capability{CapIndexQuery}
+		p := spawnHelper(t, "content-length", m, NewGrant(CapIndexQuery))
+
+		params := map[string]any{"uri": "file:///x.go", "line": 7}
+		res, err := p.Call("index/query", params)
+		if err != nil {
+			t.Fatalf("Call with Content-Length framing: %v", err)
+		}
+		var got struct {
+			Pong struct {
+				URI  string `json:"uri"`
+				Line int    `json:"line"`
+			} `json:"pong"`
+		}
+		if err := json.Unmarshal(res, &got); err != nil {
+			t.Fatalf("framed result unparsable: %v (%s)", err, res)
+		}
+		if got.Pong.URI != "file:///x.go" || got.Pong.Line != 7 {
+			t.Fatalf("framed params mangled: %+v", got.Pong)
+		}
+	})
 }
 
 // TestCall_PluginDies pins the EOF path (§O crash containment input): when
