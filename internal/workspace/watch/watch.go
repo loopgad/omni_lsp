@@ -34,11 +34,16 @@ type Poller struct {
 	interval time.Duration
 	maxDepth int
 
-	mu       sync.Mutex
-	prints   map[string]finger // nil until first Scan
-	stop     chan struct{}
-	stopped  sync.WaitGroup
-	onChange func([]Event)
+	mu           sync.Mutex
+	prints       map[string]finger // nil until first Scan
+	stop         chan struct{}
+	stopped      sync.WaitGroup
+	started      bool
+	closed       bool
+	callbacks    int
+	callbackDone *sync.Cond
+	closeOnce    sync.Once
+	onChange     func([]Event)
 }
 
 type finger struct {
@@ -50,13 +55,15 @@ func New(root string, interval time.Duration, onChange func([]Event)) *Poller {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	return &Poller{
+	poller := &Poller{
 		root:     root,
 		interval: interval,
 		maxDepth: 16, // bounded walk: runaway trees cannot stall the loop
 		stop:     make(chan struct{}),
 		onChange: onChange,
 	}
+	poller.callbackDone = sync.NewCond(&poller.mu)
+	return poller
 }
 
 // fingerprint walks the tree once and returns path→(mtime,size).
@@ -119,14 +126,32 @@ func (p *Poller) Scan() []Event {
 		}
 	}
 	if len(evs) > 0 && p.onChange != nil {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return evs
+		}
+		p.callbacks++
+		p.mu.Unlock()
 		p.onChange(evs)
+		p.mu.Lock()
+		p.callbacks--
+		p.callbackDone.Broadcast()
+		p.mu.Unlock()
 	}
 	return evs
 }
 
 // Start launches the background loop. Idempotent per Poller instance.
 func (p *Poller) Start() *Poller {
+	p.mu.Lock()
+	if p.started || p.closed {
+		p.mu.Unlock()
+		return p
+	}
+	p.started = true
 	p.stopped.Add(1)
+	p.mu.Unlock()
 	go func() {
 		defer p.stopped.Done()
 		ticker := time.NewTicker(p.interval)
@@ -143,8 +168,33 @@ func (p *Poller) Start() *Poller {
 	return p
 }
 
-// Close stops the loop and waits for it.
+// Close requests loop shutdown. When called from onChange, it returns without
+// waiting for the callback that is currently executing.
 func (p *Poller) Close() {
-	close(p.stop)
+	p.close(false)
+}
+
+// CloseAndWait stops the loop and waits for it and any active callbacks.
+// Call Close instead when shutting down from inside onChange; waiting there
+// would require the callback to return before its own completion can be seen.
+func (p *Poller) CloseAndWait() {
+	p.close(true)
+}
+
+func (p *Poller) close(waitForCallbacks bool) {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+		close(p.stop)
+	})
+	if !waitForCallbacks {
+		return
+	}
 	p.stopped.Wait()
+	p.mu.Lock()
+	for p.callbacks > 0 {
+		p.callbackDone.Wait()
+	}
+	p.mu.Unlock()
 }

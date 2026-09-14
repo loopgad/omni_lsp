@@ -62,6 +62,7 @@ import (
 )
 
 const defaultRequestTimeout = 30 * time.Second
+const shutdownWriteTimeout = 100 * time.Millisecond
 
 // Config wires a concrete language server into the shared bridge. Start is
 // injectable so supervision can be tested without a real toolchain.
@@ -92,11 +93,14 @@ type Config struct {
 type Conn struct {
 	cfg Config
 
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	pending map[int64]chan *jsonrpc.Message
+	mu          sync.Mutex
+	writeMu     sync.Mutex
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      io.ReadCloser
+	pending     map[int64]chan *jsonrpc.Message
+	readerEpoch atomic.Uint64
+	exitHandled bool
 
 	nextID atomic.Int64
 	closed atomic.Bool
@@ -148,7 +152,13 @@ func (c *Conn) StartSupervised() error {
 			c.cfg.Name, pol.State())
 	}
 	if err := c.cfg.Start(c); err != nil {
+		c.failPending(c.cfg.Name + " start failed")
+		c.closed.Store(true)
+		c.closeCurrentProcess()
 		return fmt.Errorf("%s start: %w", c.cfg.Name, err)
+	}
+	if c.closed.Load() {
+		return errors.New(errors.ErrBackendUnavailable, c.cfg.Name, "backend closed during start")
 	}
 	c.lastActivity.Store(time.Now().UnixNano())
 	// The watchdog must never fire on a request still inside its legitimate
@@ -192,16 +202,30 @@ func (c *Conn) wireSupervisor() {
 // the replacement table only carries requests from the new epoch on.
 func (c *Conn) Attach(cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser) {
 	c.mu.Lock()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		closeProcess(stdin, stdout, cmd)
+		return
+	}
+	epoch := c.readerEpoch.Add(1)
+	c.exitHandled = false
+	oldStdin, oldStdout, oldCmd := c.stdin, c.stdout, c.cmd
 	c.cmd, c.stdin, c.stdout = cmd, stdin, stdout
 	orphaned := c.pending
 	c.pending = make(map[int64]chan *jsonrpc.Message)
 	c.mu.Unlock()
 	failAll(orphaned, c.cfg.Name+" process terminated")
-	go c.readLoop(stdout)
+	closeProcess(oldStdin, oldStdout, oldCmd)
+	go c.readLoop(stdout, epoch)
 }
 
 // MarkReady promotes the supervisor into Ready after a successful handshake.
-func (c *Conn) MarkReady() { c.sup.MarkReady() }
+func (c *Conn) MarkReady() {
+	if c.closed.Load() || c.sup == nil {
+		return
+	}
+	c.sup.MarkReady()
+}
 
 // SupervisorMessage exposes the supervisor's human-facing lifecycle state
 // (§Q2 error projection): crash counts, epoch, recovery guidance.
@@ -217,8 +241,30 @@ func (c *Conn) HandleProcessExit(reason error) {
 	if c.closed.Load() {
 		return
 	}
-	c.failPending(c.cfg.Name + " process terminated")
-	c.sup.MarkUnhealthy(context.Background(), reason)
+	c.mu.Lock()
+	epoch := c.readerEpoch.Load()
+	c.mu.Unlock()
+	c.handleProcessExit(epoch, reason, false)
+}
+
+func (c *Conn) handleProcessExit(epoch uint64, reason error, deduplicate bool) {
+	if c.closed.Load() {
+		return
+	}
+	c.mu.Lock()
+	if c.readerEpoch.Load() != epoch || (deduplicate && c.exitHandled) {
+		c.mu.Unlock()
+		return
+	}
+	c.exitHandled = true
+	pending := c.pending
+	c.pending = make(map[int64]chan *jsonrpc.Message)
+	sup := c.sup
+	c.mu.Unlock()
+	failAll(pending, c.cfg.Name+" process terminated")
+	if sup != nil {
+		sup.MarkUnhealthy(context.Background(), reason)
+	}
 }
 
 func (c *Conn) failPending(msg string) {
@@ -268,7 +314,7 @@ func (c *Conn) Initialize() error {
 // new pipes without touching this goroutine's view (no cross-epoch race).
 // Framing and decoding are delegated to the shared jsonrpc.Codec so message
 // size limits and header parsing stay in one place (C1).
-func (c *Conn) readLoop(stdout io.ReadCloser) {
+func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64) {
 	codec := jsonrpc.NewCodec()
 	r := bufio.NewReader(stdout)
 	for {
@@ -281,6 +327,10 @@ func (c *Conn) readLoop(stdout io.ReadCloser) {
 			continue // server notifications / string IDs unsupported by this bridge
 		}
 		c.mu.Lock()
+		if c.readerEpoch.Load() != epoch {
+			c.mu.Unlock()
+			return
+		}
 		ch, ok := c.pending[msg.ID.Num]
 		if ok {
 			delete(c.pending, msg.ID.Num)
@@ -293,13 +343,10 @@ func (c *Conn) readLoop(stdout io.ReadCloser) {
 			}
 		}
 	}
-	// Process died: fail all pending requests fast instead of letting them
-	// ride out their timeouts against a dead pipe, then let the supervisor
-	// decide between backoff-restart and quarantine (§G2).
-	c.failPending(c.cfg.Name + " process terminated")
-	if !c.closed.Load() {
-		c.HandleProcessExit(fmt.Errorf("%s output stream ended", c.cfg.Name))
+	if c.readerEpoch.Load() != epoch {
+		return
 	}
+	c.handleProcessExit(epoch, fmt.Errorf("%s output stream ended", c.cfg.Name), true)
 }
 
 func (c *Conn) writeMessage(msg *jsonrpc.Message) error {
@@ -308,8 +355,16 @@ func (c *Conn) writeMessage(msg *jsonrpc.Message) error {
 		return err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, err = fmt.Fprintf(c.stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
+	if c.stdin == nil {
+		c.mu.Unlock()
+		return errors.New(errors.ErrBackendUnavailable, c.cfg.Name, "backend is not started")
+	}
+	stdin := c.stdin
+	c.mu.Unlock()
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_, err = fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
 	return err
 }
 
@@ -481,24 +536,46 @@ func (c *Conn) killProcess() {
 	}
 }
 
+func closeProcess(stdin io.WriteCloser, stdout io.ReadCloser, cmd *exec.Cmd) {
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdout != nil {
+		_ = stdout.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+}
+
+func (c *Conn) closeCurrentProcess() {
+	c.mu.Lock()
+	stdin, stdout, cmd := c.stdin, c.stdout, c.cmd
+	c.stdin, c.stdout, c.cmd = nil, nil, nil
+	c.mu.Unlock()
+	closeProcess(stdin, stdout, cmd)
+}
+
 func (c *Conn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
-		_ = c.Notify("shutdown", nil)
-		c.mu.Lock()
-		stdin, stdout, cmd := c.stdin, c.stdout, c.cmd
-		c.mu.Unlock()
-		if stdin != nil {
-			_ = stdin.Close()
-		}
-		if stdout != nil {
-			_ = stdout.Close()
-		}
-		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
+		c.failPending(c.cfg.Name + " backend closed")
+		c.notifyShutdown()
+		c.closeCurrentProcess()
 	}
 	return nil
+}
+
+func (c *Conn) notifyShutdown() {
+	done := make(chan struct{})
+	go func() {
+		_ = c.Notify("shutdown", nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownWriteTimeout):
+	}
 }
 
 // maxDuration returns the larger of two durations.

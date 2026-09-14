@@ -158,6 +158,80 @@ func TestSendRequest_TimeoutAndCancel(t *testing.T) {
 	}
 }
 
+func TestClose_IdleConnectionIsSafe(t *testing.T) {
+	c := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir()})
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close on idle connection: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("repeated Close on idle connection: %v", err)
+	}
+}
+
+func TestAttach_OldReaderCannotFailNewPending(t *testing.T) {
+	c := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir()})
+	oldReader, oldWriter := io.Pipe()
+	newReader, _ := io.Pipe()
+	c.Attach(nil, nopWriteCloser{}, oldReader)
+	c.Attach(nil, nopWriteCloser{}, newReader)
+	defer c.Close()
+
+	pending := c.RegisterPending(99)
+	if err := oldWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case msg := <-pending:
+		t.Fatalf("old reader failed new pending request: %+v", msg)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+type trackingReadCloser struct {
+	closed atomic.Bool
+	data   atomic.Value
+}
+
+func (c *trackingReadCloser) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *trackingReadCloser) Write(p []byte) (int, error) {
+	c.data.Store(string(p))
+	return len(p), nil
+}
+func (c *trackingReadCloser) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func TestAttach_AfterCloseReleasesIncomingResources(t *testing.T) {
+	c := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir()})
+	c.Close()
+
+	stdin := &trackingReadCloser{}
+	stdout := &trackingReadCloser{}
+	c.Attach(nil, stdin, stdout)
+
+	if !stdin.closed.Load() || !stdout.closed.Load() {
+		t.Fatal("late Attach did not release incoming resources")
+	}
+}
+
+func TestClose_SendsShutdownNotification(t *testing.T) {
+	c := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir()})
+	stdin := &trackingReadCloser{}
+	stdout := &trackingReadCloser{}
+	c.Attach(nil, stdin, stdout)
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	raw, ok := stdin.data.Load().(string)
+	if !ok || !strings.Contains(raw, `"method":"shutdown"`) {
+		t.Fatalf("shutdown notification missing from %q", raw)
+	}
+}
+
 // errWriteCloser fails every write, simulating a dead stdin pipe so the
 // initialize handshake cannot succeed.
 type errWriteCloser struct{}

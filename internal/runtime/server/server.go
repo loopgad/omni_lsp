@@ -241,7 +241,7 @@ func (s *Server) Run(ctx context.Context, t transport.Transport) error {
 	}
 	defer func() {
 		if watcher != nil {
-			watcher.Close()
+			watcher.CloseAndWait()
 		}
 		s.scheduler.Shutdown()
 		// Session teardown: stop every registered backend so nested-LSP child

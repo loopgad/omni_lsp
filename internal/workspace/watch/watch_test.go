@@ -74,6 +74,76 @@ func TestWatcherIgnoresVendoredAndBaselineSilence(t *testing.T) {
 	}
 }
 
+func TestPollerStartAndCloseAreIdempotent(t *testing.T) {
+	p := New(t.TempDir(), 10*time.Millisecond, nil)
+
+	p.Start()
+	p.Start()
+	p.Close()
+	p.Close()
+}
+
+func TestPollerCloseFromCallbackDoesNotDeadlock(t *testing.T) {
+	root := t.TempDir()
+	p := New(root, 10*time.Millisecond, nil)
+	p.Scan()
+	done := make(chan struct{})
+	p.onChange = func([]Event) {
+		p.Close()
+		close(done)
+	}
+	p.Start()
+	defer p.Close()
+
+	if err := os.WriteFile(filepath.Join(root, "new.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close from callback deadlocked")
+	}
+}
+
+func TestPollerCloseAndWaitWaitsForManualScanCallback(t *testing.T) {
+	p := New(t.TempDir(), 10*time.Millisecond, nil)
+	p.Scan()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	p.onChange = func([]Event) {
+		close(entered)
+		<-release
+	}
+
+	if err := os.WriteFile(filepath.Join(p.root, "new.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scanDone := make(chan struct{})
+	go func() {
+		p.Scan()
+		close(scanDone)
+	}()
+	<-entered
+
+	closeDone := make(chan struct{})
+	go func() {
+		p.CloseAndWait()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("CloseAndWait returned before callback completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("CloseAndWait did not return after callback completed")
+	}
+	<-scanDone
+}
+
 func waitFor(t *testing.T, ch chan struct{}, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
