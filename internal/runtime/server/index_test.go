@@ -50,7 +50,12 @@ func initializedIndexServer(t *testing.T, root string) *Server {
 }
 
 func TestC12_IndexStatsDisabled(t *testing.T) {
-	stats := indexStats(t, New(DefaultConfig()))
+	withoutRoot := New(DefaultConfig())
+	initResp := withoutRoot.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", json.RawMessage(`{}`)))
+	if initResp == nil || initResp.Error != nil {
+		t.Fatalf("initialize without root: %+v", initResp)
+	}
+	stats := indexStats(t, withoutRoot)
 	if stats.Enabled || stats.Reason == "" {
 		t.Fatalf("disabled stats = %+v", stats)
 	}
@@ -77,6 +82,27 @@ func TestC12_IndexStatsDisabled(t *testing.T) {
 
 func TestC12_IndexStatsAndReindexLifecycle(t *testing.T) {
 	t.Setenv("OMNILSP_TRUST", "trusted")
+	rootWithIndex := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rootWithIndex, "source.go"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	insideCfg := DefaultConfig()
+	insideCfg.IndexDir = filepath.Join(rootWithIndex, "index")
+	inside := New(insideCfg)
+	insideParams, err := json.Marshal(InitializeParams{RootURI: uri.FromPath(rootWithIndex).String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insideInit := inside.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", insideParams))
+	if insideInit == nil || insideInit.Error != nil {
+		t.Fatalf("initialize with internal index: %+v", insideInit)
+	}
+	if resp := indexRequest(inside, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+		t.Fatalf("reindex with internal index: %+v", resp)
+	}
+	if got := indexStats(t, inside).LastRebuild.Files; got != 1 {
+		t.Fatalf("index counted its own files: %d", got)
+	}
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "名字.go"), []byte("package 名字\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -129,6 +155,9 @@ func TestC12_ReindexTrustGate(t *testing.T) {
 	resp := indexRequest(s, context.Background(), "omnilsp/reindex")
 	if resp == nil || resp.Error == nil || resp.Error.Code != jsonrpc.RequestFailed || !strings.Contains(resp.Error.Message, "untrusted") {
 		t.Fatalf("reindex gate = %+v", resp)
+	}
+	if string(resp.Error.Data) != `{"kind":"untrusted_operation"}` {
+		t.Fatalf("untrusted error data = %s", resp.Error.Data)
 	}
 	if stats := indexStats(t, s); !stats.Enabled {
 		t.Fatalf("indexStats gated: %+v", stats)

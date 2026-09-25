@@ -180,7 +180,10 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 	}
 	if policy == nil || policy.State() == trust.StateUntrusted {
 		gateErr := ierrors.New(ierrors.ErrUntrustedOperation, "reindex", "workspace is untrusted")
-		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: fmt.Sprintf("reindex rejected: %v", gateErr)}
+		return nil, &jsonrpc.ResponseError{
+			Code: jsonrpc.RequestFailed, Message: fmt.Sprintf("reindex rejected: %v", gateErr),
+			Data: json.RawMessage(`{"kind":"untrusted_operation"}`),
+		}
 	}
 	if !idx.buildMu.TryLock() {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: "reindex already running"}
@@ -247,15 +250,25 @@ func idxGeneration(ctx context.Context, store *persistent.FileStore) uint64 {
 
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error) {
 	records := make([]fileRecord, 0)
-	err := filepath.WalkDir(idx.root, func(path string, entry fs.DirEntry, walkErr error) error {
+	indexInfo, err := os.Stat(idx.dir)
+	if err != nil {
+		return nil, err
+	}
+	err = filepath.WalkDir(idx.root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if walkErr != nil {
 			return walkErr
 		}
-		if path == idx.dir && entry.IsDir() {
-			return filepath.SkipDir
+		if entry.IsDir() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if os.SameFile(info, indexInfo) {
+				return filepath.SkipDir
+			}
 		}
 		rel, err := filepath.Rel(idx.root, path)
 		if err != nil {
