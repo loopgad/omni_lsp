@@ -6,9 +6,10 @@
 // Owned mutable state: mu guards generation pointer + history + quarantine
 // list; build sessions own their staging directories exclusively.
 //
-// Concurrency model: single-writer (BeginBuild/Publish/Quarantine/Compact
-// serialized by mu); readers clone the committed manifest under RLock and
-// read segment files immutably afterwards.
+// Concurrency model: writer.lock serializes recovery, publication,
+// quarantine, and compaction across FileStore instances/processes; mu guards
+// each instance's cached pointers. OpenSnapshot holds writer.lock while it
+// validates immutable segments and applies any quarantine fallback.
 //
 // Invariants:
 //  1. IDX-TXN-001: readers observe exactly one committed generation — never
@@ -22,9 +23,12 @@
 package persistent
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 const (
@@ -44,6 +48,44 @@ const (
 type SegmentID string
 
 func segFileName(id SegmentID) string { return fmt.Sprintf("seg-%s.bin", id) }
+
+// validSegmentID accepts only IDs emitted by fileBuild. Manifest contents are
+// untrusted, so validate before turning an ID into a filesystem path.
+func validSegmentID(id SegmentID) bool {
+	value := string(id)
+	separator := strings.IndexByte(value, '-')
+	if separator <= 0 || separator == len(value)-1 || separator != strings.LastIndexByte(value, '-') {
+		return false
+	}
+	genID, err := strconv.ParseUint(value[:separator], 10, 64)
+	if err != nil || genID == 0 || strconv.FormatUint(genID, 10) != value[:separator] {
+		return false
+	}
+	random := value[separator+1:]
+	if len(random) != 8 {
+		return false
+	}
+	decoded, err := hex.DecodeString(random)
+	return err == nil && len(decoded) > 0 && hex.EncodeToString(decoded) == random
+}
+
+func validGeneration(gen *Generation) bool {
+	if gen == nil || gen.ID == 0 || len(gen.Segments) == 0 {
+		return false
+	}
+	seen := make(map[SegmentID]bool, len(gen.Segments))
+	for _, seg := range gen.Segments {
+		if !validSegmentID(seg.ID) || seg.Len < segHeaderSz || seen[seg.ID] {
+			return false
+		}
+		seen[seg.ID] = true
+		idGen, _ := strconv.ParseUint(strings.SplitN(string(seg.ID), "-", 2)[0], 10, 64)
+		if idGen != gen.ID {
+			return false
+		}
+	}
+	return true
+}
 
 // ensureLayout creates the store root layout on first open.
 func ensureLayout(root string) error {

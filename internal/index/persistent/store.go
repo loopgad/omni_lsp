@@ -2,8 +2,10 @@ package persistent
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sort"
@@ -40,11 +42,37 @@ type GenerationView struct {
 // ReadSegment returns the verified payload bytes of a segment. The decoder
 // treats all stored lengths as untrusted input (L7).
 func (v GenerationView) ReadSegment(id SegmentID) ([]byte, error) {
+	if !validSegmentID(id) {
+		return nil, fmt.Errorf("persistent: invalid segment ID %q", id)
+	}
+	var ref *SegmentRef
+	for i := range v.Segments {
+		if v.Segments[i].ID == id {
+			ref = &v.Segments[i]
+			break
+		}
+	}
+	if ref == nil {
+		return nil, fmt.Errorf("persistent: segment %s is not in generation %d", id, v.ID)
+	}
 	raw, err := os.ReadFile(filepath.Join(v.dir, segFileName(id)))
 	if err != nil {
 		return nil, fmt.Errorf("persistent: read %s: %w", id, err)
 	}
-	return decodeSegment(raw)
+	if int64(len(raw)) != ref.Len {
+		return nil, fmt.Errorf("persistent: segment %s length %d, manifest says %d", id, len(raw), ref.Len)
+	}
+	if len(raw) < segHeaderSz || binary.BigEndian.Uint64(raw[8:16]) != v.ID {
+		return nil, fmt.Errorf("persistent: segment %s does not belong to generation %d", id, v.ID)
+	}
+	payload, err := decodeSegment(raw)
+	if err != nil {
+		return nil, err
+	}
+	if crc32.ChecksumIEEE(payload) != ref.CRC {
+		return nil, fmt.Errorf("persistent: segment %s checksum differs from manifest", id)
+	}
+	return payload, nil
 }
 
 // IndexStore is the §L5 storage boundary. Implementations own durability;
@@ -89,6 +117,11 @@ func NewFileStore(root string, cfg Config) (*FileStore, error) {
 	if err := ensureLayout(root); err != nil {
 		return nil, err
 	}
+	writerLock, err := acquireWriterLock(context.Background(), root)
+	if err != nil {
+		return nil, err
+	}
+	defer writerLock.release()
 	if cfg.KeepGenerations <= 0 {
 		cfg.KeepGenerations = historyK
 	}
@@ -109,11 +142,29 @@ func (s *FileStore) quarantineDir() string {
 	return filepath.Join(s.root, dirQuarantine)
 }
 
-// OpenSnapshot returns the current verified generation. Verification runs
-// outside the lock on immutable files; any CRC failure quarantines the whole
-// offending generation and falls back to the newest survivor (L7/L8).
+// OpenSnapshot returns the current verified generation. The per-store writer
+// lock protects recovery and quarantine across processes; any invalid segment
+// quarantines its whole generation and falls back to the newest survivor (L7/L8).
 func (s *FileStore) OpenSnapshot(ctx context.Context) (GenerationView, error) {
+	writerLock, err := acquireWriterLock(ctx, s.root)
+	if err != nil {
+		return GenerationView{}, err
+	}
+	defer writerLock.release()
+	s.mu.Lock()
+	err = s.recover()
+	s.mu.Unlock()
+	if err != nil {
+		return GenerationView{}, err
+	}
+	return s.openSnapshotWithWriterLock(ctx)
+}
+
+func (s *FileStore) openSnapshotWithWriterLock(ctx context.Context) (GenerationView, error) {
 	for attempt := 0; attempt < 8; attempt++ { // bounded fallback chain
+		if err := ctx.Err(); err != nil {
+			return GenerationView{}, err
+		}
 		s.mu.Lock()
 		cur := s.current
 		s.mu.Unlock()
@@ -133,10 +184,11 @@ func (s *FileStore) OpenSnapshot(ctx context.Context) (GenerationView, error) {
 		}
 
 		genID := cur.ID
-		if err := s.quarantineSegs(bad); err != nil {
+		s.mu.Lock()
+		if err := s.quarantineSegsLocked(bad); err != nil {
+			s.mu.Unlock()
 			return GenerationView{}, err
 		}
-		s.mu.Lock()
 		if s.current != nil && s.current.ID == genID {
 			s.dropCurrentLocked() // TXN-004: whole-generation distrust
 		}
@@ -146,29 +198,57 @@ func (s *FileStore) OpenSnapshot(ctx context.Context) (GenerationView, error) {
 }
 
 // BeginBuild starts staging a new generation in an isolated directory.
-func (s *FileStore) BeginBuild(_ context.Context) (BuildSession, error) {
+func (s *FileStore) BeginBuild(ctx context.Context) (BuildSession, error) {
+	writerLock, err := acquireWriterLock(ctx, s.root)
+	if err != nil {
+		return nil, err
+	}
+	return s.beginBuildWithWriterLock(ctx, writerLock)
+}
+
+func (s *FileStore) beginBuildWithWriterLock(ctx context.Context, writerLock *writerLock) (BuildSession, error) {
+	if err := ctx.Err(); err != nil {
+		writerLock.release()
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.recover(); err != nil {
+		writerLock.release()
+		return nil, err
+	}
 	s.nextGenID++
 	genID := s.nextGenID
 	stage := filepath.Join(s.root, fmt.Sprintf("staging-%d", genID))
 	if err := os.MkdirAll(stage, 0o755); err != nil {
+		writerLock.release()
 		return nil, fmt.Errorf("persistent: staging: %w", err)
 	}
-	return &fileBuild{store: s, genID: genID, stageDir: stage}, nil
+	return &fileBuild{store: s, genID: genID, stageDir: stage, writerLock: writerLock}, nil
 }
 
 // Quarantine moves suspect segments out of the readable path with evidence
 // preserved (TXN-004). If the current generation loses any member it is
 // dropped wholesale and the newest surviving history entry takes over.
 func (s *FileStore) Quarantine(seg SegmentID) error {
-	return s.quarantineSegs([]SegmentID{seg})
-}
-
-func (s *FileStore) quarantineSegs(segs []SegmentID) error {
+	writerLock, err := acquireWriterLock(context.Background(), s.root)
+	if err != nil {
+		return err
+	}
+	defer writerLock.release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.recover(); err != nil {
+		return err
+	}
+	return s.quarantineSegsLocked([]SegmentID{seg})
+}
+
+func (s *FileStore) quarantineSegsLocked(segs []SegmentID) error {
 	for _, seg := range segs {
+		if !validSegmentID(seg) {
+			return fmt.Errorf("persistent: invalid segment ID %q", seg)
+		}
 		src := filepath.Join(s.root, segFileName(seg))
 		dst := filepath.Join(s.quarantineDir(), segFileName(seg))
 		if _, err := os.Stat(src); err == nil {
@@ -200,21 +280,25 @@ func (s *FileStore) quarantineSegs(segs []SegmentID) error {
 // QuarantineGeneration drops an entire generation by ID (TXN-004 whole-trust
 // rule) and falls back to the newest surviving history entry.
 func (s *FileStore) QuarantineGeneration(genID uint64, segs []SegmentID) error {
-	s.mu.Lock()
-	dropped := false
-	if s.current != nil && s.current.ID == genID {
-		dropped = true
-	}
-	s.mu.Unlock()
-	if !dropped {
-		return nil
-	}
-	if err := s.quarantineSegs(segs); err != nil {
+	writerLock, err := acquireWriterLock(context.Background(), s.root)
+	if err != nil {
 		return err
 	}
+	defer writerLock.release()
 	s.mu.Lock()
-	s.dropCurrentLocked()
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if err := s.recover(); err != nil {
+		return err
+	}
+	if s.current == nil || s.current.ID != genID {
+		return nil
+	}
+	if err := s.quarantineSegsLocked(segs); err != nil {
+		return err
+	}
+	if s.current != nil && s.current.ID == genID {
+		s.dropCurrentLocked()
+	}
 	return nil
 }
 

@@ -13,11 +13,12 @@ import (
 // fileBuild stages the next generation; nothing it writes is discoverable
 // through the manifest until Commit's atomic pointer swap (TXN-002).
 type fileBuild struct {
-	store    *FileStore
-	genID    uint64
-	stageDir string
-	segments []SegmentRef
-	aborted  bool
+	store      *FileStore
+	genID      uint64
+	stageDir   string
+	segments   []SegmentRef
+	aborted    bool
+	writerLock *writerLock
 }
 
 // WriteSegment encodes, fsyncs and records one immutable segment. Budget is
@@ -69,14 +70,25 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 
 // Commit publishes the staged generation: move segments into the store root,
 // write manifest.tmp, fsync, then atomically rename over the pointer (L4).
-func (b *fileBuild) Commit(_ context.Context) error {
+func (b *fileBuild) Commit(ctx context.Context) error {
+	defer b.writerLock.release()
+	return b.commit(ctx)
+}
+
+func (b *fileBuild) commit(ctx context.Context) error {
 	if b.aborted {
 		return fmt.Errorf("persistent: build aborted")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	gen := Generation{ID: b.genID, Segments: b.segments}
 
 	// Stage → root segment placement.
 	for _, seg := range b.segments {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		src := filepath.Join(b.stageDir, segFileName(seg.ID))
 		dst := filepath.Join(b.store.root, segFileName(seg.ID))
 		if err := os.Rename(src, dst); err != nil {
@@ -90,6 +102,10 @@ func (b *fileBuild) Commit(_ context.Context) error {
 	}
 	tmp := b.store.tmpManifestPath()
 	if err := writeFileSync(tmp, mb); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	// Windows: os.Rename cannot clobber; the remove window is the one non-
@@ -122,7 +138,9 @@ func (b *fileBuild) Commit(_ context.Context) error {
 // Abort discards staging; half-written data stays undiscoverable (TXN-002).
 func (b *fileBuild) Abort() error {
 	b.aborted = true
-	return os.RemoveAll(b.stageDir)
+	err := os.RemoveAll(b.stageDir)
+	b.writerLock.release()
+	return err
 }
 
 func writeFileSync(path string, data []byte) error {
@@ -145,6 +163,7 @@ func writeFileSync(path string, data []byte) error {
 // recovery options, never correctness.
 func syncHistory(path string, hist []*Generation) {
 	if len(hist) == 0 {
+		_ = writeFileSync(path, []byte("[]"))
 		return
 	}
 	b, err := json.Marshal(hist)

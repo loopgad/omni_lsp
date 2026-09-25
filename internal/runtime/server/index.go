@@ -17,6 +17,7 @@ import (
 	"time"
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
+	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/index/persistent"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/trust"
@@ -122,6 +123,21 @@ func (s *Server) initIndex(rootURI string) {
 	s.mu.Unlock()
 }
 
+// InitializeWorkspace configures workspace identity and persistent-index state
+// for transports without an LSP initialize request, such as MCP.
+func (s *Server) InitializeWorkspace(root string) {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		s.disableIndex(err)
+		return
+	}
+	rootURI := uri.FromPath(absolute).String()
+	s.mu.Lock()
+	s.workspaceID = identity.WorkspaceID(rootURI)
+	s.mu.Unlock()
+	s.initIndex(rootURI)
+}
+
 func (s *Server) disableIndex(err error) {
 	s.mu.Lock()
 	s.idx = nil
@@ -162,8 +178,19 @@ func (s *Server) handleIndexStats(ctx context.Context, _ *jsonrpc.Message) (json
 	stats.Generation, stats.Segments = view.ID, view.Segments
 	if len(view.Segments) == 1 {
 		sealed, readErr := view.ReadSegment(view.Segments[0].ID)
+		var currentHash string
 		if readErr == nil {
-			_, readErr = persistent.VerifyPayload(sealed, persistent.FreshnessTuple{BackendVer: inventoryVersion, Revision: stats.Revision})
+			currentFiles, inventoryErr := idx.inventory(ctx, &IndexRebuildStats{})
+			if inventoryErr != nil {
+				readErr = inventoryErr
+			} else {
+				_, currentHash, readErr = inventoryPayload(currentFiles)
+			}
+		}
+		if readErr == nil {
+			_, readErr = persistent.VerifyPayload(sealed, persistent.FreshnessTuple{
+				SourceHash: currentHash, BackendVer: inventoryVersion, Revision: stats.Revision,
+			})
 		}
 		stats.Fresh = readErr == nil
 		if readErr != nil && !errors.Is(readErr, persistent.ErrStaleFreshness) {
@@ -206,7 +233,7 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		last.Error = err.Error()
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: err.Error()}
 	}
-	data, err := json.Marshal(records)
+	data, sourceHash, err := inventoryPayload(records)
 	if err != nil {
 		last.Error = err.Error()
 		return nil, err
@@ -222,12 +249,27 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 			_ = build.Abort()
 		}
 	}()
-	_, err = build.WriteSegment(persistent.SealPayload(data, persistent.FreshnessTuple{BackendVer: inventoryVersion, Revision: revision}))
+	_, err = build.WriteSegment(persistent.SealPayload(data, persistent.FreshnessTuple{
+		SourceHash: sourceHash, BackendVer: inventoryVersion, Revision: revision,
+	}))
 	if err == nil {
 		err = ctx.Err()
 	}
 	if err == nil && s.currentRevision() != revision {
 		err = fmt.Errorf("workspace changed during reindex (snapshot %d, current %d)", revision, s.currentRevision())
+	}
+	if err == nil {
+		currentFiles, inventoryErr := idx.inventory(ctx, &IndexRebuildStats{})
+		if inventoryErr != nil {
+			err = inventoryErr
+		} else {
+			_, currentHash, hashErr := inventoryPayload(currentFiles)
+			if hashErr != nil {
+				err = hashErr
+			} else if currentHash != sourceHash {
+				err = fmt.Errorf("workspace files changed during reindex")
+			}
+		}
 	}
 	if err == nil {
 		err = build.Commit(ctx)
@@ -238,6 +280,15 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 	}
 	committed = true
 	return json.Marshal(map[string]any{"generation": idxGeneration(ctx, idx.store), "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
+}
+
+func inventoryPayload(records []fileRecord) ([]byte, string, error) {
+	data, err := json.Marshal(records)
+	if err != nil {
+		return nil, "", err
+	}
+	hash := sha256.Sum256(data)
+	return data, hex.EncodeToString(hash[:]), nil
 }
 
 func idxGeneration(ctx context.Context, store *persistent.FileStore) uint64 {

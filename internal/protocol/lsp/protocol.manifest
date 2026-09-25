@@ -57,6 +57,7 @@ const SymbolStruct
 const SymbolTypeParameter
 const SymbolVariable
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error)
+func (s *Server) InitializeWorkspace(root string)
 func (s *Server) disableIndex(err error)
 func (s *Server) dispatchSemanticRequest(ctx context.Context, msg *jsonrpc.Message, uri string, line uint32, column uint32, project func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error)) (json.RawMessage, error)
 func (s *Server) findWorkspaceBackend() languages.Backend
@@ -102,6 +103,7 @@ func completenessName(c identity.Completeness) string
 func defaultIndexDir(root string) (string, error)
 func encodingWidth(value string, encoding int) uint32
 func idxGeneration(ctx context.Context, store *persistent.FileStore) uint64
+func inventoryPayload(records []fileRecord) ([]byte, string, error)
 func negotiatePositionEncoding(proposals []string) string
 func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol
 func projectLocations(locs []languages.Location) []lsp.Location

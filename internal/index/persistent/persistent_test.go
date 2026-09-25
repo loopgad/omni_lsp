@@ -3,6 +3,7 @@ package persistent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -243,6 +244,118 @@ func TestCompact_ReducesSegmentsAndPreservesReads(t *testing.T) {
 		if got[i] != wantPayloads[i] {
 			t.Errorf("payload[%d] = %q, want %q", i, got[i], wantPayloads[i])
 		}
+	}
+}
+
+func TestCompactRetiresOnlyTheCompactedFallback(t *testing.T) {
+	s := newStore(t)
+	publishOne(t, s, "older-fallback")
+	build, err := s.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, payload := range []string{"current-a", "current-b"} {
+		if _, err := build.WriteSegment([]byte(payload)); err != nil {
+			_ = build.Abort()
+			t.Fatal(err)
+		}
+	}
+	if err := build.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	compacted, err := s.OpenSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	segmentPath := filepath.Join(s.root, segFileName(compacted.Segments[0].ID))
+	if err := os.WriteFile(segmentPath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := s.OpenSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.ID != 1 {
+		t.Fatalf("fallback generation after compacted corruption = %d, want 1", fallback.ID)
+	}
+	payload, err := fallback.ReadSegment(fallback.Segments[0].ID)
+	if err != nil || string(payload) != "older-fallback" {
+		t.Fatalf("fallback payload = %q, %v", payload, err)
+	}
+}
+
+func TestL8_NullHistoryEntryDegradesWithoutPanic(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, fileHistory), []byte(`[null]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatalf("open store with malformed history: %v", err)
+	}
+	if _, err := s.OpenSnapshot(context.Background()); !errors.Is(err, ErrNoGeneration) {
+		t.Fatalf("OpenSnapshot error = %v, want ErrNoGeneration", err)
+	}
+}
+
+func TestL4_IndependentStoresSerializeWriters(t *testing.T) {
+	root := t.TempDir()
+	first, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for i, store := range []*FileStore{first, second} {
+		payload := fmt.Sprintf("writer-%d", i)
+		go func(store *FileStore, payload string) {
+			<-start
+			build, err := store.BeginBuild(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			if _, err := build.WriteSegment([]byte(payload)); err != nil {
+				_ = build.Abort()
+				errs <- err
+				return
+			}
+			errs <- build.Commit(context.Background())
+		}(store, payload)
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := first.OpenSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ID != 2 {
+		t.Fatalf("published generation = %d, want 2", view.ID)
+	}
+	payload, err := view.ReadSegment(view.Segments[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(payload); got != "writer-0" && got != "writer-1" {
+		t.Fatalf("published payload = %q", got)
+	}
+}
+
+func TestL7_UnsafeSegmentIDRejected(t *testing.T) {
+	view := GenerationView{Generation: Generation{ID: 1}, dir: t.TempDir()}
+	if _, err := view.ReadSegment(SegmentID("../../outside")); err == nil {
+		t.Fatal("unsafe segment ID was accepted")
 	}
 }
 

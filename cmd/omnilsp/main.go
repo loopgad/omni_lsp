@@ -180,6 +180,7 @@ func cmdServe(args []string) {
 	case "mcp":
 		// §C14/X6: MCP tools projection over stdio, stateless per the
 		// pinned 2026-07-28 revision.
+		srv.InitializeWorkspace(cfg.WorkspaceDir)
 		info("serving MCP %s over stdio", mcpserver.ProtocolRevision)
 		if err := mcpserver.Serve(ctx, os.Stdin, os.Stdout, mcpCore{srv: srv}); err != nil && ctx.Err() == nil {
 			fatal("mcp server error: %v", err)

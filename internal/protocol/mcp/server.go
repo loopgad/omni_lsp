@@ -375,7 +375,7 @@ func toolDefs() []toolDef {
 		},
 		{
 			Name:        "index_status",
-			Description: "Report indexer status counters (documents, symbols, generation, etc.). Informational only.",
+			Description: "Report persistent workspace file-index status, freshness, generation, and rebuild counters. Informational only.",
 			InputSchema: objectSchema(nil, map[string]any{}),
 		},
 	}

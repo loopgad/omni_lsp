@@ -131,7 +131,17 @@ func TestC12_IndexStatsAndReindexLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		payload, err := persistent.VerifyPayload(sealed, persistent.FreshnessTuple{BackendVer: inventoryVersion, Revision: stats.Revision})
+		recordsExpected, err := s.idx.inventory(context.Background(), &IndexRebuildStats{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, sourceHash, err := inventoryPayload(recordsExpected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := persistent.VerifyPayload(sealed, persistent.FreshnessTuple{
+			SourceHash: sourceHash, BackendVer: inventoryVersion, Revision: stats.Revision,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -146,6 +156,128 @@ func TestC12_IndexStatsAndReindexLifecycle(t *testing.T) {
 	s.snapMgr.Publish(snapshot.New(string(s.workspaceID), 1, nil))
 	if stats := indexStats(t, s); stats.Fresh || stats.Generation != 2 {
 		t.Fatalf("stale generation must remain visible but not fresh: %+v", stats)
+	}
+}
+
+func TestC12_IndexStatsFreshnessSurvivesServerRestart(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	root := t.TempDir()
+	indexDir := filepath.Join(t.TempDir(), "persistent-index")
+	sourcePath := filepath.Join(root, "source.go")
+	if err := os.WriteFile(sourcePath, []byte("package original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newServer := func() *Server {
+		cfg := DefaultConfig()
+		cfg.IndexDir = indexDir
+		s := New(cfg)
+		params, err := json.Marshal(InitializeParams{RootURI: uri.FromPath(root).String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := s.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", params))
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("initialize: %+v", resp)
+		}
+		return s
+	}
+	first := newServer()
+	if resp := indexRequest(first, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+		t.Fatalf("initial reindex: %+v", resp)
+	}
+	if stats := indexStats(t, first); !stats.Fresh || stats.Generation != 1 {
+		t.Fatalf("initial index stats = %+v", stats)
+	}
+	if err := os.WriteFile(sourcePath, []byte("package changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second := newServer()
+	if stats := indexStats(t, second); !stats.Enabled || stats.Fresh || stats.Generation != 1 {
+		t.Fatalf("recovered stale index stats = %+v", stats)
+	}
+	if resp := indexRequest(second, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+		t.Fatalf("rebuild after restart: %+v", resp)
+	}
+	if stats := indexStats(t, second); !stats.Fresh || stats.Generation != 2 {
+		t.Fatalf("rebuilt index stats = %+v", stats)
+	}
+}
+
+func TestC12_CorruptHistoryDoesNotBlockInitialize(t *testing.T) {
+	root := t.TempDir()
+	indexDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(indexDir, "history.json"), []byte(`[null]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.IndexDir = indexDir
+	s := New(cfg)
+	params, err := json.Marshal(InitializeParams{RootURI: uri.FromPath(root).String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := s.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", params))
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("initialize with malformed history: %+v", resp)
+	}
+	stats := indexStats(t, s)
+	if !stats.Enabled || stats.Generation != 0 {
+		t.Fatalf("degraded index status = %+v", stats)
+	}
+}
+
+func TestC12_SharedIndexDirSerializesServers(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	root := t.TempDir()
+	indexDir := filepath.Join(t.TempDir(), "shared-index")
+	if err := os.WriteFile(filepath.Join(root, "source.go"), []byte("package source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newServer := func() *Server {
+		cfg := DefaultConfig()
+		cfg.IndexDir = indexDir
+		s := New(cfg)
+		params, err := json.Marshal(InitializeParams{RootURI: uri.FromPath(root).String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := s.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", params))
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("initialize shared-index server: %+v", resp)
+		}
+		return s
+	}
+	servers := []*Server{newServer(), newServer()}
+	start := make(chan struct{})
+	results := make(chan *jsonrpc.Message, len(servers))
+	for _, srv := range servers {
+		go func(srv *Server) {
+			<-start
+			results <- indexRequest(srv, context.Background(), "omnilsp/reindex")
+		}(srv)
+	}
+	close(start)
+	seen := map[uint64]bool{}
+	for range len(servers) {
+		resp := <-results
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("shared-index reindex: %+v", resp)
+		}
+		var result struct {
+			Generation uint64 `json:"generation"`
+		}
+		if err := json.Unmarshal(resp.Result, &result); err != nil {
+			t.Fatal(err)
+		}
+		seen[result.Generation] = true
+	}
+	if !seen[1] || !seen[2] || len(seen) != 2 {
+		t.Fatalf("published generations = %+v, want distinct 1 and 2", seen)
+	}
+	for i, srv := range servers {
+		if stats := indexStats(t, srv); !stats.Enabled || !stats.Fresh || stats.Generation != 2 {
+			t.Fatalf("server %d shared index stats = %+v", i, stats)
+		}
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 )
 
 // encodeSegment frames a payload: magic | schemaVer | genID | len | crc32.
@@ -52,13 +54,16 @@ func decodeSegment(raw []byte) ([]byte, error) {
 // current manifest falls back through history entries; everything failing
 // verification leaves the store empty-but-alive with ErrNoGeneration (L8).
 func (s *FileStore) recover() error {
+	s.current = nil
+	s.history = nil
+	s.quarantined = s.readQuarantined()
+
 	mb, err := os.ReadFile(s.manifestPath())
 	if err == nil {
 		var gen Generation
-		if jerr := json.Unmarshal(mb, &gen); jerr == nil && len(gen.Segments) > 0 {
+		if jerr := json.Unmarshal(mb, &gen); jerr == nil && validGeneration(&gen) {
 			s.current = &gen
 		} else {
-			_ = s.quarantineSegs(nil) // record nothing; pointer unusable
 			_ = os.Remove(s.manifestPath())
 		}
 	}
@@ -67,7 +72,15 @@ func (s *FileStore) recover() error {
 	if err == nil {
 		var hist []*Generation
 		if json.Unmarshal(hb, &hist) == nil {
-			s.history = hist
+			seen := make(map[uint64]bool, len(hist))
+			for _, gen := range hist {
+				if !validGeneration(gen) || (s.current != nil && gen.ID == s.current.ID) || seen[gen.ID] {
+					continue
+				}
+				seen[gen.ID] = true
+				s.history = append(s.history, gen)
+			}
+			sort.Slice(s.history, func(i, j int) bool { return s.history[i].ID > s.history[j].ID })
 		}
 	}
 
@@ -93,7 +106,35 @@ func (s *FileStore) recover() error {
 	if s.current != nil && s.current.ID > s.nextGenID {
 		s.nextGenID = s.current.ID
 	}
+	for _, gen := range s.history {
+		if gen.ID > s.nextGenID {
+			s.nextGenID = gen.ID
+		}
+	}
 	return nil
+}
+
+func (s *FileStore) readQuarantined() []SegmentID {
+	entries, err := os.ReadDir(s.quarantineDir())
+	if err != nil {
+		return nil
+	}
+	var out []SegmentID
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".bin") {
+			continue
+		}
+		id := SegmentID(strings.TrimSuffix(strings.TrimPrefix(name, "seg-"), ".bin"))
+		if validSegmentID(id) {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // mergeFraming is the length-prefixed layout used to pack many logical
@@ -123,16 +164,32 @@ func SplitMerged(merged []byte) [][]byte {
 	return out
 }
 
-// Compact merges every committed segment into ONE fresh segment and atomically
-// retires the old files (§L16).
+// Compact merges the current generation into one fresh segment, then removes
+// that generation from fallback history before retiring its old files (§L16).
 func (s *FileStore) Compact(ctx context.Context) error {
-	view, err := s.OpenSnapshot(ctx)
+	writerLock, err := acquireWriterLock(ctx, s.root)
 	if err != nil {
 		return err
 	}
-	build, err := s.BeginBuild(ctx)
+	defer writerLock.release()
+	s.mu.Lock()
+	err = s.recover()
+	s.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	view, err := s.openSnapshotWithWriterLock(ctx)
+	if err != nil {
+		return err
+	}
+	build, err := s.beginBuildWithWriterLock(ctx, writerLock)
+	if err != nil {
+		return err
+	}
+	fileBuild, ok := build.(*fileBuild)
+	if !ok {
+		_ = build.Abort()
+		return fmt.Errorf("persistent: unexpected build session type %T", build)
 	}
 	oldSegs := make([]SegmentID, 0, len(view.Segments))
 	var merged []byte
@@ -149,13 +206,44 @@ func (s *FileStore) Compact(ctx context.Context) error {
 		build.Abort()
 		return err
 	}
-	if err := build.Commit(ctx); err != nil {
+	if err := fileBuild.commit(ctx); err != nil {
+		build.Abort()
 		return err
 	}
-	// Retire superseded segments after the new pointer is live (best-effort;
-	// leftovers only waste budget, never correctness — L4 retirement step).
-	for _, id := range oldSegs {
+	// The previous generation is retained in history for fallback. Retire it
+	// from that chain durably before deleting its segments; older fallbacks stay.
+	s.pruneHistoryGeneration(view.ID, oldSegs)
+	return nil
+}
+
+func (s *FileStore) pruneHistoryGeneration(genID uint64, segments []SegmentID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := make([]*Generation, 0, len(s.history))
+	for _, gen := range s.history {
+		if gen.ID != genID {
+			kept = append(kept, gen)
+		}
+	}
+	if len(kept) == len(s.history) {
+		return
+	}
+	b, err := json.Marshal(kept)
+	if err != nil {
+		return
+	}
+	path := s.historyPath()
+	if err := writeFileSync(path+".tmp", b); err != nil {
+		_ = os.Remove(path + ".tmp")
+		return
+	}
+	_ = os.Remove(path) // Windows cannot replace an existing file with Rename.
+	if err := os.Rename(path+".tmp", path); err != nil {
+		_ = os.Remove(path + ".tmp")
+		return
+	}
+	s.history = kept
+	for _, id := range segments {
 		_ = os.Remove(filepath.Join(s.root, segFileName(id)))
 	}
-	return nil
 }
