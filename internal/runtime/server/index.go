@@ -231,17 +231,17 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 	}
 	if err != nil {
 		last.Error = err.Error()
-		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: err.Error()}
+		return nil, reindexResponseError(err)
 	}
 	data, sourceHash, err := inventoryPayload(records)
 	if err != nil {
 		last.Error = err.Error()
-		return nil, err
+		return nil, reindexResponseError(err)
 	}
 	build, err := idx.store.BeginBuild(ctx)
 	if err != nil {
 		last.Error = err.Error()
-		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: err.Error()}
+		return nil, reindexResponseError(err)
 	}
 	committed := false
 	defer func() {
@@ -276,10 +276,18 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 	}
 	if err != nil {
 		last.Error = err.Error()
-		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: err.Error()}
+		return nil, reindexResponseError(err)
 	}
 	committed = true
 	return json.Marshal(map[string]any{"generation": idxGeneration(ctx, idx.store), "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
+}
+
+func reindexResponseError(err error) *jsonrpc.ResponseError {
+	code := jsonrpc.RequestFailed
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		code = jsonrpc.RequestCancelled
+	}
+	return &jsonrpc.ResponseError{Code: code, Message: err.Error()}
 }
 
 func inventoryPayload(records []fileRecord) ([]byte, string, error) {

@@ -368,14 +368,14 @@ func toolDefs() []toolDef {
 		},
 		{
 			Name:        "workspace_symbols",
-			Description: "Search workspace-level symbols matching a query substring. Matches may be incomplete depending on index coverage; the _meta field reports status and evidence.",
+			Description: "Ask the configured language backend for workspace symbols matching a query substring. Results depend on backend support and coverage; _meta reports result status and evidence. This does not query the persistent file-inventory index.",
 			InputSchema: objectSchema([]string{"query"}, map[string]any{
 				"query": strProp("Substring to match against symbol names"),
 			}),
 		},
 		{
 			Name:        "index_status",
-			Description: "Report persistent workspace file-index status, freshness, generation, and rebuild counters. Informational only.",
+			Description: "Report persistent file-inventory index status, including freshness, generation, and rebuild counters when available. Read-only and informational; this index does not contain semantic symbols.",
 			InputSchema: objectSchema(nil, map[string]any{}),
 		},
 	}

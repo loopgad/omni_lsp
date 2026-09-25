@@ -107,6 +107,7 @@ func inventoryPayload(records []fileRecord) ([]byte, string, error)
 func negotiatePositionEncoding(proposals []string) string
 func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol
 func projectLocations(locs []languages.Location) []lsp.Location
+func reindexResponseError(err error) *jsonrpc.ResponseError
 func skipIndexDir(name string) bool
 type CompletionItem struct{Label string json:"label", Kind CompletionItemKind json:"kind,omitempty", Detail string json:"detail,omitempty", Documentation string json:"documentation,omitempty", InsertText string json:"insertText,omitempty", SortText string json:"sortText,omitempty", FilterText string json:"filterText,omitempty"}
 type CompletionItemKind int

@@ -384,7 +384,7 @@ var Registry = struct{ Checks []Check }{
 			Text: "standard/target/sysroot/includes fields in BuildContextID for C/C++", Status: StatusDeferred,
 			Milestone: "X3", Reason: "compile_commands parser lands first; version+workdir hash is honest for v1"},
 		{ID: "DEF-IDXWIRE", Domain: "post-x9", Category: "INDEX", Clause: "C12 indexStats/reindex live wiring", Weight: 1,
-			Text: "live workspace access to omnilsp/indexStats and omnilsp/reindex", Status: StatusAuto,
+			Text: "read-only status and trusted transactional reindex for a bounded v1 workspace file inventory; not semantic symbol indexing", Status: StatusAuto,
 			Probe: &Probe{Groups: []ProbeGroup{
 				{Pkg: "internal/runtime/server", Tests: []string{"TestC12_IndexStatsDisabled", "TestC12_IndexStatsAndReindexLifecycle", "TestC12_IndexStatsFreshnessSurvivesServerRestart", "TestC12_CorruptHistoryDoesNotBlockInitialize", "TestC12_SharedIndexDirSerializesServers", "TestC12_ReindexTrustGate", "TestC12_ReindexCancel"}},
 				{Pkg: "cmd/omnilsp", Tests: []string{"TestMCPIndexStatusInitializesWorkspace"}},

@@ -135,6 +135,7 @@ func TestToolsListIsFiveReadOnly(t *testing.T) {
 		"hover": true, "find_definition": true, "find_references": true,
 		"workspace_symbols": true, "index_status": true,
 	}
+	descriptions := make(map[string]string, len(tools))
 	for _, tl := range tools {
 		if !want[tl.Name] {
 			t.Errorf("unexpected tool %q (mutating tools must stay unregistered)", tl.Name)
@@ -143,12 +144,19 @@ func TestToolsListIsFiveReadOnly(t *testing.T) {
 		if tl.Description == "" {
 			t.Errorf("tool %q missing description", tl.Name)
 		}
+		descriptions[tl.Name] = tl.Description
 		if tl.InputSchema["type"] != "object" {
 			t.Errorf("tool %q schema not an object schema: %v", tl.Name, tl.InputSchema)
 		}
 	}
 	for name := range want {
 		t.Errorf("missing tool %q", name)
+	}
+	if !strings.Contains(descriptions["workspace_symbols"], "does not query the persistent file-inventory index") {
+		t.Errorf("workspace_symbols description blurs semantic and persistent inventory indexes: %q", descriptions["workspace_symbols"])
+	}
+	if !strings.Contains(descriptions["index_status"], "does not contain semantic symbols") {
+		t.Errorf("index_status description overstates index contents: %q", descriptions["index_status"])
 	}
 }
 

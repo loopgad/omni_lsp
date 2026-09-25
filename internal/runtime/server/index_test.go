@@ -325,7 +325,7 @@ func TestC12_ReindexCancel(t *testing.T) {
 	}
 	ctx := &cancelAfterContext{Context: context.Background(), limit: 4}
 	resp := indexRequest(s, ctx, "omnilsp/reindex")
-	if resp == nil || resp.Error == nil || resp.Error.Code != jsonrpc.RequestFailed {
+	if resp == nil || resp.Error == nil || resp.Error.Code != jsonrpc.RequestCancelled {
 		t.Fatalf("cancel response = %+v", resp)
 	}
 	after, err := s.idx.store.OpenSnapshot(context.Background())
