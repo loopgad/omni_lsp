@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -49,8 +50,9 @@ func computeDiagKey(uri string, snapRev uint64, content []byte, bc string, epoch
 
 // diagEntry pairs the cached set with its key so pull can revalidate.
 type diagEntry struct {
-	key   diagKey
-	items []languages.Diagnostic
+	key     diagKey
+	items   []languages.Diagnostic
+	version int64
 }
 
 // diagCoordinator owns debounce timers, the bounded cache, and wire emission.
@@ -81,7 +83,7 @@ func (d *diagCoordinator) request(uri string) {
 		d.mu.Lock()
 		delete(d.timers, uri)
 		d.mu.Unlock()
-		d.computeAndPush(uri)
+		d.computeAndPush(context.Background(), uri)
 	})
 }
 
@@ -96,15 +98,27 @@ func (d *diagCoordinator) Close() {
 }
 
 // computeAndPush runs diagnostics and emits publishDiagnostics.
-func (d *diagCoordinator) computeAndPush(uri string) {
-	items, err := d.compute(uri)
+func (d *diagCoordinator) computeAndPush(ctx context.Context, uri string) {
+	items, err := d.compute(ctx, uri)
 	if err != nil {
 		return // transient backend failure: stay silent, next edit retries
 	}
-	version := int64(0)
-	if f := d.server.vfs.Get(uri); f != nil {
-		version = f.Version
+	be := d.server.findWorkspaceBackendFor(uri)
+	if be == nil {
+		return
 	}
+	if currentKey := d.currentKey(uri, be); currentKey != (diagKey{}) {
+		d.mu.Lock()
+		cached, ok := d.cache[uri]
+		d.mu.Unlock()
+		if !ok || cached.key != currentKey {
+			return
+		}
+	}
+	d.mu.Lock()
+	cached := d.cache[uri]
+	d.mu.Unlock()
+	version := cached.version
 	wire := projectDiagnostics(items)
 	payload, merr := json.Marshal(map[string]any{
 		"uri":         uri,
@@ -114,23 +128,44 @@ func (d *diagCoordinator) computeAndPush(uri string) {
 	if merr != nil {
 		return
 	}
+	if currentKey := d.currentKey(uri, be); currentKey != cached.key {
+		return
+	}
 	d.server.notifyClient("textDocument/publishDiagnostics", json.RawMessage(payload))
 }
 
+func (d *diagCoordinator) currentKey(uri string, be languages.Backend) diagKey {
+	src := d.server.vfs.Content(uri)
+	if src == nil {
+		src = []byte{}
+	}
+	rev := uint64(0)
+	if snap := d.server.snapMgr.Current(); snap != nil {
+		rev = snap.ID().Revision
+	}
+	return computeDiagKey(uri, rev, src, string(backendBuildContext(be)), backendEpoch(be))
+}
+
 // compute resolves diagnostics through the bounded §C11 cache.
-func (d *diagCoordinator) compute(uri string) ([]languages.Diagnostic, error) {
+func (d *diagCoordinator) compute(ctx context.Context, uri string) ([]languages.Diagnostic, error) {
 	be := d.server.findWorkspaceBackendFor(uri)
 	if be == nil {
 		return nil, fmt.Errorf("no backend for %s", uri)
 	}
 	var src []byte
 	snapRev := uint64(0)
-	if captured := snapshotFromCtx(context.Background()); captured != nil {
+	if captured := snapshotFromCtx(ctx); captured != nil {
 		snapRev = captured.ID().Revision
-	} else if snap := d.server.snapMgr.Current(); snap != nil {
-		snapRev = snap.ID().Revision
+		if doc := captured.Document(uri); doc != nil {
+			src = doc.Content
+		}
 	}
-	src = d.server.vfs.Content(uri)
+	if src == nil {
+		if snap := d.server.snapMgr.Current(); snap != nil {
+			snapRev = snap.ID().Revision
+		}
+		src = d.server.vfs.Content(uri)
+	}
 	if src == nil {
 		src = []byte{}
 	}
@@ -143,7 +178,13 @@ func (d *diagCoordinator) compute(uri string) ([]languages.Diagnostic, error) {
 	}
 	d.mu.Unlock()
 
-	items, err := be.Diagnostics(context.Background(), uri, src)
+	var items []languages.Diagnostic
+	var err error
+	if encoded, ok := be.(languages.EncodedDiagnosticsProvider); ok {
+		items, err = encoded.DiagnosticsWithEncoding(ctx, uri, src, snapRev, d.server.negotiatedEncodingInt())
+	} else {
+		items, err = be.Diagnostics(ctx, uri, src)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +197,15 @@ func (d *diagCoordinator) compute(uri string) ([]languages.Diagnostic, error) {
 			delete(d.cache, old)
 		}
 	}
-	d.cache[uri] = diagEntry{key: key, items: items}
+	version := int64(0)
+	if captured := snapshotFromCtx(ctx); captured != nil {
+		if doc := captured.Document(uri); doc != nil {
+			version = doc.Version
+		}
+	} else if f := d.server.vfs.Get(uri); f != nil {
+		version = f.Version
+	}
+	d.cache[uri] = diagEntry{key: key, items: items, version: version}
 	d.mu.Unlock()
 	return items, nil
 }
@@ -209,6 +258,19 @@ func resultID(item languages.Diagnostic) string {
 	return hex.EncodeToString(h[:12])
 }
 
+func diagnosticsResultID(items []languages.Diagnostic) string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, resultID(item))
+	}
+	sort.Strings(ids)
+	h := sha256.New()
+	for _, id := range ids {
+		_, _ = h.Write([]byte(id))
+	}
+	return hex.EncodeToString(h.Sum(nil)[:12])
+}
+
 // projectDiagnostics converts internal diagnostics to the LSP wire shape.
 func projectDiagnostics(items []languages.Diagnostic) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
@@ -222,7 +284,6 @@ func projectDiagnostics(items []languages.Diagnostic) []map[string]any {
 			"source":   it.Source,
 			"message":  it.Message,
 			"code":     it.Code,
-			"resultId": resultID(it),
 		}
 		out = append(out, entry)
 	}
@@ -239,7 +300,7 @@ func (s *Server) handlePullDiagnostics(ctx context.Context, msg *jsonrpc.Message
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid diagnostic params: %w", err)
 	}
-	items, err := s.diag.compute(params.TextDocument.URI)
+	items, err := s.diag.compute(ctx, params.TextDocument.URI)
 	if err != nil {
 		// §Q4 no silent fallback: an unanalyzable document answers empty-full,
 		// never stale data; the failure stays visible in metrics/logs.
@@ -247,8 +308,9 @@ func (s *Server) handlePullDiagnostics(ctx context.Context, msg *jsonrpc.Message
 		items = nil
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"kind":  "full",
-		"items": projectDiagnostics(items),
+		"kind":     "full",
+		"resultId": diagnosticsResultID(items),
+		"items":    projectDiagnostics(items),
 	})
 	return payload, nil
 }

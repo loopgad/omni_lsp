@@ -62,3 +62,25 @@ func TestK2_DepIndexCleansEvictedKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestInvalidateSnapshotDoesNotMatchSerializedFields(t *testing.T) {
+	e := NewEngine(0)
+	keyWithEmbeddedRevision := Key{
+		Kind: "hover", Workspace: "w", SnapshotRev: 2,
+		BuildContext: "b", Subject: "file|1|embedded",
+	}
+	if _, err := e.Query(context.Background(), keyWithEmbeddedRevision, nil,
+		func(_ context.Context, _ Bindings) (any, DepSet, error) { return "value", nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.InvalidateSnapshot(1); got != 0 {
+		t.Fatalf("invalidated %d unrelated entries, want 0", got)
+	}
+	if _, err := e.Query(context.Background(), keyWithEmbeddedRevision, nil,
+		func(_ context.Context, _ Bindings) (any, DepSet, error) { return "recomputed", nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if stats := e.Stats(); stats.Computations != 1 {
+		t.Fatalf("collision caused recomputation: computations=%d, want 1", stats.Computations)
+	}
+}

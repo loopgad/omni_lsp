@@ -344,4 +344,3 @@ func TestCall_PendingCleanupOnProcessDeath(t *testing.T) {
 		t.Fatal("Call hung past typical callTimeout even after process death")
 	}
 }
-

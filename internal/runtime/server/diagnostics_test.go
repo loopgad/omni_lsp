@@ -17,13 +17,37 @@ import (
 type diagBackend struct {
 	mockBackend
 	calls atomic.Int64
+	last  atomic.Value
 }
 
-func (b *diagBackend) Diagnostics(_ context.Context, _ string, _ []byte) ([]languages.Diagnostic, error) {
+func (b *diagBackend) Diagnostics(_ context.Context, _ string, content []byte) ([]languages.Diagnostic, error) {
 	b.calls.Add(1)
+	b.last.Store(string(content))
 	return []languages.Diagnostic{
 		{StartLine: 0, StartChar: 0, EndLine: 0, EndChar: 3, Severity: 1, Code: "E1", Source: "go", Message: "undefined: foo"},
 	}, nil
+}
+
+func TestC11_PullUsesCapturedSnapshot(t *testing.T) {
+	const uri = "file:///w/main.go"
+	s := New(DefaultConfig())
+	be := &diagBackend{mockBackend: mockBackend{langID: "go", exts: []string{".go"}}}
+	s.RegisterBackend("go", be)
+	s.vfs.Open(uri, "go", 1, []byte("version-one"), vfs.SourceEditor)
+	s.publishSnapshot()
+	oldSnap := s.snapMgr.Current()
+	s.vfs.Update(uri, 2, []byte("version-two"))
+	s.publishSnapshot()
+
+	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "textDocument/diagnostic",
+		json.RawMessage(`{"textDocument":{"uri":"`+uri+`"}}`))
+	resp := s.dispatcher.Dispatch(withSnapshot(context.Background(), oldSnap), msg)
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("pull failed: %+v", resp)
+	}
+	if got := be.last.Load().(string); got != "version-one" {
+		t.Fatalf("diagnostics saw %q, want captured version-one", got)
+	}
 }
 
 func TestC11_PushDebouncedPublish(t *testing.T) {
@@ -107,13 +131,11 @@ func TestC11_PullStableResultIdAndCache(t *testing.T) {
 		t.Fatalf("second pull recomputed (calls=%d): cache key must gate", n)
 	}
 	var a, b struct {
-		Items []struct {
-			ResultID string `json:"resultId"`
-		} `json:"items"`
+		ResultID string `json:"resultId"`
 	}
 	json.Unmarshal(first, &a)
 	json.Unmarshal(second, &b)
-	if len(a.Items) == 0 || a.Items[0].ResultID != b.Items[0].ResultID {
+	if a.ResultID == "" || a.ResultID != b.ResultID {
 		t.Fatalf("resultId unstable across identical pulls")
 	}
 

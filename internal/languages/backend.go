@@ -38,11 +38,13 @@ const (
 
 // CompletionRequest contains parameters for a completion query.
 type CompletionRequest struct {
-	URI      string
-	Content  []byte
-	Line     uint32
-	Column   uint32
-	Encoding int // 0=UTF8, 1=UTF16, 2=UTF32
+	URI         string
+	Content     []byte
+	SnapshotRev uint64
+	Line        uint32
+	Column      uint32
+	Encoding    int // 0=UTF8, 1=UTF16, 2=UTF32
+	EncodingSet bool
 }
 
 // CompletionItem represents a single completion candidate.
@@ -66,6 +68,7 @@ type HoverRequest struct {
 	Line         uint32
 	Column       uint32
 	Encoding     int
+	EncodingSet  bool
 }
 
 // HoverResult contains hover information.
@@ -84,6 +87,7 @@ type DefinitionRequest struct {
 	Line         uint32
 	Column       uint32
 	Encoding     int
+	EncodingSet  bool
 }
 
 // Location represents a location in a file.
@@ -109,14 +113,16 @@ type ReferencesRequest struct {
 	Line         uint32
 	Column       uint32
 	Encoding     int
+	EncodingSet  bool
 	IncludeDecl  bool
 }
 
 // DocumentSymbolRequest contains parameters for document symbols.
 type DocumentSymbolRequest struct {
-	URI      string
-	Content  []byte
-	Encoding int
+	URI         string
+	Content     []byte
+	Encoding    int
+	EncodingSet bool
 }
 
 // SymbolKind mirrors LSP SymbolKind.
@@ -208,8 +214,10 @@ type SemanticToken struct {
 
 // WorkspaceSymbolRequest contains parameters for workspace symbol search.
 type WorkspaceSymbolRequest struct {
-	Query string
-	Limit int
+	Query       string
+	Limit       int
+	Encoding    int
+	EncodingSet bool
 }
 
 // WorkspaceSymbol represents a workspace-level symbol.
@@ -230,6 +238,7 @@ type RenameRequest struct {
 	Line         uint32
 	Column       uint32
 	Encoding     int
+	EncodingSet  bool
 	NewName      string
 }
 
@@ -293,6 +302,14 @@ type Backend interface {
 
 	// Close releases any resources held by the backend.
 	Close() error
+}
+
+type EncodedDiagnosticsProvider interface {
+	DiagnosticsWithEncoding(ctx context.Context, uri string, content []byte, snapshotRev uint64, encoding int) ([]Diagnostic, error)
+}
+
+type EncodedSemanticTokensProvider interface {
+	SemanticTokensWithEncoding(ctx context.Context, uri string, content []byte, encoding int) ([]SemanticToken, error)
 }
 
 // --- Optional capability interfaces (§I16/§I20/§I22) -------------------------

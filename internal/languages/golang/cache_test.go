@@ -32,6 +32,15 @@ func TestK0_PackageCacheHits(t *testing.T) {
 	if b.cacheHits.Load() == 0 {
 		t.Error("identical repeat query must hit the package cache")
 	}
+	beforeRevisionChange := b.cacheMisses.Load()
+	if _, err := b.Definition(context.Background(), languages.DefinitionRequest{
+		URI: uri, Content: src, SnapshotRev: 2, Line: 2, Column: 6,
+	}); err != nil {
+		t.Fatalf("new snapshot definition: %v", err)
+	}
+	if b.cacheMisses.Load() <= beforeRevisionChange {
+		t.Error("new snapshot revision must not reuse the old package cache entry")
+	}
 
 	// Different content ⇒ different key ⇒ miss (no stale reuse).
 	if _, err := b.Definition(context.Background(), languages.DefinitionRequest{

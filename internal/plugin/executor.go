@@ -86,12 +86,12 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 	}
 
 	p := &Process{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdout),
-		grant:  grant,
+		cmd:     cmd,
+		stdin:   stdin,
+		stdout:  bufio.NewReader(stdout),
+		grant:   grant,
 		pending: make(map[int]chan response),
-		OnExit: onExit,
+		OnExit:  onExit,
 	}
 	go p.readLoop()
 	go func() {

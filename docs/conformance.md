@@ -27,7 +27,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| J-WIRE | Semantic reads memoized by revision; transient failures retryable; bounded table (K0) | J engine production wiring | `TestJ_EngineMemoizesSemanticReads`, `TestK0_QueryMemoBounded` | AUTO |
+| J-WIRE | Semantic reads memoized by revision; transient/unknown failures retryable; bounded table (K0) | J engine production wiring | `TestJ_EngineMemoizesSemanticReads`, `TestB6_UnknownEnvelopeNotMemoizedAcrossRecovery`, `TestB6_UnavailableEnvelopeNotMemoizedAcrossRecovery`, `TestK0_QueryMemoBounded` | AUTO |
 
 ### PERF
 
@@ -36,7 +36,7 @@
 | PERF-S19 | Large-query throughput scaling + cancelability measured | S19 large queries | `TestS19_ReferencesScalingCurve` | AUTO |
 | PERF-S20 | Accuracy KPI formulas canonical and NaN-safe | S20 accuracy KPI | `TestS20_KPIFormulas`, `TestS20_KPIZeroDenominatorSafe` | AUTO |
 | PERF-1 | Benchmark reports carry mandatory metadata banner | §S17 | `TestS17_MetadataPresent` | AUTO |
-| PERF-2 | Interactive SLO targets met (hot hover/definition/completion/syntax-update P50+P95) | §S18 | `TestS18_InteractiveSLO` | AUTO |
+| PERF-2 | Interactive SLO targets met (hot hover/definition/completion/syntax-update P50+P95+P99) | §S18 | `TestS18_InteractiveSLO` | AUTO |
 | PERF-3 | Qualified corpus zero-error goals (six-bucket classification all-zero) | §S21 | `TestS21_ZeroErrorClassification` | AUTO |
 | PERF-4 | Metamorphic invariance (whitespace / line endings / comment injection) | §S22 | `TestS22_MetamorphicWhitespaceInvariance`, `TestS22_MetamorphicLineEndingInvariance`, `TestS22_MetamorphicCommentInjectionInvariance` | AUTO |
 

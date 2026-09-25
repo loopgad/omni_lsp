@@ -393,20 +393,20 @@ func percentile(sortedAsc []time.Duration, q float64) time.Duration {
 // ponytail: 固定批量 256；需要真分布而非均值近似时换 QPC/平台高精度时钟。
 const batchOps = 256
 
-// TestS18_InteractiveSLO 预热后各操作测 ≥200 个批量样本的 P50/P95 并对照 §S18
-// 目标。被测路径为确定性伪路径（fake 后端 + 同步门面），实际在微秒级，远低于
+// TestS18_InteractiveSLO 预热后各操作测 ≥200 个批量样本的 P50/P95/P99 并对照
+// §S18 目标。被测路径为确定性伪路径（fake 后端 + 同步门面），实际在微秒级，远低于
 // 毫秒级目标，断言余量充分、可安全通过。
 func TestS18_InteractiveSLO(t *testing.T) {
 	const sloIters = 250 // ≥200（§S18 样本量要求）
 	cases := []struct {
-		name                 string
-		p50Target, p95Target time.Duration
-		op                   func(*harness) error
+		name                            string
+		p50Target, p95Target, p99Target time.Duration
+		op                              func(*harness) error
 	}{
-		{"hot hover", 20 * time.Millisecond, 75 * time.Millisecond, (*harness).hover},
-		{"hot definition", 25 * time.Millisecond, 100 * time.Millisecond, (*harness).definition},
-		{"completion first usable", 40 * time.Millisecond, 120 * time.Millisecond, (*harness).completion},
-		{"syntax update after edit", 15 * time.Millisecond, 50 * time.Millisecond, (*harness).edit},
+		{"hot hover", 20 * time.Millisecond, 75 * time.Millisecond, 150 * time.Millisecond, (*harness).hover},
+		{"hot definition", 25 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, (*harness).definition},
+		{"completion first usable", 40 * time.Millisecond, 120 * time.Millisecond, 250 * time.Millisecond, (*harness).completion},
+		{"syntax update after edit", 15 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, (*harness).edit},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -431,13 +431,17 @@ func TestS18_InteractiveSLO(t *testing.T) {
 			sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 			p50 := percentile(samples, 0.50)
 			p95 := percentile(samples, 0.95)
-			t.Logf("%s: P50=%v/op (目标 ≤%v)  P95=%v/op (目标 ≤%v)  [每样本 %d 次均值]",
-				tc.name, p50, tc.p50Target, p95, tc.p95Target, batchOps)
+			p99 := percentile(samples, 0.99)
+			t.Logf("%s: P50=%v/op (目标 ≤%v)  P95=%v/op (目标 ≤%v)  P99=%v/op (目标 ≤%v)  [每样本 %d 次均值]",
+				tc.name, p50, tc.p50Target, p95, tc.p95Target, p99, tc.p99Target, batchOps)
 			if p50 > tc.p50Target {
 				t.Errorf("%s P50 %v 超出 §S18 目标 %v", tc.name, p50, tc.p50Target)
 			}
 			if p95 > tc.p95Target {
 				t.Errorf("%s P95 %v 超出 §S18 目标 %v", tc.name, p95, tc.p95Target)
+			}
+			if p99 > tc.p99Target {
+				t.Errorf("%s P99 %v 超出 §S18 目标 %v", tc.name, p99, tc.p99Target)
 			}
 		})
 	}

@@ -61,7 +61,8 @@
     "jsonrpc": "2.0",
     "result": {
       "items": [],
-      "kind": "full"
+      "kind": "full",
+      "resultId": "e3b0c44298fc1c149afbf4c8"
     }
   },
   {

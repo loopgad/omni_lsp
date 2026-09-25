@@ -3,7 +3,8 @@
 //
 // Responsibility:
 //
-//	Implements languages.Backend for Go — hover, definition, completion, references,
+// Implements languages.Backend for Go — hover, definition, completion, references,
+//
 //	document/workspace symbols, diagnostics, semantic tokens, and rename.
 //
 // Owned mutable state:
@@ -21,6 +22,7 @@
 package golang
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -33,9 +35,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
@@ -121,13 +125,13 @@ func (b *Backend) CacheStats() (int64, int64) {
 // bounded). Oldest entries are evicted FIFO via the order slice.
 const pkgCacheLimit = 64
 
-func (b *Backend) loadPackage(ctx context.Context, uri string, content []byte) (*packages.Package, error) {
+func (b *Backend) loadPackage(ctx context.Context, uri string, content []byte, snapshotRev uint64) (*packages.Package, error) {
 	filePath := uriToPath(uri)
 
 	// §K1: cache key includes every semantic input — file identity plus exact
 	// content digest. Same hash ⇒ same fset offsets ⇒ safe reuse.
 	sum := sha256.Sum256(content)
-	key := filePath + "|" + hex.EncodeToString(sum[:8])
+	key := fmt.Sprintf("%s|%d|%s", filePath, snapshotRev, hex.EncodeToString(sum[:8]))
 	if pkg, ok := b.pkgCache[key]; ok && pkg != nil {
 		b.cacheHits.Add(1)
 		return pkg, nil
@@ -164,28 +168,64 @@ func (b *Backend) loadPackage(ctx context.Context, uri string, content []byte) (
 	return pkgs[0], nil
 }
 
-// lspPosToTokenPos converts an LSP UTF-16 line/character position into a
+// lspPosToTokenPos converts an LSP negotiated line/character position into a
 // token.Pos within tf, whose content must be src (INV-POS-001).
 // Invalid positions return a typed error, never panic (INV-POS-002).
-func lspPosToTokenPos(src []byte, tf *token.File, line, character uint32) (token.Pos, error) {
-	off, err := position.OffsetOfLineChar(src, line, character)
+func lspPosToTokenPos(src []byte, tf *token.File, line, character uint32, encoding int, encodingSet bool) (token.Pos, error) {
+	off, err := position.OffsetOfLineCharEncoding(src, line, character, requestEncoding(encoding, encodingSet))
 	if err != nil {
 		return token.NoPos, errors.New(errors.ErrInvalidPosition, "position", err.Error())
 	}
 	return tf.Pos(int(off)), nil
 }
 
+func requestEncoding(value int, set bool) position.Encoding {
+	if !set {
+		return position.UTF16
+	}
+	switch value {
+	case 0:
+		return position.UTF8
+	case 2:
+		return position.UTF32
+	default:
+		return position.UTF16
+	}
+}
+
 // posToLineCol converts a token.Pos into an LSP UTF-16 line/character pair.
 // src must be the exact content the fset offsets refer to.
-func posToLineCol(src []byte, fset *token.FileSet, pos token.Pos) (uint32, uint32) {
+func posToLineCol(src []byte, fset *token.FileSet, pos token.Pos, encoding int, encodingSet bool) (uint32, uint32) {
 	p := fset.Position(pos)
-	line, col, err := position.LineCharAt(src, uint32(p.Offset))
-	if err != nil {
+	if p.Offset < 0 || p.Offset > len(src) {
 		// Offset out of range should not happen for positions from this fset;
 		// fall back to the line only rather than fabricate a column.
-		return line, 0
+		return uint32(maxInt(p.Line-1, 0)), 0
 	}
-	return line, col
+	idx := position.NewIndex(src, requestEncoding(encoding, encodingSet))
+	posn, err := idx.OffsetToPosition(src, uint32(p.Offset))
+	if err != nil {
+		return uint32(maxInt(p.Line-1, 0)), 0
+	}
+	return posn.Line, posn.Col
+}
+
+func maxInt(value, min int) int {
+	if value < min {
+		return min
+	}
+	return value
+}
+
+func sourceForFile(requestContent []byte, requestPath, targetPath string) []byte {
+	if filepath.Clean(requestPath) == filepath.Clean(targetPath) {
+		return requestContent
+	}
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		return nil
+	}
+	return content
 }
 
 // evidenceFor builds a §B4 evidence record bound to the request's snapshot,
@@ -217,6 +257,13 @@ func evidenceFor(b *Backend, rev uint64, bc identity.BuildContextID, content []b
 		SourceHash:   identity.ContentHash(hex.EncodeToString(sum[:8])),
 		DetailCode:   detail,
 	}}
+}
+
+func packageConfidence(pkg *packages.Package) (identity.ResultStatus, languages.EvidenceLevel, identity.Completeness, string) {
+	if len(pkg.Errors) > 0 {
+		return identity.ResultPartial, languages.EvidenceL2, identity.IncompleteKnownSubset, "types-resolved-with-package-errors"
+	}
+	return identity.ResultExact, languages.EvidenceL3, identity.Complete, "types-resolved"
 }
 
 func findIdentAt(f *ast.File, fset *token.FileSet, pos token.Pos) *ast.Ident {
@@ -257,7 +304,7 @@ func (b *Backend) Completion(ctx context.Context, req languages.CompletionReques
 }
 
 func (b *Backend) completionImpl(ctx context.Context, req languages.CompletionRequest) ([]languages.CompletionItem, error) {
-	pkg, err := b.loadPackage(ctx, req.URI, req.Content)
+	pkg, err := b.loadPackage(ctx, req.URI, req.Content, req.SnapshotRev)
 	if err != nil {
 		return b.completionSyntax(req)
 	}
@@ -298,7 +345,7 @@ func (b *Backend) completionWithTypes(ctx context.Context, pkg *packages.Package
 	if tf == nil || f == nil {
 		return b.completionSyntax(req)
 	}
-	pos, err := lspPosToTokenPos(req.Content, tf, req.Line, req.Column)
+	pos, err := lspPosToTokenPos(req.Content, tf, req.Line, req.Column, req.Encoding, req.EncodingSet)
 	if err != nil {
 		// Latency-sensitive path (§I13): invalid position falls back to
 		// syntax-level candidates rather than fabricating a typed scope.
@@ -358,7 +405,7 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 			InternalDiagnostics: []string{detail},
 		}
 	}
-	pkg, err := b.loadPackage(ctx, req.URI, req.Content)
+	pkg, err := b.loadPackage(ctx, req.URI, req.Content, req.SnapshotRev)
 	if err != nil {
 		return unknown("package load failed: " + err.Error()), nil
 	}
@@ -367,7 +414,7 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 	if tf == nil || f == nil {
 		return unknown("file not in compiled package"), nil
 	}
-	pos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column)
+	pos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column, req.Encoding, req.EncodingSet)
 	if perr != nil {
 		return unknown(perr.Error()), nil
 	}
@@ -400,8 +447,9 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 			Evidence: evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, languages.EvidenceL1, "no-symbol-at-position"),
 		}, nil
 	}
-	sl, sc := posToLineCol(req.Content, b.fset, ident.Pos())
-	el, ec := posToLineCol(req.Content, b.fset, ident.End())
+	status, level, completeness, detail := packageConfidence(pkg)
+	sl, sc := posToLineCol(req.Content, b.fset, ident.Pos(), req.Encoding, req.EncodingSet)
+	el, ec := posToLineCol(req.Content, b.fset, ident.End(), req.Encoding, req.EncodingSet)
 	var buf strings.Builder
 	buf.WriteString("```go\n")
 	switch o := obj.(type) {
@@ -421,17 +469,17 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 	}
 	buf.WriteString("```")
 	return identity.SemanticResult[*languages.HoverResult]{
-		Status: identity.ResultExact,
+		Status: status,
 		Value: &languages.HoverResult{
 			Contents: buf.String(),
 			Range: &languages.Range{
 				StartLine: sl, StartCharacter: sc,
 				EndLine: el, EndCharacter: ec,
 			},
-			Evidence: languages.EvidenceL3,
+			Evidence: level,
 		},
-		Evidence:     evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, languages.EvidenceL3, "types-resolved"),
-		Completeness: identity.Complete,
+		Evidence:     evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, level, detail),
+		Completeness: completeness,
 	}, nil
 }
 
@@ -448,7 +496,7 @@ func unknownLocs(b *Backend, rev uint64, bc identity.BuildContextID, content []b
 func (b *Backend) Definition(ctx context.Context, req languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	pkg, err := b.loadPackage(ctx, req.URI, req.Content)
+	pkg, err := b.loadPackage(ctx, req.URI, req.Content, req.SnapshotRev)
 	if err != nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, "package load failed: "+err.Error()), nil
 	}
@@ -457,7 +505,7 @@ func (b *Backend) Definition(ctx context.Context, req languages.DefinitionReques
 	if tf == nil || f == nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, "file not in compiled package"), nil
 	}
-	tpos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column)
+	tpos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column, req.Encoding, req.EncodingSet)
 	if perr != nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, perr.Error()), nil
 	}
@@ -481,10 +529,20 @@ func (b *Backend) Definition(ctx context.Context, req languages.DefinitionReques
 	if df == nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, "definition outside loaded file set"), nil
 	}
-	sl, sc := posToLineCol(req.Content, b.fset, defPos)
-	el, ec := posToLineCol(req.Content, b.fset, obj.Pos()+token.Pos(len(obj.Name())))
+	_, level, _, detail := packageConfidence(pkg)
+	status := identity.ResultPartial
+	completeness := identity.IncompleteKnownSubset
+	if len(pkg.Errors) > 0 {
+		completeness = identity.CompletenessUnknown
+	}
+	defSource := sourceForFile(req.Content, filePath, df.Name())
+	if defSource == nil {
+		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, "definition source unavailable"), nil
+	}
+	sl, sc := posToLineCol(defSource, b.fset, defPos, req.Encoding, req.EncodingSet)
+	el, ec := posToLineCol(defSource, b.fset, obj.Pos()+token.Pos(len(obj.Name())), req.Encoding, req.EncodingSet)
 	return identity.SemanticResult[[]languages.Location]{
-		Status: identity.ResultExact,
+		Status: status,
 		Value: []languages.Location{{
 			URI: pathToUri(df.Name()),
 			Range: languages.Range{
@@ -492,15 +550,15 @@ func (b *Backend) Definition(ctx context.Context, req languages.DefinitionReques
 				EndLine: el, EndCharacter: ec,
 			},
 		}},
-		Evidence:     evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, languages.EvidenceL3, "types-resolved"),
-		Completeness: identity.Complete,
+		Evidence:     evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, level, detail),
+		Completeness: completeness,
 	}, nil
 }
 
 func (b *Backend) References(ctx context.Context, req languages.ReferencesRequest) (identity.SemanticResult[[]languages.Location], error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	pkg, err := b.loadPackage(ctx, req.URI, req.Content)
+	pkg, err := b.loadPackage(ctx, req.URI, req.Content, req.SnapshotRev)
 	if err != nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, "package load failed: "+err.Error()), nil
 	}
@@ -509,7 +567,7 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 	if tf == nil || f == nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, "file not in compiled package"), nil
 	}
-	tpos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column)
+	tpos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column, req.Encoding, req.EncodingSet)
 	if perr != nil {
 		return unknownLocs(b, req.SnapshotRev, req.BuildContext, req.Content, perr.Error()), nil
 	}
@@ -531,15 +589,18 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 		if defPos != token.NoPos {
 			df := b.fset.File(defPos)
 			if df != nil {
-				sl, sc := posToLineCol(req.Content, b.fset, defPos)
-				el, ec := posToLineCol(req.Content, b.fset, obj.Pos()+token.Pos(len(obj.Name())))
-				refs = append(refs, languages.Location{
-					URI: pathToUri(df.Name()),
-					Range: languages.Range{
-						StartLine: sl, StartCharacter: sc,
-						EndLine: el, EndCharacter: ec,
-					},
-				})
+				defSource := sourceForFile(req.Content, filePath, df.Name())
+				if defSource != nil {
+					sl, sc := posToLineCol(defSource, b.fset, defPos, req.Encoding, req.EncodingSet)
+					el, ec := posToLineCol(defSource, b.fset, obj.Pos()+token.Pos(len(obj.Name())), req.Encoding, req.EncodingSet)
+					refs = append(refs, languages.Location{
+						URI: pathToUri(df.Name()),
+						Range: languages.Range{
+							StartLine: sl, StartCharacter: sc,
+							EndLine: el, EndCharacter: ec,
+						},
+					})
+				}
 			}
 		}
 	}
@@ -555,8 +616,12 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 			if info.ObjectOf(id) == obj {
 				idf := b.fset.File(id.Pos())
 				if idf != nil {
-					sl, sc := posToLineCol(req.Content, b.fset, id.Pos())
-					el, ec := posToLineCol(req.Content, b.fset, id.End())
+					source := sourceForFile(req.Content, filePath, idf.Name())
+					if source == nil {
+						return true
+					}
+					sl, sc := posToLineCol(source, b.fset, id.Pos(), req.Encoding, req.EncodingSet)
+					el, ec := posToLineCol(source, b.fset, id.End(), req.Encoding, req.EncodingSet)
 					refs = append(refs, languages.Location{
 						URI: pathToUri(idf.Name()),
 						Range: languages.Range{
@@ -574,19 +639,15 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 	// Exportedness rides along so S3 callers can apply Go scope rules:
 	// references to an unexported identifier provably live inside this
 	// package, which makes the subset complete FOR THAT SYMBOL CLASS.
+	status, level, completeness, detail := packageConfidence(pkg)
 	return identity.SemanticResult[[]languages.Location]{
-		Status:   identity.ResultPartial,
+		Status:   status,
 		Value:    refs,
-		Evidence: evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, languages.EvidenceL3, "types-resolved-package-scope"),
+		Evidence: evidenceFor(b, req.SnapshotRev, req.BuildContext, req.Content, level, detail+"-package-scope"),
 		InternalDiagnostics: []string{
 			fmt.Sprintf("symbol=%s exported=%t", obj.Name(), ast.IsExported(obj.Name())),
 		},
-		Completeness: func() identity.Completeness {
-			if len(pkg.Errors) == 0 {
-				return identity.IncompleteKnownSubset
-			}
-			return identity.CompletenessUnknown
-		}(),
+		Completeness: completeness,
 	}, nil
 }
 
@@ -600,10 +661,10 @@ func (b *Backend) DocumentSymbols(ctx context.Context, req languages.DocumentSym
 		return nil, err
 	}
 	// UTF-16 column lookup over the parsed content (INV-POS-001).
-	idx := position.NewIndex(req.Content, position.UTF16)
+	idx := position.NewIndex(req.Content, requestEncoding(req.Encoding, req.EncodingSet))
 	lc := func(pos token.Pos) (line, col uint32) {
 		p := fset.Position(pos)
-		return uint32(p.Line - 1), idx.UTF16ColumnAt(uint32(p.Offset))
+		return uint32(p.Line - 1), idx.ColumnAt(uint32(p.Offset))
 	}
 	sym := func(name, detail string, kind languages.SymbolKind, pos, end, sel token.Pos) languages.DocumentSymbol {
 		sl, sc := lc(pos)
@@ -699,8 +760,9 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 		limit = 50
 	}
 	var results []languages.WorkspaceSymbol
-	// Lazy per-file UTF-16 column indexes (INV-POS-001); files are small.
+	// Lazy per-file position indexes (INV-POS-001); files are small.
 	fileIdx := make(map[string]*position.Index)
+	encoding := requestEncoding(req.Encoding, req.EncodingSet)
 	for _, pkg := range pkgs {
 		if pkg.Types == nil {
 			continue
@@ -721,11 +783,11 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 			p := b.fset.Position(pos)
 			col := uint32(p.Column - 1) // fallback: byte column
 			if idx, ok := fileIdx[p.Filename]; ok {
-				col = idx.UTF16ColumnAt(uint32(p.Offset))
+				col = idx.ColumnAt(uint32(p.Offset))
 			} else if data, rerr := os.ReadFile(p.Filename); rerr == nil {
-				ix := position.NewIndex(data, position.UTF16)
+				ix := position.NewIndex(data, encoding)
 				fileIdx[p.Filename] = ix
-				col = ix.UTF16ColumnAt(uint32(p.Offset))
+				col = ix.ColumnAt(uint32(p.Offset))
 			}
 			results = append(results, languages.WorkspaceSymbol{
 				Name:      name,
@@ -741,35 +803,28 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 }
 
 func (b *Backend) Diagnostics(ctx context.Context, uri string, content []byte) ([]languages.Diagnostic, error) {
+	return b.DiagnosticsWithEncoding(ctx, uri, content, 0, 1)
+}
+
+func (b *Backend) DiagnosticsWithEncoding(ctx context.Context, uri string, content []byte, snapshotRev uint64, encoding int) ([]languages.Diagnostic, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	pkg, err := b.loadPackage(ctx, uri, content)
+	pkg, err := b.loadPackage(ctx, uri, content, snapshotRev)
 	if err != nil {
 		return nil, err
 	}
+	idx := position.NewIndex(content, requestEncoding(encoding, true))
 	var diags []languages.Diagnostic
 	for _, e := range pkg.Errors {
-		p := e.Pos
-		var sl, sc, el, ec uint32
-		if p != "" {
-			parts := strings.SplitN(p, ":", 3)
-			if len(parts) >= 2 {
-				var line int
-				fmt.Sscanf(parts[1], "%d", &line)
-				sl = uint32(line - 1)
-				if len(parts) >= 3 {
-					var col int
-					fmt.Sscanf(parts[2], "%d", &col)
-					sc = uint32(col - 1)
-				}
-			}
+		filePath, line, column, ok := parseCompilerPosition(e.Pos)
+		if !ok || filepath.Clean(filePath) != filepath.Clean(uriToPath(uri)) {
+			continue
 		}
-		el = sl
-		if sc > 0 {
-			ec = sc + 1
-		} else {
-			ec = sc
+		sl, sc, ok := diagnosticPosition(content, idx, line, column)
+		if !ok {
+			continue
 		}
+		el, ec := sl, sc+diagnosticWidth(content, idx, line, column)
 		diags = append(diags, languages.Diagnostic{
 			StartLine: sl, StartChar: sc,
 			EndLine: el, EndChar: ec,
@@ -779,7 +834,82 @@ func (b *Backend) Diagnostics(ctx context.Context, uri string, content []byte) (
 	return diags, nil
 }
 
+func diagnosticWidth(content []byte, idx *position.Index, line, column int) uint32 {
+	if line < 1 || column < 1 {
+		return 1
+	}
+	lineStart := 0
+	for current := 1; current < line; current++ {
+		next := bytes.IndexByte(content[lineStart:], '\n')
+		if next < 0 {
+			return 1
+		}
+		lineStart += next + 1
+	}
+	offset := lineStart + column - 1
+	if offset < 0 || offset >= len(content) {
+		return 1
+	}
+	_, size := utf8.DecodeRune(content[offset:])
+	if size <= 0 {
+		return 1
+	}
+	start := idx.ColumnAt(uint32(offset))
+	end := idx.ColumnAt(uint32(offset + size))
+	if end > start {
+		return end - start
+	}
+	return 1
+}
+
+func parseCompilerPosition(raw string) (string, int, int, bool) {
+	last := strings.LastIndexByte(raw, ':')
+	if last <= 0 {
+		return "", 0, 0, false
+	}
+	column, err := strconv.Atoi(raw[last+1:])
+	if err != nil {
+		return "", 0, 0, false
+	}
+	previous := strings.LastIndexByte(raw[:last], ':')
+	if previous <= 0 {
+		return "", 0, 0, false
+	}
+	line, err := strconv.Atoi(raw[previous+1 : last])
+	if err != nil || line < 1 || column < 1 {
+		return "", 0, 0, false
+	}
+	return raw[:previous], line, column, true
+}
+
+func diagnosticPosition(content []byte, idx *position.Index, line, column int) (uint32, uint32, bool) {
+	if line < 1 || column < 1 {
+		return 0, 0, false
+	}
+	lineStart := 0
+	for current := 1; current < line; current++ {
+		next := bytes.IndexByte(content[lineStart:], '\n')
+		if next < 0 {
+			return 0, 0, false
+		}
+		lineStart += next + 1
+	}
+	offset := lineStart + column - 1
+	if offset < lineStart || offset > len(content) {
+		return 0, 0, false
+	}
+	pos, err := idx.OffsetToPosition(content, uint32(offset))
+	if err != nil {
+		return 0, 0, false
+	}
+	return pos.Line, pos.Col, true
+}
+
 func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte) ([]languages.SemanticToken, error) {
+	return b.SemanticTokensWithEncoding(ctx, uri, content, 1)
+}
+
+func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, content []byte, encoding int) ([]languages.SemanticToken, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	filePath := uriToPath(uri)
@@ -791,7 +921,7 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 	var tokens []languages.SemanticToken
 	var lastLine, lastCol uint32
 	// UTF-16 columns/lengths over the parsed content (INV-POS-001).
-	idx := position.NewIndex(content, position.UTF16)
+	idx := position.NewIndex(content, requestEncoding(encoding, true))
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -1048,7 +1178,7 @@ func objKindToSymbolKind(obj types.Object) languages.SymbolKind {
 // Returns human-readable collision reasons; nil means no type info to check
 // (callers already gate on provable completeness before consulting this).
 func (b *Backend) detectRenameCollision(ctx context.Context, req languages.RenameRequest) []string {
-	pkg, err := b.loadPackage(ctx, req.URI, req.Content)
+	pkg, err := b.loadPackage(ctx, req.URI, req.Content, req.SnapshotRev)
 	if err != nil || pkg == nil || pkg.TypesInfo == nil {
 		return nil
 	}
@@ -1056,7 +1186,7 @@ func (b *Backend) detectRenameCollision(ctx context.Context, req languages.Renam
 	if tf == nil || f == nil {
 		return nil
 	}
-	pos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column)
+	pos, perr := lspPosToTokenPos(req.Content, tf, req.Line, req.Column, req.Encoding, req.EncodingSet)
 	if perr != nil {
 		return nil
 	}

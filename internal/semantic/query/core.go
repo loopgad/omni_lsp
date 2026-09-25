@@ -44,6 +44,13 @@ func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn Compu
 	for {
 		e.mu.Lock()
 		if en := e.entries[key]; en != nil {
+			if en.snapshotRev < e.expectedRev {
+				e.removeKeyFromDeps(key, en.deps)
+				delete(e.entries, key)
+				en = nil
+			}
+		}
+		if en := e.entries[key]; en != nil {
 			switch en.state {
 			case Ready:
 				e.hits++
@@ -62,10 +69,7 @@ func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn Compu
 			e.mu.Unlock()
 			select {
 			case <-call.done:
-				if call.err != nil {
-					return Result{}, call.err
-				}
-				return call.res, nil
+				return call.res, call.err
 			case <-ctx.Done():
 				// Independent waiter cancellation: leader and siblings are
 				// unaffected; this waiter simply gives up (§J6).
@@ -103,7 +107,7 @@ func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn Compu
 		}
 
 		deps := gotDeps.Union(declared)
-		en := &entry{deps: deps}
+		en := &entry{deps: deps, snapshotRev: k.SnapshotRev}
 		if err != nil {
 			if isTransient(err) {
 				delete(e.entries, key) // retryable: drop entirely
@@ -125,10 +129,10 @@ func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn Compu
 		close(call.done)
 		e.mu.Unlock()
 
-		if err != nil {
-			return Result{}, err
-		}
-		return call.res, nil
+		// The value travels with the error on transient failures so a caller
+		// can project a computed envelope (e.g. §B6 Unknown) without a
+		// second backend call; the entry is never memoized.
+		return call.res, err
 	}
 }
 
@@ -168,13 +172,12 @@ func (e *Engine) Invalidate(dep Dep) int {
 func (e *Engine) InvalidateSnapshot(rev uint64) int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	drop := fmt.Sprintf("|%d|", rev)
 	n := 0
 	for k, en := range e.entries {
 		if en.state != Ready && en.state != FailedStable {
 			continue
 		}
-		if containsSub(k, drop) {
+		if en.snapshotRev <= rev {
 			e.removeKeyFromDeps(k, en.deps)
 			delete(e.entries, k)
 			n++
@@ -184,16 +187,8 @@ func (e *Engine) InvalidateSnapshot(rev uint64) int {
 	if rev > e.expectedRev {
 		e.expectedRev = rev
 	}
+	e.compactFIFO()
 	return n
-}
-
-func containsSub(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 // evictBounded keeps the memo table within maxQueryEntries (§K0), evicting
@@ -212,6 +207,25 @@ func (e *Engine) evictBounded(justInserted string) {
 		}
 	}
 	e.fifo = append(e.fifo, justInserted)
+	if len(e.fifo) > maxQueryEntries*2 {
+		e.compactFIFO()
+	}
+}
+
+func (e *Engine) compactFIFO() {
+	compact := e.fifo[:0]
+	seen := make(map[string]struct{}, len(e.entries))
+	for _, key := range e.fifo {
+		if _, ok := e.entries[key]; !ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		compact = append(compact, key)
+	}
+	e.fifo = compact
 }
 
 // ErrStalePublish marks a result computed against a superseded revision

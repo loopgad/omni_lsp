@@ -30,6 +30,14 @@ func semanticViaEngine[T any](s *Server, ctx context.Context, kind, uri string, 
 		{Kind: "backendEpoch", ID: string(bc)}:                 {},
 	}, func(_ context.Context, _ query.Bindings) (any, query.DepSet, error) {
 		r, ferr := fn()
+		// §B6/§J4: an in-band Unknown/Unavailable envelope (err == nil, the
+		// TS-bridge convention for upstream refusal) is an honest but
+		// non-terminal answer. It must NOT be memoized as Ready for the rest
+		// of the snapshot — a recovered backend must be consulted again.
+		// Surface it as transient so the engine drops it, then project it.
+		if ferr == nil && (r.Status == identity.ResultUnknown || r.Status == identity.ResultUnavailable) {
+			return r, nil, &query.TransientError{Err: errUnknownEnvelope}
+		}
 		return r, nil, wrapTransient(ferr)
 	})
 	if err != nil {
@@ -38,6 +46,14 @@ func semanticViaEngine[T any](s *Server, ctx context.Context, kind, uri string, 
 		// calling the backend directly — just don't memoize the result.
 		if errors.Is(err, query.ErrStalePublish) {
 			return fn()
+		}
+		// A transient Unknown/Unavailable envelope (§B6) is an honest answer
+		// (§A3): project it as-is. It was left uncached (transient dropped in
+		// the engine), so a recovered backend is consulted on the next request.
+		if errors.Is(err, errUnknownEnvelope) {
+			if envelope, ok := res.Value.(identity.SemanticResult[T]); ok {
+				return envelope, nil
+			}
 		}
 		var zero identity.SemanticResult[T]
 		return zero, err
@@ -49,6 +65,11 @@ func semanticViaEngine[T any](s *Server, ctx context.Context, kind, uri string, 
 	}
 	return envelope, nil
 }
+
+// errUnknownEnvelope marks an in-band Unknown/Unavailable result as retryable
+// (never memoized); the caller still projects the envelope, so the wire answer
+// is unchanged — only the memoization policy differs.
+var errUnknownEnvelope = ierrors.New(ierrors.ErrBackendUnavailable, "semantic", "backend returned unknown/unavailable envelope")
 
 // wrapTransient marks retryable backend failures so the memo engine drops
 // them instead of caching (a crashed-but-restarting backend must not have its

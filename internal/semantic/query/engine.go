@@ -77,12 +77,13 @@ func (e *Engine) removeKeyFromDeps(key string, deps DepSet) {
 }
 
 type entry struct {
-	state    State
-	value    any
-	err      error
-	deps     DepSet
-	evidence string
-	safety   int
+	state       State
+	snapshotRev uint64
+	value       any
+	err         error
+	deps        DepSet
+	evidence    string
+	safety      int
 }
 
 type inflightCall struct {

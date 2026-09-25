@@ -93,8 +93,9 @@ func assuranceString(a identity.Assurance) string
 func backendBuildContext(be languages.Backend) identity.BuildContextID
 func buildCapabilities(positionEncoding string) ServerCapabilities
 func completenessName(c identity.Completeness) string
+func encodingWidth(value string, encoding int) uint32
 func negotiatePositionEncoding(proposals []string) string
-func projectChildren(children []languages.DocumentSymbol) []lsp.DocumentSymbol
+func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol
 func projectLocations(locs []languages.Location) []lsp.Location
 type CompletionItem struct{Label string json:"label", Kind CompletionItemKind json:"kind,omitempty", Detail string json:"detail,omitempty", Documentation string json:"documentation,omitempty", InsertText string json:"insertText,omitempty", SortText string json:"sortText,omitempty", FilterText string json:"filterText,omitempty"}
 type CompletionItemKind int

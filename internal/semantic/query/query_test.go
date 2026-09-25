@@ -344,3 +344,34 @@ func TestK3_NegativeCachingPolicy(t *testing.T) {
 		}
 	})
 }
+
+// TestJ4_TransientErrorCarriesComputedValue pins the contract §B6 recovery
+// depends on: when a compute fails transiently AFTER producing a value, the
+// value travels back with the error so the caller can project an honest
+// Unknown/Unavailable envelope without re-invoking the backend. The failed
+// entry stays uncached (transient retry, see TestJ4_StateTransitions).
+func TestJ4_TransientErrorCarriesComputedValue(t *testing.T) {
+	e := NewEngine(0)
+	k := key("k", "tv", 1)
+	calls := 0
+	r, err := e.Query(context.Background(), k, nil,
+		func(ctx context.Context, b Bindings) (any, DepSet, error) {
+			calls++
+			return "envelope", nil, Transient(errors.New("upstream refused"))
+		})
+	if !isTransient(err) {
+		t.Fatalf("want transient error, got %v", err)
+	}
+	if r.Value != "envelope" {
+		t.Fatalf("transient result value = %v, want computed envelope carried with err", r.Value)
+	}
+	// The failed entry must not be memoized: the next query recomputes.
+	r2, err2 := e.Query(context.Background(), k, nil,
+		func(ctx context.Context, b Bindings) (any, DepSet, error) {
+			calls++
+			return "recovered", nil, nil
+		})
+	if err2 != nil || r2.Value != "recovered" || calls != 2 {
+		t.Fatalf("retry: calls=%d value=%v err=%v", calls, r2.Value, err2)
+	}
+}

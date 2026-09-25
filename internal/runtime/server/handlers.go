@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
@@ -449,6 +450,8 @@ func (s *Server) handleHover(ctx context.Context, msg *jsonrpc.Message) (json.Ra
 						BuildContext: bc,
 						Line:         params.Position.Line,
 						Column:       params.Position.Character,
+						Encoding:     s.negotiatedEncodingInt(),
+						EncodingSet:  true,
 					})
 				})
 			if err != nil {
@@ -483,10 +486,13 @@ func (s *Server) handleCompletion(ctx context.Context, msg *jsonrpc.Message) (js
 		return nil, fmt.Errorf("invalid completion params: %w", err)
 	}
 	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+		func(be languages.Backend, src []byte, snapRev uint64, _ identity.BuildContextID) (json.RawMessage, error) {
 			items, err := be.Completion(ctx, languages.CompletionRequest{
 				URI: params.TextDocument.URI, Content: src,
-				Line: params.Position.Line, Column: params.Position.Character,
+				SnapshotRev: snapRev,
+				Line:        params.Position.Line, Column: params.Position.Character,
+				Encoding:    s.negotiatedEncodingInt(),
+				EncodingSet: true,
 			})
 			if err != nil {
 				return nil, err
@@ -531,6 +537,8 @@ func (s *Server) handleDefinition(ctx context.Context, msg *jsonrpc.Message) (js
 						BuildContext: bc,
 						Line:         params.Position.Line,
 						Column:       params.Position.Character,
+						Encoding:     s.negotiatedEncodingInt(),
+						EncodingSet:  true,
 					})
 				})
 			if err != nil {
@@ -570,6 +578,8 @@ func (s *Server) handleDeclaration(ctx context.Context, msg *jsonrpc.Message) (j
 						BuildContext: bc,
 						Line:         params.Position.Line,
 						Column:       params.Position.Character,
+						Encoding:     s.negotiatedEncodingInt(),
+						EncodingSet:  true,
 					})
 				})
 			if err != nil {
@@ -594,10 +604,13 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message)
 		func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
 			syms, err := be.DocumentSymbols(ctx, languages.DocumentSymbolRequest{
 				URI: params.TextDocument.URI, Content: src,
+				Encoding:    s.negotiatedEncodingInt(),
+				EncodingSet: true,
 			})
 			if err != nil {
 				return nil, err
 			}
+			encoding := s.negotiatedEncodingInt()
 			lspSyms := make([]lsp.DocumentSymbol, len(syms))
 			for i, s := range syms {
 				lspSyms[i] = lsp.DocumentSymbol{
@@ -610,9 +623,9 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message)
 					},
 					SelectionRange: lsp.Range{
 						Start: lsp.Position{Line: s.SelectionLine, Character: s.SelectionCharacter},
-						End:   lsp.Position{Line: s.SelectionLine, Character: s.SelectionCharacter + uint32(len(s.Name))},
+						End:   lsp.Position{Line: s.SelectionLine, Character: s.SelectionCharacter + encodingWidth(s.Name, encoding)},
 					},
-					Children: projectChildren(s.Children),
+					Children: projectChildren(s.Children, encoding),
 				}
 			}
 			return json.Marshal(lspSyms)
@@ -620,7 +633,7 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message)
 	)
 }
 
-func projectChildren(children []languages.DocumentSymbol) []lsp.DocumentSymbol {
+func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol {
 	out := make([]lsp.DocumentSymbol, len(children))
 	for i, c := range children {
 		out[i] = lsp.DocumentSymbol{
@@ -633,12 +646,35 @@ func projectChildren(children []languages.DocumentSymbol) []lsp.DocumentSymbol {
 			},
 			SelectionRange: lsp.Range{
 				Start: lsp.Position{Line: c.SelectionLine, Character: c.SelectionCharacter},
-				End:   lsp.Position{Line: c.SelectionLine, Character: c.SelectionCharacter + uint32(len(c.Name))},
+				End:   lsp.Position{Line: c.SelectionLine, Character: c.SelectionCharacter + encodingWidth(c.Name, encoding)},
 			},
-			Children: projectChildren(c.Children),
+			Children: projectChildren(c.Children, encoding),
 		}
 	}
 	return out
+}
+
+func encodingWidth(value string, encoding int) uint32 {
+	var width uint32
+	for len(value) > 0 {
+		r, size := utf8.DecodeRuneInString(value)
+		switch encoding {
+		case 0:
+			width += uint32(size)
+		case 2:
+			width++
+		case 1:
+			if r <= 0xFFFF {
+				width++
+			} else {
+				width += 2
+			}
+		default:
+			width++
+		}
+		value = value[size:]
+	}
+	return width
 }
 
 // handleReferences dispatches to the appropriate language backend.
@@ -665,6 +701,7 @@ func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (js
 						Column:       params.Position.Character,
 						IncludeDecl:  params.Context.IncludeDeclaration,
 						Encoding:     s.negotiatedEncodingInt(),
+						EncodingSet:  true,
 					})
 				})
 			if err != nil {
@@ -722,6 +759,7 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 				Column:       params.Position.Character,
 				NewName:      params.NewName,
 				Encoding:     s.negotiatedEncodingInt(),
+				EncodingSet:  true,
 			})
 			if err != nil {
 				return nil, err
@@ -784,7 +822,13 @@ func (s *Server) handleSemanticTokens(ctx context.Context, msg *jsonrpc.Message)
 	}
 	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, 0, 0,
 		func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
-			tokens, err := be.SemanticTokens(ctx, params.TextDocument.URI, src)
+			var tokens []languages.SemanticToken
+			var err error
+			if encoded, ok := be.(languages.EncodedSemanticTokensProvider); ok {
+				tokens, err = encoded.SemanticTokensWithEncoding(ctx, params.TextDocument.URI, src, s.negotiatedEncodingInt())
+			} else {
+				tokens, err = be.SemanticTokens(ctx, params.TextDocument.URI, src)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -819,10 +863,11 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message
 	if be == nil {
 		return json.RawMessage("null"), nil
 	}
-	syms, err := be.WorkspaceSymbols(ctx, languages.WorkspaceSymbolRequest{Query: params.Query, Limit: 100})
+	syms, err := be.WorkspaceSymbols(ctx, languages.WorkspaceSymbolRequest{Query: params.Query, Limit: 100, Encoding: s.negotiatedEncodingInt(), EncodingSet: true})
 	if err != nil {
 		return nil, err
 	}
+	encoding := s.negotiatedEncodingInt()
 	lspSyms := make([]lsp.WorkspaceSymbol, len(syms))
 	for i, s := range syms {
 		lspSyms[i] = lsp.WorkspaceSymbol{
@@ -832,7 +877,7 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message
 				URI: s.URI,
 				Range: lsp.Range{
 					Start: lsp.Position{Line: s.StartLine, Character: s.StartCol},
-					End:   lsp.Position{Line: s.StartLine, Character: s.StartCol + uint32(len(s.Name))},
+					End:   lsp.Position{Line: s.StartLine, Character: s.StartCol + encodingWidth(s.Name, encoding)},
 				},
 			},
 		}

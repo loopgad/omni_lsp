@@ -3,7 +3,6 @@
 // guarantees (INV-POS-001).
 //
 // Concurrency model: pure functions over immutable inputs; no shared state.
-//
 // Invariants:
 //  1. Round trips are lossless: offset->line:col->offset is identity for
 //     every valid position in every supported encoding.
@@ -121,6 +120,11 @@ func (idx *Index) LineCount() int { return len(idx.lines) }
 // UTF16ColumnAt returns the UTF-16 column of a byte offset within its line.
 // Returns 0 for out-of-range offsets.
 func (idx *Index) UTF16ColumnAt(offset uint32) uint32 {
+	return idx.ColumnAt(offset)
+}
+
+// ColumnAt returns the column in the encoding used to build the index.
+func (idx *Index) ColumnAt(offset uint32) uint32 {
 	if int(offset) < len(idx.offsetCol) {
 		return idx.offsetCol[offset]
 	}
@@ -361,7 +365,13 @@ func UTF16Len(b []byte) int {
 // within the line content (terminator excluded); out-of-range positions
 // return an error — never clamp (goal.md §D6, INV-POS-002).
 func OffsetOfLineChar(content []byte, line, character uint32) (uint32, error) {
-	idx := NewIndex(content, UTF16)
+	return OffsetOfLineCharEncoding(content, line, character, UTF16)
+}
+
+// OffsetOfLineCharEncoding converts a negotiated LSP position to a byte
+// offset without assuming the protocol default encoding.
+func OffsetOfLineCharEncoding(content []byte, line, character uint32, enc Encoding) (uint32, error) {
+	idx := NewIndex(content, enc)
 	return idx.OffsetOfLineChar(content, line, character)
 }
 
@@ -385,11 +395,40 @@ func (idx *Index) OffsetOfLineChar(content []byte, line, character uint32) (uint
 	} else if n > 0 && lc[n-1] == '\r' {
 		lc = lc[:n-1]
 	}
-	off, err := utf16ColToOffset(lc, character)
+	off, err := columnToOffset(lc, character, idx.encoding)
 	if err != nil {
 		return 0, err
 	}
 	return lineStart + off, nil
+}
+
+func columnToOffset(lineContent []byte, col uint32, enc Encoding) (uint32, error) {
+	var width uint32
+	for i := 0; i < len(lineContent); {
+		if width == col {
+			return uint32(i), nil
+		}
+		r, size := utf8.DecodeRune(lineContent[i:])
+		switch enc {
+		case UTF8:
+			width += uint32(size)
+		case UTF16:
+			if r <= 0xFFFF {
+				width++
+			} else {
+				width += 2
+			}
+		case UTF32:
+			width++
+		default:
+			return 0, fmt.Errorf("unsupported encoding %d", enc)
+		}
+		i += size
+	}
+	if width == col {
+		return uint32(len(lineContent)), nil
+	}
+	return 0, fmt.Errorf("character %d out of range (line width %d %s units)", col, width, enc)
 }
 
 // LineCharAt converts a byte offset within content to an LSP-style UTF-16

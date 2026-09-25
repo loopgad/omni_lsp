@@ -46,7 +46,7 @@ func (s *Server) handleCodeAction(ctx context.Context, msg *jsonrpc.Message) (js
 		return nil, fmt.Errorf("invalid codeAction params: %w", err)
 	}
 
-	items, err := s.diag.compute(params.TextDocument.URI)
+	items, err := s.diag.compute(ctx, params.TextDocument.URI)
 	if err != nil {
 		items = nil // degraded: answer empty rather than stale data (§Q4)
 	}

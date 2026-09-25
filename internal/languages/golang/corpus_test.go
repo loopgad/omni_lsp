@@ -13,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/test/corpus"
 )
 
 const corpusDir = "../../../test/corpus/testdata/go"
@@ -30,6 +32,9 @@ func TestCorpus_GoFilesProduceGroundedSemantics(t *testing.T) {
 		t.Fatalf("corpus too thin: %d files", len(entries))
 	}
 
+	var buckets corpus.ErrorBuckets
+	const rev = uint64(1)
+
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
 			continue
@@ -45,17 +50,21 @@ func TestCorpus_GoFilesProduceGroundedSemantics(t *testing.T) {
 			uri := writeGoFile(t, b, e.Name(), string(src))
 			bcID := b.BuildContextID() // E7: caller injects the build context
 
-			line, col, ok := findFuncSymbol(src)
+			line, col, sym, ok := findFuncSymbol(src)
 			if !ok {
 				t.Skip("no func declaration in corpus file")
 			}
 
 			hres, herr := b.Hover(t.Context(), languages.HoverRequest{
 				URI: uri, Content: src, Line: uint32(line), Column: uint32(col),
-				SnapshotRev: 1, BuildContext: bcID,
+				SnapshotRev: rev, BuildContext: bcID,
 			})
 			if herr != nil {
 				t.Fatalf("hover error: %v", herr)
+			}
+			if hres.Status != identity.ResultExact {
+				t.Errorf("hover on grounded corpus must be exact, got %v (diag=%v)",
+					hres.Status, hres.InternalDiagnostics)
 			}
 			if hres.Value == nil || hres.Value.Contents == "" {
 				t.Fatalf("hover must be non-empty at func symbol (status=%v diag=%v)",
@@ -73,7 +82,7 @@ func TestCorpus_GoFilesProduceGroundedSemantics(t *testing.T) {
 
 			dres, derr := b.Definition(t.Context(), languages.DefinitionRequest{
 				URI: uri, Content: src, Line: uint32(line), Column: uint32(col),
-				SnapshotRev: 1, BuildContext: bcID,
+				SnapshotRev: rev, BuildContext: bcID,
 			})
 			if derr != nil {
 				t.Fatalf("definition error: %v", derr)
@@ -82,21 +91,62 @@ func TestCorpus_GoFilesProduceGroundedSemantics(t *testing.T) {
 				t.Errorf("definition must return a location list (status=%v diag=%v)",
 					dres.Status, dres.InternalDiagnostics)
 			}
+
+			// §S21: sort every response into the six release-blocking error
+			// buckets — Go now rides the same classifier as TestS21.
+			req := corpus.ClassifyRequest{URI: uri, Content: src, Symbol: sym, Rev: rev}
+			hresp := corpus.HoverEnvelope(hres, herr)
+			req.Epoch = hresp.Epoch // baseline from first response of this session
+			logBucketHits(t, "hover", buckets.Record(req, hresp))
+			logBucketHits(t, "definition", buckets.Record(req,
+				corpus.LocationsEnvelope("definition", dres, derr)))
+
+			rres, rerr := b.References(t.Context(), languages.ReferencesRequest{
+				URI: uri, Content: src, Line: uint32(line), Column: uint32(col),
+				SnapshotRev: rev, BuildContext: bcID, IncludeDecl: true,
+			})
+			logBucketHits(t, "references", buckets.Record(req,
+				corpus.LocationsEnvelope("references", rres, rerr)))
+
+			nres, nerr := b.Rename(t.Context(), languages.RenameRequest{
+				URI: uri, Content: src, Line: uint32(line), Column: uint32(col),
+				SnapshotRev: rev, BuildContext: bcID, NewName: sym + "_renamed",
+			})
+			nreq := req
+			nreq.NewName = sym + "_renamed"
+			logBucketHits(t, "rename", buckets.Record(nreq,
+				corpus.RenameEnvelope(nres, nerr)))
 		})
+	}
+
+	t.Logf("\n%sall six buckets must be zero (§S21)", &buckets)
+	if buckets.Total() != 0 {
+		t.Fatalf("§S21 violated: %d error-bucket hits across the go corpus", buckets.Total())
+	}
+}
+
+// logBucketHits fails the subtest when a §S21 bucket fires on a response.
+func logBucketHits(t *testing.T, feature string, hits []string) {
+	t.Helper()
+	if len(hits) > 0 {
+		t.Errorf("%s: hit buckets %v", feature, hits)
 	}
 }
 
 // findFuncSymbol locates the identifier after a top-level "func " keyword —
-// a position guaranteed to carry real semantic information.
-func findFuncSymbol(src []byte) (line, col int, ok bool) {
+// a position guaranteed to carry real semantic information. The generic type
+// parameter list ("Add[...]") is skipped so the returned name is the plain
+// identifier the backend ranges cover.
+func findFuncSymbol(src []byte) (line, col int, name string, ok bool) {
 	for i, raw := range strings.Split(string(src), "\n") {
 		l := strings.TrimSpace(raw)
 		if strings.HasPrefix(l, "func ") {
 			rest := strings.TrimPrefix(l, "func ")
-			if idx := strings.IndexFunc(rest, func(r rune) bool { return r == '(' }); idx > 0 {
-				return i, 5 + idx - 1, true // last char of the name
+			idx := strings.IndexAny(rest, "([")
+			if idx > 0 {
+				return i, 5 + idx - 1, rest[:idx], true // last char of the name
 			}
 		}
 	}
-	return 0, 0, false
+	return 0, 0, "", false
 }
