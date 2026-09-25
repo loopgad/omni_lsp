@@ -72,7 +72,7 @@ func (c mcpCore) WorkspaceSymbols(ctx context.Context, query string) (identity.S
 }
 
 func (c mcpCore) IndexStatus(ctx context.Context) (map[string]any, error) {
-	raw, err := c.srv.CallMethod(ctx, "omnilsp/status", map[string]any{})
+	raw, err := c.srv.CallMethod(ctx, "omnilsp/indexStats", map[string]any{})
 	if err != nil {
 		return nil, err
 	}

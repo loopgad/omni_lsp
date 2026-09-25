@@ -80,6 +80,7 @@ func buildManifestAt(lspDir, root string) (string, error) {
 // serverManifestSources 相对模块根，由 BuildServerManifest 覆盖。
 var serverManifestSources = []string{
 	"internal/runtime/server/handlers.go",
+	"internal/runtime/server/index.go",
 }
 
 // BuildServerManifest 把 server 投影层的导出类型并入同一指纹体系：

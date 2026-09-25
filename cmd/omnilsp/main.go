@@ -136,6 +136,8 @@ func cmdServe(args []string) {
 	srvCfg := server.DefaultConfig()
 	srvCfg.Scheduler.MaxConcurrent = cfg.MaxConcurrentRequests
 	srvCfg.Scheduler.MaxQueueSize = cfg.MaxQueueSize
+	srvCfg.IndexDir = cfg.IndexDir
+	srvCfg.IndexDiskBudgetBytes = cfg.IndexDiskBudgetBytes
 	srv := server.New(srvCfg)
 
 	registerBackends(srv, cfg)

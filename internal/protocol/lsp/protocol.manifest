@@ -56,6 +56,8 @@ const SymbolString
 const SymbolStruct
 const SymbolTypeParameter
 const SymbolVariable
+func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error)
+func (s *Server) disableIndex(err error)
 func (s *Server) dispatchSemanticRequest(ctx context.Context, msg *jsonrpc.Message, uri string, line uint32, column uint32, project func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error)) (json.RawMessage, error)
 func (s *Server) findWorkspaceBackend() languages.Backend
 func (s *Server) handleCancelRequest(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
@@ -73,6 +75,7 @@ func (s *Server) handleDidSave(ctx context.Context, msg *jsonrpc.Message) (json.
 func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleExit(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleHover(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
+func (s *Server) handleIndexStats(ctx context.Context, _ *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleInitialized(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleOmnilspBackendStatus(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
@@ -81,10 +84,13 @@ func (s *Server) handleOmnilspQueryTrace(ctx context.Context, msg *jsonrpc.Messa
 func (s *Server) handleOmnilspResultMeta(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleOmnilspStatus(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
+func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleSemanticTokens(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleShutdown(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
+func (s *Server) indexState() (*indexService, *trust.Policy, string)
+func (s *Server) initIndex(rootURI string)
 func (s *Server) negotiatedEncodingInt() int
 func (s *Server) publishSnapshot()
 func (s *Server) resolveBackend(uri string) (languages.Backend, error)
@@ -93,10 +99,13 @@ func assuranceString(a identity.Assurance) string
 func backendBuildContext(be languages.Backend) identity.BuildContextID
 func buildCapabilities(positionEncoding string) ServerCapabilities
 func completenessName(c identity.Completeness) string
+func defaultIndexDir(root string) (string, error)
 func encodingWidth(value string, encoding int) uint32
+func idxGeneration(ctx context.Context, store *persistent.FileStore) uint64
 func negotiatePositionEncoding(proposals []string) string
 func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol
 func projectLocations(locs []languages.Location) []lsp.Location
+func skipIndexDir(name string) bool
 type CompletionItem struct{Label string json:"label", Kind CompletionItemKind json:"kind,omitempty", Detail string json:"detail,omitempty", Documentation string json:"documentation,omitempty", InsertText string json:"insertText,omitempty", SortText string json:"sortText,omitempty", FilterText string json:"filterText,omitempty"}
 type CompletionItemKind int
 type CompletionList struct{IsIncomplete bool json:"isIncomplete", Items []CompletionItem json:"items"}
@@ -114,6 +123,8 @@ type DocumentSymbolParams struct{TextDocument lsp.TextDocumentIdentifier json:"t
 type DocumentURI = string
 type Hover struct{Contents MarkupContent json:"contents", Range *Range json:"range,omitempty"}
 type HoverParams struct{TextDocument lsp.TextDocumentIdentifier json:"textDocument", Position lsp.Position json:"position"}
+type IndexRebuildStats struct{Files int json:"files", Bytes int64 json:"bytes", Skipped int json:"skipped", DurationMs int64 json:"durationMs", Error string json:"error"}
+type IndexStats struct{Enabled bool json:"enabled", Reason string json:"reason,omitempty", IndexDir string json:"indexDir,omitempty", Generation uint64 json:"generation", Segments []persistent.SegmentRef json:"segments", Quarantined []persistent.SegmentID json:"quarantined", DiskBudgetBytes int64 json:"diskBudgetBytes", LastRebuild IndexRebuildStats json:"lastRebuild", Fresh bool json:"fresh", Revision uint64 json:"revision"}
 type InitializeParams struct{ProcessID int json:"processId", RootURI string json:"rootUri", Capabilities json.RawMessage json:"capabilities", WorkspaceFolders []WorkspaceFolder json:"workspaceFolders", General struct{PositionEncodings []string} json:"general"}
 type InitializeResult struct{Capabilities ServerCapabilities json:"capabilities"}
 type Location struct{URI DocumentURI json:"uri", Range Range json:"range"}
@@ -142,3 +153,5 @@ type WorkspaceFolder struct{URI string json:"uri", Name string json:"name"}
 type WorkspaceSymbol struct{Name string json:"name", Kind SymbolKind json:"kind", Location Location json:"location"}
 type WorkspaceSymbolParams struct{Query string json:"query"}
 type buildContextProvider interface{BuildContextID}
+type fileRecord struct{Path string json:"path", Size int64 json:"size", SHA256 string json:"sha256"}
+type indexService struct{root string, dir string, store *persistent.FileStore, budget int64, buildMu sync.Mutex, statsMu sync.RWMutex, last IndexRebuildStats}

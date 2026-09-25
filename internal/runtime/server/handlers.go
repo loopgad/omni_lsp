@@ -224,6 +224,7 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 			s.mu.Lock()
 			s.workspaceID = identity.WorkspaceID(params.RootURI)
 			s.mu.Unlock()
+			s.initIndex(params.RootURI)
 		}
 		// §C9 negotiation: remember whether the client wants version-aware
 		// documentChanges in future WorkspaceEdits.

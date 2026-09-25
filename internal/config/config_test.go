@@ -1,8 +1,6 @@
 package config
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := Default()
@@ -17,6 +15,12 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.RequestTimeoutMs != 5000 {
 		t.Errorf("expected 5000, got %d", cfg.RequestTimeoutMs)
+	}
+	if cfg.IndexDir != "" {
+		t.Errorf("expected empty index dir, got %q", cfg.IndexDir)
+	}
+	if want := int64(256 * 1024 * 1024); cfg.IndexDiskBudgetBytes != want {
+		t.Errorf("expected %d index budget, got %d", want, cfg.IndexDiskBudgetBytes)
 	}
 }
 
@@ -48,6 +52,34 @@ func TestValidateEmptyBackendID(t *testing.T) {
 	cfg.Backends = []BackendConfig{{Enabled: true, LanguageID: ""}}
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for empty backend language ID")
+	}
+}
+
+func TestValidateNegativeIndexDiskBudget(t *testing.T) {
+	cfg := Default()
+	cfg.IndexDiskBudgetBytes = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for negative index disk budget")
+	}
+}
+
+func TestValidateZeroIndexDiskBudget(t *testing.T) {
+	cfg := Default()
+	cfg.IndexDiskBudgetBytes = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero index disk budget should disable the limit: %v", err)
+	}
+}
+
+func TestLoadIndexDirFromEnv(t *testing.T) {
+	indexDir := t.TempDir()
+	t.Setenv("OMNILSP_INDEX_DIR", indexDir)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("loading config with index dir env: %v", err)
+	}
+	if cfg.IndexDir != indexDir {
+		t.Fatalf("expected index dir from env, got %q", cfg.IndexDir)
 	}
 }
 

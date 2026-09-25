@@ -47,6 +47,7 @@ import (
 	"github.com/omnilsp/omni/internal/semantic/query"
 	"github.com/omnilsp/omni/internal/telemetry"
 	"github.com/omnilsp/omni/internal/transport"
+	"github.com/omnilsp/omni/internal/trust"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
 	"github.com/omnilsp/omni/internal/workspace/vfs"
 	"github.com/omnilsp/omni/internal/workspace/virtual"
@@ -97,6 +98,9 @@ type Server struct {
 	positionEncoding string                       // §C4 negotiated: utf-8|utf-16|utf-32
 	config           Config
 	workspaceID      identity.WorkspaceID
+	idx              *indexService
+	idxReason        string
+	trust            *trust.Policy
 
 	// syncRejects counts rejected didChange notifications (invalid range or
 	// version) for observability (D6: rejection must be visible, not silent).
@@ -178,7 +182,9 @@ type evidenceRecord struct {
 
 // Config holds server configuration.
 type Config struct {
-	Scheduler scheduler.Config
+	Scheduler            scheduler.Config
+	IndexDir             string
+	IndexDiskBudgetBytes int64
 	// WatchInterval > 0 enables the §D14 workspace poller (external file
 	// changes are rescanned on this cadence). Zero disables it: editors that
 	// drive didChangeWatchedFiles themselves need no second opinion.
@@ -187,7 +193,7 @@ type Config struct {
 
 // DefaultConfig returns default server configuration.
 func DefaultConfig() Config {
-	return Config{Scheduler: scheduler.DefaultConfig()}
+	return Config{Scheduler: scheduler.DefaultConfig(), IndexDiskBudgetBytes: 256 << 20}
 }
 
 // New creates a new LSP server.
@@ -695,6 +701,8 @@ func (s *Server) registerHandlers() {
 	s.dispatcher.Register("omnilsp/backendStatus", s.handleOmnilspBackendStatus)
 	s.dispatcher.Register("omnilsp/resultMeta", s.handleOmnilspResultMeta)
 	s.dispatcher.Register("omnilsp/queryTrace", s.handleOmnilspQueryTrace)
+	s.dispatcher.Register("omnilsp/indexStats", s.handleIndexStats)
+	s.dispatcher.Register("omnilsp/reindex", s.handleReindex)
 }
 
 // State returns the current server state.

@@ -38,14 +38,20 @@ const (
 )
 
 type Config struct {
-	LogLevel              string          `json:"logLevel"`
-	Transport             string          `json:"transport"`
-	TCPAddr               string          `json:"tcpAddr,omitempty"`
-	MaxConcurrentRequests int             `json:"maxConcurrentRequests"`
-	MaxQueueSize          int             `json:"maxQueueSize"`
-	WorkspaceDir          string          `json:"workspaceDir,omitempty"`
-	Backends              []BackendConfig `json:"backends,omitempty"`
-	RequestTimeoutMs      int             `json:"requestTimeoutMs"`
+	LogLevel              string `json:"logLevel"`
+	Transport             string `json:"transport"`
+	TCPAddr               string `json:"tcpAddr,omitempty"`
+	MaxConcurrentRequests int    `json:"maxConcurrentRequests"`
+	MaxQueueSize          int    `json:"maxQueueSize"`
+	WorkspaceDir          string `json:"workspaceDir,omitempty"`
+	// IndexDir selects the persistent index directory. An empty value lets the
+	// server derive a per-workspace path outside the user's repository.
+	IndexDir string `json:"indexDir,omitempty"`
+	// IndexDiskBudgetBytes limits persistent index storage. Zero disables the
+	// limit; the default is 256 MiB.
+	IndexDiskBudgetBytes int64           `json:"indexDiskBudgetBytes"`
+	Backends             []BackendConfig `json:"backends,omitempty"`
+	RequestTimeoutMs     int             `json:"requestTimeoutMs"`
 	// FeatureFlags (§R7): every flag must be registered in KnownFlags with an
 	// owner and expiry; unknown keys fail Validate so typos never silently
 	// disable behavior.
@@ -67,6 +73,7 @@ func Default() Config {
 		MaxConcurrentRequests: 64,
 		MaxQueueSize:          1024,
 		RequestTimeoutMs:      5000,
+		IndexDiskBudgetBytes:  256 * 1024 * 1024,
 	}
 }
 
@@ -109,6 +116,9 @@ func applyEnv(cfg Config) Config {
 	if v := os.Getenv("OMNILSP_WORKSPACE"); v != "" {
 		cfg.WorkspaceDir = v
 	}
+	if v := os.Getenv("OMNILSP_INDEX_DIR"); v != "" {
+		cfg.IndexDir = v
+	}
 	if v := os.Getenv("OMNILSP_MAX_CONCURRENT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxConcurrentRequests = n
@@ -133,6 +143,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxQueueSize <= 0 {
 		return fmt.Errorf("config: MaxQueueSize must be positive")
+	}
+	if c.IndexDiskBudgetBytes < 0 {
+		return fmt.Errorf("config: IndexDiskBudgetBytes must be non-negative")
 	}
 	for _, b := range c.Backends {
 		if !b.Enabled {
