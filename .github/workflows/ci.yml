@@ -47,6 +47,9 @@ jobs:
       - run: go test -fuzz=FuzzConfigLoad -fuzztime=10s ./internal/config/
       - run: go test -fuzz=FuzzConfigValidate -fuzztime=10s ./internal/config/
       - run: go test -fuzz=FuzzURI -fuzztime=10s ./internal/languages/golang/
+      - run: go test -fuzz=FuzzOpenSnapshotCorruptStore -fuzztime=10s ./internal/index/persistent/
+      - run: go test -fuzz=FuzzFreshnessSealVerify -fuzztime=10s ./internal/index/persistent/
+      - run: go test -fuzz=FuzzURIParse -fuzztime=10s ./internal/workspace/uri/
 
   coverage:
     name: Coverage
