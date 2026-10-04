@@ -58,6 +58,25 @@ func TestSnapshotDocument(t *testing.T) {
 	}
 }
 
+func TestSnapshotCanonicalIdentityPreservesDisplayURI(t *testing.T) {
+	displayURI := "file:///C:/test.go"
+	aliasURI := "file:///c:/test.go"
+	snap := New("ws", 1, map[string]DocumentSnapshot{
+		displayURI: {URI: displayURI, Content: []byte("source")},
+	})
+
+	doc := snap.Document(aliasURI)
+	if doc == nil {
+		t.Fatal("canonical URI alias did not resolve document")
+	}
+	if doc.URI != displayURI {
+		t.Fatalf("document display URI = %q, want %q", doc.URI, displayURI)
+	}
+	if got := snap.Documents(); len(got) != 1 || got[0] != displayURI {
+		t.Fatalf("Documents lost display spelling: %v", got)
+	}
+}
+
 func TestSnapshotIsolation(t *testing.T) {
 	original := []byte("original")
 	docs := map[string]DocumentSnapshot{

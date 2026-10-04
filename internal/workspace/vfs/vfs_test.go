@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -119,6 +120,60 @@ func TestDiskOverlay(t *testing.T) {
 	f := v.Get(uri)
 	if string(f.Content) != "editor content" {
 		t.Errorf("editor should overlay disk, got %s", string(f.Content))
+	}
+}
+
+func TestCanonicalIdentityAndTryOpen(t *testing.T) {
+	v := New()
+	displayURI := "file:///C:/test.go"
+	aliasURI := "file:///c:/test.go"
+
+	if err := v.TryOpen(displayURI, "go", 1, []byte("one"), SourceEditor); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.TryOpen(displayURI, "go", 1, []byte("one"), SourceEditor); err != nil {
+		t.Fatalf("identical open should be idempotent: %v", err)
+	}
+	if got := v.Revision(); got != 1 {
+		t.Fatalf("idempotent open changed revision: %d", got)
+	}
+	if err := v.TryOpen(displayURI, "go", 2, []byte("two"), SourceEditor); !errors.Is(err, ErrDuplicateOpen) {
+		t.Fatalf("conflicting duplicate open error = %v", err)
+	}
+	if err := v.TryOpen(aliasURI, "go", 1, []byte("one"), SourceEditor); err != nil {
+		t.Fatalf("identical canonical alias should be idempotent: %v", err)
+	}
+	if err := v.TryOpen(aliasURI, "go", 1, []byte("different"), SourceEditor); !errors.Is(err, ErrDuplicateOpen) {
+		t.Fatalf("conflicting canonical URI alias error = %v", err)
+	}
+	if got := v.Get(aliasURI); got == nil || got.URI != displayURI || string(got.Content) != "one" {
+		t.Fatalf("alias read did not preserve original document: %+v", got)
+	}
+	if got := v.OpenFiles(); len(got) != 1 || got[0] != displayURI {
+		t.Fatalf("OpenFiles lost display spelling: %v", got)
+	}
+
+	v.Update(aliasURI, 2, []byte("updated"))
+	if got := v.Content(displayURI); string(got) != "updated" {
+		t.Fatalf("canonical update content = %q", got)
+	}
+	v.Save(aliasURI)
+	if got := v.Get(displayURI); got == nil || got.Dirty {
+		t.Fatalf("canonical save did not update state: %+v", got)
+	}
+	v.Close(aliasURI)
+	if got := v.Get(displayURI); got != nil {
+		t.Fatalf("canonical close left document open: %+v", got)
+	}
+}
+
+func TestOpenRetainsLegacyUpdateBehavior(t *testing.T) {
+	v := New()
+	uri := "file:///test.go"
+	v.Open(uri, "go", 1, []byte("one"), SourceEditor)
+	v.Open(uri, "go", 2, []byte("two"), SourceEditor)
+	if got := v.Get(uri); got == nil || got.Version != 2 || string(got.Content) != "two" {
+		t.Fatalf("legacy Open did not replace state: %+v", got)
 	}
 }
 

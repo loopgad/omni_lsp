@@ -24,8 +24,12 @@
 package vfs
 
 import (
+	"bytes"
+	"errors"
 	"sync"
 	"sync/atomic"
+
+	"github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 // FileSource indicates where a file's content comes from.
@@ -47,6 +51,10 @@ type FileState struct {
 	Source     FileSource
 	Dirty      bool // true if editor has unsaved changes
 }
+
+// ErrDuplicateOpen reports that an open document was reopened with conflicting
+// language, version, or content. The original open state remains intact.
+var ErrDuplicateOpen = errors.New("vfs: conflicting duplicate open")
 
 // VFS is a thread-safe virtual file system that maintains file state.
 // Invariants:
@@ -74,11 +82,32 @@ func New() *VFS {
 // VFS property (callers may freely reuse/mutate their slice). This is what
 // lets snapshot publication share content slices without copying.
 func (v *VFS) Open(uri, langID string, version int64, content []byte, source FileSource) {
+	key := canonicalURI(uri)
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.openLocked(key, uri, langID, version, content, source)
+}
+
+// TryOpen opens a file, or accepts an idempotent reopen when language,
+// version, and content match. A conflict leaves the existing state intact.
+func (v *VFS) TryOpen(uriText, langID string, version int64, content []byte, source FileSource) error {
+	key := canonicalURI(uriText)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if existing := v.files[key]; existing != nil {
+		if existing.LanguageID != langID || existing.Version != version || !bytes.Equal(existing.Content, content) {
+			return ErrDuplicateOpen
+		}
+		return nil
+	}
+	v.openLocked(key, uriText, langID, version, content, source)
+	return nil
+}
+
+func (v *VFS) openLocked(key, uriText, langID string, version int64, content []byte, source FileSource) {
 	content = cloneBytes(content)
-	v.files[uri] = &FileState{
-		URI:        uri,
+	v.files[key] = &FileState{
+		URI:        uriText,
 		LanguageID: langID,
 		Version:    version,
 		Content:    content,
@@ -86,7 +115,7 @@ func (v *VFS) Open(uri, langID string, version int64, content []byte, source Fil
 		Dirty:      source == SourceEditor,
 	}
 	if source == SourceDisk {
-		v.diskFiles[uri] = content
+		v.diskFiles[key] = content
 	}
 	v.revision.Add(1)
 }
@@ -94,16 +123,17 @@ func (v *VFS) Open(uri, langID string, version int64, content []byte, source Fil
 // Update updates the content of an open file (e.g., on didChange). The
 // content is cloned at this write boundary (see Open).
 func (v *VFS) Update(uri string, version int64, content []byte) {
+	key := canonicalURI(uri)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	content = cloneBytes(content)
-	if f, ok := v.files[uri]; ok {
+	if f, ok := v.files[key]; ok {
 		f.Version = version
 		f.Content = content
 		f.Dirty = true
 		f.Source = SourceEditor
 	} else {
-		v.files[uri] = &FileState{
+		v.files[key] = &FileState{
 			URI:     uri,
 			Version: version,
 			Content: content,
@@ -116,21 +146,23 @@ func (v *VFS) Update(uri string, version int64, content []byte) {
 
 // Save marks a file as saved (e.g., on didSave).
 func (v *VFS) Save(uri string) {
+	key := canonicalURI(uri)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if f, ok := v.files[uri]; ok {
+	if f, ok := v.files[key]; ok {
 		f.Dirty = false
 		f.Source = SourceDisk
-		v.diskFiles[uri] = f.Content
+		v.diskFiles[key] = f.Content
 	}
 	v.revision.Add(1)
 }
 
 // Close removes a file from the VFS (e.g., on didClose).
 func (v *VFS) Close(uri string) {
+	key := canonicalURI(uri)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	delete(v.files, uri)
+	delete(v.files, key)
 	v.revision.Add(1)
 }
 
@@ -142,9 +174,10 @@ func (v *VFS) Close(uri string) {
 // MUST treat it as read-only; to own mutable bytes use Content(), which
 // copies. Hot-path consumers (snapshot publication) rely on the sharing.
 func (v *VFS) Get(uri string) *FileState {
+	key := canonicalURI(uri)
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	f := v.files[uri]
+	f := v.files[key]
 	if f == nil {
 		return nil
 	}
@@ -156,9 +189,10 @@ func (v *VFS) Get(uri string) *FileState {
 // Content returns the content bytes for the given URI.
 // Returns nil if the file is not open.
 func (v *VFS) Content(uri string) []byte {
+	key := canonicalURI(uri)
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	f := v.files[uri]
+	f := v.files[key]
 	if f == nil {
 		return nil
 	}
@@ -173,7 +207,7 @@ func (v *VFS) OpenFiles() []string {
 	defer v.mu.RUnlock()
 	uris := make([]string, 0, len(v.files))
 	for uri := range v.files {
-		uris = append(uris, uri)
+		uris = append(uris, v.files[uri].URI)
 	}
 	return uris
 }
@@ -183,8 +217,22 @@ func (v *VFS) Revision() uint64 {
 	return v.revision.Load()
 }
 
+// AdvanceRevision invalidates analyses after an external source change without
+// replacing editor-authoritative content or changing document versions.
+func (v *VFS) AdvanceRevision() uint64 {
+	return v.revision.Add(1)
+}
+
 func cloneBytes(b []byte) []byte {
 	cp := make([]byte, len(b))
 	copy(cp, b)
 	return cp
+}
+
+func canonicalURI(value string) string {
+	parsed, err := uri.Parse(value)
+	if err != nil {
+		return value
+	}
+	return parsed.Canonical()
 }

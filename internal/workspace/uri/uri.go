@@ -133,6 +133,7 @@ func runtimeIsWindows() bool { return runtime.GOOS == "windows" }
 //   - lowercase scheme
 //   - Windows drive letters lowercased in the authority+path
 //   - empty authority dropped for localhost-style file URIs
+//   - percent-encoded unreserved path characters decoded
 //   - everything else re-encoded minimally by url.URL.String
 func normalize(u *url.URL) string {
 	cp := *u
@@ -144,6 +145,7 @@ func normalize(u *url.URL) string {
 		}
 		if cp.Path != "" {
 			cp.Path = normalizeDriveInPath(cp.Path)
+			cp.RawPath = normalizeEscapedUnreservedPath(normalizeDriveInRawPath(cp.RawPath, cp.Path))
 		}
 		if cp.Opaque != "" {
 			cp.Opaque = normalizeDrive(cp.Opaque)
@@ -166,4 +168,91 @@ func normalizeDriveInPath(p string) string {
 		return "/" + string(p[1]+32) + p[2:]
 	}
 	return p
+}
+
+// normalizeDriveInRawPath canonicalizes only the Windows drive prefix in an
+// escaped path. url.URL preserves RawPath when a client spells the drive colon
+// as %3A; without normalizing this hint, c:/ and c%3A/ produce different
+// canonical identities even though Path has already decoded them equally.
+// Keep escapes in the remainder intact (notably %2F, which is not a path
+// separator in the original URI spelling).
+func normalizeDriveInRawPath(rawPath, path string) string {
+	if rawPath == "" || len(path) < 3 || path[0] != '/' || path[2] != ':' ||
+		!isASCIILetter(path[1]) || len(rawPath) < 3 || rawPath[0] != '/' ||
+		!isASCIILetter(rawPath[1]) {
+		return rawPath
+	}
+	colonEnd := 0
+	switch {
+	case rawPath[2] == ':':
+		colonEnd = 3
+	case len(rawPath) >= 5 && strings.EqualFold(rawPath[2:5], "%3a"):
+		colonEnd = 5
+	default:
+		return rawPath
+	}
+	return "/" + string(toLowerASCII(rawPath[1])) + ":" + rawPath[colonEnd:]
+}
+
+// normalizeEscapedUnreservedPath decodes percent escapes for RFC 3986
+// unreserved ASCII bytes and uppercases the hex digits for other escapes.
+// Escaped reserved bytes (especially %2F) stay escaped to preserve identity.
+func normalizeEscapedUnreservedPath(rawPath string) string {
+	if rawPath == "" || !strings.Contains(rawPath, "%") {
+		return rawPath
+	}
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(rawPath))
+	for i := 0; i < len(rawPath); i++ {
+		if rawPath[i] != '%' || i+2 >= len(rawPath) {
+			b.WriteByte(rawPath[i])
+			continue
+		}
+		hi, okHi := hexDigit(rawPath[i+1])
+		lo, okLo := hexDigit(rawPath[i+2])
+		if !okHi || !okLo {
+			b.WriteByte(rawPath[i])
+			continue
+		}
+		value := hi<<4 | lo
+		if isUnreservedASCII(value) {
+			b.WriteByte(value)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(hex[value>>4])
+			b.WriteByte(hex[value&0x0f])
+		}
+		i += 2
+	}
+	return b.String()
+}
+
+func hexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func isUnreservedASCII(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' ||
+		b == '-' || b == '.' || b == '_' || b == '~'
+}
+
+func isASCIILetter(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+}
+
+func toLowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }

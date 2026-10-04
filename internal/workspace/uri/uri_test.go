@@ -47,6 +47,43 @@ func TestDriveLetterCaseCanonicalizes(t *testing.T) {
 	}
 }
 
+func TestEncodedDriveColonCanonicalizesWithoutChangingEscapedPathData(t *testing.T) {
+	literal, err := Parse("file:///C:/Users/test/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := Parse("file:///c%3A/Users/test/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if literal.Canonical() != encoded.Canonical() {
+		t.Errorf("encoded drive colon must preserve Windows file identity:\n %q\n %q", literal.Canonical(), encoded.Canonical())
+	}
+	withEscapedUnreserved, err := Parse("file:///c:/Users/A%20B/%7Espace.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withLiteralUnreserved, err := Parse("file:///C:/Users/A%20B/~space.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withEscapedUnreserved.Canonical() != withLiteralUnreserved.Canonical() {
+		t.Errorf("encoded unreserved path characters must preserve identity:\n %q\n %q", withEscapedUnreserved.Canonical(), withLiteralUnreserved.Canonical())
+	}
+
+	withEscapedSlash, err := Parse("file:///C:/Users/a%2Fb/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withPathSeparator, err := Parse("file:///C:/Users/a/b/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withEscapedSlash.Canonical() == withPathSeparator.Canonical() {
+		t.Errorf("canonicalization must preserve escaped path data: %q", withEscapedSlash.Canonical())
+	}
+}
+
 func TestDisplaySpellingPreserved(t *testing.T) {
 	in := "file:///C:/Users/Test/Main.GO"
 	u, err := Parse(in)

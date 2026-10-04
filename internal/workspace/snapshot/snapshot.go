@@ -22,7 +22,11 @@ package snapshot
 
 import (
 	"sync/atomic"
+
+	"github.com/omnilsp/omni/internal/workspace/uri"
 )
+
+var nextInstanceID atomic.Uint64
 
 // ID uniquely identifies a snapshot.
 type ID struct {
@@ -37,6 +41,7 @@ type ID struct {
 //  3. Old snapshots remain valid until garbage collected.
 type Snapshot struct {
 	id        ID
+	instance  uint64
 	vfsRev    uint64
 	documents map[string]DocumentSnapshot
 }
@@ -62,11 +67,15 @@ type DocumentSnapshot struct {
 // after handing it to the VFS.
 func New(wsID string, rev uint64, docs map[string]DocumentSnapshot) *Snapshot {
 	cp := make(map[string]DocumentSnapshot, len(docs))
-	for k, v := range docs {
-		cp[k] = v // shares Content — immutable by VFS write-boundary contract
+	for key, doc := range docs {
+		if doc.URI == "" {
+			doc.URI = key
+		}
+		cp[canonicalURI(key)] = doc // shares Content — immutable by VFS write-boundary contract
 	}
 	return &Snapshot{
 		id:        ID{WorkspaceID: wsID, Revision: rev},
+		instance:  nextInstanceID.Add(1),
 		vfsRev:    rev,
 		documents: cp,
 	}
@@ -75,6 +84,11 @@ func New(wsID string, rev uint64, docs map[string]DocumentSnapshot) *Snapshot {
 // ID returns the snapshot identifier.
 func (s *Snapshot) ID() ID { return s.id }
 
+// InstanceID identifies this immutable in-process snapshot publication.
+// It disambiguates distinct snapshots if a caller accidentally reuses a
+// revision number; it is not persistent or exposed on the product protocol.
+func (s *Snapshot) InstanceID() uint64 { return s.instance }
+
 // Revision returns the monotonic revision of this snapshot (J6: part of the
 // coalescing key — requests on different revisions must never join).
 func (s *Snapshot) Revision() uint64 { return s.id.Revision }
@@ -82,7 +96,7 @@ func (s *Snapshot) Revision() uint64 { return s.id.Revision }
 // Document returns the document snapshot for the given URI.
 // Returns nil if the document is not in this snapshot.
 func (s *Snapshot) Document(uri string) *DocumentSnapshot {
-	d, ok := s.documents[uri]
+	d, ok := s.documents[canonicalURI(uri)]
 	if !ok {
 		return nil
 	}
@@ -95,10 +109,18 @@ func (s *Snapshot) Document(uri string) *DocumentSnapshot {
 // Documents returns all document URIs in this snapshot.
 func (s *Snapshot) Documents() []string {
 	uris := make([]string, 0, len(s.documents))
-	for uri := range s.documents {
-		uris = append(uris, uri)
+	for _, doc := range s.documents {
+		uris = append(uris, doc.URI)
 	}
 	return uris
+}
+
+func canonicalURI(value string) string {
+	parsed, err := uri.Parse(value)
+	if err != nil {
+		return value
+	}
+	return parsed.Canonical()
 }
 
 // Manager manages snapshot lifecycle.
