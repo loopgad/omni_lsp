@@ -15,11 +15,19 @@ var (
 )
 
 func tryWriterLock(f *os.File) (func() error, error) {
+	return tryGenerationLock(f, true)
+}
+
+func tryGenerationLock(f *os.File, exclusive bool) (func() error, error) {
 	const failImmediately = 0x1
 	const exclusiveLock = 0x2
 	const lockViolation = syscall.Errno(33)
 	overlapped := new(syscall.Overlapped)
-	result, _, callErr := lockFileExProc.Call(f.Fd(), failImmediately|exclusiveLock, 0, 1, 0, uintptr(unsafe.Pointer(overlapped)))
+	flags := uintptr(failImmediately)
+	if exclusive {
+		flags |= exclusiveLock
+	}
+	result, _, callErr := lockFileExProc.Call(f.Fd(), flags, 0, 1, 0, uintptr(unsafe.Pointer(overlapped)))
 	runtime.KeepAlive(overlapped)
 	if result == 0 {
 		if callErr == lockViolation {

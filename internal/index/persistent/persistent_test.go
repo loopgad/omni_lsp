@@ -2,11 +2,16 @@ package persistent
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func newStore(t *testing.T) *FileStore {
@@ -32,6 +37,435 @@ func publishOne(t *testing.T, s *FileStore, payload string) SegmentID {
 		t.Fatal(err)
 	}
 	return id
+}
+
+type cancelDuringCommitContext struct {
+	context.Context
+	calls    int
+	cancelAt int
+	canceled bool
+	onCancel func()
+}
+
+type commitDecisionContext struct {
+	context.Context
+	calls   int
+	checked chan struct{}
+	resume  chan struct{}
+}
+
+func (c *commitDecisionContext) Err() error {
+	c.calls++
+	if c.calls == 6 {
+		err := c.Context.Err()
+		close(c.checked)
+		<-c.resume
+		return err
+	}
+	return c.Context.Err()
+}
+
+func (c *cancelDuringCommitContext) Err() error {
+	c.calls++
+	if c.calls == c.cancelAt {
+		c.canceled = true
+		if c.onCancel != nil {
+			c.onCancel()
+		}
+	}
+	if c.canceled {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestCommitCancellationAfterSegmentPromotionRollsBackUncommittedFiles(t *testing.T) {
+	s := newStore(t)
+	oldID := publishOne(t, s, "generation-one")
+	build, err := s.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedID, err := build.WriteSegment([]byte("must-not-become-an-orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sawPromotedSegment, sawTemporaryManifest, sawCurrentInHistory, sawPreviousManifest bool
+	ctx := &cancelDuringCommitContext{Context: context.Background(), cancelAt: 6}
+	ctx.onCancel = func() {
+		_, segmentErr := os.Stat(filepath.Join(s.root, segFileName(failedID)))
+		_, manifestErr := os.Stat(s.tmpManifestPath())
+		_, currentManifestErr := os.Stat(s.manifestPath())
+		sawPromotedSegment = segmentErr == nil
+		sawTemporaryManifest = manifestErr == nil
+		sawPreviousManifest = currentManifestErr == nil
+		historyBytes, historyErr := os.ReadFile(s.historyPath())
+		var history []*Generation
+		if historyErr == nil && json.Unmarshal(historyBytes, &history) == nil {
+			for _, generation := range history {
+				if generation != nil && generation.ID == 1 {
+					sawCurrentInHistory = true
+				}
+			}
+		}
+	}
+	if err := build.Commit(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit error = %v, want context.Canceled", err)
+	}
+	if !sawPromotedSegment || !sawTemporaryManifest || !sawCurrentInHistory || !sawPreviousManifest {
+		t.Fatalf("cancellation did not occur before atomic publication: segment=%t temp-manifest=%t current-in-history=%t previous-manifest=%t", sawPromotedSegment, sawTemporaryManifest, sawCurrentInHistory, sawPreviousManifest)
+	}
+
+	view, err := s.OpenSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("open snapshot after cancellation: %v", err)
+	}
+	if view.ID != 1 || len(view.Segments) != 1 || view.Segments[0].ID != oldID {
+		t.Fatalf("canceled commit changed readable generation: %+v", view.Generation)
+	}
+	if _, err := view.ReadSegment(oldID); err != nil {
+		t.Fatalf("previous generation became unreadable: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.root, segFileName(failedID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled commit left orphan segment %s: %v", failedID, err)
+	}
+	if _, err := os.Stat(s.tmpManifestPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled commit left temporary manifest: %v", err)
+	}
+	if staging, err := filepath.Glob(filepath.Join(s.root, "staging-*")); err != nil || len(staging) != 0 {
+		t.Fatalf("canceled commit left staging directories: %v (%v)", staging, err)
+	}
+
+	lockCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	probe, err := s.BeginBuild(lockCtx)
+	if err != nil {
+		t.Fatalf("canceled commit left writer lock held: %v", err)
+	}
+	if err := probe.Abort(); err != nil {
+		t.Fatalf("release writer lock probe: %v", err)
+	}
+
+	reopened, err := NewFileStore(s.root, Config{})
+	if err != nil {
+		t.Fatalf("reopen store after canceled commit: %v", err)
+	}
+	recovered, err := reopened.OpenSnapshot(context.Background())
+	if err != nil || recovered.ID != 1 || len(recovered.Segments) != 1 || recovered.Segments[0].ID != oldID {
+		t.Fatalf("canceled commit changed recovered generation: %+v, err=%v", recovered.Generation, err)
+	}
+}
+
+func TestCommitCanceledBeforePublishKeepsCurrentGeneration(t *testing.T) {
+	s := newStore(t)
+	oldID := publishOne(t, s, "still-current")
+	build, err := s.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newID, err := build.WriteSegment([]byte("canceled"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := build.Commit(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit error = %v, want context.Canceled", err)
+	}
+	if err := build.Commit(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("repeated commit changed its terminal result: %v", err)
+	}
+	view, err := s.OpenSnapshot(context.Background())
+	if err != nil || view.ID != 1 || view.Segments[0].ID != oldID {
+		t.Fatalf("canceled commit changed current generation: %+v, err=%v", view.Generation, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.root, segFileName(newID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled segment remains discoverable: %v", err)
+	}
+	if _, err := os.Stat(s.manifestPath()); err != nil {
+		t.Fatalf("previous manifest was not preserved: %v", err)
+	}
+}
+
+func TestCancellationRacingCommitHasOneTerminalOutcome(t *testing.T) {
+	s := newStore(t)
+	oldID := publishOne(t, s, "before-race")
+	for i := 0; i < 8; i++ {
+		build, err := s.BeginBuild(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		newID, err := build.WriteSegment([]byte("race-result"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		start := make(chan struct{})
+		commitResult := make(chan error, 1)
+		go func() {
+			<-start
+			commitResult <- build.Commit(ctx)
+		}()
+		go func() {
+			<-start
+			cancel()
+		}()
+		close(start)
+		err = <-commitResult
+		cancel()
+		view, openErr := s.OpenSnapshot(context.Background())
+		if openErr != nil {
+			t.Fatalf("open after commit race: %v", openErr)
+		}
+		switch {
+		case err == nil:
+			if len(view.Segments) != 1 || view.Segments[0].ID != newID {
+				t.Fatalf("commit reported success but generation %d was not published", view.ID)
+			}
+			oldID = newID
+		case errors.Is(err, context.Canceled):
+			if view.ID == 1 && view.Segments[0].ID != oldID || view.ID != 1 && view.Segments[0].ID == newID {
+				t.Fatalf("commit reported cancellation but published generation %d", view.ID)
+			}
+		default:
+			t.Fatalf("unexpected commit result: %v", err)
+		}
+	}
+}
+
+func TestCancellationAfterCommitDecisionReturnsCommittedOutcome(t *testing.T) {
+	s := newStore(t)
+	oldID := publishOne(t, s, "before-commit-wins")
+	build, err := s.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newID, err := build.WriteSegment([]byte("commit-wins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &commitDecisionContext{Context: base, checked: make(chan struct{}), resume: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() { result <- build.Commit(ctx) }()
+	select {
+	case <-ctx.checked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit did not reach its final cancellation check")
+	}
+	cancel()
+	close(ctx.resume)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("cancellation after the commit decision changed its result: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit did not finish after its final cancellation check")
+	}
+	view, err := s.OpenSnapshot(context.Background())
+	if err != nil || view.ID != 2 || len(view.Segments) != 1 || view.Segments[0].ID != newID {
+		t.Fatalf("commit reported success without publishing generation 2: %+v, err=%v", view.Generation, err)
+	}
+	if view.Segments[0].ID == oldID {
+		t.Fatal("commit kept the previous generation after reporting success")
+	}
+}
+
+func TestGenerationLeasePinsSegmentsDuringCompaction(t *testing.T) {
+	s := newStore(t)
+	oldID := publishOne(t, s, "reader-pinned")
+	lease, err := s.OpenSnapshotLease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	oldPath := filepath.Join(s.root, segFileName(oldID))
+	if err := s.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("compaction removed a pinned segment: %v", err)
+	}
+	got, err := lease.Snapshot().ReadSegment(oldID)
+	if err != nil || string(got) != "reader-pinned" {
+		t.Fatalf("leased reader lost its segment: %q, %v", got, err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired segment remains after its last lease closed: %v", err)
+	}
+}
+
+func TestRestartRecoveryReservesPastAbandonedBuild(t *testing.T) {
+	root := t.TempDir()
+	s, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := publishOne(t, s, "survives-restart")
+	ready := filepath.Join(root, "crashed-helper.ready")
+	release := filepath.Join(root, "crashed-helper.release")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPersistentReservationHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"OMNILSP_PERSISTENT_RESERVATION_HELPER=1",
+		"OMNILSP_PERSISTENT_RESERVATION_ROOT="+root,
+		"OMNILSP_PERSISTENT_RESERVATION_READY="+ready,
+		"OMNILSP_PERSISTENT_RESERVATION_RELEASE="+release,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childWaited := false
+	defer func() {
+		if !childWaited {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not stage its abandoned generation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait() // A forced process exit simulates a crash before Abort.
+	childWaited = true
+	if idBytes, err := os.ReadFile(ready); err != nil || string(idBytes) != "2" {
+		t.Fatalf("crashed helper reservation = %q, err=%v; want generation 2", idBytes, err)
+	}
+
+	reopened, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := reopened.OpenSnapshot(context.Background())
+	if err != nil || view.ID != 1 || view.Segments[0].ID != oldID {
+		t.Fatalf("restart lost the previous generation: %+v, err=%v", view.Generation, err)
+	}
+	next, err := reopened.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.GenerationID() != 3 {
+		t.Fatalf("generation after abandoned reservation = %d, want 3", next.GenerationID())
+	}
+	if err := next.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentReservationHelperProcess(t *testing.T) {
+	if os.Getenv("OMNILSP_PERSISTENT_RESERVATION_HELPER") != "1" {
+		return
+	}
+	root := os.Getenv("OMNILSP_PERSISTENT_RESERVATION_ROOT")
+	ready := os.Getenv("OMNILSP_PERSISTENT_RESERVATION_READY")
+	release := os.Getenv("OMNILSP_PERSISTENT_RESERVATION_RELEASE")
+	store, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, err := store.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := build.WriteSegment([]byte("helper-staged")); err != nil {
+		t.Fatal(err)
+	}
+	readyTmp := ready + ".tmp"
+	if err := os.WriteFile(readyTmp, []byte(strconv.FormatUint(build.GenerationID(), 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(readyTmp, ready); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(release); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("parent did not release reservation helper")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := build.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentCrossProcessBuildReservation(t *testing.T) {
+	root := t.TempDir()
+	ready := filepath.Join(root, "helper.ready")
+	release := filepath.Join(root, "helper.release")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPersistentReservationHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"OMNILSP_PERSISTENT_RESERVATION_HELPER=1",
+		"OMNILSP_PERSISTENT_RESERVATION_ROOT="+root,
+		"OMNILSP_PERSISTENT_RESERVATION_READY="+ready,
+		"OMNILSP_PERSISTENT_RESERVATION_RELEASE="+release,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	helperWaited := false
+	defer func() {
+		_ = os.WriteFile(release, nil, 0o600)
+		if !helperWaited && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	var firstID uint64
+	for {
+		if raw, err := os.ReadFile(ready); err == nil {
+			firstID, err = strconv.ParseUint(string(raw), 10, 64)
+			if err != nil {
+				t.Fatalf("parse helper reservation %q: %v", raw, err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not reserve a generation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	store, err := NewFileStore(root, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	second, err := store.BeginBuild(ctx)
+	if err != nil {
+		t.Fatalf("second process could not reserve while first staged: %v", err)
+	}
+	if got := second.GenerationID(); got <= firstID {
+		t.Fatalf("reservations are not unique and monotonic: first=%d second=%d", firstID, got)
+	}
+	if err := second.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("reservation helper failed: %v", err)
+	}
+	helperWaited = true
 }
 
 // TestL4_CrashBeforePublishKeepsOldGeneration: staging data abandoned before
@@ -301,7 +735,7 @@ func TestL8_NullHistoryEntryDegradesWithoutPanic(t *testing.T) {
 	}
 }
 
-func TestL4_IndependentStoresSerializeWriters(t *testing.T) {
+func TestL4_IndependentStoresReserveDistinctMonotonicGenerations(t *testing.T) {
 	root := t.TempDir()
 	first, err := NewFileStore(root, Config{})
 	if err != nil {
@@ -312,27 +746,44 @@ func TestL4_IndependentStoresSerializeWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := make(chan struct{})
-	errs := make(chan error, 2)
+	type reservedBuild struct {
+		build   BuildSession
+		payload string
+		err     error
+	}
+	results := make(chan reservedBuild, 2)
 	for i, store := range []*FileStore{first, second} {
 		payload := fmt.Sprintf("writer-%d", i)
 		go func(store *FileStore, payload string) {
 			<-start
 			build, err := store.BeginBuild(context.Background())
 			if err != nil {
-				errs <- err
+				results <- reservedBuild{err: err}
 				return
 			}
 			if _, err := build.WriteSegment([]byte(payload)); err != nil {
 				_ = build.Abort()
-				errs <- err
+				results <- reservedBuild{err: err}
 				return
 			}
-			errs <- build.Commit(context.Background())
+			results <- reservedBuild{build: build, payload: payload}
 		}(store, payload)
 	}
 	close(start)
-	for range 2 {
-		if err := <-errs; err != nil {
+	reserved := []reservedBuild{<-results, <-results}
+	for _, result := range reserved {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+	}
+	if reserved[0].build.GenerationID() > reserved[1].build.GenerationID() {
+		reserved[0], reserved[1] = reserved[1], reserved[0]
+	}
+	if reserved[0].build.GenerationID() != 1 || reserved[1].build.GenerationID() != 2 {
+		t.Fatalf("reserved generations = %d, %d, want 1, 2", reserved[0].build.GenerationID(), reserved[1].build.GenerationID())
+	}
+	for _, result := range reserved {
+		if err := result.build.Commit(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -347,8 +798,45 @@ func TestL4_IndependentStoresSerializeWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(payload); got != "writer-0" && got != "writer-1" {
-		t.Fatalf("published payload = %q", got)
+	if got := string(payload); got != reserved[1].payload {
+		t.Fatalf("published payload = %q, want highest reservation payload %q", got, reserved[1].payload)
+	}
+}
+
+func TestOlderReservationCannotReplaceNewerCommittedGeneration(t *testing.T) {
+	s := newStore(t)
+	publishOne(t, s, "base")
+	older, err := s.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	olderID, err := older.WriteSegment([]byte("older-reservation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := s.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerID, err := newer.WriteSegment([]byte("newer-reservation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newer.GenerationID() <= older.GenerationID() {
+		t.Fatalf("generation IDs regressed: older=%d newer=%d", older.GenerationID(), newer.GenerationID())
+	}
+	if err := newer.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := older.Commit(context.Background()); err == nil {
+		t.Fatal("older reservation replaced a newer committed generation")
+	}
+	view, err := s.OpenSnapshot(context.Background())
+	if err != nil || view.ID != newer.GenerationID() || view.Segments[0].ID != newerID {
+		t.Fatalf("newer committed generation was replaced: %+v, err=%v", view.Generation, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.root, segFileName(olderID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded reservation left a segment: %v", err)
 	}
 }
 
@@ -406,19 +894,22 @@ func TestL9_FutureSchemaQuarantinesAndFallsBack(t *testing.T) {
 // records whose identity inputs no longer match are stale — never visible;
 // matching tuples round-trip the payload untouched.
 func TestL10_FreshnessTupleGatesVisibility(t *testing.T) {
-	fresh := FreshnessTuple{SourceHash: "h1", BuildContext: "bc1", Toolchain: "go1.26", BackendVer: "v7", Revision: 42}
+	fresh := FreshnessTuple{SourceHash: "h1", BuildContext: "bc1", Toolchain: "go1.26", BackendVer: "v7"}
 	sealed := SealPayload([]byte("payload-bytes"), fresh)
+	headerLen := int(binary.BigEndian.Uint32(sealed[:freshnessHeaderSz]))
+	var persisted map[string]json.RawMessage
+	if err := json.Unmarshal(sealed[freshnessHeaderSz:freshnessHeaderSz+headerLen], &persisted); err != nil {
+		t.Fatalf("decode persisted freshness tuple: %v", err)
+	}
+	if _, ok := persisted["revision"]; ok {
+		t.Fatal("process-local snapshot revision must not be persisted as freshness identity")
+	}
 
 	got, err := VerifyPayload(sealed, fresh)
 	if err != nil || string(got) != "payload-bytes" {
 		t.Fatalf("fresh tuple round-trip: %q %v", got, err)
 	}
 
-	stale := fresh
-	stale.Revision = 43
-	if _, err := VerifyPayload(sealed, stale); err == nil {
-		t.Fatal("stale revision accepted as fresh")
-	}
 	for name, mut := range map[string]func(*FreshnessTuple){
 		"sourceHash":   func(f *FreshnessTuple) { f.SourceHash = "other" },
 		"buildContext": func(f *FreshnessTuple) { f.BuildContext = "other" },

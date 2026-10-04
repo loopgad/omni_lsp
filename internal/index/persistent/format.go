@@ -4,12 +4,14 @@
 // fallback to the last good generation, and a disk budget.
 //
 // Owned mutable state: mu guards generation pointer + history + quarantine
-// list; build sessions own their staging directories exclusively.
+// list; build sessions own their staging directories exclusively. A durable
+// sequence file reserves generation IDs before extraction starts.
 //
-// Concurrency model: writer.lock serializes recovery, publication,
-// quarantine, and compaction across FileStore instances/processes; mu guards
-// each instance's cached pointers. OpenSnapshot holds writer.lock while it
-// validates immutable segments and applies any quarantine fallback.
+// Concurrency model: writer.lock serializes reservation, recovery,
+// publication, quarantine, and compaction across FileStore instances/processes.
+// Build sessions release it between segment writes so extraction can proceed
+// concurrently. Generation leases use shared per-generation locks to prevent
+// compaction from deleting files a reader still uses.
 //
 // Invariants:
 //  1. IDX-TXN-001: readers observe exactly one committed generation — never
@@ -33,6 +35,7 @@ import (
 
 const (
 	dirFormat   = "v1"
+	dirLeases   = "leases"
 	segMagic    = "OMNI"
 	schemaVer   = uint32(1)
 	segHeaderSz = 4 + 4 + 8 + 8 + 4 // magic + ver + gen + len + crc32
@@ -41,6 +44,7 @@ const (
 	fileManifest  = "manifest.json"
 	fileTmp       = "manifest.json.tmp"
 	fileHistory   = "history.json"
+	fileGenSeq    = "generation.seq"
 	dirQuarantine = "quarantine"
 )
 
@@ -89,7 +93,7 @@ func validGeneration(gen *Generation) bool {
 
 // ensureLayout creates the store root layout on first open.
 func ensureLayout(root string) error {
-	for _, d := range []string{"", dirQuarantine} {
+	for _, d := range []string{"", dirQuarantine, dirLeases} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
 			return fmt.Errorf("persistent: layout %s: %w", d, err)
 		}

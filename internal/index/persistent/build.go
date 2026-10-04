@@ -4,29 +4,47 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // fileBuild stages the next generation; nothing it writes is discoverable
 // through the manifest until Commit's atomic pointer swap (TXN-002).
 type fileBuild struct {
-	store      *FileStore
-	genID      uint64
-	stageDir   string
-	segments   []SegmentRef
-	aborted    bool
-	writerLock *writerLock
+	mu       sync.Mutex
+	store    *FileStore
+	genID    uint64
+	stageDir string
+	segments []SegmentRef
+	state    buildState
+	result   error
 }
+
+type buildState uint8
+
+const (
+	buildOpen buildState = iota
+	buildCommitted
+	buildAborted
+)
 
 // WriteSegment encodes, fsyncs and records one immutable segment. Budget is
 // enforced before touching disk (§L17).
 func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
-	if b.aborted {
-		return "", fmt.Errorf("persistent: build aborted")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != buildOpen {
+		return "", b.closedError()
 	}
+	writerLock, err := acquireWriterLock(context.Background(), b.store.root)
+	if err != nil {
+		return "", err
+	}
+	defer writerLock.release()
 	b.store.mu.Lock()
 	budget := b.store.cfg.DiskBudgetBytes
 	b.store.mu.Unlock()
@@ -68,21 +86,101 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 	return id, nil
 }
 
+func (b *fileBuild) GenerationID() uint64 { return b.genID }
+
 // Commit publishes the staged generation: move segments into the store root,
-// write manifest.tmp, fsync, then atomically rename over the pointer (L4).
+// write manifest.tmp, persist recovery history, then atomically replace the
+// manifest (L4). The build mutex makes cancellation/commit/abort terminal.
+// Cancellation observed before the final context check aborts; a successful
+// manifest replacement wins if cancellation happens after that check.
 func (b *fileBuild) Commit(ctx context.Context) error {
-	defer b.writerLock.release()
-	return b.commit(ctx)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.state {
+	case buildCommitted:
+		return nil
+	case buildAborted:
+		if b.result != nil {
+			return b.result
+		}
+		return ErrBuildAborted
+	}
+	writerLock, err := acquireWriterLock(ctx, b.store.root)
+	if err != nil {
+		return b.finishAbort(err)
+	}
+	defer writerLock.release()
+	if err := b.commitWithWriterLock(ctx); err != nil {
+		return b.finishAbort(err)
+	}
+	b.state = buildCommitted
+	b.result = nil
+	return nil
 }
 
-func (b *fileBuild) commit(ctx context.Context) error {
-	if b.aborted {
-		return fmt.Errorf("persistent: build aborted")
+func (b *fileBuild) commitWithWriterLock(ctx context.Context) (retErr error) {
+	b.store.mu.Lock()
+	if err := b.store.recover(); err != nil {
+		b.store.mu.Unlock()
+		return err
+	}
+	var previous *Generation
+	if b.store.current != nil {
+		copy := *b.store.current
+		copy.Segments = append([]SegmentRef(nil), copy.Segments...)
+		previous = &copy
+	}
+	oldHistory := append([]*Generation(nil), b.store.history...)
+	b.store.mu.Unlock()
+	rollbackHistory := append([]*Generation(nil), oldHistory...)
+	if previous != nil {
+		rollbackHistory = append([]*Generation{previous}, rollbackHistory...)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if previous != nil && b.genID <= previous.ID {
+		return fmt.Errorf("persistent: generation %d superseded by committed generation %d", b.genID, previous.ID)
+	}
+	if len(b.segments) == 0 {
+		return fmt.Errorf("persistent: cannot commit generation %d without segments", b.genID)
+	}
+
 	gen := Generation{ID: b.genID, Segments: b.segments}
+	promoted := make([]SegmentID, 0, len(b.segments))
+	manifestTmpTouched := false
+	published := false
+	historyUpdated := false
+	defer func() {
+		if published {
+			return
+		}
+		var cleanupErrs []error
+		if historyUpdated {
+			if err := writeHistoryAtomic(b.store.historyPath(), rollbackHistory); err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("restore recovery history: %w", err))
+			}
+		}
+		for _, id := range promoted {
+			if err := os.Remove(filepath.Join(b.store.root, segFileName(id))); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("remove uncommitted segment %s: %w", id, err))
+			}
+		}
+		if manifestTmpTouched {
+			if err := os.Remove(b.store.tmpManifestPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("remove uncommitted manifest: %w", err))
+			}
+		}
+		if err := os.RemoveAll(b.stageDir); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove staging directory: %w", err))
+		}
+		if err := errors.Join(cleanupErrs...); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("persistent: rollback uncommitted generation %d: %w", b.genID, err))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Stage → root segment placement.
 	for _, seg := range b.segments {
@@ -94,6 +192,10 @@ func (b *fileBuild) commit(ctx context.Context) error {
 		if err := os.Rename(src, dst); err != nil {
 			return fmt.Errorf("persistent: promote %s: %w", seg.ID, err)
 		}
+		promoted = append(promoted, seg.ID)
+	}
+	if err := os.RemoveAll(b.stageDir); err != nil {
+		return fmt.Errorf("persistent: remove staging directory: %w", err)
 	}
 
 	mb, err := json.MarshalIndent(gen, "", "  ")
@@ -101,6 +203,7 @@ func (b *fileBuild) commit(ctx context.Context) error {
 		return err
 	}
 	tmp := b.store.tmpManifestPath()
+	manifestTmpTouched = true
 	if err := writeFileSync(tmp, mb); err != nil {
 		return err
 	}
@@ -108,39 +211,77 @@ func (b *fileBuild) commit(ctx context.Context) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	// Windows: os.Rename cannot clobber; the remove window is the one non-
-	// atomic step — recovery tolerates a missing pointer (falls back to
-	// history), so this never exposes a half-published generation.
-	_ = os.Remove(b.store.manifestPath())
-	if err := os.Rename(tmp, b.store.manifestPath()); err != nil {
+	// Save the current generation in recovery history before atomically
+	// replacing the manifest, so recovery retains a fallback after publication.
+	nextHistory := append([]*Generation(nil), b.store.history...)
+	if b.store.current != nil {
+		nextHistory = append([]*Generation{b.store.current}, nextHistory...)
+	}
+	var retired []*Generation
+	if len(nextHistory) > b.store.cfg.KeepGenerations {
+		retired = nextHistory[b.store.cfg.KeepGenerations:]
+		nextHistory = nextHistory[:b.store.cfg.KeepGenerations]
+	}
+	if err := syncHistory(b.store.historyPath(), nextHistory); err != nil {
+		return fmt.Errorf("persistent: stage recovery history: %w", err)
+	}
+	historyUpdated = true
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmp, b.store.manifestPath()); err != nil {
 		return fmt.Errorf("persistent: publish manifest: %w", err)
 	}
+	published = true
 
 	b.store.mu.Lock()
-	if b.store.current != nil {
-		b.store.history = append([]*Generation{b.store.current}, b.store.history...)
-		if len(b.store.history) > b.store.cfg.KeepGenerations {
-			old := b.store.history[len(b.store.history)-1]
-			for _, seg := range old.Segments {
-				_ = os.Remove(filepath.Join(b.store.root, segFileName(seg.ID)))
-			}
-			b.store.history = b.store.history[:len(b.store.history)-1]
-		}
-	}
+	b.store.history = nextHistory
 	b.store.current = &gen
-	b.store.nextGenID = b.genID
-	syncHistory(b.store.historyPath(), b.store.history)
 	b.store.mu.Unlock()
+	for _, old := range retired {
+		_ = b.store.removeGenerationSegments(old)
+	}
 
-	return os.RemoveAll(b.stageDir)
+	return retErr
 }
 
 // Abort discards staging; half-written data stays undiscoverable (TXN-002).
 func (b *fileBuild) Abort() error {
-	b.aborted = true
-	err := os.RemoveAll(b.stageDir)
-	b.writerLock.release()
-	return err
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == buildCommitted {
+		return ErrBuildCommitted
+	}
+	if b.state == buildAborted {
+		return nil
+	}
+	b.state = buildAborted
+	b.result = ErrBuildAborted
+	if err := os.RemoveAll(b.stageDir); err != nil {
+		b.result = errors.Join(b.result, err)
+		return err
+	}
+	return nil
+}
+
+func (b *fileBuild) finishAbort(err error) error {
+	b.state = buildAborted
+	b.result = err
+	if cleanupErr := os.RemoveAll(b.stageDir); cleanupErr != nil {
+		b.result = errors.Join(b.result, fmt.Errorf("persistent: remove staging directory: %w", cleanupErr))
+	}
+	return b.result
+}
+
+func (b *fileBuild) closedError() error {
+	switch b.state {
+	case buildCommitted:
+		return ErrBuildCommitted
+	case buildAborted:
+		return ErrBuildAborted
+	default:
+		return nil
+	}
 }
 
 func writeFileSync(path string, data []byte) error {
@@ -159,16 +300,34 @@ func writeFileSync(path string, data []byte) error {
 	return f.Close()
 }
 
-// syncHistory persists the fallback chain best-effort; loss only narrows
-// recovery options, never correctness.
-func syncHistory(path string, hist []*Generation) {
+// syncHistory persists the fallback chain before the manifest is replaced.
+func syncHistory(path string, hist []*Generation) error {
+	return writeHistoryAtomic(path, hist)
+}
+
+func writeHistoryAtomic(path string, hist []*Generation) error {
+	var data []byte
 	if len(hist) == 0 {
-		_ = writeFileSync(path, []byte("[]"))
-		return
+		data = []byte("[]")
+	} else {
+		var err error
+		data, err = json.Marshal(hist)
+		if err != nil {
+			return err
+		}
 	}
-	b, err := json.Marshal(hist)
-	if err != nil {
-		return
+	return writeFileAtomic(path, data)
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := writeFileSync(tmp, data); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
-	_ = writeFileSync(path, b)
+	if err := replaceFile(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("persistent: replace %s: %w", filepath.Base(path), err)
+	}
+	return nil
 }

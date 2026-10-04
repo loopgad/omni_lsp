@@ -15,7 +15,6 @@ type FreshnessTuple struct {
 	BuildContext string `json:"buildContext"`
 	Toolchain    string `json:"toolchain"`
 	BackendVer   string `json:"backendVersion"`
-	Revision     uint64 `json:"revision"`
 }
 
 // freshnessHeaderSz is the length prefix of the embedded JSON tuple.

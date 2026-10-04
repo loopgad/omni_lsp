@@ -41,10 +41,10 @@ func FuzzOpenSnapshotCorruptStore(f *testing.F) {
 func FuzzFreshnessSealVerify(f *testing.F) {
 	f.Add([]byte("payload"), uint32(1))
 	f.Add([]byte{}, uint32(0))
-	f.Fuzz(func(t *testing.T, payload []byte, rev uint32) {
+	f.Fuzz(func(t *testing.T, payload []byte, _ uint32) {
 		tup := FreshnessTuple{
 			SourceHash: "abc", BuildContext: "ctx", Toolchain: "go",
-			BackendVer: "v1", Revision: uint64(rev),
+			BackendVer: "v1",
 		}
 		sealed := SealPayload(payload, tup)
 		_, _ = VerifyPayload(sealed, tup) // must not panic on any sealed input

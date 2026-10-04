@@ -1,0 +1,727 @@
+#include <clang-c/Index.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cstddef>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+static constexpr std::size_t maxEmittedSymbols = 250000;
+
+static std::string take(CXString value) {
+  const char *text = clang_getCString(value);
+  std::string result = text ? text : "";
+  clang_disposeString(value);
+  return result;
+}
+
+static std::string json(const std::string &value) {
+  std::string result;
+  result.reserve(value.size() + 2);
+  result.push_back('"');
+  for (unsigned char c : value) {
+    switch (c) {
+    case '"': result += "\\\""; break;
+    case '\\': result += "\\\\"; break;
+    case '\b': result += "\\b"; break;
+    case '\f': result += "\\f"; break;
+    case '\n': result += "\\n"; break;
+    case '\r': result += "\\r"; break;
+    case '\t': result += "\\t"; break;
+    default:
+      if (c < 0x20) {
+        static const char hex[] = "0123456789abcdef";
+        result += "\\u00";
+        result.push_back(hex[(c >> 4) & 0xf]);
+        result.push_back(hex[c & 0xf]);
+      } else {
+        result.push_back(static_cast<char>(c));
+      }
+    }
+  }
+  result.push_back('"');
+  return result;
+}
+
+static std::string lower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+static std::string slash(std::string value) {
+  std::replace(value.begin(), value.end(), '\\', '/');
+  return value;
+}
+
+static bool relativeToRoot(const std::string &fileName,
+                           const fs::path &root,
+                           std::string &relative) {
+  if (fileName.empty()) return false;
+  std::error_code error;
+  fs::path file = fs::weakly_canonical(fs::path(fileName), error);
+  if (error) file = fs::path(fileName).lexically_normal();
+  fs::path rootPath = root;
+  std::string fileText = slash(file.generic_string());
+  std::string rootText = slash(rootPath.generic_string());
+#ifdef _WIN32
+  fileText = lower(fileText);
+  rootText = lower(rootText);
+#endif
+  if (!rootText.empty() && rootText.back() != '/') rootText.push_back('/');
+  if (fileText.size() <= rootText.size() || fileText.compare(0, rootText.size(), rootText) != 0)
+    return false;
+  relative = slash(fs::path(fileName).lexically_relative(rootPath).generic_string());
+  return !relative.empty() && relative.rfind("../", 0) != 0 && relative != "..";
+}
+
+struct Event {
+  std::string type;
+  std::string usr;
+  std::string target;
+  std::string name;
+  std::string kind;
+  std::string signature;
+  std::string path;
+  std::string targetPath;
+  std::string spellingPath;
+  std::string role;
+  std::string edgeKind;
+  std::string message;
+  unsigned line = 0;
+  unsigned column = 0;
+  unsigned endLine = 0;
+  unsigned endColumn = 0;
+  unsigned severity = 0;
+};
+
+static void emit(const Event &event) {
+  std::cout << "{\"type\":" << json(event.type)
+            << ",\"usr\":" << json(event.usr)
+            << ",\"target\":" << json(event.target)
+            << ",\"name\":" << json(event.name)
+            << ",\"kind\":" << json(event.kind)
+            << ",\"signature\":" << json(event.signature)
+            << ",\"path\":" << json(event.path)
+            << ",\"target_path\":" << json(event.targetPath)
+            << ",\"spelling_path\":" << json(event.spellingPath)
+            << ",\"role\":" << json(event.role)
+            << ",\"edge_kind\":" << json(event.edgeKind)
+            << ",\"message\":" << json(event.message)
+            << ",\"line\":" << event.line
+            << ",\"column\":" << event.column
+            << ",\"end_line\":" << event.endLine
+            << ",\"end_column\":" << event.endColumn
+            << ",\"severity\":" << event.severity << "}\n";
+  std::cout.flush();
+}
+
+static bool location(const fs::path &root, CXSourceLocation loc,
+                     std::string &path, unsigned &line, unsigned &column,
+                     unsigned &offset) {
+  CXFile file = nullptr;
+  clang_getExpansionLocation(loc, &file, &line, &column, &offset);
+  if (!file) return false;
+  return relativeToRoot(take(clang_getFileName(file)), root, path);
+}
+
+static bool spellingLocationPath(const fs::path &root, CXSourceLocation loc,
+                                 std::string &path) {
+  CXFile file = nullptr;
+  clang_getSpellingLocation(loc, &file, nullptr, nullptr, nullptr);
+  if (!file) return false;
+  return relativeToRoot(take(clang_getFileName(file)), root, path);
+}
+
+static bool spellingMatchesExpansion(const fs::path &root,
+                                     CXSourceLocation loc,
+                                     const std::string &expansionPath,
+                                     unsigned expansionLine,
+                                     unsigned expansionColumn) {
+  CXFile file = nullptr;
+  unsigned line = 0, column = 0, offset = 0;
+  clang_getSpellingLocation(loc, &file, &line, &column, &offset);
+  if (!file) return false;
+  std::string path;
+  return relativeToRoot(take(clang_getFileName(file)), root, path) &&
+         path == expansionPath && line == expansionLine &&
+         column == expansionColumn;
+}
+
+static std::string cursorUSR(CXCursor cursor) {
+  return take(clang_getCursorUSR(cursor));
+}
+
+static std::string cursorName(CXCursor cursor) {
+  return take(clang_getCursorSpelling(cursor));
+}
+
+static std::string cursorKind(CXCursor cursor) {
+  return take(clang_getCursorKindSpelling(clang_getCursorKind(cursor)));
+}
+
+static std::string cursorStableID(CXCursor cursor, const fs::path &root) {
+  std::string usr = cursorUSR(cursor);
+  if (!usr.empty()) return usr;
+  std::string path;
+  unsigned line = 0, column = 0, offset = 0;
+  if (!location(root, clang_getCursorLocation(cursor), path, line, column, offset))
+    return {};
+  std::string name = cursorName(cursor);
+  if (clang_getCursorKind(cursor) == CXCursor_MacroDefinition)
+    return path + ":macro:" + name;
+  return path + ":" + std::to_string(line) + ":" +
+         std::to_string(column) + ":" + cursorKind(cursor);
+}
+
+static std::string cursorSignature(CXCursor cursor) {
+  return take(clang_getTypeSpelling(clang_getCursorType(cursor)));
+}
+
+static bool isFunction(CXCursorKind kind) {
+  switch (kind) {
+  case CXCursor_FunctionDecl:
+  case CXCursor_CXXMethod:
+  case CXCursor_Constructor:
+  case CXCursor_Destructor:
+  case CXCursor_ConversionFunction:
+  case CXCursor_FunctionTemplate:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isReference(CXCursorKind kind) {
+  switch (kind) {
+  case CXCursor_DeclRefExpr:
+  case CXCursor_MemberRefExpr:
+  case CXCursor_TypeRef:
+  case CXCursor_TemplateRef:
+  case CXCursor_NamespaceRef:
+  case CXCursor_MemberRef:
+  case CXCursor_LabelRef:
+  case CXCursor_VariableRef:
+  case CXCursor_OverloadedDeclRef:
+  case CXCursor_MacroExpansion:
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct WalkState {
+  fs::path root;
+  CXTranslationUnit translationUnit = nullptr;
+  std::unordered_set<std::string> emittedSymbols;
+  bool symbolsTruncated = false;
+};
+
+static bool referenceOccurrence(const fs::path &root, CXTranslationUnit tu,
+                                CXCursor cursor, CXCursor tokenExtentCursor,
+                                const std::string &path,
+                                unsigned line, unsigned column,
+                                const std::string &usr,
+                                const std::string &name,
+                                const std::string &kind,
+                                const std::string &role, Event &occurrence) {
+  CXSourceLocation cursorLocation = clang_getCursorLocation(cursor);
+  CXToken *cursorToken = clang_getToken(tu, cursorLocation);
+  if (cursorToken) {
+    CXSourceLocation tokenLocation = clang_getTokenLocation(tu, *cursorToken);
+    CXSourceRange tokenRange = clang_getTokenExtent(tu, *cursorToken);
+    CXSourceLocation tokenEnd = clang_getRangeEnd(tokenRange);
+    std::string candidatePath, candidateEndPath;
+    unsigned candidateLine = 0, candidateColumn = 0, candidateOffset = 0;
+    unsigned candidateEndLine = 0, candidateEndColumn = 0, candidateEndOffset = 0;
+    bool hasTokenLocation = location(root, tokenLocation, candidatePath,
+                                     candidateLine, candidateColumn,
+                                     candidateOffset);
+    bool hasTokenEnd = location(root, tokenEnd, candidateEndPath,
+                                candidateEndLine, candidateEndColumn,
+                                candidateEndOffset);
+    bool exactReferenceToken =
+        clang_getTokenKind(*cursorToken) == CXToken_Identifier &&
+        take(clang_getTokenSpelling(tu, *cursorToken)) == name &&
+        hasTokenLocation && hasTokenEnd && candidatePath == candidateEndPath &&
+        candidatePath == path && candidateLine == line &&
+        candidateColumn == column && candidateOffset < candidateEndOffset &&
+        (candidateEndLine > candidateLine ||
+         (candidateEndLine == candidateLine &&
+          candidateEndColumn > candidateColumn)) &&
+        (clang_getCursorKind(cursor) == CXCursor_MacroExpansion ||
+         spellingMatchesExpansion(root, tokenLocation, candidatePath,
+                                  candidateLine, candidateColumn));
+    if (exactReferenceToken) {
+      occurrence.type = "occurrence";
+      occurrence.usr = usr;
+      occurrence.name = name;
+      occurrence.kind = kind;
+      occurrence.path = candidatePath;
+      occurrence.line = candidateLine;
+      occurrence.column = candidateColumn;
+      occurrence.endLine = candidateEndLine;
+      occurrence.endColumn = candidateEndColumn;
+      occurrence.role = role;
+      if (clang_getCursorKind(cursor) == CXCursor_MacroExpansion)
+        spellingLocationPath(root, tokenLocation, occurrence.spellingPath);
+      clang_disposeTokens(tu, cursorToken, 1);
+      return true;
+    }
+    clang_disposeTokens(tu, cursorToken, 1);
+  }
+
+  CXSourceRange cursorExtent = clang_getCursorExtent(tokenExtentCursor);
+  CXToken *tokens = nullptr;
+  unsigned tokenCount = 0;
+  clang_tokenize(tu, cursorExtent, &tokens, &tokenCount);
+
+  bool found = false;
+  CXSourceLocation matchedLocation = clang_getNullLocation();
+  std::string tokenPath;
+  unsigned tokenLine = 0, tokenColumn = 0;
+  unsigned tokenEndLine = 0, tokenEndColumn = 0;
+  for (unsigned i = 0; i < tokenCount; ++i) {
+    CXToken token = tokens[i];
+    if (clang_getTokenKind(token) != CXToken_Identifier ||
+        take(clang_getTokenSpelling(tu, token)) != name)
+      continue;
+
+    CXSourceLocation tokenLocation = clang_getTokenLocation(tu, token);
+    CXSourceRange tokenRange = clang_getTokenExtent(tu, token);
+    CXSourceLocation tokenEnd = clang_getRangeEnd(tokenRange);
+    std::string candidatePath, candidateEndPath;
+    unsigned candidateLine = 0, candidateColumn = 0, candidateOffset = 0;
+    unsigned candidateEndLine = 0, candidateEndColumn = 0, candidateEndOffset = 0;
+    bool hasTokenLocation = location(root, tokenLocation, candidatePath,
+                                     candidateLine, candidateColumn,
+                                     candidateOffset);
+    bool hasTokenEnd = location(root, tokenEnd, candidateEndPath,
+                                candidateEndLine, candidateEndColumn,
+                                candidateEndOffset);
+    bool exactReferenceToken =
+        hasTokenLocation && hasTokenEnd && candidatePath == candidateEndPath &&
+        candidatePath == path && candidateOffset < candidateEndOffset &&
+        (candidateEndLine > candidateLine ||
+         (candidateEndLine == candidateLine &&
+          candidateEndColumn > candidateColumn)) &&
+        (clang_getCursorKind(cursor) == CXCursor_MacroExpansion ||
+         spellingMatchesExpansion(root, tokenLocation, candidatePath,
+                                  candidateLine, candidateColumn));
+    if (!exactReferenceToken || found) {
+      found = false;
+      break;
+    }
+    found = true;
+    matchedLocation = tokenLocation;
+    tokenPath = candidatePath;
+    tokenLine = candidateLine;
+    tokenColumn = candidateColumn;
+    tokenEndLine = candidateEndLine;
+    tokenEndColumn = candidateEndColumn;
+  }
+  if (tokens) clang_disposeTokens(tu, tokens, tokenCount);
+  if (!found) return false;
+
+  occurrence.type = "occurrence";
+  occurrence.usr = usr;
+  occurrence.name = name;
+  occurrence.kind = kind;
+  occurrence.path = tokenPath;
+  occurrence.line = tokenLine;
+  occurrence.column = tokenColumn;
+  occurrence.endLine = tokenEndLine;
+  occurrence.endColumn = tokenEndColumn;
+  occurrence.role = role;
+  if (clang_getCursorKind(cursor) == CXCursor_MacroExpansion)
+    spellingLocationPath(root, matchedLocation, occurrence.spellingPath);
+  return true;
+}
+
+static void emitIncompleteReference(const std::string &reason) {
+  Event incomplete;
+  incomplete.type = "incomplete";
+  incomplete.message = reason;
+  emit(incomplete);
+}
+
+static void emitIncompleteCall(const std::string &reason) {
+  Event incomplete;
+  incomplete.type = "incomplete_call";
+  incomplete.message = reason;
+  emit(incomplete);
+}
+
+static void emitIncompleteTypeRelation(const std::string &reason) {
+  Event incomplete;
+  incomplete.type = "incomplete_type_relation";
+  incomplete.message = reason;
+  emit(incomplete);
+}
+
+static void emitIncompleteImplementation(const std::string &reason) {
+  Event incomplete;
+  incomplete.type = "incomplete_implementation";
+  incomplete.message = reason;
+  emit(incomplete);
+}
+
+static void walk(CXCursor cursor, CXCursor currentFunction, CXCursor parent,
+                 WalkState &state);
+
+struct ChildState {
+  WalkState *walk = nullptr;
+  CXCursor function = clang_getNullCursor();
+  CXCursor parent = clang_getNullCursor();
+};
+
+static enum CXChildVisitResult childVisitor(CXCursor child, CXCursor,
+                                             CXClientData opaque) {
+  auto *state = static_cast<ChildState *>(opaque);
+  walk(child, state->function, state->parent, *state->walk);
+  return CXChildVisit_Continue;
+}
+
+static void walk(CXCursor cursor, CXCursor currentFunction, CXCursor parent,
+                 WalkState &state) {
+  CXCursorKind kind = clang_getCursorKind(cursor);
+  if (isFunction(kind)) currentFunction = cursor;
+
+  std::string path;
+  unsigned line = 0, column = 0, offset = 0;
+  bool inWorkspace = location(state.root, clang_getCursorLocation(cursor), path,
+                               line, column, offset);
+  std::string usr = cursorStableID(cursor, state.root);
+
+  if (inWorkspace && clang_isDeclaration(kind) && kind != CXCursor_TranslationUnit) {
+    std::string key = usr;
+    if (key.empty()) key = path + ":" + std::to_string(line) + ":" +
+                           std::to_string(column) + ":" + cursorKind(cursor);
+    bool emitSymbol = false;
+    if (state.emittedSymbols.find(key) == state.emittedSymbols.end()) {
+      if (state.emittedSymbols.size() >= maxEmittedSymbols) {
+        if (!state.symbolsTruncated) {
+          Event truncated;
+          truncated.type = "truncated";
+          truncated.message = "per-translation-unit symbol deduplication limit reached";
+          emit(truncated);
+          state.symbolsTruncated = true;
+        }
+      } else {
+        state.emittedSymbols.insert(key);
+        emitSymbol = true;
+      }
+    }
+    if (emitSymbol) {
+      Event symbol;
+      symbol.type = "symbol";
+      symbol.usr = key;
+      symbol.name = cursorName(cursor);
+      symbol.kind = cursorKind(cursor);
+      symbol.signature = cursorSignature(cursor);
+      symbol.path = path;
+      symbol.line = line;
+      symbol.column = column;
+      emit(symbol);
+    }
+    Event occurrence;
+    occurrence.type = "occurrence";
+    occurrence.usr = usr.empty() ? key : usr;
+    occurrence.name = cursorName(cursor);
+    occurrence.kind = cursorKind(cursor);
+    occurrence.path = path;
+    occurrence.line = line;
+    occurrence.column = column;
+    clang_getExpansionLocation(clang_getRangeEnd(clang_getCursorExtent(cursor)),
+                               nullptr, &occurrence.endLine,
+                               &occurrence.endColumn, nullptr);
+    occurrence.role = "declaration";
+    emit(occurrence);
+    if (clang_isCursorDefinition(cursor)) {
+      occurrence.role = "definition";
+      emit(occurrence);
+    }
+  }
+
+  if (kind == CXCursor_MacroDefinition && inWorkspace) {
+    Event macro;
+    macro.type = "symbol";
+    macro.usr = usr.empty() ? path + ":macro:" + cursorName(cursor) : usr;
+    macro.name = cursorName(cursor);
+    macro.kind = "MacroDefinition";
+    macro.path = path;
+    macro.line = line;
+    macro.column = column;
+    emit(macro);
+    Event occurrence;
+    occurrence.type = "occurrence";
+    occurrence.usr = macro.usr;
+    occurrence.name = macro.name;
+    occurrence.kind = macro.kind;
+    occurrence.path = path;
+    occurrence.line = line;
+    occurrence.column = column;
+    occurrence.role = "declaration";
+    emit(occurrence);
+    occurrence.role = "definition";
+    emit(occurrence);
+  }
+
+  if (inWorkspace && isReference(kind)) {
+    CXCursor target = clang_getCursorReferenced(cursor);
+    std::string targetUSR = cursorStableID(target, state.root);
+    if (targetUSR.empty()) {
+      emitIncompleteReference("reference target has no stable semantic identity");
+    } else {
+      Event occurrence;
+      const std::string role =
+          kind == CXCursor_MacroExpansion ? "macro_expansion" : "reference";
+      if (referenceOccurrence(state.root, state.translationUnit, cursor, cursor,
+                              path,
+                              line, column, targetUSR, cursorName(target),
+                              cursorKind(target), role, occurrence)) {
+        emit(occurrence);
+      } else {
+        emitIncompleteReference("reference has no exact source token mapping");
+      }
+      std::string targetPath;
+      unsigned targetLine = 0, targetColumn = 0, targetOffset = 0;
+      if (!location(state.root, clang_getCursorLocation(target), targetPath,
+                    targetLine, targetColumn, targetOffset)) {
+        Event external;
+        external.type = "external";
+        external.path = path;
+        external.usr = targetUSR;
+        emit(external);
+      }
+    }
+  }
+
+  if (inWorkspace && kind == CXCursor_CallExpr) {
+    CXCursor target = clang_getCursorReferenced(cursor);
+    std::string from = cursorStableID(currentFunction, state.root);
+    std::string to = cursorStableID(target, state.root);
+    unsigned callLine = line, callColumn = column;
+    unsigned callEndLine = 0, callEndColumn = 0;
+    if (clang_getCursorKind(target) == CXCursor_Constructor) {
+      if (to.empty()) {
+        emitIncompleteCall("constructor call target has no stable semantic identity");
+      } else {
+        Event occurrence;
+        if (referenceOccurrence(state.root, state.translationUnit, cursor, parent,
+                                path, line, column, to, cursorName(target),
+                                cursorKind(target), "reference", occurrence)) {
+          emit(occurrence);
+          callLine = occurrence.line;
+          callColumn = occurrence.column;
+          callEndLine = occurrence.endLine;
+          callEndColumn = occurrence.endColumn;
+        } else {
+          emitIncompleteCall(
+              "constructor call has no exact source token mapping");
+        }
+      }
+      if (from.empty() && !to.empty())
+        emitIncompleteCall("constructor call has no stable caller identity");
+    } else if (from.empty() || to.empty()) {
+      emitIncompleteCall("call edge has no stable caller or target identity");
+    }
+    if (!from.empty() && !to.empty()) {
+      Event edge;
+      edge.type = "edge";
+      edge.usr = from;
+      edge.target = to;
+      edge.edgeKind = "call";
+      edge.path = path;
+      edge.line = callLine;
+      edge.column = callColumn;
+      edge.endLine = callEndLine;
+      edge.endColumn = callEndColumn;
+      emit(edge);
+    }
+  }
+
+  if (inWorkspace && (kind == CXCursor_TypeRef || kind == CXCursor_CXXBaseSpecifier)) {
+    CXCursor target = clang_getCursorReferenced(cursor);
+    if (kind == CXCursor_CXXBaseSpecifier) {
+      target = clang_getTypeDeclaration(clang_getCursorType(cursor));
+      if (clang_Cursor_isNull(target)) target = clang_getCursorReferenced(cursor);
+    }
+    CXCursor owner = kind == CXCursor_CXXBaseSpecifier
+                         ? parent
+                         : clang_getCursorSemanticParent(cursor);
+    if (kind == CXCursor_TypeRef &&
+        (clang_Cursor_isNull(owner) ||
+         clang_getCursorKind(owner) == CXCursor_InvalidFile ||
+         clang_getCursorKind(owner) == CXCursor_TranslationUnit)) {
+      // libclang can omit the semantic parent for C type references. Use the
+      // containing declaration when available, then the enclosing function.
+      CXCursorKind parentKind = clang_getCursorKind(parent);
+      owner = clang_isDeclaration(parentKind) ? parent : currentFunction;
+    }
+    std::string from = cursorStableID(owner, state.root);
+    std::string to = cursorStableID(target, state.root);
+    if (from.empty() || to.empty()) {
+      emitIncompleteTypeRelation(
+          "type relation has no stable owner or target identity");
+    } else {
+      Event edge;
+      edge.type = "edge";
+      edge.usr = from;
+      edge.target = to;
+      edge.edgeKind = "type_relation";
+      edge.path = path;
+      edge.line = line;
+      edge.column = column;
+      emit(edge);
+    }
+  }
+
+  if (inWorkspace && kind == CXCursor_ModuleImportDecl) {
+    Event unresolved;
+    unresolved.type = "unresolved_module";
+    unresolved.path = path;
+    unresolved.line = line;
+    unresolved.column = column;
+    unresolved.message =
+        "libclang reports a module import without an attested immutable source or PCM identity; no module edge was exported";
+    emit(unresolved);
+  }
+
+  if (inWorkspace && (kind == CXCursor_CXXMethod || kind == CXCursor_ConversionFunction)) {
+    CXCursor *overridden = nullptr;
+    unsigned count = 0;
+    clang_getOverriddenCursors(cursor, &overridden, &count);
+    for (unsigned i = 0; i < count; ++i) {
+      std::string target = cursorStableID(overridden[i], state.root);
+      if (usr.empty() || target.empty()) {
+        emitIncompleteImplementation(
+            "override relation has no stable source or target identity");
+        continue;
+      }
+      Event edge;
+      edge.type = "edge";
+      edge.usr = usr;
+      edge.target = target;
+      edge.edgeKind = "implementation";
+      edge.path = path;
+      edge.line = line;
+      edge.column = column;
+      emit(edge);
+    }
+    clang_disposeOverriddenCursors(overridden);
+  }
+
+  ChildState childState{&state, currentFunction, cursor};
+  clang_visitChildren(cursor, childVisitor, &childState);
+}
+
+struct IncludeState {
+  fs::path root;
+};
+
+static void inclusionVisitor(CXFile includedFile, CXSourceLocation *stack,
+                             unsigned length, CXClientData opaque) {
+  if (length == 0) return;
+  auto *state = static_cast<IncludeState *>(opaque);
+  CXFile includingFile = nullptr;
+  unsigned line = 0, column = 0, offset = 0;
+  clang_getExpansionLocation(stack[length - 1], &includingFile, &line, &column,
+                             &offset);
+  if (!includingFile) return;
+  std::string sourcePath, targetPath;
+  if (!relativeToRoot(take(clang_getFileName(includingFile)), state->root,
+                      sourcePath))
+    return;
+  Event edge;
+  edge.type = "include";
+  edge.path = sourcePath;
+  edge.targetPath = relativeToRoot(take(clang_getFileName(includedFile)),
+                                   state->root, targetPath)
+                        ? targetPath
+                        : "";
+  edge.line = line;
+  edge.column = column;
+  edge.endLine = line;
+  edge.endColumn = column;
+  emit(edge);
+}
+
+static int parseArgs(int argc, char **argv, fs::path &root,
+                     std::string &source, std::vector<const char *> &arguments) {
+  int separator = -1;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--") { separator = i; break; }
+    if (std::string(argv[i]) == "--root" && i + 1 < argc) root = argv[++i];
+    else if (std::string(argv[i]) == "--source" && i + 1 < argc) source = argv[++i];
+  }
+  if (separator < 0 || root.empty() || source.empty()) return 2;
+  for (int i = separator + 1; i < argc; ++i) arguments.push_back(argv[i]);
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc == 2 && std::string(argv[1]) == "--version") {
+    std::cout << "omnilsp-clang-helper/3\n" << take(clang_getClangVersion()) << "\n";
+    return 0;
+  }
+
+  fs::path root;
+  std::string source;
+  std::vector<const char *> arguments;
+  if (parseArgs(argc, argv, root, source, arguments) != 0) {
+    std::cerr << "usage: helper --root PATH --source PATH -- [clang arguments]\n";
+    return 2;
+  }
+  std::error_code pathError;
+  root = fs::weakly_canonical(root, pathError);
+  CXIndex index = clang_createIndex(0, 0);
+  CXTranslationUnit translationUnit = nullptr;
+  CXErrorCode result = clang_parseTranslationUnit2(
+      index, source.c_str(), arguments.empty() ? nullptr : arguments.data(),
+      static_cast<int>(arguments.size()), nullptr, 0,
+      CXTranslationUnit_DetailedPreprocessingRecord | CXTranslationUnit_KeepGoing,
+      &translationUnit);
+  if (result != CXError_Success || !translationUnit) {
+    Event failure;
+    failure.type = "fatal";
+    failure.message = "libclang could not parse translation unit (error " +
+                      std::to_string(static_cast<int>(result)) + ")";
+    emit(failure);
+    if (translationUnit) clang_disposeTranslationUnit(translationUnit);
+    clang_disposeIndex(index);
+    return 1;
+  }
+
+  unsigned diagnosticCount = clang_getNumDiagnostics(translationUnit);
+  for (unsigned i = 0; i < diagnosticCount; ++i) {
+    CXDiagnostic diagnostic = clang_getDiagnostic(translationUnit, i);
+    CXDiagnosticSeverity severity = clang_getDiagnosticSeverity(diagnostic);
+    if (severity >= CXDiagnostic_Error) {
+      Event event;
+      event.type = "diagnostic";
+      event.severity = static_cast<unsigned>(severity);
+      event.message = take(clang_getDiagnosticSpelling(diagnostic));
+      emit(event);
+    }
+    clang_disposeDiagnostic(diagnostic);
+  }
+
+  WalkState state;
+  state.root = root;
+  state.translationUnit = translationUnit;
+  walk(clang_getTranslationUnitCursor(translationUnit), clang_getNullCursor(),
+       clang_getNullCursor(), state);
+  IncludeState includeState{root};
+  clang_getInclusions(translationUnit, inclusionVisitor, &includeState);
+
+  clang_disposeTranslationUnit(translationUnit);
+  clang_disposeIndex(index);
+  return 0;
+}

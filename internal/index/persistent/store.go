@@ -19,6 +19,11 @@ var ErrDiskBudgetExceeded = errors.New("persistent: disk budget exceeded")
 // ErrNoGeneration reports that no verified generation could be recovered.
 var ErrNoGeneration = errors.New("persistent: no usable generation")
 
+var (
+	ErrBuildAborted   = errors.New("persistent: build aborted")
+	ErrBuildCommitted = errors.New("persistent: build already committed")
+)
+
 // SegmentRef locates one segment inside the committed generation.
 type SegmentRef struct {
 	ID  SegmentID `json:"id"`
@@ -85,8 +90,18 @@ type IndexStore interface {
 	Compact(ctx context.Context) error
 }
 
+// LeasedIndexStore is an optional capability for readers that need their
+// generation's segments to remain on disk for the lifetime of a replay.
+// Callers must close each returned lease after the last segment read.
+type LeasedIndexStore interface {
+	OpenSnapshotLease(ctx context.Context) (*GenerationLease, error)
+}
+
 // BuildSession stages segments for the next generation (TXN-002).
 type BuildSession interface {
+	// GenerationID is assigned durably when the session is reserved. It is
+	// published only if Commit succeeds.
+	GenerationID() uint64
 	WriteSegment(payload []byte) (SegmentID, error)
 	Commit(ctx context.Context) error
 	Abort() error
@@ -129,6 +144,7 @@ func NewFileStore(root string, cfg Config) (*FileStore, error) {
 	if err := s.recover(); err != nil && !errors.Is(err, ErrNoGeneration) {
 		return nil, err
 	}
+	s.cleanupOrphanSegments()
 	return s, nil
 }
 
@@ -157,7 +173,35 @@ func (s *FileStore) OpenSnapshot(ctx context.Context) (GenerationView, error) {
 	if err != nil {
 		return GenerationView{}, err
 	}
+	s.cleanupOrphanSegments()
 	return s.openSnapshotWithWriterLock(ctx)
+}
+
+// OpenSnapshotLease opens and pins the current verified generation. The
+// returned lease prevents compaction in this or another process from deleting
+// its segment files until Close is called.
+func (s *FileStore) OpenSnapshotLease(ctx context.Context) (*GenerationLease, error) {
+	writerLock, err := acquireWriterLock(ctx, s.root)
+	if err != nil {
+		return nil, err
+	}
+	defer writerLock.release()
+	s.mu.Lock()
+	err = s.recover()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	s.cleanupOrphanSegments()
+	view, err := s.openSnapshotWithWriterLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	leaseLock, err := acquireGenerationLock(ctx, s.root, view.ID, false, true)
+	if err != nil {
+		return nil, err
+	}
+	return &GenerationLease{view: view, lock: leaseLock, store: s}, nil
 }
 
 func (s *FileStore) openSnapshotWithWriterLock(ctx context.Context) (GenerationView, error) {
@@ -207,24 +251,36 @@ func (s *FileStore) BeginBuild(ctx context.Context) (BuildSession, error) {
 }
 
 func (s *FileStore) beginBuildWithWriterLock(ctx context.Context, writerLock *writerLock) (BuildSession, error) {
+	defer writerLock.release()
 	if err := ctx.Err(); err != nil {
-		writerLock.release()
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.recover(); err != nil {
-		writerLock.release()
 		return nil, err
 	}
-	s.nextGenID++
-	genID := s.nextGenID
+	seqID, exists, err := readGenerationSequence(s.root)
+	if err != nil {
+		return nil, err
+	}
+	if exists && seqID > s.nextGenID {
+		s.nextGenID = seqID
+	}
+	if s.nextGenID == ^uint64(0) {
+		return nil, fmt.Errorf("persistent: generation ID space exhausted")
+	}
+	genID := s.nextGenID + 1
 	stage := filepath.Join(s.root, fmt.Sprintf("staging-%d", genID))
-	if err := os.MkdirAll(stage, 0o755); err != nil {
-		writerLock.release()
+	if err := os.Mkdir(stage, 0o755); err != nil {
 		return nil, fmt.Errorf("persistent: staging: %w", err)
 	}
-	return &fileBuild{store: s, genID: genID, stageDir: stage, writerLock: writerLock}, nil
+	if err := writeGenerationSequence(s.root, genID); err != nil {
+		_ = os.RemoveAll(stage)
+		return nil, fmt.Errorf("persistent: reserve generation %d: %w", genID, err)
+	}
+	s.nextGenID = genID
+	return &fileBuild{store: s, genID: genID, stageDir: stage}, nil
 }
 
 // Quarantine moves suspect segments out of the readable path with evidence

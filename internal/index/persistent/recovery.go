@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -111,7 +112,98 @@ func (s *FileStore) recover() error {
 			s.nextGenID = gen.ID
 		}
 	}
+	if seq, exists, err := readGenerationSequence(s.root); err == nil && exists && seq > s.nextGenID {
+		s.nextGenID = seq
+	}
+	if staged, err := stagingHighWater(s.root); err == nil && staged > s.nextGenID {
+		s.nextGenID = staged
+	}
 	return nil
+}
+
+func readGenerationSequence(root string) (uint64, bool, error) {
+	path := filepath.Join(root, fileGenSeq)
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	value := strings.TrimSpace(string(raw))
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || id == 0 || strconv.FormatUint(id, 10) != value {
+		return 0, true, fmt.Errorf("persistent: invalid generation sequence %q", value)
+	}
+	return id, true, nil
+}
+
+func writeGenerationSequence(root string, id uint64) error {
+	return writeFileAtomic(filepath.Join(root, fileGenSeq), []byte(strconv.FormatUint(id, 10)+"\n"))
+}
+
+func stagingHighWater(root string) (uint64, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, err
+	}
+	var high uint64
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "staging-") {
+			continue
+		}
+		text := strings.TrimPrefix(entry.Name(), "staging-")
+		id, err := strconv.ParseUint(text, 10, 64)
+		if err == nil && id > high && strconv.FormatUint(id, 10) == text {
+			high = id
+		}
+	}
+	return high, nil
+}
+
+func (s *FileStore) cleanupOrphanSegments() {
+	s.mu.Lock()
+	referenced := make(map[SegmentID]bool)
+	if s.current != nil {
+		for _, seg := range s.current.Segments {
+			referenced[seg.ID] = true
+		}
+	}
+	for _, gen := range s.history {
+		for _, seg := range gen.Segments {
+			referenced[seg.ID] = true
+		}
+	}
+	s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return
+	}
+	retired := make(map[uint64]*Generation)
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), "seg-") || !strings.HasSuffix(entry.Name(), ".bin") {
+			continue
+		}
+		id := SegmentID(strings.TrimSuffix(strings.TrimPrefix(entry.Name(), "seg-"), ".bin"))
+		if referenced[id] || !validSegmentID(id) {
+			continue
+		}
+		separator := strings.IndexByte(string(id), '-')
+		genID, err := strconv.ParseUint(string(id[:separator]), 10, 64)
+		if err != nil {
+			continue
+		}
+		gen := retired[genID]
+		if gen == nil {
+			gen = &Generation{ID: genID}
+			retired[genID] = gen
+		}
+		gen.Segments = append(gen.Segments, SegmentRef{ID: id})
+	}
+	for _, gen := range retired {
+		_ = s.removeGenerationSegments(gen)
+	}
 }
 
 func (s *FileStore) readQuarantined() []SegmentID {
@@ -164,8 +256,9 @@ func SplitMerged(merged []byte) [][]byte {
 	return out
 }
 
-// Compact merges the current generation into one fresh segment, then removes
-// that generation from fallback history before retiring its old files (§L16).
+// Compact merges a pinned snapshot into one fresh segment. It holds the
+// cross-process writer lock only while opening the snapshot, reserving the new
+// generation, publishing it, and pruning history.
 func (s *FileStore) Compact(ctx context.Context) error {
 	writerLock, err := acquireWriterLock(ctx, s.root)
 	if err != nil {
@@ -178,20 +271,23 @@ func (s *FileStore) Compact(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.cleanupOrphanSegments()
 	view, err := s.openSnapshotWithWriterLock(ctx)
 	if err != nil {
 		return err
 	}
-	build, err := s.beginBuildWithWriterLock(ctx, writerLock)
+	leaseLock, err := acquireGenerationLock(ctx, s.root, view.ID, false, true)
 	if err != nil {
 		return err
 	}
-	fileBuild, ok := build.(*fileBuild)
-	if !ok {
-		_ = build.Abort()
-		return fmt.Errorf("persistent: unexpected build session type %T", build)
+	lease := &GenerationLease{view: view, lock: leaseLock, store: s}
+	build, err := s.beginBuildWithWriterLock(ctx, writerLock)
+	if err != nil {
+		_ = lease.Close()
+		return err
 	}
-	oldSegs := make([]SegmentID, 0, len(view.Segments))
+	defer lease.Close()
+	view = lease.Snapshot()
 	var merged []byte
 	for _, seg := range view.Segments {
 		payload, err := view.ReadSegment(seg.ID)
@@ -199,51 +295,51 @@ func (s *FileStore) Compact(ctx context.Context) error {
 			build.Abort()
 			return err
 		}
-		oldSegs = append(oldSegs, seg.ID)
 		merged = mergeAppend(merged, payload)
 	}
 	if _, err := build.WriteSegment(merged); err != nil {
-		build.Abort()
+		_ = build.Abort()
 		return err
 	}
-	if err := fileBuild.commit(ctx); err != nil {
-		build.Abort()
+	if err := build.Commit(ctx); err != nil {
+		_ = build.Abort()
 		return err
 	}
+	_ = lease.Close()
 	// The previous generation is retained in history for fallback. Retire it
 	// from that chain durably before deleting its segments; older fallbacks stay.
-	s.pruneHistoryGeneration(view.ID, oldSegs)
-	return nil
+	return s.pruneHistoryGeneration(view.ID)
 }
 
-func (s *FileStore) pruneHistoryGeneration(genID uint64, segments []SegmentID) {
+func (s *FileStore) pruneHistoryGeneration(genID uint64) error {
+	writerLock, err := acquireWriterLock(context.Background(), s.root)
+	if err != nil {
+		return err
+	}
+	defer writerLock.release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.recover(); err != nil {
+		return err
+	}
+	if s.current != nil && s.current.ID == genID {
+		return fmt.Errorf("persistent: refusing to prune current generation %d", genID)
+	}
 	kept := make([]*Generation, 0, len(s.history))
+	var retired *Generation
 	for _, gen := range s.history {
-		if gen.ID != genID {
+		if gen.ID == genID {
+			retired = gen
+		} else {
 			kept = append(kept, gen)
 		}
 	}
-	if len(kept) == len(s.history) {
-		return
+	if retired == nil {
+		return nil
 	}
-	b, err := json.Marshal(kept)
-	if err != nil {
-		return
-	}
-	path := s.historyPath()
-	if err := writeFileSync(path+".tmp", b); err != nil {
-		_ = os.Remove(path + ".tmp")
-		return
-	}
-	_ = os.Remove(path) // Windows cannot replace an existing file with Rename.
-	if err := os.Rename(path+".tmp", path); err != nil {
-		_ = os.Remove(path + ".tmp")
-		return
+	if err := writeHistoryAtomic(s.historyPath(), kept); err != nil {
+		return fmt.Errorf("persistent: prune recovery history: %w", err)
 	}
 	s.history = kept
-	for _, id := range segments {
-		_ = os.Remove(filepath.Join(s.root, segFileName(id)))
-	}
+	return s.removeGenerationSegments(retired)
 }
