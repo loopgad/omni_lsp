@@ -1,0 +1,839 @@
+package typescript
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/omnilsp/omni/internal/identity"
+	"github.com/omnilsp/omni/internal/index/model"
+)
+
+type semanticTestView struct {
+	id      model.Identity
+	files   map[string][]model.File
+	content map[string][]byte
+}
+
+type borrowedSemanticTestView struct {
+	*semanticTestView
+	rootPath string
+}
+
+func (v borrowedSemanticTestView) Materialize(ctx context.Context, rootURI, _ string) (model.MaterializedView, error) {
+	return v.semanticTestView.Materialize(ctx, rootURI, v.rootPath)
+}
+
+func (v *semanticTestView) Identity() model.Identity { return v.id }
+
+func (v *semanticTestView) Walk(ctx context.Context, root string, visit func(model.File) error) error {
+	files := append([]model.File(nil), v.files[root]...)
+	sort.Slice(files, func(i, j int) bool { return files[i].URI < files[j].URI })
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := visit(file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (v *semanticTestView) Read(ctx context.Context, uri string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	content, ok := v.content[uri]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(content)), nil
+}
+
+func (v *semanticTestView) Materialize(ctx context.Context, rootURI, destination string) (model.MaterializedView, error) {
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		return nil, err
+	}
+	root, err := url.Parse(rootURI)
+	if err != nil {
+		return nil, err
+	}
+	paths := make(map[string]string, len(v.files[rootURI]))
+	for _, file := range v.files[rootURI] {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		parsed, err := url.Parse(file.URI)
+		if err != nil {
+			return nil, err
+		}
+		relative, err := filepath.Rel(filepath.FromSlash(root.Path), filepath.FromSlash(parsed.Path))
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("file outside root: %s", file.URI)
+		}
+		localPath := filepath.Join(destination, relative)
+		if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(localPath, v.content[file.URI], 0o600); err != nil {
+			return nil, err
+		}
+		paths[file.URI] = localPath
+	}
+	return semanticTestMaterialized{rootURI: rootURI, rootPath: destination, paths: paths}, nil
+}
+
+type semanticTestMaterialized struct {
+	rootURI, rootPath string
+	paths             map[string]string
+}
+
+func (v semanticTestMaterialized) RootURI() string  { return v.rootURI }
+func (v semanticTestMaterialized) RootPath() string { return v.rootPath }
+func (v semanticTestMaterialized) Close() error     { return nil }
+func (v semanticTestMaterialized) PathForURI(uri string) (string, error) {
+	path, ok := v.paths[uri]
+	if !ok {
+		return "", os.ErrNotExist
+	}
+	return path, nil
+}
+
+type semanticTestRunner struct {
+	batches        []SCIPBatch
+	batchesByScope map[string][]SCIPBatch
+	coverage       []model.Coverage
+	verifyErr      error
+	exportErr      error
+	cancel         context.CancelFunc
+	projectScopes  map[string][]model.Scope
+	verifyCall     int
+	exportCall     int
+}
+
+func (r *semanticTestRunner) VerifyTools(_ context.Context, request SCIPRequest) ([]model.ToolIdentity, error) {
+	r.verifyCall++
+	if r.verifyErr != nil {
+		return nil, r.verifyErr
+	}
+	if request.Materialized == nil || request.Materialized.RootPath() == "" {
+		return nil, errors.New("missing materialized view")
+	}
+	return append([]model.ToolIdentity(nil), request.Tools...), nil
+}
+
+func (r *semanticTestRunner) ExportSCIP(ctx context.Context, request SCIPRequest, emit func(SCIPBatch) error) (SCIPResult, error) {
+	r.exportCall++
+	if r.projectScopes == nil {
+		r.projectScopes = make(map[string][]model.Scope)
+	}
+	r.projectScopes[request.Scope.ID] = append([]model.Scope(nil), request.ProjectScopes...)
+	if r.exportErr != nil {
+		return SCIPResult{}, r.exportErr
+	}
+	batches := r.batches
+	if scoped, ok := r.batchesByScope[request.Scope.ID]; ok {
+		batches = scoped
+	}
+	for _, batch := range batches {
+		if err := emit(batch); err != nil {
+			return SCIPResult{}, err
+		}
+	}
+	if r.cancel != nil {
+		r.cancel()
+		if err := ctx.Err(); err != nil {
+			return SCIPResult{}, err
+		}
+	}
+	coverage := append([]model.Coverage(nil), r.coverage...)
+	for i := range coverage {
+		coverage[i].ScopeID = request.Scope.ID
+	}
+	return SCIPResult{Coverage: coverage}, nil
+}
+
+type semanticTestSink struct {
+	symbols     []model.Symbol
+	occurrences []model.Occurrence
+	edges       []model.Edge
+	maxBatch    int
+}
+
+func (s *semanticTestSink) WriteSymbols(_ context.Context, values []model.Symbol) error {
+	s.maxBatch = max(s.maxBatch, len(values))
+	s.symbols = append(s.symbols, values...)
+	return nil
+}
+func (s *semanticTestSink) WriteOccurrences(_ context.Context, values []model.Occurrence) error {
+	s.maxBatch = max(s.maxBatch, len(values))
+	s.occurrences = append(s.occurrences, values...)
+	return nil
+}
+func (s *semanticTestSink) WriteEdges(_ context.Context, values []model.Edge) error {
+	s.maxBatch = max(s.maxBatch, len(values))
+	s.edges = append(s.edges, values...)
+	return nil
+}
+
+func TestSemanticIndexTypeScriptSCIPFixturePreservesFactsAndSnapshotLocations(t *testing.T) {
+	root := "file:///repo/typescript"
+	baseURI := root + "/pkg/base.ts"
+	useURI := root + "/pkg/use.ts"
+	generatedURI := root + "/generated/api.ts"
+	baseContent := []byte("export interface Base { run(): void; }\r\n")
+	useContent := []byte("import { Base } from './base';\r\nclass Child implements Base {\r\n  call(x: Base) { return x.run(); }\r\n}\r\n")
+	generatedContent := []byte("export class Generated extends Base {}\r\n")
+	baseFile := semanticFile(baseURI, "typescript", baseContent)
+	useFile := semanticFile(useURI, "typescript", useContent)
+	generatedFile := semanticFile(generatedURI, "typescript", generatedContent)
+	generatedFile.Generated = true
+	generatedFile.SourceURI = useURI
+	generatedFile.SourceMap = []model.SourceMapSpan{{
+		Generated: model.Position{StartLine: 0, StartChar: 31, EndLine: 0, EndChar: 35},
+		SourceURI: useURI,
+		Source:    model.Position{StartLine: 1, StartChar: 23, EndLine: 1, EndChar: 27},
+	}}
+	view := &semanticTestView{
+		id:    model.Identity{Workspace: "ts-fixture", DiskDigest: "sha256:fixture", SnapshotRev: 17},
+		files: map[string][]model.File{root: {baseFile, useFile, generatedFile}},
+		content: map[string][]byte{
+			baseURI: baseContent, useURI: useContent, generatedURI: generatedContent,
+		},
+	}
+	scope, provenance := typescriptScope(root, "pkg", view.id, semanticTools(t))
+	coverage := completeCoverage(scope.ID)
+	runner := &semanticTestRunner{
+		coverage: coverage,
+		batches: []SCIPBatch{{
+			Symbols: []model.Symbol{
+				{ID: "scip-typescript Base", Name: "Base", Kind: "class"},
+				{ID: "scip-typescript Child", Name: "Child", Kind: "class"},
+				{ID: "scip-typescript call", Name: "call", Kind: "method"},
+				{ID: "scip-typescript run", Name: "run", Kind: "method"},
+				{ID: "scip-typescript pkg", Name: "./base", Kind: "module"},
+			},
+			Occurrences: []model.Occurrence{
+				{SymbolID: "scip-typescript Base", URI: baseURI, Range: model.Position{StartLine: 0, StartChar: 17, EndLine: 0, EndChar: 21}, Role: "definition"},
+				{SymbolID: "scip-typescript Base", URI: useURI, Range: model.Position{StartLine: 0, StartChar: 9, EndLine: 0, EndChar: 13}, Role: "reference"},
+				{SymbolID: "scip-typescript Child", URI: useURI, Range: model.Position{StartLine: 1, StartChar: 6, EndLine: 1, EndChar: 11}, Role: "definition"},
+				{SymbolID: "scip-typescript Base", URI: generatedURI, Range: model.Position{StartLine: 0, StartChar: 31, EndLine: 0, EndChar: 35}, Role: "reference"},
+			},
+			Edges: []model.Edge{
+				{From: "scip-typescript Child", To: "scip-typescript Base", ScopeID: scope.ID, Kind: model.EdgeImplementation, SourceURI: useURI, Range: model.Position{StartLine: 1, StartChar: 23, EndLine: 1, EndChar: 27}},
+				{From: "scip-typescript Child", To: "scip-typescript Base", Kind: model.EdgeTypeRelation, SourceURI: useURI, Range: model.Position{StartLine: 1, StartChar: 23, EndLine: 1, EndChar: 27}},
+				{From: "scip-typescript call", To: "scip-typescript run", Kind: model.EdgeCall, SourceURI: useURI, Range: model.Position{StartLine: 2, StartChar: 27, EndLine: 2, EndChar: 30}},
+				{From: "scip-typescript call", To: "scip-typescript Base", Kind: model.EdgeImport, SourceURI: useURI, Range: model.Position{StartLine: 0, StartChar: 9, EndLine: 0, EndChar: 13}},
+				{From: "scip-typescript call", To: "scip-typescript pkg", Kind: model.EdgeModule, SourceURI: useURI, Range: model.Position{StartLine: 0, StartChar: 22, EndLine: 0, EndChar: 28}},
+			},
+		}},
+	}
+	sink := &semanticTestSink{}
+	got, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(context.Background(), model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, sink)
+	if err != nil {
+		t.Fatalf("ExportIndex: %v", err)
+	}
+	if err := model.ValidateReport(model.Request{View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance}}, got); err != nil {
+		t.Fatalf("ValidateReport: %v", err)
+	}
+	if runner.verifyCall != 1 || runner.exportCall != 1 || sink.maxBatch > semanticIndexBatchLimit {
+		t.Fatalf("runner calls=(%d,%d), max batch=%d", runner.verifyCall, runner.exportCall, sink.maxBatch)
+	}
+	if len(sink.symbols) != 5 || len(sink.occurrences) != 4 || len(sink.edges) != 5 {
+		t.Fatalf("fact counts symbols/occurrences/edges = %d/%d/%d", len(sink.symbols), len(sink.occurrences), len(sink.edges))
+	}
+	for _, symbol := range sink.symbols {
+		if symbol.ScopeID != scope.ID || !strings.HasPrefix(string(symbol.ID), "scip-typescript ") {
+			t.Errorf("symbol semantic identity was not preserved: %+v", symbol)
+		}
+	}
+	var mapped, crossFile bool
+	for _, occurrence := range sink.occurrences {
+		if occurrence.URI == useURI && occurrence.Range == (model.Position{StartLine: 1, StartChar: 23, EndLine: 1, EndChar: 27}) && occurrence.SourceHash == useFile.SHA256 {
+			mapped = true
+		}
+		if occurrence.URI == useURI && occurrence.Range.StartLine == 0 && occurrence.Role == "reference" {
+			crossFile = true
+		}
+		if occurrence.BuildContext != scope.BuildContext || occurrence.ScopeID != scope.ID {
+			t.Errorf("occurrence lost context: %+v", occurrence)
+		}
+	}
+	if !mapped || !crossFile {
+		t.Errorf("generated source-map or cross-file location was not preserved: mapped=%v crossFile=%v", mapped, crossFile)
+	}
+	for _, fact := range []model.FactKind{model.FactReference, model.FactCall, model.FactImport, model.FactModule} {
+		if coverageState(got.Coverage, scope.ID, fact) != model.IncompleteKnownSubset {
+			t.Errorf("coverage for %s = %s, want explicit static subset", fact, coverageState(got.Coverage, scope.ID, fact))
+		}
+	}
+	for _, fact := range []model.FactKind{model.FactImplementation, model.FactTypeRelation} {
+		if coverageState(got.Coverage, scope.ID, fact) != model.Complete {
+			t.Errorf("static TypeScript coverage for %s = %s, want compiler-complete", fact, coverageState(got.Coverage, scope.ID, fact))
+		}
+	}
+	if coverageState(got.Coverage, scope.ID, model.FactGenerated) != model.IncompleteKnownSubset {
+		t.Errorf("generated-source coverage = %s, want incomplete without exhaustive source-map attestation", coverageState(got.Coverage, scope.ID, model.FactGenerated))
+	}
+	if coverageState(got.Coverage, scope.ID, model.FactInclude) != model.Unavailable {
+		t.Errorf("include coverage = %s, want unavailable", coverageState(got.Coverage, scope.ID, model.FactInclude))
+	}
+}
+
+func TestSemanticIndexTypeScriptMultipleContextsAndIncompleteConfig(t *testing.T) {
+	view, scopes, provenances := typescriptMultiScopeFixture(t)
+	runner := &semanticTestRunner{
+		coverage: completeCoverage(scopes[0].ID),
+		batchesByScope: map[string][]SCIPBatch{
+			scopes[0].ID: {{Symbols: []model.Symbol{{ID: "scip-typescript project-a entry", Name: "entry", Kind: "function"}}}},
+			scopes[1].ID: {{Symbols: []model.Symbol{{ID: "scip-typescript project-b entry", Name: "entry", Kind: "function"}}}},
+		},
+	}
+	sink := &semanticTestSink{}
+	request := model.Request{View: view, Scopes: scopes, Provenance: provenances}
+	got, err := testSemanticProvider(runner, provenances[scopes[0].ID].Tools).ExportIndex(context.Background(), request, sink)
+	if err != nil {
+		t.Fatalf("ExportIndex: %v", err)
+	}
+	if len(sink.symbols) != 2 || sink.symbols[0].ID == sink.symbols[1].ID || sink.symbols[0].ScopeID == sink.symbols[1].ScopeID {
+		t.Fatalf("same raw symbol was not isolated by project context: %+v", sink.symbols)
+	}
+	if len(got.UsedTools[scopes[0].ID]) != 2 || len(got.UsedTools[scopes[1].ID]) != 2 {
+		t.Fatalf("used tools not recorded per context: %+v", got.UsedTools)
+	}
+
+	incomplete := scopes[0]
+	incomplete.Build.Options = map[string]string{"projectConfig": "default"}
+	badScope, badProvenance := typescriptScope("file:///repo/incomplete", "broken", view.id, provenances[scopes[0].ID].Tools)
+	badScope.Build.Options = incomplete.Build.Options
+	badProvenance.Scope = badScope
+	badScope.BuildContext = model.ComputeBuildContextID(badScope, badProvenance.Extractor, badProvenance.ExtractorVer, badProvenance.Toolchain, badProvenance.Tools)
+	badProvenance.Scope = badScope
+	badView := &semanticTestView{id: view.id, files: map[string][]model.File{badScope.RootURI: {}}, content: map[string][]byte{}}
+	badRequest := model.Request{View: badView, Scopes: []model.Scope{badScope}, Provenance: map[string]model.Provenance{badScope.ID: badProvenance}}
+	badReport, err := testSemanticProvider(runner, badProvenance.Tools).ExportIndex(context.Background(), badRequest, &semanticTestSink{})
+	if err != nil {
+		t.Fatalf("incomplete config should be reported as unavailable: %v", err)
+	}
+	if runner.verifyCall != 2 || runner.exportCall != 2 {
+		t.Fatalf("incomplete configuration invoked tools: verify=%d export=%d", runner.verifyCall, runner.exportCall)
+	}
+	for _, fact := range model.RequiredFactKinds {
+		if coverageState(badReport.Coverage, badScope.ID, fact) != model.Unavailable {
+			t.Errorf("incomplete configuration coverage %s = %s", fact, coverageState(badReport.Coverage, badScope.ID, fact))
+		}
+	}
+}
+
+func TestSemanticIndexTypeScriptPreservesCrossProjectSemanticIDs(t *testing.T) {
+	view, scopes, provenances := typescriptMultiScopeFixture(t)
+	sourceID := identity.SymbolID("scip-typescript project-a/entry@" + string(scopes[0].BuildContext))
+	targetID := identity.SymbolID("scip-typescript project-b/Base@" + string(scopes[1].BuildContext))
+	sourceURI := scopes[0].RootURI + "/main.ts"
+	runner := &semanticTestRunner{
+		coverage: completeCoverage(scopes[0].ID),
+		batchesByScope: map[string][]SCIPBatch{
+			scopes[0].ID: {{
+				Symbols:     []model.Symbol{{ID: sourceID, Name: "entry", Kind: "function"}},
+				Occurrences: []model.Occurrence{{SymbolID: targetID, URI: sourceURI, Range: model.Position{StartLine: 0, StartChar: 0, EndLine: 0, EndChar: 5}, Role: "reference"}},
+				Edges:       []model.Edge{{From: sourceID, To: targetID, Kind: model.EdgeImport, SourceURI: sourceURI, Range: model.Position{StartLine: 0, StartChar: 0, EndLine: 0, EndChar: 5}}},
+			}},
+			scopes[1].ID: {{Symbols: []model.Symbol{{ID: targetID, Name: "Base", Kind: "interface"}}}},
+		},
+	}
+	sink := &semanticTestSink{}
+	request := model.Request{View: view, Scopes: scopes, Provenance: provenances}
+	got, err := testSemanticProvider(runner, provenances[scopes[0].ID].Tools).ExportIndex(context.Background(), request, sink)
+	if err != nil {
+		t.Fatalf("ExportIndex: %v", err)
+	}
+	if len(got.Coverage) != len(scopes)*len(model.RequiredFactKinds) {
+		t.Fatalf("coverage matrix size = %d", len(got.Coverage))
+	}
+	if len(sink.edges) != 1 || sink.edges[0].ScopeID != scopes[0].ID || sink.edges[0].From != sourceID || sink.edges[0].To != targetID {
+		t.Fatalf("cross-project edge semantic IDs were rewritten: %+v", sink.edges)
+	}
+	if len(sink.occurrences) != 1 || sink.occurrences[0].SymbolID != targetID || sink.occurrences[0].ScopeID != scopes[0].ID {
+		t.Fatalf("cross-project occurrence target was rewritten: %+v", sink.occurrences)
+	}
+	if len(sink.symbols) != 2 || sink.symbols[1].ID != targetID || sink.symbols[1].ScopeID != scopes[1].ID {
+		t.Fatalf("target declaration does not match edge target: %+v", sink.symbols)
+	}
+	projectScopes := runner.projectScopes[scopes[0].ID]
+	if len(projectScopes) != 2 || projectScopes[1].BuildContext != scopes[1].BuildContext {
+		t.Fatalf("runner did not receive target project context: %+v", projectScopes)
+	}
+}
+
+func TestSemanticIndexTypeScriptCancellationStopsExport(t *testing.T) {
+	view, scope, provenance := typescriptOneFileFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := &semanticTestRunner{coverage: completeCoverage(scope.ID), cancel: cancel}
+	_, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(ctx, model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, &semanticTestSink{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExportIndex error = %v, want context.Canceled", err)
+	}
+}
+
+func TestSemanticIndexTypeScriptRecordsVerifiedToolsOnExportFailure(t *testing.T) {
+	view, scope, provenance := typescriptOneFileFixture(t)
+	wantErr := errors.New("export failed")
+	runner := &semanticTestRunner{exportErr: wantErr}
+	got, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(context.Background(), model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, &semanticTestSink{})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ExportIndex error = %v, want %v", err, wantErr)
+	}
+	if len(got.UsedTools[scope.ID]) != len(provenance.Tools) {
+		t.Fatalf("verified tools lost after export error: %+v", got.UsedTools)
+	}
+}
+
+func TestSemanticIndexTypeScriptRejectsFloatingCompilerVersion(t *testing.T) {
+	tools := semanticTools(t)
+	tools[0].Version = "latest"
+	root, uri := "file:///repo/floating-ts", "file:///repo/floating-ts/main.ts"
+	content := []byte("export function main(): number { return 1; }\r\n")
+	view := &semanticTestView{
+		id:    model.Identity{Workspace: "ts-floating", DiskDigest: "sha256:floating", SnapshotRev: 4},
+		files: map[string][]model.File{root: {semanticFile(uri, "typescript", content)}}, content: map[string][]byte{uri: content},
+	}
+	scope, provenance := typescriptScope(root, "floating-ts", view.id, tools)
+	runner := &semanticTestRunner{}
+	got, err := testSemanticProvider(runner, tools).ExportIndex(context.Background(), model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, &semanticTestSink{})
+	if err != nil {
+		t.Fatalf("floating tool config should fail closed as unavailable: %v", err)
+	}
+	if runner.verifyCall != 0 || runner.exportCall != 0 {
+		t.Fatalf("floating version invoked tool: verify=%d export=%d", runner.verifyCall, runner.exportCall)
+	}
+	for _, fact := range model.RequiredFactKinds {
+		if coverageState(got.Coverage, scope.ID, fact) != model.Unavailable {
+			t.Errorf("coverage %s = %s, want unavailable", fact, coverageState(got.Coverage, scope.ID, fact))
+		}
+	}
+}
+
+func TestSemanticIndexTypeScriptAcceptsBorrowedReadOnlyMaterializedView(t *testing.T) {
+	source, scope, provenance := typescriptOneFileFixture(t)
+	rootPath := t.TempDir()
+	view := borrowedSemanticTestView{semanticTestView: source, rootPath: rootPath}
+	runner := &semanticTestRunner{coverage: completeCoverage(scope.ID)}
+	_, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(context.Background(), model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, &semanticTestSink{})
+	if err != nil {
+		t.Fatalf("ExportIndex with borrowed materialized view: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootPath, "main.ts")); err != nil {
+		t.Fatalf("provider removed borrowed RootPath: %v", err)
+	}
+}
+
+func TestSemanticIndexRequestBuilderPinsMultipleTypeScriptProjects(t *testing.T) {
+	view, scopes, _ := typescriptMultiScopeFixture(t)
+	tools := semanticTools(t)
+	provider := NewSemanticIndexProvider(SemanticIndexConfig{
+		Tools: tools,
+		BuildScopes: func(_ context.Context, _ model.WorkspaceView, _ string) ([]model.Scope, error) {
+			return scopes, nil
+		},
+	})
+	request, err := provider.BuildIndexRequest(context.Background(), view, "file:///repo")
+	if err != nil {
+		t.Fatalf("BuildIndexRequest: %v", err)
+	}
+	if len(request.Scopes) != 2 {
+		t.Fatalf("scopes = %d, want 2", len(request.Scopes))
+	}
+	if request.WorkspaceRootURI != "file:///repo" {
+		t.Fatalf("request workspace root = %q, want explicit builder boundary file:///repo", request.WorkspaceRootURI)
+	}
+	for _, scope := range request.Scopes {
+		provenance := request.Provenance[scope.ID]
+		if !reflect.DeepEqual(provenance.Scope, scope) || len(provenance.Tools) != 2 ||
+			scope.BuildContext != model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, provenance.Tools) {
+			t.Errorf("request did not pin project context/tool identities: scope=%+v provenance=%+v", scope, provenance)
+		}
+	}
+	if request.Scopes[0].BuildContext == request.Scopes[1].BuildContext {
+		t.Fatal("different TypeScript project roots shared one build context")
+	}
+}
+
+func TestSemanticIndexTypeScriptMissingReferencedScopeStaysUnknown(t *testing.T) {
+	view, scope, provenance := typescriptOneFileFixture(t)
+	scope.Build.Options["projectReferences"] = `[{"path":"../missing"}]`
+	scope.BuildContext = model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, provenance.Tools)
+	provenance.Scope = scope
+	runner := &semanticTestRunner{}
+	request := model.Request{
+		WorkspaceRootURI: "file:///repo",
+		View:             view,
+		Scopes:           []model.Scope{scope},
+		Provenance:       map[string]model.Provenance{scope.ID: provenance},
+	}
+	report, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(context.Background(), request, &semanticTestSink{})
+	if err != nil {
+		t.Fatalf("missing reference should be represented by unknown coverage: %v", err)
+	}
+	if runner.verifyCall != 0 || runner.exportCall != 0 {
+		t.Fatalf("incomplete reference closure reached compiler: verify=%d export=%d", runner.verifyCall, runner.exportCall)
+	}
+	if err := model.ValidateReport(request, report); err != nil {
+		t.Fatalf("ValidateReport: %v", err)
+	}
+	for _, fact := range model.RequiredFactKinds {
+		state := coverageState(report.Coverage, scope.ID, fact)
+		if fact == model.FactInclude {
+			if state != model.Unavailable {
+				t.Errorf("include coverage = %s, want unavailable", state)
+			}
+			continue
+		}
+		if state != model.Unknown {
+			t.Errorf("unresolved reference coverage for %s = %s, want unknown", fact, state)
+		}
+	}
+}
+
+func TestSemanticIndexRequestBuilderAllowsMissingToolPinsToFailClosed(t *testing.T) {
+	view, scopes, _ := typescriptMultiScopeFixture(t)
+	provider := NewSemanticIndexProvider(SemanticIndexConfig{
+		BuildScopes: func(_ context.Context, _ model.WorkspaceView, _ string) ([]model.Scope, error) {
+			return scopes, nil
+		},
+	})
+	request, err := provider.BuildIndexRequest(context.Background(), view, "file:///repo")
+	if err != nil {
+		t.Fatalf("BuildIndexRequest without tool pins: %v", err)
+	}
+	runner := &semanticTestRunner{}
+	provider = NewSemanticIndexProvider(SemanticIndexConfig{Runner: runner})
+	got, err := provider.ExportIndex(context.Background(), request, &semanticTestSink{})
+	if err != nil {
+		t.Fatalf("ExportIndex without tool pins: %v", err)
+	}
+	if runner.verifyCall != 0 || runner.exportCall != 0 || len(got.UsedTools) != 0 {
+		t.Fatalf("missing tool pins reached runner or were recorded: verify=%d export=%d used=%v", runner.verifyCall, runner.exportCall, got.UsedTools)
+	}
+	for _, scope := range request.Scopes {
+		for _, fact := range model.RequiredFactKinds {
+			if coverageState(got.Coverage, scope.ID, fact) != model.Unavailable {
+				t.Errorf("scope %s coverage %s = %s, want unavailable", scope.ID, fact, coverageState(got.Coverage, scope.ID, fact))
+			}
+		}
+	}
+}
+
+func TestSemanticIndexJavaScriptUnicodeCRLFPositionsAndDynamicCoverage(t *testing.T) {
+	root, uri := "file:///repo/js", "file:///repo/js/src/main.js"
+	content := []byte("const emoji = \"😀\"; use(widget);\r\n")
+	view := &semanticTestView{
+		id:    model.Identity{Workspace: "js-fixture", DiskDigest: "sha256:js", SnapshotRev: 23},
+		files: map[string][]model.File{root: {semanticFile(uri, "javascript", content)}}, content: map[string][]byte{uri: content},
+	}
+	scope, provenance := javascriptScope(root, "js-app", view.id, semanticTools(t))
+	runner := &semanticTestRunner{
+		coverage: completeCoverage(scope.ID),
+		batches: []SCIPBatch{{
+			Symbols:     []model.Symbol{{ID: "js widget", Name: "widget", Kind: "variable"}},
+			Occurrences: []model.Occurrence{{SymbolID: "js widget", URI: uri, Range: model.Position{StartLine: 0, StartChar: 24, EndLine: 0, EndChar: 30}, Role: "reference"}},
+		}},
+	}
+	for index := range runner.coverage {
+		if runner.coverage[index].Fact == model.FactReference {
+			runner.coverage[index].Reason = directJavaScriptCheckJSProof + ";typescript=6.0.3;allowJs=true;checkJs=true;closedScopes=1;sourceFiles=1"
+		}
+	}
+	sink := &semanticTestSink{}
+	got, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(context.Background(), model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, sink)
+	if err != nil {
+		t.Fatalf("ExportIndex: %v", err)
+	}
+	if len(sink.occurrences) != 1 || sink.occurrences[0].Range != (model.Position{StartLine: 0, StartChar: 24, EndLine: 0, EndChar: 30}) {
+		t.Fatalf("UTF-16 compiler range changed: %+v", sink.occurrences)
+	}
+	for _, fact := range []model.FactKind{
+		model.FactSymbol, model.FactDeclaration, model.FactDefinition,
+		model.FactReference, model.FactImplementation, model.FactTypeRelation,
+		model.FactCall, model.FactImport, model.FactModule,
+	} {
+		if coverageState(got.Coverage, scope.ID, fact) != model.IncompleteKnownSubset {
+			t.Errorf("dynamic JavaScript coverage %s = %s, want explicit subset", fact, coverageState(got.Coverage, scope.ID, fact))
+		}
+	}
+}
+
+func TestDirectTypeScriptStaticModuleProofRejectsUnprovenScopes(t *testing.T) {
+	proof := directTypeScriptStaticModuleProof + ";typescript=6.0.3;closedScopes=1;projectReferences=0;sourceFiles=2"
+	typescriptFile := semanticFile("file:///repo/project/main.ts", "typescript", []byte("export {};\n"))
+	javascriptFile := semanticFile("file:///repo/project/main.js", "javascript", []byte("export {};\n"))
+	generatedTypeScriptFile := typescriptFile
+	generatedTypeScriptFile.Generated = true
+	cases := []struct {
+		name           string
+		reason         string
+		fact           model.FactKind
+		language       string
+		files          []model.File
+		directCompiler bool
+		want           bool
+	}{
+		{name: "closed TypeScript", reason: proof, fact: model.FactImport, language: "typescript", files: []model.File{typescriptFile}, directCompiler: true, want: true},
+		{name: "module graph fact", reason: proof, fact: model.FactModule, language: "typescript", files: []model.File{typescriptFile}, directCompiler: true, want: true},
+		{name: "stale TypeScript version", reason: strings.Replace(proof, "typescript=6.0.3", "typescript=5.9.0", 1), fact: model.FactImport, language: "typescript", files: []model.File{typescriptFile}, directCompiler: true},
+		{name: "project references", reason: strings.Replace(proof, "closedScopes=1;projectReferences=0", "closedScopes=2;projectReferences=1", 1), fact: model.FactImport, language: "typescript", files: []model.File{typescriptFile}, directCompiler: true},
+		{name: "mixed JavaScript", reason: proof, fact: model.FactImport, language: "typescript", files: []model.File{typescriptFile, javascriptFile}, directCompiler: true},
+		{name: "pure JavaScript tsconfig", reason: proof, fact: model.FactModule, language: "typescript", files: []model.File{javascriptFile}, directCompiler: true},
+		{name: "generated source", reason: proof, fact: model.FactModule, language: "typescript", files: []model.File{generatedTypeScriptFile}, directCompiler: true},
+		{name: "non-module fact", reason: proof, fact: model.FactCall, language: "typescript", files: []model.File{typescriptFile}, directCompiler: true},
+		{name: "non-TypeScript scope", reason: proof, fact: model.FactModule, language: "javascript", files: []model.File{typescriptFile}, directCompiler: true},
+		{name: "non-direct runner", reason: proof, fact: model.FactModule, language: "typescript", files: []model.File{typescriptFile}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := directTypeScriptStaticModuleProofApplies(tc.reason, tc.fact, tc.language, tc.files, tc.directCompiler); got != tc.want {
+				t.Fatalf("module proof applicability = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSemanticIndexTypeScriptPluginWaitsForTrust(t *testing.T) {
+	view, scope, provenance := typescriptOneFileFixture(t)
+	priorContext := scope.BuildContext
+	scope.Build.Features = []string{"plugin:workspace-analysis"}
+	scope.BuildContext = model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, provenance.Tools)
+	provenance.Scope = scope
+	runner := &semanticTestRunner{coverage: completeCoverage(scope.ID)}
+	got, err := testSemanticProvider(runner, provenance.Tools).ExportIndex(context.Background(), model.Request{
+		View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, &semanticTestSink{})
+	if err != nil {
+		t.Fatalf("untrusted plugin should be reported unavailable: %v", err)
+	}
+	if scope.BuildContext == priorContext {
+		t.Fatal("plugin configuration did not affect the build context")
+	}
+	if runner.verifyCall != 0 || runner.exportCall != 0 {
+		t.Fatalf("untrusted plugin was loaded: verify=%d export=%d", runner.verifyCall, runner.exportCall)
+	}
+	for _, fact := range model.RequiredFactKinds {
+		if coverageState(got.Coverage, scope.ID, fact) != model.Unavailable {
+			t.Errorf("plugin scope coverage %s = %s, want unavailable", fact, coverageState(got.Coverage, scope.ID, fact))
+		}
+	}
+}
+
+func TestRebuildVerifiedPlannerRequestUsesCurrentScopesWithoutRunningTools(t *testing.T) {
+	view, root, attestations := typescriptRebuildFixture(t)
+	current := *view
+	current.id.SnapshotRev++
+	request, err := RebuildVerifiedPlannerRequest(context.Background(), &current, root, attestations)
+	if err != nil {
+		t.Fatalf("RebuildVerifiedPlannerRequest: %v", err)
+	}
+	if len(request.Scopes) != 1 || len(request.Provenance) != 1 {
+		t.Fatalf("rebuilt request = %d scopes, %d provenances; want one each", len(request.Scopes), len(request.Provenance))
+	}
+	if request.Provenance[request.Scopes[0].ID].Identity != current.Identity() {
+		t.Fatalf("rebuilt provenance identity = %+v, want current view identity %+v", request.Provenance[request.Scopes[0].ID].Identity, current.Identity())
+	}
+}
+
+func TestRebuildVerifiedPlannerRequestRejectsSourceConfigAndToolDrift(t *testing.T) {
+	t.Run("source identity", func(t *testing.T) {
+		view, root, attestations := typescriptRebuildFixture(t)
+		changed := *view
+		changed.id.DiskDigest = "sha256:changed-source"
+		if _, err := RebuildVerifiedPlannerRequest(context.Background(), &changed, root, attestations); err == nil {
+			t.Fatal("source identity drift was accepted")
+		}
+	})
+
+	t.Run("current config closure", func(t *testing.T) {
+		view, root, attestations := typescriptRebuildFixture(t)
+		changed := *view
+		changed.content = make(map[string][]byte, len(view.content))
+		for uri, content := range view.content {
+			changed.content[uri] = append([]byte(nil), content...)
+		}
+		configURI := root + "/tsconfig.json"
+		changed.content[configURI] = []byte(`{"compilerOptions":{"strict":false},"include":["src/**/*.ts"]}`)
+		changed.files = map[string][]model.File{root: append([]model.File(nil), view.files[root]...)}
+		for i := range changed.files[root] {
+			if changed.files[root][i].URI == configURI {
+				changed.files[root][i] = semanticFile(configURI, "json", changed.content[configURI])
+			}
+		}
+		if _, err := RebuildVerifiedPlannerRequest(context.Background(), &changed, root, attestations); err == nil {
+			t.Fatal("current config closure drift was accepted")
+		}
+	})
+
+	t.Run("pinned tool bytes", func(t *testing.T) {
+		view, root, attestations := typescriptRebuildFixture(t)
+		if err := os.WriteFile(attestations[0].Tools[0].Path, []byte("changed tool bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RebuildVerifiedPlannerRequest(context.Background(), view, root, attestations); err == nil {
+			t.Fatal("pinned tool hash drift was accepted")
+		}
+	})
+}
+
+func typescriptRebuildFixture(t *testing.T) (*semanticTestView, string, []model.Provenance) {
+	t.Helper()
+	root := "file:///repo/rebuild-ts"
+	configURI, sourceURI := root+"/tsconfig.json", root+"/src/main.ts"
+	config := []byte(`{"compilerOptions":{"strict":true},"include":["src/**/*.ts"]}`)
+	source := []byte("export const value: string = 'ok';\n")
+	view := &semanticTestView{
+		id: model.Identity{Workspace: "ts-rebuild", DiskDigest: "sha256:ts-rebuild", SnapshotRev: 9},
+		files: map[string][]model.File{root: {
+			semanticFile(configURI, "json", config), semanticFile(sourceURI, "typescript", source),
+		}},
+		content: map[string][]byte{configURI: config, sourceURI: source},
+	}
+	provider := NewSemanticIndexProvider(SemanticIndexConfig{Tools: semanticTools(t)})
+	request, err := provider.BuildIndexRequest(context.Background(), view, root)
+	if err != nil {
+		t.Fatalf("build attested fixture: %v", err)
+	}
+	attestations := make([]model.Provenance, 0, len(request.Provenance))
+	for _, scope := range request.Scopes {
+		attestations = append(attestations, request.Provenance[scope.ID])
+	}
+	return view, root, attestations
+}
+
+func typescriptOneFileFixture(t *testing.T) (*semanticTestView, model.Scope, model.Provenance) {
+	t.Helper()
+	root, uri := "file:///repo/one", "file:///repo/one/main.ts"
+	content := []byte("export function main(): number {\r\n  return 1;\r\n}\r\n")
+	view := &semanticTestView{id: model.Identity{Workspace: "ts-one", DiskDigest: "sha256:one", SnapshotRev: 1},
+		files: map[string][]model.File{root: {semanticFile(uri, "typescript", content)}}, content: map[string][]byte{uri: content}}
+	scope, provenance := typescriptScope(root, "one", view.id, semanticTools(t))
+	return view, scope, provenance
+}
+
+func typescriptMultiScopeFixture(t *testing.T) (*semanticTestView, []model.Scope, map[string]model.Provenance) {
+	t.Helper()
+	rootA, rootB := "file:///repo/a", "file:///repo/b"
+	uriA, uriB := rootA+"/main.ts", rootB+"/main.ts"
+	contentA, contentB := []byte("export function entry() { return 1; }\r\n"), []byte("export function entry() { return 2; }\r\n")
+	view := &semanticTestView{
+		id: model.Identity{Workspace: "ts-multi", DiskDigest: "sha256:multi", SnapshotRev: 5},
+		files: map[string][]model.File{
+			rootA: {semanticFile(uriA, "typescript", contentA)},
+			rootB: {semanticFile(uriB, "typescript", contentB)},
+		}, content: map[string][]byte{uriA: contentA, uriB: contentB},
+	}
+	tools := semanticTools(t)
+	scopeA, provenanceA := typescriptScope(rootA, "project-a", view.id, tools)
+	scopeB, provenanceB := typescriptScope(rootB, "project-b", view.id, tools)
+	provenance := map[string]model.Provenance{scopeA.ID: provenanceA, scopeB.ID: provenanceB}
+	return view, []model.Scope{scopeA, scopeB}, provenance
+}
+
+func typescriptScope(root, id string, viewIdentity model.Identity, tools []model.ToolIdentity) (model.Scope, model.Provenance) {
+	scope := model.Scope{
+		ID: id, Language: "typescript", RootURI: root,
+		Build: model.BuildInputs{
+			IncludePaths: []string{"src", "node_modules"},
+			Options: map[string]string{
+				"tsconfig": "tsconfig.json", "projectConfigDigest": "sha256:" + strings.Repeat("b", 64),
+				"compilerOptions":   "{\"strict\":true,\"moduleResolution\":\"bundler\"}",
+				"projectReferences": "[]", "plugins": "[]",
+			},
+		},
+	}
+	provenance := model.Provenance{
+		SchemaVersion: model.SchemaVersion, Identity: viewIdentity, Extractor: "omnilsp-typescript-scip", ExtractorVer: semanticIndexExtractorVersion,
+		Backend: identity.BackendID{Language: scope.Language, Name: "typescript-semantic-index"}, Toolchain: "typescript/6.0.3",
+		Tools: append([]model.ToolIdentity(nil), tools...),
+	}
+	scope.BuildContext = model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, provenance.Tools)
+	provenance.Scope = scope
+	return scope, provenance
+}
+
+func javascriptScope(root, id string, viewIdentity model.Identity, tools []model.ToolIdentity) (model.Scope, model.Provenance) {
+	scope, provenance := typescriptScope(root, id, viewIdentity, tools)
+	scope.Language = "javascript"
+	scope.Build.Options = map[string]string{
+		"jsconfig": "jsconfig.json", "jsconfigDigest": "sha256:" + strings.Repeat("c", 64),
+		"compilerOptions":   "{\"allowJs\":true,\"checkJs\":true}",
+		"projectReferences": "[]", "plugins": "[]",
+	}
+	provenance.Backend.Language = scope.Language
+	scope.BuildContext = model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, provenance.Tools)
+	provenance.Scope = scope
+	return scope, provenance
+}
+
+func semanticTools(t *testing.T) []model.ToolIdentity {
+	t.Helper()
+	dir := t.TempDir()
+	tools := []model.ToolIdentity{
+		{Name: semanticIndexCompilerName, Version: semanticIndexCompilerVersion, Path: filepath.Join(dir, "typescript.bin")},
+		{Name: semanticIndexExporterName, Version: "0.6.2", Path: filepath.Join(dir, "scip-typescript.bin")},
+	}
+	for i := range tools {
+		content := []byte("pinned tool " + tools[i].Name + "\n")
+		if err := os.WriteFile(tools[i].Path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(content)
+		tools[i].SHA256 = hex.EncodeToString(hash[:])
+	}
+	return tools
+}
+
+func testSemanticProvider(runner SCIPRunner, tools []model.ToolIdentity) *SemanticIndexProvider {
+	return NewSemanticIndexProvider(SemanticIndexConfig{Runner: runner, Tools: tools})
+}
+
+func semanticFile(uri, language string, content []byte) model.File {
+	hash := sha256.Sum256(content)
+	return model.File{URI: uri, LanguageID: language, Size: int64(len(content)), SHA256: identity.ContentHash("sha256:" + hex.EncodeToString(hash[:]))}
+}
+
+func completeCoverage(scopeID string) []model.Coverage {
+	coverage := make([]model.Coverage, 0, len(model.RequiredFactKinds))
+	for _, fact := range model.RequiredFactKinds {
+		coverage = append(coverage, model.Coverage{ScopeID: scopeID, Fact: fact, State: model.Complete})
+	}
+	return coverage
+}
+
+func coverageState(coverage []model.Coverage, scope string, fact model.FactKind) model.Completeness {
+	for _, item := range coverage {
+		if item.ScopeID == scope && item.Fact == fact {
+			return item.State
+		}
+	}
+	return ""
+}

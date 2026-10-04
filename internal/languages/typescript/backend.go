@@ -11,6 +11,7 @@
 package typescript
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,9 +24,12 @@ import (
 	"strings"
 	"sync"
 
+	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/internal/languages/lspwire"
 	"github.com/omnilsp/omni/internal/languages/nested"
+	"github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 // ErrToolchainMissing reports that typescript-language-server itself is
@@ -55,12 +59,14 @@ func New(workDir string) (*Backend, error) {
 	}
 	b := &Backend{workDir: workDir, cfgFile: "tsconfig.json"}
 	b.conn = nested.New(nested.Config{
-		Name:         serverName,
-		Lang:         langID,
-		WorkDir:      workDir,
-		Start:        spawnServer,
-		VersionProbe: probeTscVersion,
-		ParseVersion: parseTscVersion,
+		Name:                        serverName,
+		Lang:                        langID,
+		WorkDir:                     workDir,
+		Start:                       spawnServer,
+		VersionProbe:                probeTscVersion,
+		ParseVersion:                parseTscVersion,
+		CaptureDiagnostics:          true,
+		AllowUnversionedDiagnostics: true,
 	})
 	if err := b.conn.StartSupervised(); err != nil {
 		return nil, err
@@ -117,40 +123,63 @@ func (b *Backend) LanguageID() string { return langID }
 func (b *Backend) BackendStatusMessage() string { return b.conn.SupervisorMessage() }
 func (b *Backend) FileExtensions() []string     { return []string{".ts", ".tsx", ".js", ".jsx"} }
 
+func documentLanguageID(documentURI string) string {
+	document, err := uri.Parse(documentURI)
+	if err != nil {
+		return langID
+	}
+	path, err := document.Path()
+	if err != nil {
+		return langID
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".js":
+		return "javascript"
+	case ".jsx":
+		return "javascriptreact"
+	case ".tsx":
+		return "typescriptreact"
+	default:
+		return langID
+	}
+}
+
 func (b *Backend) BuildContextID() identity.BuildContextID { return b.conn.BuildContextID() }
 func (b *Backend) SupervisorEpoch() uint64                 { return b.conn.SupervisorEpoch() }
 
-func (b *Backend) Completion(ctx context.Context, req languages.CompletionRequest) ([]languages.CompletionItem, error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/completion", map[string]interface{}{
-		"textDocument": map[string]string{"uri": req.URI},
-		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
-	})
-	if err != nil {
-		return nil, err
+func (b *Backend) currentBackendEpoch() identity.BackendEpoch {
+	if b.conn == nil {
+		return 0
 	}
-	var items []languages.CompletionItem
-	var raw []struct {
-		Label  string `json:"label"`
-		Kind   int    `json:"kind"`
-		Detail string `json:"detail"`
-	}
-	if err := json.Unmarshal(result, &raw); err == nil {
-		for _, r := range raw {
-			items = append(items, languages.CompletionItem{Label: r.Label, Kind: r.Kind, Detail: r.Detail})
-		}
-	}
-	return items, nil
+	return identity.BackendEpoch(b.SupervisorEpoch())
 }
 
-func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/hover", map[string]interface{}{
+func (b *Backend) Completion(ctx context.Context, req languages.CompletionRequest) ([]languages.CompletionItem, error) {
+	result, err := b.CompletionList(ctx, req)
+	return result.Items, err
+}
+
+func (b *Backend) CompletionList(ctx context.Context, req languages.CompletionRequest) (languages.CompletionList, error) {
+	result, err := b.conn.SendRequestAtRevision(ctx, documentLanguageID(req.URI), req.URI, req.Content, req.SnapshotRev, "textDocument/completion", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 	})
 	if err != nil {
-		return unknownHover(req, serverName+" request failed: "+err.Error()), nil
+		return languages.CompletionList{}, err
+	}
+	return lspwire.DecodeCompletionList(result)
+}
+
+func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (envelope identity.SemanticResult[*languages.HoverResult], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, documentLanguageID(req.URI), req.URI, req.Content, req.SnapshotRev, "textDocument/hover", map[string]interface{}{
+		"textDocument": map[string]string{"uri": req.URI},
+		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
+	})
+	epoch = identity.BackendEpoch(requestEpoch)
+	if err != nil {
+		return unknownHover(req, serverName+" request failed: "+err.Error()), err
 	}
 	if result == nil {
 		return identity.SemanticResult[*languages.HoverResult]{
@@ -165,7 +194,7 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 		} `json:"contents"`
 	}
 	if err := json.Unmarshal(result, &hover); err != nil {
-		return unknownHover(req, "hover decode failed"), nil
+		return unknownHover(req, "hover decode failed"), err
 	}
 	return identity.SemanticResult[*languages.HoverResult]{
 		Status: identity.ResultExact,
@@ -187,14 +216,16 @@ func unknownHover(req languages.HoverRequest, detail string) identity.SemanticRe
 	}
 }
 
-func (b *Backend) Definition(ctx context.Context, req languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/definition", map[string]interface{}{
+func (b *Backend) Definition(ctx context.Context, req languages.DefinitionRequest) (envelope identity.SemanticResult[[]languages.Location], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, documentLanguageID(req.URI), req.URI, req.Content, req.SnapshotRev, "textDocument/definition", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, serverName+" request failed: "+err.Error()), nil
+		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, serverName+" request failed: "+err.Error()), err
 	}
 	if result == nil {
 		return identity.SemanticResult[[]languages.Location]{
@@ -205,7 +236,7 @@ func (b *Backend) Definition(ctx context.Context, req languages.DefinitionReques
 	}
 	var raw lspLocationList
 	if err := json.Unmarshal(result, &raw); err != nil {
-		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, "definition decode failed"), nil
+		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, "definition decode failed"), err
 	}
 	return identity.SemanticResult[[]languages.Location]{
 		Status:       identity.ResultExact,
@@ -224,15 +255,17 @@ func unknownLocs(rev uint64, bc identity.BuildContextID, content []byte, detail 
 	}
 }
 
-func (b *Backend) References(ctx context.Context, req languages.ReferencesRequest) (identity.SemanticResult[[]languages.Location], error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/references", map[string]interface{}{
+func (b *Backend) References(ctx context.Context, req languages.ReferencesRequest) (envelope identity.SemanticResult[[]languages.Location], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, documentLanguageID(req.URI), req.URI, req.Content, req.SnapshotRev, "textDocument/references", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 		"context":      map[string]bool{"includeDeclaration": req.IncludeDecl},
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, serverName+" request failed: "+err.Error()), nil
+		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, serverName+" request failed: "+err.Error()), err
 	}
 	if result == nil {
 		return identity.SemanticResult[[]languages.Location]{
@@ -243,7 +276,7 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 	}
 	var raw lspLocationList
 	if err := json.Unmarshal(result, &raw); err != nil {
-		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, "references decode failed"), nil
+		return unknownLocs(req.SnapshotRev, req.BuildContext, req.Content, "references decode failed"), err
 	}
 	// The server enumerates over its loaded project; the bridge inherits
 	// that proof but cannot independently verify scope (§G1 normalization).
@@ -256,38 +289,112 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 }
 
 func (b *Backend) DocumentSymbols(ctx context.Context, req languages.DocumentSymbolRequest) ([]languages.DocumentSymbol, error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/documentSymbol", map[string]interface{}{
+	result, err := b.conn.SendRequestAtRevision(ctx, documentLanguageID(req.URI), req.URI, req.Content, req.SnapshotRev, "textDocument/documentSymbol", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 	})
 	if err != nil || result == nil {
 		return nil, err
 	}
-	var syms []languages.DocumentSymbol
-	var raw []struct {
-		Name  string `json:"name"`
-		Kind  int    `json:"kind"`
-		Range struct {
-			Start struct {
-				Line      uint32 `json:"line"`
-				Character uint32 `json:"character"`
-			} `json:"start"`
-			End struct {
-				Line      uint32 `json:"line"`
-				Character uint32 `json:"character"`
-			} `json:"end"`
-		} `json:"range"`
+	return decodeDocumentSymbols(result)
+}
+
+type documentSymbolPosition struct {
+	Line      uint32 `json:"line"`
+	Character uint32 `json:"character"`
+}
+
+type documentSymbolRange struct {
+	Start documentSymbolPosition `json:"start"`
+	End   documentSymbolPosition `json:"end"`
+}
+
+type documentSymbolWire struct {
+	Name           string               `json:"name"`
+	Detail         string               `json:"detail"`
+	Kind           int                  `json:"kind"`
+	Range          documentSymbolRange  `json:"range"`
+	SelectionRange *documentSymbolRange `json:"selectionRange"`
+	Children       []documentSymbolWire `json:"children"`
+}
+
+type symbolInformationWire struct {
+	Name     string `json:"name"`
+	Kind     int    `json:"kind"`
+	Location struct {
+		Range documentSymbolRange `json:"range"`
+	} `json:"location"`
+}
+
+// decodeDocumentSymbols accepts both LSP document symbol response forms.
+// Nested DocumentSymbol entries retain their selection range and children;
+// flat SymbolInformation entries can only prove the location range, so that
+// range is used for both the symbol span and its selection position.
+func decodeDocumentSymbols(result []byte) ([]languages.DocumentSymbol, error) {
+	if len(result) == 0 {
+		return nil, nil
 	}
-	if err := json.Unmarshal(result, &raw); err == nil {
-		for _, s := range raw {
-			syms = append(syms, languages.DocumentSymbol{
-				Name: s.Name, Kind: languages.SymbolKind(s.Kind),
-				StartLine: s.Range.Start.Line, StartCharacter: s.Range.Start.Character,
-				EndLine: s.Range.End.Line, EndCharacter: s.Range.End.Character,
-			})
+	var entries []json.RawMessage
+	if err := json.Unmarshal(result, &entries); err != nil {
+		return nil, fmt.Errorf("document symbol decode: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	syms := make([]languages.DocumentSymbol, 0, len(entries))
+	for i, entry := range entries {
+		var shape struct {
+			Location json.RawMessage `json:"location"`
 		}
+		if err := json.Unmarshal(entry, &shape); err != nil {
+			return nil, fmt.Errorf("document symbol %d decode: %w", i, err)
+		}
+		if len(shape.Location) != 0 && string(shape.Location) != "null" {
+			var info symbolInformationWire
+			if err := json.Unmarshal(entry, &info); err != nil {
+				return nil, fmt.Errorf("symbol information %d decode: %w", i, err)
+			}
+			syms = append(syms, projectSymbolInformation(info))
+			continue
+		}
+		var symbol documentSymbolWire
+		if err := json.Unmarshal(entry, &symbol); err != nil {
+			return nil, fmt.Errorf("document symbol %d decode: %w", i, err)
+		}
+		syms = append(syms, projectDocumentSymbol(symbol))
 	}
 	return syms, nil
+}
+
+func projectDocumentSymbol(raw documentSymbolWire) languages.DocumentSymbol {
+	selection := raw.Range
+	if raw.SelectionRange != nil {
+		selection = *raw.SelectionRange
+	}
+	children := make([]languages.DocumentSymbol, 0, len(raw.Children))
+	for _, child := range raw.Children {
+		children = append(children, projectDocumentSymbol(child))
+	}
+	return languages.DocumentSymbol{
+		Name: raw.Name, Detail: raw.Detail, Kind: languages.SymbolKind(raw.Kind),
+		StartLine: raw.Range.Start.Line, StartCharacter: raw.Range.Start.Character,
+		EndLine: raw.Range.End.Line, EndCharacter: raw.Range.End.Character,
+		SelectionLine: selection.Start.Line, SelectionCharacter: selection.Start.Character,
+		SelectionEndLine: selection.End.Line, SelectionEndCharacter: selection.End.Character,
+		SelectionRangeSet: true,
+		Children:          children,
+	}
+}
+
+func projectSymbolInformation(raw symbolInformationWire) languages.DocumentSymbol {
+	rangeValue := raw.Location.Range
+	return languages.DocumentSymbol{
+		Name: raw.Name, Kind: languages.SymbolKind(raw.Kind),
+		StartLine: rangeValue.Start.Line, StartCharacter: rangeValue.Start.Character,
+		EndLine: rangeValue.End.Line, EndCharacter: rangeValue.End.Character,
+		SelectionLine: rangeValue.Start.Line, SelectionCharacter: rangeValue.Start.Character,
+		SelectionEndLine: rangeValue.End.Line, SelectionEndCharacter: rangeValue.End.Character,
+		SelectionRangeSet: true,
+	}
 }
 
 func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceSymbolRequest) ([]languages.WorkspaceSymbol, error) {
@@ -322,15 +429,63 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 }
 
 func (b *Backend) Diagnostics(ctx context.Context, uri string, content []byte) ([]languages.Diagnostic, error) {
-	b.didOpen(uri, content)
-	return nil, nil // push diagnostics not yet consumed; explicit empty (Q3)
+	return b.DiagnosticsWithEncoding(ctx, uri, content, 0, 1)
+}
+
+func (b *Backend) BeginWorkspaceSnapshot(ctx context.Context, snapshot languages.WorkspaceSnapshot) (context.Context, func() error, error) {
+	documents := make([]nested.SnapshotDocument, 0, len(snapshot.Documents))
+	for _, doc := range snapshot.Documents {
+		switch doc.LanguageID {
+		case "typescript", "javascript", "typescriptreact", "javascriptreact":
+			// Preserve the actual TS/JS family language ID so tsserver selects
+			// the matching configured project for each open document.
+			documents = append(documents, nested.SnapshotDocument{URI: doc.URI, LangID: documentLanguageID(doc.URI), Content: doc.Content})
+		}
+	}
+	return b.conn.BeginWorkspaceSnapshot(ctx, snapshot.Revision, documents)
+}
+
+func (b *Backend) WorkspaceSnapshotGeneration() uint64 {
+	return b.conn.WorkspaceSnapshotGeneration()
+}
+
+// SetDiagnosticsUpdateHandler forwards current child diagnostic changes to
+// the parent diagnostic cache coordinator.
+func (b *Backend) SetDiagnosticsUpdateHandler(handler func(uri string)) {
+	b.conn.SetDiagnosticsUpdateHandler(handler)
+}
+
+func (b *Backend) DiagnosticsWithEncoding(ctx context.Context, uri string, content []byte, snapshotRev uint64, encoding int) ([]languages.Diagnostic, error) {
+	token, err := b.conn.RefreshDiagnosticsAtRevision(ctx, documentLanguageID(uri), uri, content, snapshotRev)
+	if err != nil {
+		return nil, err
+	}
+	upstream, err := b.conn.WaitForDiagnostics(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	converted, err := nested.ConvertDiagnosticPositions(content, upstream, encoding)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", serverName, err)
+	}
+	result := make([]languages.Diagnostic, 0, len(converted))
+	for _, diagnostic := range converted {
+		result = append(result, languages.Diagnostic{
+			StartLine: diagnostic.StartLine, StartChar: diagnostic.StartChar,
+			EndLine: diagnostic.EndLine, EndChar: diagnostic.EndChar,
+			Severity: diagnostic.Severity, Code: diagnostic.Code, Source: diagnostic.Source, Message: diagnostic.Message,
+		})
+	}
+	return result, nil
 }
 
 func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte) ([]languages.SemanticToken, error) {
 	return nil, nil // push-based semantic tokens not yet consumed; explicit empty (Q3)
 }
 
-func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (identity.SemanticResult[languages.ValidatedEdit], error) {
+func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
 	// X3/R4.1 fail-closed gate: without a tsconfig the server works in
 	// inferred-project mode with no project-wide file set, so rename
 	// completeness is unprovable.
@@ -344,26 +499,40 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 			},
 		}, nil
 	}
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/rename", map[string]interface{}{
+	kind, refusal, err := b.classifyRenameTarget(ctx, req)
+	if refusal != "" {
+		message := "rename refused: TypeScript/JavaScript target classification is unavailable (SEM-SAFE-001)"
+		if refusal == "rename-target-outside-document" {
+			message = "rename refused: TypeScript/JavaScript target is outside the current document; collision analysis is not proven (SEM-SAFE-001)"
+		}
+		return unavailableTSRename(req, refusal, message), nil
+	}
+	if err != nil {
+		if ierrors.IsKind(err, ierrors.ErrContentModified) {
+			return unavailableTSRename(req, "rename-target-revision-changed", "rename refused: TypeScript/JavaScript target classification changed with the document revision (SEM-SAFE-001)"), err
+		}
+		return unavailableTSRename(req, "rename-target-classification-failed", "rename refused: TypeScript/JavaScript target classification is unavailable (SEM-SAFE-001)"), err
+	}
+	if tsRenameNeedsCollisionProof(kind) {
+		return unavailableTSRename(req, "rename-function-collision-unproven", "rename refused: TypeScript/JavaScript function/method collision analysis is not proven (SEM-SAFE-001)"), nil
+	}
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, documentLanguageID(req.URI), req.URI, req.Content, req.SnapshotRev, "textDocument/rename", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 		"newName":      req.NewName,
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return identity.SemanticResult[languages.ValidatedEdit]{
+		result := identity.SemanticResult[languages.ValidatedEdit]{
 			Status:              identity.ResultUnavailable,
 			Evidence:            evidenceForTs(req.SnapshotRev, req.BuildContext, req.Content, serverName+" request failed"),
 			InternalDiagnostics: []string{err.Error()},
-		}, nil
+		}
+		return result, err
 	}
-	if result == nil {
+	if len(bytes.TrimSpace(result)) == 0 || bytes.Equal(bytes.TrimSpace(result), []byte("null")) {
 		// The server refuses renames it cannot prove; inherit the refusal.
-		return identity.SemanticResult[languages.ValidatedEdit]{
-			Status:              identity.ResultUnavailable,
-			Evidence:            evidenceForTs(req.SnapshotRev, req.BuildContext, req.Content, serverName+"-refused"),
-			InternalDiagnostics: []string{"upstream language service refused rename"},
-		}, nil
+		return unavailableTSRename(req, serverName+"-refused", "upstream language service refused rename"), nil
 	}
 	var edits []languages.TextEdit
 	var workspaceEdit struct {
@@ -386,7 +555,7 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 			Status:              identity.ResultUnavailable,
 			Evidence:            evidenceForTs(req.SnapshotRev, req.BuildContext, req.Content, "rename decode failed"),
 			InternalDiagnostics: []string{err.Error()},
-		}, nil
+		}, err
 	}
 	for uri, changes := range workspaceEdit.Changes {
 		for _, c := range changes {
@@ -397,6 +566,9 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 				NewText: c.NewText,
 			})
 		}
+	}
+	if len(edits) == 0 {
+		return unavailableTSRename(req, serverName+"-refused", "upstream language service refused rename"), nil
 	}
 	// G9 Phase 1: a non-null WorkspaceEdit carries the server's own proof.
 	return identity.SemanticResult[languages.ValidatedEdit]{
@@ -410,8 +582,143 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 	}, nil
 }
 
-func (b *Backend) didOpen(uri string, content []byte) {
-	b.conn.DidOpen(langID, uri, content)
+const tsFunctionLikeSymbolOperator languages.SymbolKind = 25 // LSP SymbolKind::Operator.
+
+// classifyRenameTarget asks the same revision-bound language service to
+// resolve the target and classify its declaration. Rename cannot proceed
+// without one unambiguous declaration in the current document.
+func (b *Backend) classifyRenameTarget(ctx context.Context, req languages.RenameRequest) (languages.SymbolKind, string, error) {
+	definition, err := b.Definition(ctx, languages.DefinitionRequest{
+		URI: req.URI, Content: req.Content, SnapshotRev: req.SnapshotRev,
+		BuildContext: req.BuildContext, Line: req.Line, Column: req.Column,
+		Encoding: req.Encoding, EncodingSet: req.EncodingSet,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	if definition.Status != identity.ResultExact || definition.Completeness != identity.Complete || len(definition.Value) != 1 {
+		return 0, "rename-target-unclassified", nil
+	}
+	target := definition.Value[0]
+	if target.URI != req.URI {
+		return 0, "rename-target-outside-document", nil
+	}
+	if !validTSRange(target.Range) {
+		return 0, "rename-target-unclassified", nil
+	}
+	symbols, err := b.DocumentSymbols(ctx, languages.DocumentSymbolRequest{
+		URI: req.URI, Content: req.Content, SnapshotRev: req.SnapshotRev,
+		Encoding: req.Encoding, EncodingSet: req.EncodingSet,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	kind, ok := classifyTSSymbolAtDefinition(symbols, target.Range)
+	if !ok {
+		return 0, "rename-target-unclassified", nil
+	}
+	return kind, "", nil
+}
+
+func unavailableTSRename(req languages.RenameRequest, detailCode, message string) identity.SemanticResult[languages.ValidatedEdit] {
+	return identity.SemanticResult[languages.ValidatedEdit]{
+		Status:              identity.ResultUnavailable,
+		Evidence:            evidenceForTs(req.SnapshotRev, req.BuildContext, req.Content, detailCode),
+		InternalDiagnostics: []string{message},
+		Completeness:        identity.CompletenessUnknown,
+	}
+}
+
+func tsRenameNeedsCollisionProof(kind languages.SymbolKind) bool {
+	return kind == languages.SymbolFunction || kind == languages.SymbolMethod ||
+		kind == languages.SymbolConstructor || kind == tsFunctionLikeSymbolOperator
+}
+
+func classifyTSSymbolAtDefinition(symbols []languages.DocumentSymbol, target languages.Range) (languages.SymbolKind, bool) {
+	var candidates []languages.DocumentSymbol
+	var visit func([]languages.DocumentSymbol)
+	visit = func(items []languages.DocumentSymbol) {
+		for _, item := range items {
+			selection := tsSymbolSelection(item)
+			if item.SelectionRangeSet && validTSRange(selection) && tsRangeContains(selection, target) {
+				candidates = append(candidates, item)
+			}
+			visit(item.Children)
+		}
+	}
+	visit(symbols)
+	if len(candidates) == 0 {
+		return 0, false
+	}
+	var narrowest []languages.DocumentSymbol
+	for i, candidate := range candidates {
+		candidateRange := tsSymbolSelection(candidate)
+		isNarrowest := true
+		for j, other := range candidates {
+			if i != j && tsRangeStrictlyContains(candidateRange, tsSymbolSelection(other)) {
+				isNarrowest = false
+				break
+			}
+		}
+		if isNarrowest {
+			narrowest = append(narrowest, candidate)
+		}
+	}
+	if len(narrowest) == 0 {
+		return 0, false
+	}
+	kind := narrowest[0].Kind
+	if kind < languages.SymbolFile || kind > 26 {
+		return 0, false
+	}
+	for _, candidate := range narrowest[1:] {
+		if candidate.Kind != kind {
+			return 0, false
+		}
+	}
+	return kind, true
+}
+
+func tsSymbolSelection(symbol languages.DocumentSymbol) languages.Range {
+	return languages.Range{
+		StartLine: symbol.SelectionLine, StartCharacter: symbol.SelectionCharacter,
+		EndLine: symbol.SelectionEndLine, EndCharacter: symbol.SelectionEndCharacter,
+	}
+}
+
+func validTSRange(r languages.Range) bool {
+	return tsPositionLess(r.StartLine, r.StartCharacter, r.EndLine, r.EndCharacter)
+}
+
+func tsRangeContains(outer, inner languages.Range) bool {
+	return !tsPositionLess(inner.StartLine, inner.StartCharacter, outer.StartLine, outer.StartCharacter) &&
+		!tsPositionLess(outer.EndLine, outer.EndCharacter, inner.EndLine, inner.EndCharacter)
+}
+
+func tsRangeStrictlyContains(outer, inner languages.Range) bool {
+	return tsRangeContains(outer, inner) &&
+		(outer.StartLine != inner.StartLine || outer.StartCharacter != inner.StartCharacter ||
+			outer.EndLine != inner.EndLine || outer.EndCharacter != inner.EndCharacter)
+}
+
+func tsPositionLess(lineA, charA, lineB, charB uint32) bool {
+	return lineA < lineB || (lineA == lineB && charA < charB)
+}
+
+func (b *Backend) didOpen(uri string, content []byte, revision ...uint64) error {
+	var snapshotRevision uint64
+	if len(revision) != 0 {
+		snapshotRevision = revision[0]
+	}
+	_, err := b.conn.SyncDocumentAtRevision(documentLanguageID(uri), uri, content, snapshotRevision)
+	return err
+}
+
+// DidCloseDocument is an optional lifecycle hook used by the runtime server
+// when an editor closes a document. It does not change the frozen Backend
+// method set.
+func (b *Backend) DidCloseDocument(uri string, snapshotRevision uint64) error {
+	return b.conn.CloseDocument(uri, snapshotRevision)
 }
 
 // cfgPresent reports whether the workspace tsconfig exists (§X3), cached:
