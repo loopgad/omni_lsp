@@ -26,3 +26,11 @@ nvim.log
 Thumbs.db
 desktop.ini
 __pycache__/
+
+# Local test binaries and zcode workflow state.
+/.tmp-omnilsp-scheduler-trace.exe
+/.tmp-golang-test.exe
+/.zcode/
+
+# Local test evidence with absolute paths; never commit.
+/test/corpus/test/
