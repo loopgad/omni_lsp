@@ -10,6 +10,7 @@ import (
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/runtime/scheduler"
+	"github.com/omnilsp/omni/internal/workspace/snapshot"
 	"github.com/omnilsp/omni/internal/workspace/vfs"
 )
 
@@ -24,9 +25,15 @@ type mockBackend struct {
 	renResult   languages.ValidatedEdit
 	semtResult  []languages.SemanticToken
 	wsymResult  []languages.WorkspaceSymbol
+	closeErr    error
 }
 
-func (m *mockBackend) LanguageID() string       { return m.langID }
+func (m *mockBackend) LanguageID() string { return m.langID }
+
+// The fixture backend reads only immutable request content, never disk.
+func (m *mockBackend) SemanticInputFingerprint(context.Context, *snapshot.Snapshot, string) (string, error) {
+	return "immutable-request-fixture", nil
+}
 func (m *mockBackend) FileExtensions() []string { return m.exts }
 func (m *mockBackend) Hover(_ context.Context, _ languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
 	return identity.SemanticResult[*languages.HoverResult]{
@@ -68,7 +75,49 @@ func (m *mockBackend) SemanticTokens(_ context.Context, _ string, _ []byte) ([]l
 func (m *mockBackend) Rename(_ context.Context, _ languages.RenameRequest) (identity.SemanticResult[languages.ValidatedEdit], error) {
 	return identity.SemanticResult[languages.ValidatedEdit]{Status: identity.ResultExact, Value: m.renResult}, nil
 }
-func (m *mockBackend) Close() error { return nil }
+func (m *mockBackend) Close() error { return m.closeErr }
+
+type didCloseTrackingBackend struct {
+	mockBackend
+	server   *Server
+	called   bool
+	uri      string
+	revision uint64
+	wasOpen  bool
+}
+
+func (b *didCloseTrackingBackend) DidCloseDocument(uri string, revision uint64) error {
+	b.called = true
+	b.uri = uri
+	b.revision = revision
+	b.wasOpen = b.server.vfs.Get(uri) != nil
+	return nil
+}
+
+type didSaveTrackingBackend struct {
+	mockBackend
+	server               *Server
+	called               bool
+	uri                  string
+	content              string
+	revision             uint64
+	wasDirty             bool
+	snapshotRevisionSeen uint64
+}
+
+func (b *didSaveTrackingBackend) DidSaveDocument(uri string, content []byte, revision uint64) error {
+	b.called = true
+	b.uri = uri
+	b.content = string(content)
+	b.revision = revision
+	if file := b.server.vfs.Get(uri); file != nil {
+		b.wasDirty = file.Dirty
+	}
+	if snapshot := b.server.snapMgr.Current(); snapshot != nil {
+		b.snapshotRevisionSeen = uint64(snapshot.ID().Revision)
+	}
+	return nil
+}
 
 func TestNewServer(t *testing.T) {
 	s := New(DefaultConfig())
@@ -146,6 +195,16 @@ func TestHandleInitialize(t *testing.T) {
 	if !result.Capabilities.DefinitionProvider {
 		t.Error("DefinitionProvider should be true")
 	}
+	if got := result.Capabilities.DiagnosticProvider; got == nil {
+		t.Error("diagnosticProvider options should be present")
+	} else {
+		if !got.InterFileDependencies {
+			t.Error("diagnosticProvider.interFileDependencies should be true for workspace-aware backends")
+		}
+		if got.WorkspaceDiagnostics {
+			t.Error("diagnosticProvider.workspaceDiagnostics should be false without workspace/diagnostic handler")
+		}
+	}
 	if result.Capabilities.TextDocumentSync == nil || !result.Capabilities.TextDocumentSync.OpenClose {
 		t.Error("OpenClose should be true")
 	}
@@ -194,27 +253,53 @@ func TestHandleDidChange(t *testing.T) {
 
 func TestHandleDidClose(t *testing.T) {
 	s := New(DefaultConfig())
-	s.vfs.Open("file:///tmp/a.go", "go", 1, []byte("package main\n"), vfs.SourceDisk)
-	params := `{"textDocument":{"uri":"file:///tmp/a.go"}}`
+	const uri = "file:///tmp/a.go"
+	be := &didCloseTrackingBackend{mockBackend: mockBackend{langID: "go", exts: []string{".go"}}, server: s}
+	s.RegisterBackend("go", be)
+	s.vfs.Open(uri, "go", 1, []byte("package main\n"), vfs.SourceDisk)
+	s.publishSnapshot()
+	closeRevision := s.vfs.Revision() + 1
+	params := `{"textDocument":{"uri":"` + uri + `"}}`
 	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "dc", IsStr: true}, "textDocument/didClose", json.RawMessage(params))
-	s.dispatcher.Dispatch(context.Background(), msg)
-	if s.vfs.Get("file:///tmp/a.go") != nil {
+	if _, err := s.handleDidClose(context.Background(), msg); err != nil {
+		t.Fatalf("handleDidClose returned error: %v", err)
+	}
+	if s.vfs.Get(uri) != nil {
 		t.Error("file should be removed from VFS after close")
+	}
+	if !be.called || be.uri != uri || be.revision != closeRevision || !be.wasOpen {
+		t.Fatalf("optional backend close hook = called:%v uri:%q rev:%d open:%v; want URI/post-close revision and open state", be.called, be.uri, be.revision, be.wasOpen)
+	}
+	if got := s.snapMgr.Current().ID().Revision; got != closeRevision {
+		t.Fatalf("published close revision = %d, want backend barrier revision %d", got, closeRevision)
 	}
 }
 
 func TestHandleDidSave(t *testing.T) {
 	s := New(DefaultConfig())
-	s.vfs.Open("file:///tmp/a.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
-	params := `{"textDocument":{"uri":"file:///tmp/a.go"}}`
+	defer s.diag.Close()
+	const uri = "file:///tmp/a.go"
+	const content = "package main\n"
+	be := &didSaveTrackingBackend{
+		mockBackend: mockBackend{langID: "go", exts: []string{".go"}},
+		server:      s,
+	}
+	s.RegisterBackend("go", be)
+	s.vfs.Open(uri, "go", 1, []byte(content), vfs.SourceEditor)
+	s.publishSnapshot()
+	params := `{"textDocument":{"uri":"` + uri + `"}}`
 	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "ds", IsStr: true}, "textDocument/didSave", json.RawMessage(params))
 	s.dispatcher.Dispatch(context.Background(), msg)
-	f := s.vfs.Get("file:///tmp/a.go")
+	f := s.vfs.Get(uri)
 	if f == nil {
 		t.Fatal("file missing after save")
 	}
 	if f.Dirty {
 		t.Error("file should not be dirty after save")
+	}
+	wantRevision := s.vfs.Revision()
+	if !be.called || be.uri != uri || be.content != content || be.revision != wantRevision || be.wasDirty || be.snapshotRevisionSeen != wantRevision {
+		t.Fatalf("save hook = called:%v uri:%q content:%q revision:%d dirty:%v snapshot revision:%d; want saved URI/content and published clean snapshot at revision %d", be.called, be.uri, be.content, be.revision, be.wasDirty, be.snapshotRevisionSeen, wantRevision)
 	}
 }
 
@@ -250,7 +335,7 @@ func TestResolveBackend(t *testing.T) {
 
 func TestDispatchSemanticRequestNoBackend(t *testing.T) {
 	s := New(DefaultConfig())
-	_, err := s.dispatchSemanticRequest(context.Background(), nil, "file:///foo.py", 0, 0, func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+	_, err := s.dispatchSemanticRequest(context.Background(), nil, "file:///foo.py", 0, 0, func(_ context.Context, be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
 		return nil, nil
 	})
 	if err == nil {
@@ -360,9 +445,31 @@ func TestHandleRename(t *testing.T) {
 	}
 }
 
+func TestHandleRenameRejectsInvalidWorkspaceEdit(t *testing.T) {
+	s := New(DefaultConfig())
+	be := &mockBackend{langID: "go", exts: []string{".go"}, renResult: languages.ValidatedEdit{
+		Complete: true,
+		Edits: []languages.TextEdit{
+			{URI: "file:///x.go", StartLine: 0, StartChar: 0, EndLine: 0, EndChar: 4, NewText: "first"},
+			{URI: "file:///x.go", StartLine: 0, StartChar: 3, EndLine: 0, EndChar: 5, NewText: "second"},
+		},
+	}}
+	s.RegisterBackend("go", be)
+	s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
+	resp := s.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(
+		jsonrpc.RequestID{Str: "rn-invalid", IsStr: true}, "textDocument/rename",
+		json.RawMessage(`{"textDocument":{"uri":"file:///x.go"},"position":{"line":0,"character":0},"newName":"bar"}`)))
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("overlapping WorkspaceEdit was not rejected: %+v", resp)
+	}
+	if resp.Error.Code != jsonrpc.RequestFailed || !contains(resp.Error.Message, "WorkspaceEdit validation") {
+		t.Fatalf("invalid WorkspaceEdit refusal = %+v", resp.Error)
+	}
+}
+
 func TestHandleDocumentSymbol(t *testing.T) {
 	s := New(DefaultConfig())
-	be := &mockBackend{langID: "go", exts: []string{".go"}, symResult: []languages.DocumentSymbol{{Name: "foo", Kind: languages.SymbolFunction, StartLine: 0, StartCharacter: 5, EndLine: 0, EndCharacter: 8, SelectionLine: 0, SelectionCharacter: 5}}}
+	be := &mockBackend{langID: "go", exts: []string{".go"}, symResult: []languages.DocumentSymbol{{Name: "foo", Kind: languages.SymbolFunction, StartLine: 0, StartCharacter: 0, EndLine: 0, EndCharacter: 12, SelectionLine: 0, SelectionCharacter: 5, SelectionEndLine: 0, SelectionEndCharacter: 7, SelectionRangeSet: true}}}
 	s.RegisterBackend("go", be)
 	s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
 	params := `{"textDocument":{"uri":"file:///x.go"}}`
@@ -373,13 +480,20 @@ func TestHandleDocumentSymbol(t *testing.T) {
 		t.Fatalf("expected success")
 	}
 	var syms []struct {
-		Name string `json:"name"`
+		Name           string `json:"name"`
+		SelectionRange struct {
+			Start struct{ Line, Character uint32 } `json:"start"`
+			End   struct{ Line, Character uint32 } `json:"end"`
+		} `json:"selectionRange"`
 	}
 	if err := json.Unmarshal(resp.Result, &syms); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if len(syms) != 1 || syms[0].Name != "foo" {
 		t.Errorf("symbols = %v, want [{foo}]", syms)
+	}
+	if len(syms) == 1 && (syms[0].SelectionRange.Start.Character != 5 || syms[0].SelectionRange.End.Character != 7) {
+		t.Errorf("selection range = %+v, want exact stored end 0:7", syms[0].SelectionRange)
 	}
 }
 
@@ -669,7 +783,7 @@ func TestDispatchSemanticRequestNilSourceFallback(t *testing.T) {
 	s.vfs.Close("file:///x.go")
 	called := false
 	_, _ = s.dispatchSemanticRequest(context.Background(), nil, "file:///x.go", 0, 0,
-		func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+		func(_ context.Context, be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
 			called = true
 			return json.RawMessage(`{"ok":true}`), nil
 		})

@@ -68,18 +68,20 @@ func TestE7_BuildContextFlowsIntoRequests(t *testing.T) {
 
 type contextCapturingMock struct {
 	mockBackend
-	seen *identity.BuildContextID
-	bc   identity.BuildContextID
+	seen  *identity.BuildContextID
+	bc    identity.BuildContextID
+	epoch uint64
 }
 
 func (m *contextCapturingMock) BuildContextID() identity.BuildContextID { return m.bc }
+func (m *contextCapturingMock) SupervisorEpoch() uint64                 { return m.epoch }
 
 func (m *contextCapturingMock) Hover(_ context.Context, req languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
 	*m.seen = req.BuildContext
 	return identity.SemanticResult[*languages.HoverResult]{
 		Status:   identity.ResultExact,
 		Value:    &languages.HoverResult{Contents: "ok"},
-		Evidence: []identity.Evidence{{BuildContext: req.BuildContext}},
+		Evidence: []identity.Evidence{{BuildContext: req.BuildContext, BackendEpoch: identity.BackendEpoch(m.epoch)}},
 	}, nil
 }
 
@@ -87,7 +89,7 @@ func (m *contextCapturingMock) Hover(_ context.Context, req languages.HoverReque
 // omnilsp/explain with the real §B4 records from semantic handlers.
 func TestI25_ExplainReportsEvidenceChain(t *testing.T) {
 	s := New(DefaultConfig())
-	be := &contextCapturingMock{bc: "go:sha256:testctx", seen: new(identity.BuildContextID)}
+	be := &contextCapturingMock{bc: "go:sha256:testctx", seen: new(identity.BuildContextID), epoch: 7}
 	be.hoverResult = &languages.HoverResult{Contents: "sig"}
 	s.RegisterBackend("go", be)
 
@@ -118,6 +120,7 @@ func TestI25_ExplainReportsEvidenceChain(t *testing.T) {
 			Kind         string `json:"kind"`
 			Assurance    string `json:"assurance"`
 			BuildContext string `json:"buildContext"`
+			BackendEpoch uint64 `json:"backendEpoch"`
 		} `json:"evidence"`
 	}
 	if err := json.Unmarshal(expResp.Result, &out); err != nil {
@@ -132,5 +135,43 @@ func TestI25_ExplainReportsEvidenceChain(t *testing.T) {
 	}
 	if e.BuildContext != "go:sha256:testctx" {
 		t.Errorf("buildContext = %q, want go:sha256:testctx", e.BuildContext)
+	}
+	if e.BackendEpoch != 7 {
+		t.Errorf("backendEpoch = %d, want the producing backend's epoch 7", e.BackendEpoch)
+	}
+}
+
+func TestEvidenceQueriesAcceptEquivalentDocumentURIs(t *testing.T) {
+	s := New(DefaultConfig())
+	s.recordEvidence(context.Background(), "textDocument/hover", "file:///C:/workspace/a%20b.go", identity.ResultExact, identity.Complete,
+		[]identity.Evidence{{Kind: identity.EvidenceIndex}}, nil)
+	for _, method := range []string{"omnilsp/explain", "omnilsp/resultMeta"} {
+		params, err := json.Marshal(map[string]string{"uri": "file:///c:/workspace/a b.go"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := &jsonrpc.Message{Method: method, Params: params}
+		var raw json.RawMessage
+		if method == "omnilsp/explain" {
+			raw, err = s.handleOmnilspExplain(context.Background(), msg)
+		} else {
+			raw, err = s.handleOmnilspResultMeta(context.Background(), msg)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if method == "omnilsp/explain" {
+			var result struct {
+				Evidence []json.RawMessage `json:"evidence"`
+			}
+			if err := json.Unmarshal(raw, &result); err != nil || len(result.Evidence) != 1 {
+				t.Fatalf("%s alias evidence missing: %s err=%v", method, raw, err)
+			}
+		} else {
+			var entries []json.RawMessage
+			if err := json.Unmarshal(raw, &entries); err != nil || len(entries) != 1 {
+				t.Fatalf("%s alias evidence missing: %s err=%v", method, raw, err)
+			}
+		}
 	}
 }

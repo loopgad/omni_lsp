@@ -87,6 +87,47 @@ func TestS13_HalfFrameDisconnect(t *testing.T) {
 	}
 }
 
+func TestLSP_GracefulExitClosesRunWithoutTransportFailure(t *testing.T) {
+	var inbound, outbound bytes.Buffer
+	codec := jsonrpc.NewCodec()
+	messages := []*jsonrpc.Message{
+		jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", json.RawMessage(`{"processId":1,"rootUri":"file:///ws"}`)),
+		jsonrpc.NewNotification("initialized", json.RawMessage(`{}`)),
+		jsonrpc.NewRequest(jsonrpc.RequestID{Num: 2}, "shutdown", json.RawMessage(`{}`)),
+		jsonrpc.NewNotification("exit", json.RawMessage(`{}`)),
+	}
+	for _, msg := range messages {
+		if err := codec.WriteMessage(&inbound, msg); err != nil {
+			t.Fatalf("encode lifecycle message %s: %v", msg.Method, err)
+		}
+	}
+
+	srv := New(DefaultConfig())
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	tr := transport.NewStdioTransport(pr, &outbound)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := pw.Write(inbound.Bytes())
+		writeDone <- err
+	}()
+	if err := srv.Run(context.Background(), tr); err != nil {
+		t.Fatalf("Run returned an error after the LSP exit notification: %v", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write lifecycle messages: %v", err)
+	}
+	_ = pw.Close()
+	select {
+	case <-tr.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdio read loop did not stop after closing its input")
+	}
+	if srv.State() != StateExited {
+		t.Fatalf("server state after graceful exit = %s, want exited", srv.State())
+	}
+}
+
 // TestS13_P0FloodDoesNotStarveP4 verifies forward progress of background
 // work under a sustained flood of interactive requests (goal.md §S15/F7).
 //
@@ -257,9 +298,8 @@ func (b *crashHoverBackend) Hover(ctx context.Context, _ languages.HoverRequest)
 // TestS4_CancelRaceWithCrash replays the §S4 cancel-race permutation against
 // a §S13 crashing backend: cancel lands while the backend is mid-request and
 // the backend dies at the same moment. Each permutation must end in exactly
-// one terminal outcome — a single error/response for the request, or silence
-// (cancelled requests get no protocol response) — never a double response,
-// panic, or goroutine leak.
+// one terminal response for the request, never silence, a double response,
+// panic, or a goroutine leak.
 func TestS4_CancelRaceWithCrash(t *testing.T) {
 	base := runtime.NumGoroutine()
 
@@ -329,32 +369,28 @@ func TestS4_CancelRaceWithCrash(t *testing.T) {
 			srv.scheduleMessage(context.Background(), cancelMsg)
 		}
 
-		// Terminal outcome reached when a response for id appears or the
-		// in-flight entry is gone (cancelled: no response by design).
+		// The in-flight entry is removed before the response is written, so
+		// wait for the correlated terminal response itself.
 		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			done := inflightGone(id)
-			if done {
-				break
-			}
+		responded := false
+		for !responded && time.Now().Before(deadline) {
 			for _, m := range ft.responses() {
 				if m.ID != nil && m.ID.Num == id {
-					done = true
+					responded = true
 					break
 				}
 			}
-			if done {
-				break
+			if !responded {
+				time.Sleep(2 * time.Millisecond)
 			}
-			time.Sleep(2 * time.Millisecond)
 		}
-		if !inflightGone(id) {
-			t.Fatalf("iter %d: request never reached a terminal state", i)
+		if !responded || !inflightGone(id) {
+			t.Fatalf("iter %d: request did not produce its correlated terminal response and clear in-flight state (responded=%t)", i, responded)
 		}
 	}
 
-	// Settle, then audit: at most one response per request ID anywhere on
-	// the wire (double-response is the forbidden outcome).
+	// Settle, then audit: exactly one response per request ID anywhere on
+	// the wire (silence and double-response are both forbidden).
 	time.Sleep(300 * time.Millisecond)
 	counts := make(map[int64]int)
 	for _, m := range ft.responses() {
@@ -362,9 +398,9 @@ func TestS4_CancelRaceWithCrash(t *testing.T) {
 			counts[m.ID.Num]++
 		}
 	}
-	for id, n := range counts {
-		if n > 1 {
-			t.Errorf("request id %d produced %d responses; want exactly one terminal outcome", id, n)
+	for id := int64(100); id < 100+iterations; id++ {
+		if n := counts[id]; n != 1 {
+			t.Errorf("request id %d produced %d responses; want exactly one terminal response", id, n)
 		}
 	}
 

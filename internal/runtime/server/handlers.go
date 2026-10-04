@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,7 +15,9 @@ import (
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/protocol/lsp"
+	"github.com/omnilsp/omni/internal/semantic/query"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
+	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 	"github.com/omnilsp/omni/internal/workspace/vfs"
 	"github.com/omnilsp/omni/internal/workspace/virtual"
 )
@@ -41,22 +44,22 @@ type InitializeResult struct {
 }
 
 type ServerCapabilities struct {
-	PositionEncoding           string                   `json:"positionEncoding,omitempty"`
-	TextDocumentSync           *TextDocumentSyncOptions `json:"textDocumentSync"`
-	HoverProvider              bool                     `json:"hoverProvider"`
-	CompletionProvider         *CompletionOptions       `json:"completionProvider"`
-	DefinitionProvider         bool                     `json:"definitionProvider"`
-	DeclarationProvider        bool                     `json:"declarationProvider,omitempty"`
-	ReferencesProvider         bool                     `json:"referencesProvider"`
-	DocumentSymbolProvider     bool                     `json:"documentSymbolProvider"`
-	RenameProvider             bool                     `json:"renameProvider"`
-	SemanticTokensProvider     *SemanticTokensOptions   `json:"semanticTokensProvider"`
-	WorkspaceSymbolProvider    bool                     `json:"workspaceSymbolProvider"`
-	SignatureHelpProvider      bool                     `json:"signatureHelpProvider,omitempty"`
-	CodeActionProvider         bool                     `json:"codeActionProvider,omitempty"`
-	DiagnosticProvider         bool                     `json:"diagnosticProvider,omitempty"`
-	DocumentFormattingProvider bool                     `json:"documentFormattingProvider,omitempty"`
-	InlayHintProvider          bool                     `json:"inlayHintProvider,omitempty"`
+	PositionEncoding           string                     `json:"positionEncoding,omitempty"`
+	TextDocumentSync           *TextDocumentSyncOptions   `json:"textDocumentSync"`
+	HoverProvider              bool                       `json:"hoverProvider"`
+	CompletionProvider         *CompletionOptions         `json:"completionProvider"`
+	DefinitionProvider         bool                       `json:"definitionProvider"`
+	DeclarationProvider        bool                       `json:"declarationProvider,omitempty"`
+	ReferencesProvider         bool                       `json:"referencesProvider"`
+	DocumentSymbolProvider     bool                       `json:"documentSymbolProvider"`
+	RenameProvider             bool                       `json:"renameProvider"`
+	SemanticTokensProvider     *SemanticTokensOptions     `json:"semanticTokensProvider"`
+	WorkspaceSymbolProvider    bool                       `json:"workspaceSymbolProvider"`
+	SignatureHelpProvider      *SignatureHelpOptions      `json:"signatureHelpProvider,omitempty"`
+	CodeActionProvider         bool                       `json:"codeActionProvider,omitempty"`
+	DiagnosticProvider         *DiagnosticProviderOptions `json:"diagnosticProvider,omitempty"`
+	DocumentFormattingProvider bool                       `json:"documentFormattingProvider,omitempty"`
+	InlayHintProvider          bool                       `json:"inlayHintProvider,omitempty"`
 }
 
 type TextDocumentSyncOptions struct {
@@ -73,6 +76,10 @@ type CompletionOptions struct {
 	TriggerCharacters []string `json:"triggerCharacters"`
 }
 
+// SignatureHelpOptions must be an object in initialize capabilities; clients
+// such as Helix reject the boolean shape used by most other provider fields.
+type SignatureHelpOptions struct{}
+
 type SemanticTokensOptions struct {
 	Legend      SemanticTokensLegend `json:"legend"`
 	Full        bool                 `json:"full"`
@@ -83,6 +90,13 @@ type SemanticTokensOptions struct {
 type SemanticTokensLegend struct {
 	TokenTypes     []string `json:"tokenTypes"`
 	TokenModifiers []string `json:"tokenModifiers"`
+}
+
+// DiagnosticProviderOptions describes pull diagnostic support to LSP clients.
+// Unlike the boolean capabilities, diagnosticProvider is an options object.
+type DiagnosticProviderOptions struct {
+	InterFileDependencies bool `json:"interFileDependencies"`
+	WorkspaceDiagnostics  bool `json:"workspaceDiagnostics"`
 }
 
 type DidOpenTextDocumentParams struct {
@@ -221,6 +235,11 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 			return nil, fmt.Errorf("invalid initialize params: %w", err)
 		}
 		if params.RootURI != "" {
+			root, err := workspaceuri.Parse(params.RootURI)
+			if err != nil {
+				return nil, fmt.Errorf("invalid root URI: %w", err)
+			}
+			params.RootURI = root.Canonical()
 			s.mu.Lock()
 			s.workspaceID = identity.WorkspaceID(params.RootURI)
 			s.mu.Unlock()
@@ -283,9 +302,9 @@ func buildCapabilities(positionEncoding string) ServerCapabilities {
 			// method-not-found (§C3 honesty).
 		},
 		WorkspaceSymbolProvider:    true,
-		SignatureHelpProvider:      true,
+		SignatureHelpProvider:      &SignatureHelpOptions{},
 		CodeActionProvider:         true,
-		DiagnosticProvider:         true, // pull + push (C11)
+		DiagnosticProvider:         &DiagnosticProviderOptions{InterFileDependencies: true}, // pull + push (C11)
 		DocumentFormattingProvider: true,
 		InlayHintProvider:          true,
 	}
@@ -309,9 +328,28 @@ func (s *Server) handleShutdown(ctx context.Context, msg *jsonrpc.Message) (json
 	case StateRunning, StateInitializing:
 		s.state = StateShuttingDown
 		s.mu.Unlock()
+		s.scheduler.Shutdown()
+		s.mu.RLock()
+		for _, request := range s.inflight {
+			request.Cancel()
+		}
+		s.mu.RUnlock()
+		err := stderrors.Join(s.drainInflight(2*time.Second), s.closeBackends())
+		s.mu.Lock()
+		s.shutdownErr = err
+		s.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 		return json.RawMessage("null"), nil
 	case StateShuttingDown:
 		s.mu.Unlock()
+		s.mu.RLock()
+		err := s.shutdownErr
+		s.mu.RUnlock()
+		if err != nil {
+			return nil, err
+		}
 		return json.RawMessage("null"), nil
 	default:
 		st := s.state
@@ -357,8 +395,15 @@ func (s *Server) handleDidOpen(ctx context.Context, msg *jsonrpc.Message) (json.
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid didOpen params: %w", err)
 	}
-	s.vfs.Open(params.TextDocument.URI, params.TextDocument.LanguageID,
-		params.TextDocument.Version, []byte(params.TextDocument.Text), vfs.SourceEditor)
+	if _, err := workspaceuri.Parse(params.TextDocument.URI); err != nil {
+		return nil, fmt.Errorf("invalid document URI: %w", err)
+	}
+	if err := s.vfs.TryOpen(params.TextDocument.URI, params.TextDocument.LanguageID,
+		params.TextDocument.Version, []byte(params.TextDocument.Text), vfs.SourceEditor); err != nil {
+		s.syncRejects.Add(1)
+		s.metrics.SyncRejects.Inc(1)
+		return nil, err
+	}
 	s.publishSnapshot()
 	// §C11 push path: debounced diagnostics for the freshly opened document.
 	s.diag.request(params.TextDocument.URI)
@@ -415,9 +460,25 @@ func (s *Server) handleDidSave(ctx context.Context, msg *jsonrpc.Message) (json.
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid didSave params: %w", err)
 	}
-	s.vfs.Save(params.TextDocument.URI)
+	uri := params.TextDocument.URI
+	wasOpen := s.vfs.Get(uri) != nil
+	s.vfs.Save(uri)
 	s.publishSnapshot()
-	return nil, nil
+	var saveErr error
+	if wasOpen {
+		if saver, ok := s.findWorkspaceBackendFor(uri).(interface {
+			DidSaveDocument(uri string, content []byte, snapshotRev uint64) error
+		}); ok {
+			saveErr = saver.DidSaveDocument(uri, s.vfs.Content(uri), s.vfs.Revision())
+			if saveErr != nil {
+				s.recordEvidence(ctx, "textDocument/didSave", uri, identity.ResultUnavailable, identity.CompletenessUnknown, nil, []string{saveErr.Error()})
+			}
+		}
+		if s.diag != nil {
+			s.diag.request(uri)
+		}
+	}
+	return nil, saveErr
 }
 
 func (s *Server) handleDidClose(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
@@ -425,9 +486,29 @@ func (s *Server) handleDidClose(ctx context.Context, msg *jsonrpc.Message) (json
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid didClose params: %w", err)
 	}
-	s.vfs.Close(params.TextDocument.URI)
+	uri := params.TextDocument.URI
+	be := s.findWorkspaceBackendFor(uri)
+	wasOpen := s.vfs.Get(uri) != nil
+	// Announce the exact post-close workspace revision before VFS.Close. The
+	// child connection uses this as a barrier so queued requests captured from
+	// the pre-close snapshot cannot reopen the just-closed document.
+	snapshotRev := s.vfs.Revision() + 1
+	var closeErr error
+	if closer, ok := be.(interface {
+		DidCloseDocument(uri string, snapshotRev uint64) error
+	}); wasOpen && ok {
+		closeErr = closer.DidCloseDocument(uri, snapshotRev)
+		if closeErr != nil {
+			s.recordEvidence(ctx, "textDocument/didClose", uri, identity.ResultUnavailable, identity.CompletenessUnknown, nil, []string{closeErr.Error()})
+		}
+	}
+	if s.diag != nil {
+		s.diag.didCloseDocument(uri, func() { s.vfs.Close(uri) })
+	} else {
+		s.vfs.Close(uri)
+	}
 	s.publishSnapshot()
-	return nil, nil
+	return nil, closeErr
 }
 
 // --- Semantic request handlers ----------------------------------------------
@@ -439,12 +520,12 @@ func (s *Server) handleHover(ctx context.Context, msg *jsonrpc.Message) (json.Ra
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid hover params: %w", err)
 	}
-	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
-			result, err := semanticViaEngine(s, ctx, "hover", params.TextDocument.URI, snapRev, bc,
+	return s.dispatchSemanticRequest(withEvidenceStage(ctx, &evidenceStage{}), msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+			result, err := semanticViaEngine(s, ctx, be, "hover", params.TextDocument.URI, snapRev, bc,
 				fmt.Sprintf("%d:%d", params.Position.Line, params.Position.Character),
-				func() (identity.SemanticResult[*languages.HoverResult], error) {
-					return be.Hover(ctx, languages.HoverRequest{
+				func(computeCtx context.Context) (identity.SemanticResult[*languages.HoverResult], error) {
+					return be.Hover(computeCtx, languages.HoverRequest{
 						URI:          params.TextDocument.URI,
 						Content:      src,
 						SnapshotRev:  snapRev,
@@ -458,7 +539,7 @@ func (s *Server) handleHover(ctx context.Context, msg *jsonrpc.Message) (json.Ra
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/hover", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence(ctx, "textDocument/hover", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if result.Value == nil {
 				// Exact negative or unknown: LSP projects both as null.
 				return json.RawMessage("null"), nil
@@ -487,37 +568,160 @@ func (s *Server) handleCompletion(ctx context.Context, msg *jsonrpc.Message) (js
 		return nil, fmt.Errorf("invalid completion params: %w", err)
 	}
 	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, snapRev uint64, _ identity.BuildContextID) (json.RawMessage, error) {
-			items, err := be.Completion(ctx, languages.CompletionRequest{
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+			var phaseSpan *completionPhaseTraceSpan
+			if s.completionPhaseTrace != nil {
+				phaseSpan = completionPhaseSpanFromContext(ctx)
+			}
+			providerOutcome := ""
+			parentRequestID := rawJSONRPCRequestID(msg.ID)
+			completionRequest := languages.CompletionRequest{
 				URI: params.TextDocument.URI, Content: src,
 				SnapshotRev: snapRev,
 				Line:        params.Position.Line, Column: params.Position.Character,
-				Encoding:    s.negotiatedEncodingInt(),
-				EncodingSet: true,
-			})
-			if err != nil {
-				return nil, err
+				Encoding:        s.negotiatedEncodingInt(),
+				EncodingSet:     true,
+				ParentRequestID: parentRequestID,
+			}
+			var items []languages.CompletionItem
+			incomplete := false
+			if p, ok := be.(languages.CompletionListProvider); ok {
+				if phaseSpan != nil {
+					phaseSpan.sample.ProviderKind = "completion_list"
+					phaseSpan.sample.ProviderOutcome = "in_progress"
+				}
+				providerOutcome = "in_progress"
+				defer func() {
+					if phaseSpan != nil && providerOutcome == "in_progress" {
+						phaseSpan.sample.ProviderOutcome = "panicked"
+					}
+				}()
+				started := time.Time{}
+				if phaseSpan != nil {
+					started = time.Now()
+				}
+				result, err := p.CompletionList(ctx, completionRequest)
+				if phaseSpan != nil {
+					phaseSpan.sample.BackendCompletionListNS = elapsedNanoseconds(started)
+				}
+				if err != nil {
+					providerOutcome = "error"
+					if phaseSpan != nil {
+						phaseSpan.sample.ProviderOutcome = providerOutcome
+					}
+					return nil, err
+				}
+				providerOutcome = "success"
+				if phaseSpan != nil {
+					phaseSpan.sample.ProviderOutcome = providerOutcome
+				}
+				items, incomplete = result.Items, result.IsIncomplete
+			} else {
+				if phaseSpan != nil {
+					phaseSpan.sample.ProviderKind = "completion_fallback"
+					phaseSpan.sample.ProviderOutcome = "in_progress"
+				}
+				providerOutcome = "in_progress"
+				defer func() {
+					if phaseSpan != nil && providerOutcome == "in_progress" {
+						phaseSpan.sample.ProviderOutcome = "panicked"
+					}
+				}()
+				started := time.Time{}
+				if phaseSpan != nil {
+					started = time.Now()
+				}
+				var err error
+				items, err = be.Completion(ctx, completionRequest)
+				if phaseSpan != nil {
+					phaseSpan.sample.BackendCompletionFallbackNS = elapsedNanoseconds(started)
+				}
+				if err != nil {
+					providerOutcome = "error"
+					if phaseSpan != nil {
+						phaseSpan.sample.ProviderOutcome = providerOutcome
+					}
+					return nil, err
+				}
+				providerOutcome = "success"
+				if phaseSpan != nil {
+					phaseSpan.sample.ProviderOutcome = providerOutcome
+				}
+				// §I9: honest incompleteness lets clients re-query as they type.
+				if p, ok := be.(languages.IncompleteCompletionProvider); ok {
+					incomplete = p.CompletionIsIncomplete()
+				}
+			}
+			var projectionStarted time.Time
+			if phaseSpan != nil {
+				phaseSpan.sample.ProjectionAttempted = true
+				phaseSpan.sample.ProjectionOutcome = "error"
+				projectionStarted = time.Now()
+				defer func() {
+					phaseSpan.sample.CompletionProjectionMarshalNS = elapsedNanoseconds(projectionStarted)
+				}()
 			}
 			lspItems := make([]lsp.CompletionItem, len(items))
 			for i, it := range items {
+				textEdit, err := projectCompletionTextEdit(it.TextEdit)
+				if err != nil {
+					return nil, fmt.Errorf("completion item %d: %w", i, err)
+				}
+				additionalTextEdits := make([]lsp.TextEdit, len(it.AdditionalTextEdits))
+				for j, edit := range it.AdditionalTextEdits {
+					additionalTextEdits[j] = lsp.TextEdit{
+						Range: completionRangeToLSP(languages.Range{
+							StartLine: edit.StartLine, StartCharacter: edit.StartChar,
+							EndLine: edit.EndLine, EndCharacter: edit.EndChar,
+						}),
+						NewText: edit.NewText,
+					}
+				}
 				lspItems[i] = lsp.CompletionItem{
-					Label:         it.Label,
-					Kind:          lsp.CompletionItemKind(it.Kind),
-					Detail:        it.Detail,
-					Documentation: it.Documentation,
-					InsertText:    it.InsertText,
-					SortText:      it.SortText,
-					FilterText:    it.FilterText,
+					Label:               it.Label,
+					Kind:                lsp.CompletionItemKind(it.Kind),
+					Detail:              it.Detail,
+					Documentation:       it.Documentation,
+					InsertText:          it.InsertText,
+					SortText:            it.SortText,
+					FilterText:          it.FilterText,
+					TextEdit:            textEdit,
+					AdditionalTextEdits: additionalTextEdits,
+					InsertTextFormat:    lsp.InsertTextFormat(it.InsertTextFormat),
 				}
 			}
-			// §I9: honest incompleteness lets clients re-query as they type.
-			incomplete := false
-			if p, ok := be.(languages.IncompleteCompletionProvider); ok {
-				incomplete = p.CompletionIsIncomplete()
+			response, err := json.Marshal(lsp.CompletionList{IsIncomplete: incomplete, Items: lspItems})
+			if phaseSpan != nil && err == nil {
+				phaseSpan.sample.ProjectionOutcome = "success"
 			}
-			return json.Marshal(lsp.CompletionList{IsIncomplete: incomplete, Items: lspItems})
+			return response, err
 		},
 	)
+}
+
+func projectCompletionTextEdit(edit *languages.CompletionTextEdit) (any, error) {
+	if edit == nil {
+		return nil, nil
+	}
+	switch {
+	case edit.Range != nil && edit.InsertReplace == nil:
+		return lsp.TextEdit{Range: completionRangeToLSP(*edit.Range), NewText: edit.NewText}, nil
+	case edit.Range == nil && edit.InsertReplace != nil:
+		return lsp.InsertReplaceEdit{
+			Insert:  completionRangeToLSP(edit.InsertReplace.Insert),
+			Replace: completionRangeToLSP(edit.InsertReplace.Replace),
+			NewText: edit.NewText,
+		}, nil
+	default:
+		return nil, fmt.Errorf("invalid textEdit union")
+	}
+}
+
+func completionRangeToLSP(r languages.Range) lsp.Range {
+	return lsp.Range{
+		Start: lsp.Position{Line: r.StartLine, Character: r.StartCharacter},
+		End:   lsp.Position{Line: r.EndLine, Character: r.EndCharacter},
+	}
 }
 
 // handleDefinition dispatches to the appropriate language backend.
@@ -526,12 +730,20 @@ func (s *Server) handleDefinition(ctx context.Context, msg *jsonrpc.Message) (js
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid definition params: %w", err)
 	}
-	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
-			result, err := semanticViaEngine(s, ctx, "definition", params.TextDocument.URI, snapRev, bc,
+	return s.dispatchSemanticRequest(withEvidenceStage(ctx, &evidenceStage{}), msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+			if result, used := s.goSnapshotSemanticLocations(ctx, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+				s.negotiatedEncodingInt(), snapRev, persistentDefinition, false); used {
+				s.recordEvidence(ctx, "textDocument/definition", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+				if len(result.Value) == 0 {
+					return json.RawMessage("null"), nil
+				}
+				return json.Marshal(projectLocations(result.Value))
+			}
+			result, err := semanticViaEngine(s, ctx, be, "definition", params.TextDocument.URI, snapRev, bc,
 				fmt.Sprintf("%d:%d", params.Position.Line, params.Position.Character),
-				func() (identity.SemanticResult[[]languages.Location], error) {
-					return be.Definition(ctx, languages.DefinitionRequest{
+				func(computeCtx context.Context) (identity.SemanticResult[[]languages.Location], error) {
+					return be.Definition(computeCtx, languages.DefinitionRequest{
 						URI:          params.TextDocument.URI,
 						Content:      src,
 						SnapshotRev:  snapRev,
@@ -545,7 +757,7 @@ func (s *Server) handleDefinition(ctx context.Context, msg *jsonrpc.Message) (js
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/definition", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence(ctx, "textDocument/definition", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if len(result.Value) == 0 {
 				return json.RawMessage("null"), nil
 			}
@@ -562,17 +774,17 @@ func (s *Server) handleDeclaration(ctx context.Context, msg *jsonrpc.Message) (j
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid declaration params: %w", err)
 	}
-	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+	return s.dispatchSemanticRequest(withEvidenceStage(ctx, &evidenceStage{}), msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
 			dp, ok := be.(languages.DeclarationProvider)
 			if !ok {
 				return nil, &jsonrpc.ResponseError{Code: jsonrpc.MethodNotFound,
 					Message: "declaration not supported by backend for " + params.TextDocument.URI}
 			}
-			result, err := semanticViaEngine(s, ctx, "declaration", params.TextDocument.URI, snapRev, bc,
+			result, err := semanticViaEngine(s, ctx, be, "declaration", params.TextDocument.URI, snapRev, bc,
 				fmt.Sprintf("%d:%d", params.Position.Line, params.Position.Character),
-				func() (identity.SemanticResult[[]languages.Location], error) {
-					return dp.Declaration(ctx, languages.DefinitionRequest{
+				func(computeCtx context.Context) (identity.SemanticResult[[]languages.Location], error) {
+					return dp.Declaration(computeCtx, languages.DefinitionRequest{
 						URI:          params.TextDocument.URI,
 						Content:      src,
 						SnapshotRev:  snapRev,
@@ -586,7 +798,7 @@ func (s *Server) handleDeclaration(ctx context.Context, msg *jsonrpc.Message) (j
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/declaration", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence(ctx, "textDocument/declaration", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if len(result.Value) == 0 {
 				return json.RawMessage("null"), nil
 			}
@@ -602,11 +814,13 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message)
 		return nil, fmt.Errorf("invalid documentSymbol params: %w", err)
 	}
 	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, 0, 0,
-		func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, _ identity.BuildContextID) (json.RawMessage, error) {
 			syms, err := be.DocumentSymbols(ctx, languages.DocumentSymbolRequest{
 				URI: params.TextDocument.URI, Content: src,
-				Encoding:    s.negotiatedEncodingInt(),
-				EncodingSet: true,
+				SnapshotRev:     snapRev,
+				Encoding:        s.negotiatedEncodingInt(),
+				EncodingSet:     true,
+				ParentRequestID: rawJSONRPCRequestID(msg.ID),
 			})
 			if err != nil {
 				return nil, err
@@ -624,7 +838,7 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message)
 					},
 					SelectionRange: lsp.Range{
 						Start: lsp.Position{Line: s.SelectionLine, Character: s.SelectionCharacter},
-						End:   lsp.Position{Line: s.SelectionLine, Character: s.SelectionCharacter + encodingWidth(s.Name, encoding)},
+						End:   documentSymbolSelectionEnd(s, encoding),
 					},
 					Children: projectChildren(s.Children, encoding),
 				}
@@ -632,6 +846,27 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, msg *jsonrpc.Message)
 			return json.Marshal(lspSyms)
 		},
 	)
+}
+
+func rawJSONRPCRequestID(id *jsonrpc.RequestID) json.RawMessage {
+	if id == nil {
+		return nil
+	}
+	raw, err := id.MarshalJSON()
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func documentSymbolSelectionEnd(symbol languages.DocumentSymbol, encoding int) lsp.Position {
+	if symbol.SelectionRangeSet {
+		return lsp.Position{Line: symbol.SelectionEndLine, Character: symbol.SelectionEndCharacter}
+	}
+	return lsp.Position{
+		Line:      symbol.SelectionLine,
+		Character: symbol.SelectionCharacter + encodingWidth(symbol.Name, encoding),
+	}
 }
 
 func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol {
@@ -647,7 +882,7 @@ func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.Do
 			},
 			SelectionRange: lsp.Range{
 				Start: lsp.Position{Line: c.SelectionLine, Character: c.SelectionCharacter},
-				End:   lsp.Position{Line: c.SelectionLine, Character: c.SelectionCharacter + encodingWidth(c.Name, encoding)},
+				End:   documentSymbolSelectionEnd(c, encoding),
 			},
 			Children: projectChildren(c.Children, encoding),
 		}
@@ -688,12 +923,20 @@ func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (js
 	token := extractWorkDoneToken(msg.Params)
 	s.progressBegin(token, "Finding references")
 	defer s.progressEnd(token, "")
-	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
-			result, err := semanticViaEngine(s, ctx, "references", params.TextDocument.URI, snapRev, bc,
+	return s.dispatchSemanticRequest(withEvidenceStage(ctx, &evidenceStage{}), msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+			if result, used := s.goSnapshotSemanticLocations(ctx, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+				s.negotiatedEncodingInt(), snapRev, persistentReferences, params.Context.IncludeDeclaration); used {
+				s.recordEvidence(ctx, "textDocument/references", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+				if len(result.Value) == 0 {
+					return json.RawMessage("[]"), nil
+				}
+				return json.Marshal(projectLocations(result.Value))
+			}
+			result, err := semanticViaEngine(s, ctx, be, "references", params.TextDocument.URI, snapRev, bc,
 				fmt.Sprintf("%d:%d:decl=%v", params.Position.Line, params.Position.Character, params.Context.IncludeDeclaration),
-				func() (identity.SemanticResult[[]languages.Location], error) {
-					return be.References(ctx, languages.ReferencesRequest{
+				func(computeCtx context.Context) (identity.SemanticResult[[]languages.Location], error) {
+					return be.References(computeCtx, languages.ReferencesRequest{
 						URI:          params.TextDocument.URI,
 						Content:      src,
 						SnapshotRev:  snapRev,
@@ -708,7 +951,7 @@ func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (js
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/references", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+			s.recordEvidence(ctx, "textDocument/references", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if len(result.Value) == 0 {
 				return json.RawMessage("[]"), nil
 			}
@@ -738,7 +981,7 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 		}
 	}
 	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
-		func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
 			// D11/§B7: a mutating (S3) result must be fresh. If any edit
 			// landed after this request captured its snapshot, refuse with
 			// the LSP ContentModified code so clients retry transparently.
@@ -751,6 +994,7 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 					}
 				}
 			}
+			s.renameRequestsStarted.Add(1)
 			result, err := be.Rename(ctx, languages.RenameRequest{
 				URI:          params.TextDocument.URI,
 				Content:      src,
@@ -765,7 +1009,17 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 			if err != nil {
 				return nil, err
 			}
-			s.recordEvidence("textDocument/rename", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+			if captured := snapshotFromCtx(ctx); captured != nil {
+				if cur := s.snapMgr.Current(); cur != nil && cur.ID().Revision != captured.ID().Revision {
+					s.renameStaleRejected.Add(1)
+					return nil, &jsonrpc.ResponseError{
+						Code: jsonrpc.ContentModified,
+						Message: fmt.Sprintf("workspace changed since request (snapshot %d, current %d)",
+							captured.ID().Revision, cur.ID().Revision),
+					}
+				}
+			}
+			s.recordEvidence(ctx, "textDocument/rename", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
 			if result.Status != identity.ResultExact || !result.Value.Complete {
 				reason := "rename unavailable: completeness not proven"
 				if len(result.InternalDiagnostics) > 0 {
@@ -778,6 +1032,12 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 			}
 			if len(result.Value.Edits) == 0 {
 				return json.Marshal(struct{ Changes json.RawMessage }{json.RawMessage("null")})
+			}
+			if err := ValidateEditSet(result.Value.Edits); err != nil {
+				return nil, &jsonrpc.ResponseError{
+					Code:    jsonrpc.RequestFailed,
+					Message: "rename rejected by WorkspaceEdit validation: " + err.Error(),
+				}
 			}
 			// Group edits by URI into a TextEditMap.
 			changeMap := make(map[string][]lsp.TextEdit)
@@ -822,7 +1082,7 @@ func (s *Server) handleSemanticTokens(ctx context.Context, msg *jsonrpc.Message)
 		return nil, fmt.Errorf("invalid semanticTokens params: %w", err)
 	}
 	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, 0, 0,
-		func(be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+		func(ctx context.Context, be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
 			var tokens []languages.SemanticToken
 			var err error
 			if encoded, ok := be.(languages.EncodedSemanticTokensProvider); ok {
@@ -857,28 +1117,137 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message
 	token := extractWorkDoneToken(msg.Params)
 	s.progressBegin(token, "Searching workspace symbols")
 	defer s.progressEnd(token, "")
-	// F2 lock discipline: findWorkspaceBackend takes its own RLock — never
-	// nest it under an outer read lock, or a pending writer deadlocks both
-	// (found via TestS13_P0FloodDoesNotStarveP4 fault injection).
-	be := s.findWorkspaceBackend()
-	if be == nil {
-		return json.RawMessage("null"), nil
+	revision := s.currentRevision()
+	if captured := snapshotFromCtx(ctx); captured != nil {
+		revision = captured.ID().Revision
+	} else if s.snapMgr != nil {
+		if captured := s.snapMgr.Current(); captured != nil {
+			ctx = withSnapshot(ctx, captured)
+			revision = captured.ID().Revision
+		}
 	}
-	syms, err := be.WorkspaceSymbols(ctx, languages.WorkspaceSymbolRequest{Query: params.Query, Limit: 100, Encoding: s.negotiatedEncodingInt(), EncodingSet: true})
+	stage := &evidenceStage{}
+	ctx = withEvidenceStage(ctx, stage)
+	if symbols, used := s.persistentWorkspaceSymbols(ctx, params.Query, revision); used {
+		result, err := marshalWorkspaceSymbols(symbols, s.negotiatedEncodingInt())
+		if err == nil && msg.ID != nil {
+			s.observeSemanticResponse(*msg.ID, stage.evidence())
+		}
+		stage.commit(s)
+		return result, err
+	}
+	backends := s.workspaceBackends()
+	if len(backends) == 0 {
+		s.recordEvidence(ctx, "workspace/symbol", "", identity.ResultUnavailable, identity.CompletenessUnknown, nil, []string{"no verified persistent result or live backend is available"})
+		stage.commit(s)
+		return nil, errors.New(errors.ErrBackendUnavailable, "server.workspace_symbols", "no verified persistent result or live backend is available")
+	}
+	var symbols []languages.WorkspaceSymbol
+	seen := make(map[languages.WorkspaceSymbol]struct{})
+	// Query the Go overlay after the other services so its final source checks
+	// are adjacent to response projection rather than preceding nested RPCs.
+	sort.SliceStable(backends, func(i, j int) bool {
+		return backends[i].LanguageID() != "go" && backends[j].LanguageID() == "go"
+	})
+	for _, be := range backends {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var syms []languages.WorkspaceSymbol
+		var err error
+		if be.LanguageID() == "go" {
+			if overlay, used := s.goSnapshotSemanticWorkspaceSymbols(ctx, params.Query, revision, s.negotiatedEncodingInt()); used {
+				if overlay.Status != identity.ResultExact || overlay.Completeness != identity.Complete {
+					return nil, errors.New(errors.ErrContentModified, "server.workspace_symbols", "current Go workspace symbols could not be verified against the editor snapshot")
+				}
+				syms = overlay.Value
+				s.recordEvidence(ctx, "workspace/symbol", "", overlay.Status, overlay.Completeness, overlay.Evidence, overlay.InternalDiagnostics)
+			} else {
+				syms, err = s.workspaceSymbolsFromBackend(ctx, be, params.Query)
+			}
+		} else {
+			syms, err = s.workspaceSymbolsFromBackend(ctx, be, params.Query)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("workspace symbols from %s: %w", be.LanguageID(), err)
+		}
+		for _, symbol := range syms {
+			if _, duplicate := seen[symbol]; !duplicate {
+				seen[symbol] = struct{}{}
+				symbols = append(symbols, symbol)
+			}
+		}
+	}
+	sort.Slice(symbols, func(i, j int) bool {
+		left, right := symbols[i], symbols[j]
+		if strings.ToLower(left.Name) != strings.ToLower(right.Name) {
+			return strings.ToLower(left.Name) < strings.ToLower(right.Name)
+		}
+		if left.URI != right.URI {
+			return left.URI < right.URI
+		}
+		if left.StartLine != right.StartLine {
+			return left.StartLine < right.StartLine
+		}
+		if left.StartCol != right.StartCol {
+			return left.StartCol < right.StartCol
+		}
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		return left.Kind < right.Kind
+	})
+	if len(symbols) > maxPersistentWorkspaceSymbols {
+		symbols = symbols[:maxPersistentWorkspaceSymbols]
+	}
+	result, err := marshalWorkspaceSymbols(symbols, s.negotiatedEncodingInt())
+	if err == nil {
+		if msg.ID != nil {
+			s.observeSemanticResponse(*msg.ID, stage.evidence())
+		}
+		stage.commit(s)
+	}
+	return result, err
+}
+
+func (s *Server) workspaceSymbolsFromBackend(ctx context.Context, be languages.Backend, query string) ([]languages.WorkspaceSymbol, error) {
+	leaseCtx, finishSnapshot, err := s.beginBackendWorkspaceSnapshot(ctx, be, snapshotFromCtx(ctx))
 	if err != nil {
 		return nil, err
 	}
-	encoding := s.negotiatedEncodingInt()
-	lspSyms := make([]lsp.WorkspaceSymbol, len(syms))
-	for i, s := range syms {
+	finishedSnapshot := false
+	if finishSnapshot != nil {
+		defer func() {
+			if !finishedSnapshot {
+				_ = finishSnapshot()
+			}
+		}()
+	}
+	syms, err := be.WorkspaceSymbols(leaseCtx, languages.WorkspaceSymbolRequest{Query: query, Limit: maxPersistentWorkspaceSymbols, Encoding: s.negotiatedEncodingInt(), EncodingSet: true})
+	if finishSnapshot != nil {
+		if finishErr := finishSnapshot(); finishErr != nil {
+			finishedSnapshot = true
+			return nil, finishErr
+		}
+		finishedSnapshot = true
+	}
+	if err != nil {
+		return nil, err
+	}
+	return syms, nil
+}
+
+func marshalWorkspaceSymbols(symbols []languages.WorkspaceSymbol, encoding int) (json.RawMessage, error) {
+	lspSyms := make([]lsp.WorkspaceSymbol, len(symbols))
+	for i, symbol := range symbols {
 		lspSyms[i] = lsp.WorkspaceSymbol{
-			Name: s.Name,
-			Kind: lsp.SymbolKind(s.Kind),
+			Name: symbol.Name,
+			Kind: lsp.SymbolKind(symbol.Kind),
 			Location: lsp.Location{
-				URI: s.URI,
+				URI: symbol.URI,
 				Range: lsp.Range{
-					Start: lsp.Position{Line: s.StartLine, Character: s.StartCol},
-					End:   lsp.Position{Line: s.StartLine, Character: s.StartCol + encodingWidth(s.Name, encoding)},
+					Start: lsp.Position{Line: symbol.StartLine, Character: symbol.StartCol},
+					End:   lsp.Position{Line: symbol.StartLine, Character: symbol.StartCol + encodingWidth(symbol.Name, encoding)},
 				},
 			},
 		}
@@ -886,14 +1255,31 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message
 	return json.Marshal(lspSyms)
 }
 
-// findWorkspaceBackend returns any registered backend suitable for workspace-wide symbol search.
-func (s *Server) findWorkspaceBackend() languages.Backend {
+// workspaceBackends captures each language service once, including services
+// registered under several aliases, without holding the registry lock during RPC.
+func (s *Server) workspaceBackends() []languages.Backend {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, be := range s.languages {
-		return be // First registered backend handles workspace symbols.
+	keys := make([]string, 0, len(s.languages))
+	for key := range s.languages {
+		keys = append(keys, key)
 	}
-	return nil
+	sort.Strings(keys)
+	var backends []languages.Backend
+	for _, key := range keys {
+		be := s.languages[key]
+		duplicate := false
+		for _, prior := range backends {
+			if sameSemanticCapability(be, prior) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			backends = append(backends, be)
+		}
+	}
+	return backends
 }
 
 // dispatchSemanticRequest is the unified dispatch path for all semantic
@@ -901,7 +1287,7 @@ func (s *Server) findWorkspaceBackend() languages.Backend {
 //  1. Resolves the language backend for the URI.
 //  2. Reads document content from the request's CAPTURED snapshot when
 //     available (INV-SNAPSHOT-002: one request, one snapshot). Live VFS is a
-//     fallback only for documents absent from the snapshot.
+//     fallback only when there is no captured request snapshot.
 //  3. Fills §B5 identity inputs (snapshot revision, build context) into the
 //     request via the project callback.
 //  4. Wraps the result JSON in a proper jsonrpc.Message response.
@@ -910,37 +1296,183 @@ func (s *Server) dispatchSemanticRequest(
 	msg *jsonrpc.Message,
 	uri string,
 	line, column uint32,
-	project func(be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error),
+	project func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error),
 ) (json.RawMessage, error) {
+	uri = canonicalDocumentURI(uri)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stagedEvidence, _ := ctx.Value(evidenceStageCtxKey{}).(*evidenceStage)
+	sharedQueryLease := stagedEvidence != nil
+	// Verified disk generations do not depend on a live language service.
+	// The persistent path performs its own source, overlay and planning checks;
+	// attempt it before resolving the optional real-time fallback.
+	if msg != nil && (msg.Method == "textDocument/definition" || msg.Method == "textDocument/references") {
+		captured := snapshotFromCtx(ctx)
+		if captured == nil && s.snapMgr != nil {
+			captured = s.snapMgr.Current()
+		}
+		if captured != nil {
+			ctx = withSnapshot(ctx, captured)
+		}
+		{
+			revision := s.currentRevision()
+			if captured != nil {
+				revision = captured.ID().Revision
+			}
+			query, includeDeclaration := persistentDefinition, false
+			if msg.Method == "textDocument/references" {
+				var params ReferencesParams
+				if err := json.Unmarshal(msg.Params, &params); err != nil {
+					return nil, err
+				}
+				query, includeDeclaration = persistentReferences, params.Context.IncludeDeclaration
+			}
+			result, used := s.goSnapshotSemanticLocations(ctx, uri, line, column, s.negotiatedEncodingInt(), revision, query, includeDeclaration)
+			if !used {
+				result, used = s.persistentSemanticLocations(ctx, uri, line, column, s.negotiatedEncodingInt(), revision, query, includeDeclaration)
+			}
+			if used {
+				s.recordEvidence(ctx, msg.Method, uri, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+				if stagedEvidence != nil && msg.ID != nil {
+					s.observeSemanticResponse(*msg.ID, stagedEvidence.evidence())
+				}
+				if stagedEvidence != nil {
+					stagedEvidence.commit(s)
+				}
+				if query == persistentDefinition && len(result.Value) == 0 {
+					return json.RawMessage("null"), nil
+				}
+				return json.Marshal(projectLocations(result.Value))
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	be, err := s.resolveBackend(uri)
 	if err != nil {
 		s.metrics.BackendFails.Inc(1)
 		return nil, err
 	}
+	phaseSpan := completionPhaseSpanFromContext(ctx)
+	finishPhaseSpanHere := false
+	if recorder := s.completionPhaseTrace; recorder != nil && msg != nil &&
+		msg.Method == "textDocument/completion" && msg.ID != nil {
+		languageID := be.LanguageID()
+		if phaseSpan == nil && (languageID == "c" || languageID == "cpp") {
+			phaseSpan = recorder.begin(languageID, uri, rawJSONRPCRequestID(msg.ID))
+			finishPhaseSpanHere = phaseSpan != nil
+		}
+		if phaseSpan != nil {
+			phaseSpan.sample.LanguageID = languageID
+		}
+	}
+	if finishPhaseSpanHere {
+		defer phaseSpan.finish()
+	}
+	dispatchStarted := time.Time{}
+	dispatchOutcome := "failed"
+	if phaseSpan != nil {
+		dispatchStarted = time.Now()
+		defer func() {
+			phaseSpan.sample.SemanticDispatchNS = elapsedNanoseconds(dispatchStarted)
+			phaseSpan.sample.DispatchOutcome = dispatchOutcome
+		}()
+	}
 	// The captured snapshot is authoritative for this request.
 	captured := snapshotFromCtx(ctx)
+	if captured == nil && s.snapMgr != nil {
+		captured = s.snapMgr.Current()
+		if captured != nil {
+			ctx = withSnapshot(ctx, captured)
+		}
+	}
 	snapRev := uint64(0)
-	src := s.vfs.Content(uri)
+	var src []byte
 	if captured != nil {
 		snapRev = captured.ID().Revision
-		if doc := captured.Document(uri); doc != nil && doc.Content != nil {
-			src = doc.Content
+		doc := captured.Document(uri)
+		if doc == nil {
+			return nil, errors.New(errors.ErrContentModified, "server.dispatch", "requested document is absent from the captured workspace snapshot")
 		}
+		src = doc.Content
 	} else if snap := s.snapMgr.Current(); snap != nil {
 		snapRev = snap.ID().Revision
+	}
+	if src == nil {
+		src = s.vfs.Content(uri)
 	}
 	bc := backendBuildContext(be)
 	if src == nil {
 		// File never opened — nothing to analyze; let the backend decide.
 		src = []byte{}
 	}
-	resultJSON, err := project(be, src, snapRev, bc)
+	projectCtx := ctx
+	var finishSnapshot func() error
+	if phaseSpan != nil && sharedQueryLease {
+		phaseSpan.sample.SnapshotMode = "borrowed"
+	}
+	if !sharedQueryLease {
+		if phaseSpan != nil {
+			phaseSpan.sample.SnapshotMode = "acquiring"
+		}
+		beginSnapshotStarted := time.Time{}
+		if phaseSpan != nil {
+			beginSnapshotStarted = time.Now()
+		}
+		leaseCtx, finish, beginErr := s.beginBackendWorkspaceSnapshot(ctx, be, captured)
+		if phaseSpan != nil {
+			phaseSpan.sample.BeginBackendWorkspaceSnapshotNS = elapsedNanoseconds(beginSnapshotStarted)
+		}
+		if beginErr != nil {
+			if phaseSpan != nil {
+				phaseSpan.sample.SnapshotMode = "failed"
+			}
+			return nil, beginErr
+		}
+		if phaseSpan != nil {
+			phaseSpan.sample.SnapshotMode = "acquired"
+		}
+		projectCtx = leaseCtx
+		finishSnapshot = finish
+	}
+	if phaseSpan != nil {
+		projectCtx = withCompletionPhaseSpan(projectCtx, phaseSpan)
+	}
+	if stagedEvidence == nil && finishSnapshot != nil {
+		stagedEvidence = &evidenceStage{}
+		projectCtx = withEvidenceStage(projectCtx, stagedEvidence)
+	}
+	finishedSnapshot := false
+	if finishSnapshot != nil {
+		defer func() {
+			if !finishedSnapshot {
+				_ = finishSnapshot()
+			}
+		}()
+	}
+	resultJSON, err := project(projectCtx, be, src, snapRev, bc)
+	if finishSnapshot != nil {
+		if finishErr := finishSnapshot(); finishErr != nil {
+			finishedSnapshot = true
+			return nil, finishErr
+		}
+		finishedSnapshot = true
+	}
+	if err == nil && stagedEvidence != nil && msg != nil && msg.ID != nil {
+		s.observeSemanticResponse(*msg.ID, stagedEvidence.evidence())
+	}
+	if stagedEvidence != nil {
+		stagedEvidence.commit(s)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if resultJSON == nil {
 		resultJSON = json.RawMessage("null")
 	}
+	dispatchOutcome = "success"
 	return resultJSON, nil
 }
 
@@ -1017,6 +1549,7 @@ func (s *Server) handleOmnilspExplain(ctx context.Context, msg *jsonrpc.Message)
 		SnapshotRev  uint64   `json:"snapshotRev"`
 		BuildContext string   `json:"buildContext"`
 		Backend      string   `json:"backend"`
+		BackendEpoch uint64   `json:"backendEpoch"`
 		SourceHash   string   `json:"sourceHash"`
 		Detail       string   `json:"detail,omitempty"`
 		Diagnostics  []string `json:"diagnostics,omitempty"`
@@ -1025,7 +1558,7 @@ func (s *Server) handleOmnilspExplain(ctx context.Context, msg *jsonrpc.Message)
 	records := s.recentEvidence()
 	out := make([]evidenceJSON, 0, len(records))
 	for _, r := range records {
-		if req.URI != "" && r.URI != req.URI {
+		if req.URI != "" && canonicalDocumentURI(r.URI) != canonicalDocumentURI(req.URI) {
 			continue
 		}
 		for _, ev := range r.Ev {
@@ -1037,6 +1570,7 @@ func (s *Server) handleOmnilspExplain(ctx context.Context, msg *jsonrpc.Message)
 				SnapshotRev:  uint64(ev.Snapshot.Revision),
 				BuildContext: string(ev.BuildContext),
 				Backend:      ev.Backend.Language + "/" + ev.Backend.Name,
+				BackendEpoch: uint64(ev.BackendEpoch),
 				SourceHash:   string(ev.SourceHash),
 				Detail:       ev.DetailCode,
 				Diagnostics:  r.Diag,
@@ -1144,12 +1678,23 @@ func (s *Server) workspaceRoot() string {
 	if ws == "" {
 		return ""
 	}
-	return strings.TrimPrefix(strings.TrimPrefix(ws, "file://"), "file:")
+	parsed, err := workspaceuri.Parse(ws)
+	if err != nil {
+		return ""
+	}
+	return parsed.PathOr()
 }
 
-// handleDidChangeWatchedFiles records client-reported external changes (§D14).
-// Open documents stay editor-authoritative; the notification's v1 value is
-// observability: it proves the channel and counts churn per session.
+func canonicalDocumentURI(raw string) string {
+	parsed, err := workspaceuri.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return parsed.Canonical()
+}
+
+// External changes invalidate analyses while preserving open editor buffers.
+// Client notifications run on the same writer as document synchronization.
 func (s *Server) handleDidChangeWatchedFiles(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params struct {
 		Changes []struct {
@@ -1160,26 +1705,85 @@ func (s *Server) handleDidChangeWatchedFiles(ctx context.Context, msg *jsonrpc.M
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid didChangeWatchedFiles params: %w", err)
 	}
-	s.metrics.ExternalSyncs.Inc(1) // reuse the sync counter: external-change traffic
-	return nil, nil
+	for _, change := range params.Changes {
+		if change.Type < 1 || change.Type > 3 || !externalChangeURIValid(change.URI) {
+			return nil, fmt.Errorf("invalid didChangeWatchedFiles change")
+		}
+	}
+	changes := make([]languages.SourceChange, 0, len(params.Changes))
+	for _, change := range params.Changes {
+		changes = append(changes, languages.SourceChange{URI: canonicalDocumentURI(change.URI), Kind: languages.SourceChangeKind(change.Type)})
+	}
+	return nil, s.applyExternalSourceChanges(ctx, changes)
 }
 
-// handleDidCreateFiles / Rename / Delete (§D15): closed-document lifecycle
-// notifications. v1 semantics: open documents are untouched (editor wins);
-// the notifications are accepted, counted, and acknowledged.
+// File operations invalidate cached disk analyses. Open-buffer identity
+// transitions are a separate operation and are not inferred from disk hints.
 func (s *Server) handleDidCreateFiles(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
-	s.metrics.ExternalSyncs.Inc(1)
-	return nil, nil
+	return s.handleExternalFileURIs(ctx, msg, languages.SourceChangeCreated)
 }
 
 func (s *Server) handleDidRenameFiles(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
-	s.metrics.ExternalSyncs.Inc(1)
-	return nil, nil
+	var params struct {
+		Files []struct {
+			OldURI string `json:"oldUri"`
+			NewURI string `json:"newUri"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return nil, fmt.Errorf("invalid didRenameFiles params: %w", err)
+	}
+	for _, file := range params.Files {
+		if !externalChangeURIValid(file.OldURI) || !externalChangeURIValid(file.NewURI) {
+			return nil, fmt.Errorf("invalid didRenameFiles URI")
+		}
+	}
+	changes := make([]languages.SourceChange, 0, 2*len(params.Files))
+	for _, file := range params.Files {
+		changes = append(changes,
+			languages.SourceChange{URI: canonicalDocumentURI(file.OldURI), Kind: languages.SourceChangeDeleted},
+			languages.SourceChange{URI: canonicalDocumentURI(file.NewURI), Kind: languages.SourceChangeCreated})
+	}
+	return nil, s.applyExternalSourceChanges(ctx, changes)
 }
 
 func (s *Server) handleDidDeleteFiles(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
+	return s.handleExternalFileURIs(ctx, msg, languages.SourceChangeDeleted)
+}
+
+func (s *Server) handleExternalFileURIs(ctx context.Context, msg *jsonrpc.Message, kind languages.SourceChangeKind) (json.RawMessage, error) {
+	var params struct {
+		Files []struct {
+			URI string `json:"uri"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return nil, fmt.Errorf("invalid %s params: %w", msg.Method, err)
+	}
+	for _, file := range params.Files {
+		if !externalChangeURIValid(file.URI) {
+			return nil, fmt.Errorf("invalid %s URI", msg.Method)
+		}
+	}
+	changes := make([]languages.SourceChange, 0, len(params.Files))
+	for _, file := range params.Files {
+		changes = append(changes, languages.SourceChange{URI: canonicalDocumentURI(file.URI), Kind: kind})
+	}
+	return nil, s.applyExternalSourceChanges(ctx, changes)
+}
+
+func externalChangeURIValid(raw string) bool {
+	parsed, err := workspaceuri.Parse(raw)
+	return err == nil && parsed.IsFile()
+}
+
+func (s *Server) invalidateExternalSources(count int) {
+	if count == 0 {
+		return
+	}
+	s.vfs.AdvanceRevision()
+	s.publishSnapshot()
 	s.metrics.ExternalSyncs.Inc(1)
-	return nil, nil
 }
 
 // handleOmnilspResultMeta serves omnilsp/resultMeta (§C12/B5): the envelope
@@ -1206,7 +1810,7 @@ func (s *Server) handleOmnilspResultMeta(ctx context.Context, msg *jsonrpc.Messa
 	}
 	var out []metaEntry
 	for _, r := range s.recentEvidence() {
-		if req.URI != "" && r.URI != req.URI {
+		if req.URI != "" && canonicalDocumentURI(r.URI) != canonicalDocumentURI(req.URI) {
 			continue
 		}
 		if req.Method != "" && r.Method != req.Method {
@@ -1228,8 +1832,15 @@ func (s *Server) handleOmnilspResultMeta(ctx context.Context, msg *jsonrpc.Messa
 // query.Engine counters — memo hits/misses, computations, cycle detections,
 // evictions, and stale-publish rejections.
 func (s *Server) handleOmnilspQueryTrace(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
-	st := s.queries.Stats()
-	return json.Marshal(st)
+	return json.Marshal(struct {
+		query.Stats
+		RenameRequestsStarted uint64
+		RenameStaleRejected   uint64
+	}{
+		Stats:                 s.queries.Stats(),
+		RenameRequestsStarted: s.renameRequestsStarted.Load(),
+		RenameStaleRejected:   s.renameStaleRejected.Load(),
+	})
 }
 
 // completenessName renders identity.Completeness for the resultMeta wire.

@@ -132,7 +132,7 @@ func (s *Server) handlePrepareRename(ctx context.Context, msg *jsonrpc.Message) 
 	}
 	if lang := be.LanguageID(); lang == "go" && isExportedIdent(ident) {
 		return nil, &jsonrpc.ResponseError{
-			Code:    jsonrpc.InvalidRequest,
+			Code:    jsonrpc.RequestFailed,
 			Message: "rename refused: symbol is exported; importer packages are not loaded (SEM-SAFE-001)",
 		}
 	}

@@ -18,13 +18,17 @@ import (
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
+	"github.com/omnilsp/omni/internal/index/model"
 	"github.com/omnilsp/omni/internal/index/persistent"
+	"github.com/omnilsp/omni/internal/index/semantic"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/trust"
 	"github.com/omnilsp/omni/internal/workspace/uri"
 )
 
-const inventoryVersion = "file-inventory-v1"
+// v2 binds persisted freshness to the canonical workspace root and disk tree;
+// process-local snapshot revisions remain build guards only.
+const inventoryVersion = "file-inventory-v2"
 const maxIndexDepth = 16
 const maxIndexFileSize = 1 << 20
 
@@ -43,28 +47,46 @@ type IndexRebuildStats struct {
 	Error      string `json:"error"`
 }
 
+type semanticCoverageStat struct {
+	ScopeID string             `json:"scopeId"`
+	Fact    model.FactKind     `json:"fact"`
+	State   model.Completeness `json:"state"`
+	Reason  string             `json:"reason,omitempty"`
+}
+
 // IndexStats is the C12 read-only status projection.
 type IndexStats struct {
-	Enabled         bool                    `json:"enabled"`
-	Reason          string                  `json:"reason,omitempty"`
-	IndexDir        string                  `json:"indexDir,omitempty"`
-	Generation      uint64                  `json:"generation"`
-	Segments        []persistent.SegmentRef `json:"segments"`
-	Quarantined     []persistent.SegmentID  `json:"quarantined"`
-	DiskBudgetBytes int64                   `json:"diskBudgetBytes"`
-	LastRebuild     IndexRebuildStats       `json:"lastRebuild"`
-	Fresh           bool                    `json:"fresh"`
-	Revision        uint64                  `json:"revision"`
+	Enabled          bool                    `json:"enabled"`
+	Reason           string                  `json:"reason,omitempty"`
+	IndexDir         string                  `json:"indexDir,omitempty"`
+	Generation       uint64                  `json:"generation"`
+	Segments         []persistent.SegmentRef `json:"segments"`
+	Quarantined      []persistent.SegmentID  `json:"quarantined"`
+	DiskBudgetBytes  int64                   `json:"diskBudgetBytes"`
+	LastRebuild      IndexRebuildStats       `json:"lastRebuild"`
+	Fresh            bool                    `json:"fresh"`
+	Revision         uint64                  `json:"revision"`
+	SemanticStatus   string                  `json:"semanticStatus,omitempty"`
+	SemanticCoverage []semanticCoverageStat  `json:"semanticCoverage,omitempty"`
 }
 
 type indexService struct {
-	root    string
-	dir     string
-	store   *persistent.FileStore
-	budget  int64
-	buildMu sync.Mutex
-	statsMu sync.RWMutex
-	last    IndexRebuildStats
+	root        string
+	workspaceID identity.WorkspaceID
+	dir         string
+	store       *persistent.FileStore
+	budget      int64
+	buildMu     sync.Mutex
+	statsMu     sync.RWMutex
+	last        IndexRebuildStats
+}
+
+func projectSemanticCoverage(coverage []model.Coverage) []semanticCoverageStat {
+	out := make([]semanticCoverageStat, len(coverage))
+	for i, item := range coverage {
+		out[i] = semanticCoverageStat{ScopeID: item.ScopeID, Fact: item.Fact, State: item.State, Reason: item.Reason}
+	}
+	return out
 }
 
 func defaultIndexDir(root string) (string, error) {
@@ -95,6 +117,7 @@ func (s *Server) initIndex(rootURI string) {
 		s.disableIndex(err)
 		return
 	}
+	workspaceID := identity.WorkspaceID(uri.FromPath(root).Canonical())
 	policy, err := trust.PolicyForBackend(root, "server")
 	if err != nil {
 		s.disableIndex(err)
@@ -117,7 +140,7 @@ func (s *Server) initIndex(rootURI string) {
 		return
 	}
 	s.mu.Lock()
-	s.idx = &indexService{root: root, dir: dir, store: store, budget: s.config.IndexDiskBudgetBytes}
+	s.idx = &indexService{root: root, workspaceID: workspaceID, dir: dir, store: store, budget: s.config.IndexDiskBudgetBytes}
 	s.idxReason = ""
 	s.trust = policy
 	s.mu.Unlock()
@@ -131,7 +154,7 @@ func (s *Server) InitializeWorkspace(root string) {
 		s.disableIndex(err)
 		return
 	}
-	rootURI := uri.FromPath(absolute).String()
+	rootURI := uri.FromPath(absolute).Canonical()
 	s.mu.Lock()
 	s.workspaceID = identity.WorkspaceID(rootURI)
 	s.mu.Unlock()
@@ -163,10 +186,15 @@ func (s *Server) handleIndexStats(ctx context.Context, _ *jsonrpc.Message) (json
 		return json.Marshal(stats)
 	}
 	stats.Enabled, stats.IndexDir, stats.DiskBudgetBytes = true, idx.dir, idx.budget
+	if len(s.semanticIndexBindings()) > 0 {
+		stats.SemanticStatus = "not_built"
+	} else {
+		stats.SemanticStatus = "unverified"
+	}
 	idx.statsMu.RLock()
 	stats.LastRebuild = idx.last
 	idx.statsMu.RUnlock()
-	view, err := idx.store.OpenSnapshot(ctx)
+	lease, err := idx.store.OpenSnapshotLease(ctx)
 	stats.Quarantined = idx.store.Quarantined()
 	if errors.Is(err, persistent.ErrNoGeneration) {
 		return json.Marshal(stats)
@@ -175,7 +203,36 @@ func (s *Server) handleIndexStats(ctx context.Context, _ *jsonrpc.Message) (json
 		stats.Reason = err.Error()
 		return json.Marshal(stats)
 	}
+	defer lease.Close()
+	view := lease.Snapshot()
 	stats.Generation, stats.Segments = view.ID, view.Segments
+	semanticReader, semanticErr := semantic.OpenReader(ctx, view)
+	if semanticErr == nil {
+		defer semanticReader.Close()
+		metadata := semanticReader.Metadata()
+		stats.SemanticCoverage = projectSemanticCoverage(metadata.Coverage)
+		stats.SemanticStatus = "disk_stale"
+		if metadata.Identity.Workspace != idx.workspaceID {
+			stats.Reason = "semantic generation belongs to a different workspace"
+			return json.Marshal(stats)
+		}
+		currentDigest, digestErr := semanticDiskDigest(ctx, idx.root, idx.dir)
+		if digestErr != nil {
+			stats.Reason = digestErr.Error()
+			return json.Marshal(stats)
+		}
+		stats.Fresh = metadata.DiskDigest == currentDigest
+		if stats.Fresh {
+			stats.SemanticStatus = "disk_fresh"
+		}
+		return json.Marshal(stats)
+	}
+	if !errors.Is(semanticErr, semantic.ErrNotSemantic) {
+		stats.SemanticStatus = "invalid"
+		stats.Reason = semanticErr.Error()
+		return json.Marshal(stats)
+	}
+	stats.SemanticStatus = "legacy_inventory"
 	if len(view.Segments) == 1 {
 		sealed, readErr := view.ReadSegment(view.Segments[0].ID)
 		var currentHash string
@@ -184,12 +241,16 @@ func (s *Server) handleIndexStats(ctx context.Context, _ *jsonrpc.Message) (json
 			if inventoryErr != nil {
 				readErr = inventoryErr
 			} else {
-				_, currentHash, readErr = inventoryPayload(currentFiles)
+				var inventoryHash string
+				_, inventoryHash, readErr = inventoryPayload(currentFiles)
+				if readErr == nil {
+					currentHash = inventorySourceHash(idx.workspaceID, inventoryHash)
+				}
 			}
 		}
 		if readErr == nil {
 			_, readErr = persistent.VerifyPayload(sealed, persistent.FreshnessTuple{
-				SourceHash: currentHash, BackendVer: inventoryVersion, Revision: stats.Revision,
+				SourceHash: currentHash, BackendVer: inventoryVersion,
 			})
 		}
 		stats.Fresh = readErr == nil
@@ -216,6 +277,14 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestFailed, Message: "reindex already running"}
 	}
 	defer idx.buildMu.Unlock()
+	// Serialize rebuilds across processes that share the same index directory.
+	// This lease is independent of the storage writer lock; extraction continues
+	// without blocking readers or short-lived segment publication operations.
+	reindexLease, err := idx.store.AcquireReindexLease(ctx)
+	if err != nil {
+		return nil, reindexResponseError(err)
+	}
+	defer reindexLease.Close()
 	started := time.Now()
 	revision := s.currentRevision()
 	last := IndexRebuildStats{}
@@ -225,6 +294,14 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		idx.last = last
 		idx.statsMu.Unlock()
 	}()
+	if len(s.semanticIndexBindings()) > 0 {
+		result, semanticErr := s.reindexSemantic(ctx, idx, revision, &last)
+		if semanticErr != nil {
+			last.Error = semanticErr.Error()
+			return nil, reindexResponseError(semanticErr)
+		}
+		return result, nil
+	}
 	records, err := idx.inventory(ctx, &last)
 	if err == nil {
 		err = ctx.Err()
@@ -233,16 +310,18 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		last.Error = err.Error()
 		return nil, reindexResponseError(err)
 	}
-	data, sourceHash, err := inventoryPayload(records)
+	data, inventoryHash, err := inventoryPayload(records)
 	if err != nil {
 		last.Error = err.Error()
 		return nil, reindexResponseError(err)
 	}
+	sourceHash := inventorySourceHash(idx.workspaceID, inventoryHash)
 	build, err := idx.store.BeginBuild(ctx)
 	if err != nil {
 		last.Error = err.Error()
 		return nil, reindexResponseError(err)
 	}
+	generation := build.GenerationID()
 	committed := false
 	defer func() {
 		if !committed {
@@ -250,13 +329,10 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		}
 	}()
 	_, err = build.WriteSegment(persistent.SealPayload(data, persistent.FreshnessTuple{
-		SourceHash: sourceHash, BackendVer: inventoryVersion, Revision: revision,
+		SourceHash: sourceHash, BackendVer: inventoryVersion,
 	}))
 	if err == nil {
 		err = ctx.Err()
-	}
-	if err == nil && s.currentRevision() != revision {
-		err = fmt.Errorf("workspace changed during reindex (snapshot %d, current %d)", revision, s.currentRevision())
 	}
 	if err == nil {
 		currentFiles, inventoryErr := idx.inventory(ctx, &IndexRebuildStats{})
@@ -266,10 +342,13 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 			_, currentHash, hashErr := inventoryPayload(currentFiles)
 			if hashErr != nil {
 				err = hashErr
-			} else if currentHash != sourceHash {
-				err = fmt.Errorf("workspace files changed during reindex")
+			} else if currentHash != inventoryHash {
+				err = fmt.Errorf("workspace files changed during reindex: %s", firstInventoryChange(records, currentFiles))
 			}
 		}
+	}
+	if err == nil && s.currentRevision() != revision {
+		err = fmt.Errorf("workspace changed during reindex (snapshot %d, current %d)", revision, s.currentRevision())
 	}
 	if err == nil {
 		err = build.Commit(ctx)
@@ -279,7 +358,24 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		return nil, reindexResponseError(err)
 	}
 	committed = true
-	return json.Marshal(map[string]any{"generation": idxGeneration(ctx, idx.store), "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
+	return json.Marshal(map[string]any{"generation": generation, "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
+}
+
+func firstInventoryChange(before, after []fileRecord) string {
+	for i, j := 0, 0; i < len(before) || j < len(after); {
+		if i == len(before) || (j < len(after) && after[j].Path < before[i].Path) {
+			return "added " + after[j].Path
+		}
+		if j == len(after) || before[i].Path < after[j].Path {
+			return "removed " + before[i].Path
+		}
+		if before[i].Size != after[j].Size || before[i].SHA256 != after[j].SHA256 {
+			return "changed " + before[i].Path
+		}
+		i++
+		j++
+	}
+	return "inventory digest changed without a differing file record"
 }
 
 func reindexResponseError(err error) *jsonrpc.ResponseError {
@@ -299,12 +395,10 @@ func inventoryPayload(records []fileRecord) ([]byte, string, error) {
 	return data, hex.EncodeToString(hash[:]), nil
 }
 
-func idxGeneration(ctx context.Context, store *persistent.FileStore) uint64 {
-	view, err := store.OpenSnapshot(ctx)
-	if err != nil {
-		return 0
-	}
-	return view.ID
+func inventorySourceHash(workspaceID identity.WorkspaceID, inventoryHash string) string {
+	key := "omnilsp-file-inventory\x00" + string(workspaceID) + "\x00" + inventoryVersion + "\x00" + inventoryHash
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:])
 }
 
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error) {

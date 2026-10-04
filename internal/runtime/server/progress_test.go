@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 )
 
@@ -156,6 +157,111 @@ func TestI9_CompletionIsIncompleteNegotiation(t *testing.T) {
 			t.Errorf("expected isIncomplete false, got %s", raw)
 		}
 	})
+}
+
+type completionListBackend struct {
+	mockBackend
+	result languages.CompletionList
+}
+
+func (b *completionListBackend) CompletionList(context.Context, languages.CompletionRequest) (languages.CompletionList, error) {
+	return b.result, nil
+}
+
+type parentRequestIDBackend struct {
+	mockBackend
+	completionID     json.RawMessage
+	documentSymbolID json.RawMessage
+}
+
+func (b *parentRequestIDBackend) CompletionList(_ context.Context, req languages.CompletionRequest) (languages.CompletionList, error) {
+	b.completionID = append(json.RawMessage(nil), req.ParentRequestID...)
+	return languages.CompletionList{}, nil
+}
+
+func (b *parentRequestIDBackend) DocumentSymbols(_ context.Context, req languages.DocumentSymbolRequest) ([]languages.DocumentSymbol, error) {
+	b.documentSymbolID = append(json.RawMessage(nil), req.ParentRequestID...)
+	return nil, nil
+}
+
+func TestCompletionAndDocumentSymbolPreserveParentRequestID(t *testing.T) {
+	const uri = "file:///w/main.cpp"
+	s := New(DefaultConfig())
+	backend := &parentRequestIDBackend{mockBackend: mockBackend{langID: "cpp", exts: []string{".cpp"}}}
+	s.RegisterBackend("cpp", backend)
+	s.vfs.Open(uri, "cpp", 1, []byte("int main() {}\n"), 0)
+
+	cases := []struct {
+		method string
+		id     jsonrpc.RequestID
+		params string
+		got    *json.RawMessage
+	}{
+		{
+			method: "textDocument/completion",
+			id:     jsonrpc.RequestID{Num: 41},
+			params: `{"textDocument":{"uri":"` + uri + `"},"position":{"line":0,"character":0}}`,
+			got:    &backend.completionID,
+		},
+		{
+			method: "textDocument/documentSymbol",
+			id:     jsonrpc.RequestID{Str: "syntax-42", IsStr: true},
+			params: `{"textDocument":{"uri":"` + uri + `"}}`,
+			got:    &backend.documentSymbolID,
+		},
+	}
+	for _, tc := range cases {
+		resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(tc.id, tc.method, json.RawMessage(tc.params)))
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("Dispatch(%s) = %+v", tc.method, resp)
+		}
+		want, err := tc.id.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(*tc.got) != string(want) {
+			t.Errorf("%s parent request ID = %s, want %s", tc.method, *tc.got, want)
+		}
+	}
+}
+
+func TestCompletionListProviderPreservesRequestMetadata(t *testing.T) {
+	const uri = "file:///w/main.go"
+	for _, incomplete := range []bool{false, true} {
+		t.Run(map[bool]string{false: "complete", true: "incomplete"}[incomplete], func(t *testing.T) {
+			s := New(DefaultConfig())
+			s.RegisterBackend("go", &completionListBackend{
+				mockBackend: mockBackend{langID: "go", exts: []string{".go"}},
+				result: languages.CompletionList{
+					IsIncomplete: incomplete,
+					Items: []languages.CompletionItem{{
+						Label: "symbol", Kind: int(languages.CompletionFunction), Detail: "func symbol()",
+						Documentation: "**symbol**", InsertText: "symbol($0)", SortText: "01", FilterText: "sym",
+					}},
+				},
+			})
+			s.vfs.Open(uri, "go", 1, []byte("package main\n"), 0)
+			raw := dispatchCompletion(t, s, uri)
+			var got struct {
+				IsIncomplete bool `json:"isIncomplete"`
+				Items        []struct {
+					Label         string `json:"label"`
+					Documentation string `json:"documentation"`
+					InsertText    string `json:"insertText"`
+					SortText      string `json:"sortText"`
+					FilterText    string `json:"filterText"`
+				} `json:"items"`
+			}
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("decode completion response: %v", err)
+			}
+			if got.IsIncomplete != incomplete || len(got.Items) != 1 || got.Items[0].Label != "symbol" ||
+				got.Items[0].Documentation != "**symbol**" || got.Items[0].InsertText != "symbol($0)" ||
+				got.Items[0].SortText != "01" || got.Items[0].FilterText != "sym" {
+				t.Fatalf("completion response lost list or item metadata: %+v", got)
+			}
+		})
+	}
 }
 
 func dispatchCompletion(t *testing.T, s *Server, uri string) json.RawMessage {

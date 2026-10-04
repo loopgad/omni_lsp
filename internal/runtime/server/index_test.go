@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/omnilsp/omni/internal/index/persistent"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
@@ -18,6 +19,60 @@ import (
 
 func indexRequest(s *Server, ctx context.Context, method string) *jsonrpc.Message {
 	return s.dispatcher.Dispatch(ctx, jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, method, nil))
+}
+
+type indexMutationContext struct {
+	context.Context
+	trigger     func() bool
+	mutate      func() error
+	mutationErr error
+	mutated     bool
+}
+
+func (c *indexMutationContext) Err() error {
+	if !c.mutated && c.mutate != nil && c.trigger != nil && c.trigger() {
+		c.mutated = true
+		c.mutationErr = c.mutate()
+	}
+	return c.Context.Err()
+}
+
+func stagedBuildHasSegment(indexDir string) bool {
+	staging, err := filepath.Glob(filepath.Join(indexDir, "staging-*"))
+	if err != nil {
+		return false
+	}
+	for _, dir := range staging {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.Type().IsRegular() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestFirstInventoryChange(t *testing.T) {
+	base := []fileRecord{{Path: "a.go", Size: 1, SHA256: "a"}, {Path: "c.go", Size: 1, SHA256: "c"}}
+	for _, tc := range []struct {
+		name  string
+		after []fileRecord
+		want  string
+	}{
+		{"added", []fileRecord{{Path: "a.go", Size: 1, SHA256: "a"}, {Path: "b.go", Size: 1, SHA256: "b"}, {Path: "c.go", Size: 1, SHA256: "c"}}, "added b.go"},
+		{"removed", []fileRecord{{Path: "c.go", Size: 1, SHA256: "c"}}, "removed a.go"},
+		{"changed", []fileRecord{{Path: "a.go", Size: 1, SHA256: "different"}, {Path: "c.go", Size: 1, SHA256: "c"}}, "changed a.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := firstInventoryChange(base, tc.after); got != tc.want {
+				t.Fatalf("firstInventoryChange = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func indexStats(t *testing.T, s *Server) IndexStats {
@@ -135,12 +190,12 @@ func TestC12_IndexStatsAndReindexLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, sourceHash, err := inventoryPayload(recordsExpected)
+		_, inventoryHash, err := inventoryPayload(recordsExpected)
 		if err != nil {
 			t.Fatal(err)
 		}
 		payload, err := persistent.VerifyPayload(sealed, persistent.FreshnessTuple{
-			SourceHash: sourceHash, BackendVer: inventoryVersion, Revision: stats.Revision,
+			SourceHash: inventorySourceHash(s.idx.workspaceID, inventoryHash), BackendVer: inventoryVersion,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -154,8 +209,8 @@ func TestC12_IndexStatsAndReindexLifecycle(t *testing.T) {
 		}
 	}
 	s.snapMgr.Publish(snapshot.New(string(s.workspaceID), 1, nil))
-	if stats := indexStats(t, s); stats.Fresh || stats.Generation != 2 {
-		t.Fatalf("stale generation must remain visible but not fresh: %+v", stats)
+	if stats := indexStats(t, s); !stats.Fresh || stats.Generation != 2 {
+		t.Fatalf("snapshot revision alone must not stale the disk inventory: %+v", stats)
 	}
 }
 
@@ -182,16 +237,21 @@ func TestC12_IndexStatsFreshnessSurvivesServerRestart(t *testing.T) {
 		return s
 	}
 	first := newServer()
+	first.snapMgr.Publish(snapshot.New(string(first.workspaceID), 7, nil))
 	if resp := indexRequest(first, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
 		t.Fatalf("initial reindex: %+v", resp)
 	}
-	if stats := indexStats(t, first); !stats.Fresh || stats.Generation != 1 {
+	if stats := indexStats(t, first); !stats.Fresh || stats.Generation != 1 || stats.Revision != 7 {
 		t.Fatalf("initial index stats = %+v", stats)
+	}
+	second := newServer()
+	second.snapMgr.Publish(snapshot.New(string(second.workspaceID), 2, nil))
+	if stats := indexStats(t, second); !stats.Enabled || !stats.Fresh || stats.Generation != 1 || stats.Revision != 2 {
+		t.Fatalf("unchanged tree must stay fresh after restart with a different snapshot revision: %+v", stats)
 	}
 	if err := os.WriteFile(sourcePath, []byte("package changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	second := newServer()
 	if stats := indexStats(t, second); !stats.Enabled || stats.Fresh || stats.Generation != 1 {
 		t.Fatalf("recovered stale index stats = %+v", stats)
 	}
@@ -200,6 +260,194 @@ func TestC12_IndexStatsFreshnessSurvivesServerRestart(t *testing.T) {
 	}
 	if stats := indexStats(t, second); !stats.Fresh || stats.Generation != 2 {
 		t.Fatalf("rebuilt index stats = %+v", stats)
+	}
+}
+
+func TestC12_IndexStatsTracksDiskInventoryChanges(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source.go")
+	if err := os.WriteFile(sourcePath, []byte("package source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := initializedIndexServer(t, root)
+	assertFresh := func(generation uint64) {
+		t.Helper()
+		if resp := indexRequest(s, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+			t.Fatalf("reindex generation %d: %+v", generation, resp)
+		}
+		if stats := indexStats(t, s); !stats.Fresh || stats.Generation != generation {
+			t.Fatalf("fresh generation %d stats = %+v", generation, stats)
+		}
+	}
+	assertStale := func(generation uint64, change string) {
+		t.Helper()
+		if stats := indexStats(t, s); stats.Fresh || stats.Generation != generation {
+			t.Fatalf("%s must stale generation %d without replacing it: %+v", change, generation, stats)
+		}
+	}
+	assertFresh(1)
+	if err := os.WriteFile(sourcePath, []byte("package edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertStale(1, "disk edit")
+	assertFresh(2)
+
+	addedPath := filepath.Join(root, "added.go")
+	if err := os.WriteFile(addedPath, []byte("package added\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertStale(2, "disk add")
+	assertFresh(3)
+
+	if err := os.Remove(addedPath); err != nil {
+		t.Fatal(err)
+	}
+	assertStale(3, "disk delete")
+}
+
+func TestC12_IndexFreshnessBindsWorkspaceIdentity(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	indexDir := filepath.Join(t.TempDir(), "shared-index")
+	newServer := func(root string) *Server {
+		t.Helper()
+		cfg := DefaultConfig()
+		cfg.IndexDir = indexDir
+		s := New(cfg)
+		params, err := json.Marshal(InitializeParams{RootURI: uri.FromPath(root).String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := s.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "initialize", params))
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("initialize %s: %+v", root, resp)
+		}
+		return s
+	}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	for _, root := range []string{rootA, rootB} {
+		if err := os.WriteFile(filepath.Join(root, "same.go"), []byte("package same\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := newServer(rootA)
+	if resp := indexRequest(first, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+		t.Fatalf("first workspace reindex: %+v", resp)
+	}
+	second := newServer(rootB)
+	if stats := indexStats(t, second); stats.Fresh || stats.Generation != 1 {
+		t.Fatalf("identical file inventory from another workspace must be stale: %+v", stats)
+	}
+}
+
+func TestC12_IndexStatsRebuildsLegacyInventory(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "source.go"), []byte("package source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := initializedIndexServer(t, root)
+	records, err := s.idx.inventory(context.Background(), &IndexRebuildStats{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, oldSourceHash, err := inventoryPayload(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, err := s.idx.store.BeginBuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = build.Abort()
+		}
+	}()
+	if _, err := build.WriteSegment(persistent.SealPayload(data, persistent.FreshnessTuple{
+		SourceHash: oldSourceHash, BackendVer: "file-inventory-v1",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := build.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	committed = true
+	if stats := indexStats(t, s); stats.Fresh || stats.Generation != 1 {
+		t.Fatalf("legacy inventory must be retained but stale: %+v", stats)
+	}
+	if resp := indexRequest(s, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+		t.Fatalf("rebuild legacy inventory: %+v", resp)
+	}
+	if stats := indexStats(t, s); !stats.Fresh || stats.Generation != 2 {
+		t.Fatalf("rebuilt inventory = %+v", stats)
+	}
+}
+
+func TestC12_ReindexMutationAbortsWithoutReplacingGeneration(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*Server, string) func() error
+		want      string
+		wantFresh bool
+	}{
+		{
+			name: "snapshot revision",
+			mutate: func(s *Server, _ string) func() error {
+				return func() error {
+					s.snapMgr.Publish(snapshot.New(string(s.workspaceID), 1, nil))
+					return nil
+				}
+			},
+			want:      "workspace changed during reindex",
+			wantFresh: true,
+		},
+		{
+			name: "disk content",
+			mutate: func(_ *Server, sourcePath string) func() error {
+				return func() error {
+					return os.WriteFile(sourcePath, []byte("package altered\n"), 0o644)
+				}
+			},
+			want:      "workspace files changed during reindex: changed source.go",
+			wantFresh: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			sourcePath := filepath.Join(root, "source.go")
+			if err := os.WriteFile(sourcePath, []byte("package original\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s := initializedIndexServer(t, root)
+			if resp := indexRequest(s, context.Background(), "omnilsp/reindex"); resp == nil || resp.Error != nil {
+				t.Fatalf("initial reindex: %+v", resp)
+			}
+			before := indexStats(t, s)
+			if !before.Fresh || before.Generation != 1 {
+				t.Fatalf("initial generation = %+v", before)
+			}
+			ctx := &indexMutationContext{
+				Context: context.Background(),
+				trigger: func() bool { return stagedBuildHasSegment(s.idx.dir) },
+				mutate:  tc.mutate(s, sourcePath),
+			}
+			if _, err := s.handleReindex(ctx, nil); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("reindex error = %v, want substring %q", err, tc.want)
+			}
+			if ctx.mutationErr != nil {
+				t.Fatalf("injected mutation failed: %v", ctx.mutationErr)
+			}
+			after := indexStats(t, s)
+			if after.Generation != before.Generation || len(after.Segments) != len(before.Segments) {
+				t.Fatalf("failed reindex replaced last generation: before=%+v after=%+v", before, after)
+			}
+			if after.Fresh != tc.wantFresh {
+				t.Fatalf("freshness after %s mutation = %t, want %t: %+v", tc.name, after.Fresh, tc.wantFresh, after)
+			}
+		})
 	}
 }
 
@@ -298,12 +546,18 @@ func TestC12_ReindexTrustGate(t *testing.T) {
 
 type cancelAfterContext struct {
 	context.Context
-	checks atomic.Int32
-	limit  int32
+	cancelWhen func() bool
+	onCancel   func()
+	canceled   atomic.Bool
 }
 
 func (c *cancelAfterContext) Err() error {
-	if c.checks.Add(1) >= c.limit {
+	if !c.canceled.Load() && c.cancelWhen != nil && c.cancelWhen() {
+		if c.canceled.CompareAndSwap(false, true) && c.onCancel != nil {
+			c.onCancel()
+		}
+	}
+	if c.canceled.Load() {
 		return context.Canceled
 	}
 	return nil
@@ -323,10 +577,22 @@ func TestC12_ReindexCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := &cancelAfterContext{Context: context.Background(), limit: 4}
+	sawStagedSegment := false
+	ctx := &cancelAfterContext{Context: context.Background(), cancelWhen: func() bool { return stagedBuildHasSegment(s.idx.dir) }}
+	ctx.onCancel = func() {
+		staging, err := filepath.Glob(filepath.Join(s.idx.dir, "staging-*"))
+		if err != nil || len(staging) != 1 {
+			return
+		}
+		entries, err := os.ReadDir(staging[0])
+		sawStagedSegment = err == nil && len(entries) == 1 && !entries[0].IsDir()
+	}
 	resp := indexRequest(s, ctx, "omnilsp/reindex")
 	if resp == nil || resp.Error == nil || resp.Error.Code != jsonrpc.RequestCancelled {
 		t.Fatalf("cancel response = %+v", resp)
+	}
+	if !sawStagedSegment {
+		t.Fatal("cancellation was not injected after a staged segment had been written")
 	}
 	after, err := s.idx.store.OpenSnapshot(context.Background())
 	if err != nil {
@@ -340,6 +606,18 @@ func TestC12_ReindexCancel(t *testing.T) {
 	}
 	if staging, err := filepath.Glob(filepath.Join(s.idx.dir, "staging-*")); err != nil || len(staging) != 0 {
 		t.Fatalf("cancel left staging directories: %v (%v)", staging, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.idx.dir, "manifest.tmp")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cancel left a temporary manifest: %v", err)
+	}
+	lockCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	build, err := s.idx.store.BeginBuild(lockCtx)
+	if err != nil {
+		t.Fatalf("cancel left the persistent writer lock held: %v", err)
+	}
+	if err := build.Abort(); err != nil {
+		t.Fatalf("abort lock-release probe: %v", err)
 	}
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatal("cancellation was not exercised")
