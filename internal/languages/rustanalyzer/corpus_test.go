@@ -8,7 +8,9 @@ package rustanalyzer
 // compiles them as part of this package.
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,26 +70,28 @@ func TestCorpus_RustFilesProduceGroundedSemantics(t *testing.T) {
 				t.Skip("no fn declaration in corpus file")
 			}
 
-			// rust-analyzer answers null until its workspace fetch and
-			// first analysis pass settle (seconds after initialize).
-			// Editors wait for publishDiagnostics; the nested bridge does
-			// not surface it, so poll until hover grounds or give up.
 			var hres identity.SemanticResult[*languages.HoverResult]
 			var herr error
 			broken := strings.Contains(e.Name(), "broken")
-			deadline := time.Now().Add(45 * time.Second)
-			for {
-				hres, herr = b.Hover(t.Context(), languages.HoverRequest{
-					URI: furi, Content: src, Line: uint32(line), Column: uint32(col),
-					SnapshotRev: 1, BuildContext: bcID,
-				})
-				if herr != nil {
-					t.Fatalf("hover error: %v", herr)
+			hoverRequest := languages.HoverRequest{
+				URI: furi, Content: src, Line: uint32(line), Column: uint32(col),
+				SnapshotRev: 1, BuildContext: bcID,
+			}
+			if broken {
+				// Keep deliberately broken input as a single resilience query.
+				hres, herr = b.Hover(t.Context(), hoverRequest)
+			} else {
+				probeCtx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+				hres, herr = probePositiveHover(probeCtx, b, hoverRequest)
+				cancel()
+			}
+			if herr != nil {
+				t.Fatalf("hover semantic probe failed: %v", herr)
+			}
+			if !broken {
+				if epoch, ready := b.SemanticReadiness(); epoch != identity.BackendEpoch(b.SupervisorEpoch()) || !ready {
+					t.Fatalf("positive corpus hover did not establish readiness for current supervisor epoch: (%d, %t), supervisor=%d", epoch, ready, b.SupervisorEpoch())
 				}
-				if broken || (hres.Value != nil && hres.Value.Contents != "") || time.Now().After(deadline) {
-					break
-				}
-				time.Sleep(200 * time.Millisecond) // ponytail: poll — bridge exposes no readiness signal
 			}
 			assertHoverEnvelope(t, e.Name(), hres.Status, hres.Value, hres.InternalDiagnostics)
 			if len(hres.Evidence) == 0 || hres.Evidence[0].BuildContext == "" {
@@ -105,6 +109,28 @@ func TestCorpus_RustFilesProduceGroundedSemantics(t *testing.T) {
 				t.Errorf("illegal definition status %d", dres.Status)
 			}
 		})
+	}
+}
+
+// probePositiveHover waits for real semantic content on a known declaration
+// in the corpus fixture. Only empty/unknown results are retried. Transport,
+// ContentModified, and other backend errors are returned immediately.
+func probePositiveHover(ctx context.Context, backend *Backend, request languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		result, err := backend.Hover(ctx, request)
+		if err != nil {
+			return result, err
+		}
+		if result.Status == identity.ResultExact && result.Value != nil && strings.TrimSpace(result.Value.Contents) != "" {
+			return result, nil
+		}
+		select {
+		case <-ctx.Done():
+			return result, fmt.Errorf("timed out waiting for positive rust-analyzer hover: %w", ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 

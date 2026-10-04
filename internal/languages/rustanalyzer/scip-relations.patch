@@ -1,0 +1,541 @@
+--- a/test/acceptance/tools/bin/rust-analyzer-source-1.97.0/crates/rust-analyzer/src/cli/scip.rs
++++ b/test/acceptance/tools/bin/rust-analyzer-source-1.97.0/crates/rust-analyzer/src/cli/scip.rs
+@@ -1,13 +1,14 @@
+ //! SCIP generator
+ 
+-use std::{path::PathBuf, time::Instant};
++use std::{io::Write, path::PathBuf, time::Instant};
+ 
+ use ide::{
+-    AnalysisHost, LineCol, Moniker, MonikerDescriptorKind, MonikerIdentifier, MonikerResult,
++    Analysis, AnalysisHost, CallHierarchyConfig, FilePosition, GotoImplementationConfig, LineCol,
++    Moniker, MonikerDescriptorKind, MonikerIdentifier, MonikerResult, NavigationTarget,
+     RootDatabase, StaticIndex, StaticIndexedFile, SymbolInformationKind, TextRange, TokenId,
+     TokenStaticData, VendoredLibrariesConfig,
+ };
+-use ide_db::line_index;
++use ide_db::{line_index, ra_fixture::RaFixtureConfig};
+ use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
+ use rustc_hash::{FxHashMap, FxHashSet};
+ use scip::types::{self as scip_types, SymbolInformation};
+@@ -96,6 +97,13 @@ impl flags::Scip {
+         let mut token_ids_emitted: FxHashSet<TokenId> = FxHashSet::default();
+         // All FileIds emitted as documents.
+         let mut file_ids_emitted: FxHashSet<FileId> = FxHashSet::default();
++        // Exact occurrence locations let semantic navigation targets map back to symbols. This
++        // deliberately avoids deriving relation owners from enclosing source ranges.
++        let mut symbols_at_occurrence: FxHashMap<(FileId, TextRange), String> =
++            FxHashMap::default();
++        let mut symbols_at_definition: FxHashMap<(FileId, TextRange), String> =
++            FxHashMap::default();
++        let mut relation_sources = Vec::new();
+ 
+         // All non-local symbols encountered, for detecting duplicate symbol errors.
+         let mut nonlocal_symbols_emitted: FxHashSet<String> = FxHashSet::default();
+@@ -186,10 +194,32 @@ impl flags::Scip {
+                     _ => false,
+                 };
+ 
++                symbols_at_occurrence.insert((file_id, text_range), symbol.clone());
++                if let Some(definition) = token.definition {
++                    symbols_at_definition
++                        .insert((definition.file_id, definition.range), symbol.clone());
++                }
++                if is_definition {
++                    relation_sources.push(RelationSource {
++                        file_id,
++                        range: text_range,
++                        kind: token.kind,
++                        symbol: symbol.clone(),
++                        body: token.definition_body.map(|body| (body.file_id, body.range)),
++                    });
++                }
++
+                 let mut symbol_roles = Default::default();
+                 if is_definition {
+                     symbol_roles |= scip_types::SymbolRole::Definition as i32;
+                 }
++                if token.references.iter().any(|reference| {
++                    reference.is_import
++                        && reference.range.file_id == file_id
++                        && reference.range.range == text_range
++                }) {
++                    symbol_roles |= scip_types::SymbolRole::Import as i32;
++                }
+ 
+                 let enclosing_range = match token.definition_body {
+                     Some(def_body) if def_body.file_id == file_id => {
+@@ -266,12 +296,40 @@ impl flags::Scip {
+             external_symbols.push(compute_symbol_info(symbol.clone(), enclosing_symbol, token));
+         }
+ 
++        let relationships = collect_semantic_relationships(
++            &analysis,
++            &relation_sources,
++            &symbols_at_occurrence,
++            &symbols_at_definition,
++        )?;
++        for document in &mut documents {
++            for symbol in &mut document.symbols {
++                if let Some(found) = relationships.get(&symbol.symbol) {
++                    symbol.relationships.extend(found.iter().cloned());
++                }
++            }
++        }
++
+         let index = scip_types::Index {
+             metadata: Some(metadata).into(),
+             documents,
+             external_symbols,
+             special_fields: Default::default(),
+         };
++        let typed_relations = collect_typed_relations(
++            &analysis,
++            db,
++            &vfs,
++            &root,
++            &relation_sources,
++            &symbols_at_occurrence,
++            &symbols_at_definition,
++        )?;
++        let mut relation_data = LimitedRelationBuffer::default();
++        serde_json::to_writer(
++            &mut relation_data,
++            &RelationSidecar { schema_version: 1, relations: typed_relations },
++        )?;
+ 
+         if !duplicate_symbol_errors.is_empty() {
+             eprintln!("{DUPLICATE_SYMBOLS_MESSAGE}");
+@@ -283,14 +341,392 @@ impl flags::Scip {
+         }
+ 
+         let out_path = self.output.unwrap_or_else(|| PathBuf::from(r"index.scip"));
++        let mut relation_path = out_path.as_os_str().to_os_string();
++        relation_path.push(".relations.json");
+         scip::write_message_to_file(out_path, index)
+             .map_err(|err| anyhow::format_err!("Failed to write scip to file: {}", err))?;
++        std::fs::write(PathBuf::from(relation_path), relation_data.into_inner())
++            .map_err(|err| anyhow::format_err!("Failed to write semantic relations: {}", err))?;
+ 
+         eprintln!("Generating SCIP finished {:?}", now.elapsed());
+         Ok(())
+     }
+ }
+ 
++#[derive(Clone)]
++struct RelationSource {
++    file_id: FileId,
++    range: TextRange,
++    kind: SymbolInformationKind,
++    symbol: String,
++    body: Option<(FileId, TextRange)>,
++}
++
++const MAX_RELATION_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
++const MAX_TYPED_RELATIONS: usize = 250_000;
++const MAX_RELATION_FIELD_BYTES: usize = 4096;
++
++#[derive(Default)]
++struct LimitedRelationBuffer(Vec<u8>);
++
++impl LimitedRelationBuffer {
++    fn into_inner(self) -> Vec<u8> {
++        self.0
++    }
++}
++
++impl Write for LimitedRelationBuffer {
++    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
++        if self.0.len().saturating_add(data.len()) > MAX_RELATION_SIDECAR_BYTES {
++            return Err(std::io::Error::other("semantic relation sidecar exceeds its byte limit"));
++        }
++        self.0.extend_from_slice(data);
++        Ok(data.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++#[derive(serde::Serialize)]
++struct RelationSidecar {
++    schema_version: u32,
++    relations: Vec<TypedRelation>,
++}
++
++#[derive(serde::Serialize)]
++struct TypedRelation {
++    kind: &'static str,
++    source_document: String,
++    source_symbol: String,
++    target_symbol: String,
++    range: TypedRange,
++}
++
++#[derive(serde::Serialize)]
++struct TypedRange {
++    start: TypedPosition,
++    end: TypedPosition,
++}
++
++#[derive(serde::Serialize)]
++struct TypedPosition {
++    line: u32,
++    character: u32,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++enum RelationKind {
++    Implementation,
++    TypeDefinition,
++}
++
++fn collect_semantic_relationships(
++    analysis: &Analysis,
++    sources: &[RelationSource],
++    symbols_at_occurrence: &FxHashMap<(FileId, TextRange), String>,
++    symbols_at_definition: &FxHashMap<(FileId, TextRange), String>,
++) -> anyhow::Result<FxHashMap<String, Vec<scip_types::Relationship>>> {
++    let mut seen: FxHashSet<(String, String, RelationKind)> = FxHashSet::default();
++    let mut result: FxHashMap<String, Vec<scip_types::Relationship>> = FxHashMap::default();
++    let implementation_config =
++        GotoImplementationConfig { filter_adjacent_derive_implementations: true };
++
++    for source in sources {
++        let position = FilePosition { file_id: source.file_id, offset: source.range.start() };
++        let (kind, targets): (RelationKind, Vec<NavigationTarget>) = match source.kind {
++            SymbolInformationKind::Trait => {
++                let found =
++                    analysis.goto_implementation(&implementation_config, position).map_err(
++                        |_| anyhow::anyhow!("SCIP trait implementation query was cancelled"),
++                    )?;
++                let Some(found) = found else { continue };
++                (RelationKind::Implementation, found.info)
++            }
++            SymbolInformationKind::Parameter
++            | SymbolInformationKind::Field
++            | SymbolInformationKind::Variable => {
++                let found = analysis
++                    .goto_type_definition(position)
++                    .map_err(|_| anyhow::anyhow!("SCIP declaration type query was cancelled"))?;
++                let Some(found) = found else { continue };
++                (RelationKind::TypeDefinition, found.info)
++            }
++            _ => continue,
++        };
++
++        for target in targets {
++            let target_range = target.focus_or_full_range();
++            let target_symbol = symbols_at_definition
++                .get(&(target.file_id, target_range))
++                .or_else(|| symbols_at_occurrence.get(&(target.file_id, target_range)));
++            let Some(target_symbol) = target_symbol else {
++                continue;
++            };
++            // SCIP relationships are outgoing from the implementation/type owner. A trait query
++            // returns its implementors, so that edge must be reversed before it is attached.
++            let (relationship_source, relationship_target) = match kind {
++                RelationKind::Implementation => (target_symbol.clone(), source.symbol.clone()),
++                RelationKind::TypeDefinition => (source.symbol.clone(), target_symbol.clone()),
++            };
++            if relationship_source == relationship_target
++                || !seen.insert((relationship_source.clone(), relationship_target.clone(), kind))
++            {
++                continue;
++            }
++            let relationship = match kind {
++                RelationKind::Implementation => scip_types::Relationship {
++                    symbol: relationship_target,
++                    is_implementation: true,
++                    ..Default::default()
++                },
++                RelationKind::TypeDefinition => scip_types::Relationship {
++                    symbol: relationship_target,
++                    is_type_definition: true,
++                    ..Default::default()
++                },
++            };
++            result.entry(relationship_source).or_default().push(relationship);
++        }
++    }
++
++    Ok(result)
++}
++
++fn collect_typed_relations(
++    analysis: &Analysis,
++    db: &RootDatabase,
++    vfs: &vfs::Vfs,
++    root: &vfs::AbsPathBuf,
++    sources: &[RelationSource],
++    symbols_at_occurrence: &FxHashMap<(FileId, TextRange), String>,
++    symbols_at_definition: &FxHashMap<(FileId, TextRange), String>,
++) -> anyhow::Result<Vec<TypedRelation>> {
++    let mut relations = Vec::new();
++    let mut seen: FxHashSet<TypedRelationKey> = FxHashSet::default();
++    let mut relation_bytes = 0usize;
++    let call_config =
++        CallHierarchyConfig { exclude_tests: false, ra_fixture: RaFixtureConfig::default() };
++
++    for source in sources {
++        if !is_callable_kind(source.kind) {
++            continue;
++        }
++        let calls = analysis
++            .outgoing_calls(
++                &call_config,
++                FilePosition { file_id: source.file_id, offset: source.range.start() },
++            )
++            .map_err(|_| anyhow::anyhow!("SCIP outgoing-call query was cancelled"))?;
++        let Some(calls) = calls else { continue };
++        for call in calls {
++            let target_range = call.target.focus_or_full_range();
++            let Some(target_symbol) =
++                symbols_at_definition.get(&(call.target.file_id, target_range))
++            else {
++                anyhow::bail!(
++                    "resolved Rust call target has no SCIP symbol at {:?}:{:?}",
++                    call.target.file_id,
++                    target_range
++                );
++            };
++            for call_range in call.ranges {
++                if !source_owns_call_range(source, call_range.file_id, call_range.range, sources) {
++                    continue;
++                }
++                let relative_path = get_relative_filepath(vfs, root, call_range.file_id)
++                    .ok_or_else(|| {
++                        anyhow::anyhow!("Rust call range is outside the SCIP workspace")
++                    })?;
++                let line_index = get_line_index(db, call_range.file_id);
++                let range = typed_range(&line_index, call_range.range);
++                push_typed_relation(
++                    &mut relations,
++                    &mut seen,
++                    &mut relation_bytes,
++                    TypedRelation {
++                        kind: "call",
++                        source_document: relative_path,
++                        source_symbol: source.symbol.clone(),
++                        target_symbol: target_symbol.clone(),
++                        range,
++                    },
++                )?;
++            }
++        }
++    }
++
++    for source in sources {
++        if source.kind != SymbolInformationKind::Module {
++            continue;
++        }
++        let Some((file_id, body_range)) = source.body else { continue };
++        let children = analysis
++            .child_modules(FilePosition { file_id, offset: body_range.start() })
++            .map_err(|_| anyhow::anyhow!("SCIP child-module query was cancelled"))?;
++        for child in children {
++            let child_range = child.focus_or_full_range();
++            let Some(child_symbol) = symbols_at_definition
++                .get(&(child.file_id, child_range))
++                .or_else(|| symbols_at_occurrence.get(&(child.file_id, child_range)))
++            else {
++                anyhow::bail!(
++                    "Rust child module has no SCIP symbol at {:?}:{:?}",
++                    child.file_id,
++                    child_range
++                );
++            };
++            if child_symbol == &source.symbol {
++                continue;
++            }
++            let relative_path =
++                get_relative_filepath(vfs, root, child.file_id).ok_or_else(|| {
++                    anyhow::anyhow!("Rust module declaration is outside the SCIP workspace")
++                })?;
++            let line_index = get_line_index(db, child.file_id);
++            push_typed_relation(
++                &mut relations,
++                &mut seen,
++                &mut relation_bytes,
++                TypedRelation {
++                    kind: "module",
++                    source_document: relative_path,
++                    source_symbol: source.symbol.clone(),
++                    target_symbol: child_symbol.clone(),
++                    range: typed_range(&line_index, child_range),
++                },
++            )?;
++        }
++    }
++
++    if relations.len() > MAX_TYPED_RELATIONS {
++        anyhow::bail!("semantic relation sidecar exceeds its relation-count limit");
++    }
++    relations.sort_by(|left, right| {
++        (
++            left.kind,
++            left.source_document.as_str(),
++            left.source_symbol.as_str(),
++            left.target_symbol.as_str(),
++            left.range.start.line,
++            left.range.start.character,
++            left.range.end.line,
++            left.range.end.character,
++        )
++            .cmp(&(
++                right.kind,
++                right.source_document.as_str(),
++                right.source_symbol.as_str(),
++                right.target_symbol.as_str(),
++                right.range.start.line,
++                right.range.start.character,
++                right.range.end.line,
++                right.range.end.character,
++            ))
++    });
++    Ok(relations)
++}
++
++type TypedRelationKey = (&'static str, String, String, String, u32, u32, u32, u32);
++
++fn push_typed_relation(
++    relations: &mut Vec<TypedRelation>,
++    seen: &mut FxHashSet<TypedRelationKey>,
++    relation_bytes: &mut usize,
++    relation: TypedRelation,
++) -> anyhow::Result<()> {
++    if relation.source_document.len() > MAX_RELATION_FIELD_BYTES
++        || relation.source_symbol.len() > MAX_RELATION_FIELD_BYTES
++        || relation.target_symbol.len() > MAX_RELATION_FIELD_BYTES
++    {
++        anyhow::bail!("semantic relation record exceeds its field-size limit");
++    }
++    let key = (
++        relation.kind,
++        relation.source_document.clone(),
++        relation.source_symbol.clone(),
++        relation.target_symbol.clone(),
++        relation.range.start.line,
++        relation.range.start.character,
++        relation.range.end.line,
++        relation.range.end.character,
++    );
++    if seen.insert(key) {
++        if relations.len() >= MAX_TYPED_RELATIONS {
++            anyhow::bail!("semantic relation sidecar exceeds its relation-count limit");
++        }
++        let field_bytes = relation
++            .source_document
++            .len()
++            .saturating_add(relation.source_symbol.len())
++            .saturating_add(relation.target_symbol.len())
++            .saturating_add(relation.kind.len());
++        let record_budget = field_bytes.saturating_mul(6).saturating_add(256);
++        if (*relation_bytes).saturating_add(record_budget) > MAX_RELATION_SIDECAR_BYTES {
++            anyhow::bail!("semantic relation sidecar exceeds its aggregate record-size limit");
++        }
++        *relation_bytes += record_budget;
++        relations.push(relation);
++    }
++    Ok(())
++}
++
++fn is_callable_kind(kind: SymbolInformationKind) -> bool {
++    matches!(
++        kind,
++        SymbolInformationKind::Function
++            | SymbolInformationKind::Method
++            | SymbolInformationKind::StaticMethod
++            | SymbolInformationKind::TraitMethod
++            | SymbolInformationKind::Constant
++            | SymbolInformationKind::StaticVariable
++    )
++}
++
++fn source_owns_call_range(
++    source: &RelationSource,
++    file_id: FileId,
++    range: TextRange,
++    sources: &[RelationSource],
++) -> bool {
++    let Some((body_file, body)) = source.body else { return false };
++    if body_file != file_id || range.start() < body.start() || range.end() > body.end() {
++        return false;
++    }
++    !sources.iter().any(|nested| {
++        if !is_callable_kind(nested.kind)
++            || (nested.file_id == source.file_id
++                && nested.range == source.range
++                && nested.symbol == source.symbol)
++        {
++            return false;
++        }
++        let Some((nested_file, nested_body)) = nested.body else { return false };
++        nested_file == file_id
++            && nested_body.len() < body.len()
++            && nested_body.start() <= range.start()
++            && range.end() <= nested_body.end()
++    })
++}
++
++fn typed_range(line_index: &LineIndex, range: TextRange) -> TypedRange {
++    let start = line_index.index.line_col(range.start());
++    let end = line_index.index.line_col(range.end());
++    let start = line_index
++        .index
++        .to_wide(ide_db::line_index::WideEncoding::Utf16, start)
++        .expect("a source range start has a valid UTF-16 position");
++    let end = line_index
++        .index
++        .to_wide(ide_db::line_index::WideEncoding::Utf16, end)
++        .expect("a source range end has a valid UTF-16 position");
++    TypedRange {
++        start: TypedPosition { line: start.line, character: start.col },
++        end: TypedPosition { line: end.line, character: end.col },
++    }
++}
++
+ // FIXME: Known buggy cases are described here.
+ const DUPLICATE_SYMBOLS_MESSAGE: &str = "
+ Encountered duplicate scip symbols, indicating an internal rust-analyzer bug. These duplicates are
+@@ -343,7 +779,8 @@ fn get_relative_filepath(
+     rootpath: &vfs::AbsPathBuf,
+     file_id: ide::FileId,
+ ) -> Option<String> {
+-    Some(vfs.file_path(file_id).as_path()?.strip_prefix(rootpath)?.as_str().to_owned())
++    let relative_path = vfs.file_path(file_id).as_path()?.strip_prefix(rootpath)?;
++    Some(relative_path.as_str().replace('\\', "/"))
+ }
+ 
+ fn get_line_index(db: &RootDatabase, file_id: FileId) -> LineIndex {
+--- a/test/acceptance/tools/bin/rust-analyzer-source-1.97.0/crates/rust-analyzer/build.rs
++++ b/test/acceptance/tools/bin/rust-analyzer-source-1.97.0/crates/rust-analyzer/build.rs
+@@ -12,6 +12,9 @@ fn main() {
+ 
+ fn set_rerun() {
+     println!("cargo:rerun-if-env-changed=CFG_RELEASE");
++    println!("cargo:rerun-if-env-changed=RA_COMMIT_HASH");
++    println!("cargo:rerun-if-env-changed=RA_COMMIT_SHORT_HASH");
++    println!("cargo:rerun-if-env-changed=RA_COMMIT_DATE");
+ 
+     let mut manifest_dir = PathBuf::from(
+         env::var("CARGO_MANIFEST_DIR").expect("`CARGO_MANIFEST_DIR` is always set by cargo."),
+@@ -31,6 +34,17 @@ fn set_rerun() {
+ }
+ 
+ fn set_commit_info() {
++    if let (Ok(hash), Ok(short_hash), Ok(date)) = (
++        env::var("RA_COMMIT_HASH"),
++        env::var("RA_COMMIT_SHORT_HASH"),
++        env::var("RA_COMMIT_DATE"),
++    ) {
++        println!("cargo:rustc-env=RA_COMMIT_HASH={hash}");
++        println!("cargo:rustc-env=RA_COMMIT_SHORT_HASH={short_hash}");
++        println!("cargo:rustc-env=RA_COMMIT_DATE={date}");
++        return;
++    }
++
+     #[allow(clippy::disallowed_methods)]
+     let output = match Command::new("git")
+         .arg("log")
