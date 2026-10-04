@@ -15,7 +15,8 @@ const (
 	scipProvenance    = "scip"
 	scipFreshnessNote = "静态索引快照：数据可能已过时，不反映工作区当前状态（SCIP 导入）"
 
-	commitArgPrefix = "omnilsp.commit="
+	commitArgPrefix       = "omnilsp.commit="
+	scipRepositoryArgPrefix = "omnilsp.repository="
 )
 
 var kindToSCIP = map[Kind]scip.SymbolInformation_Kind{
@@ -116,6 +117,9 @@ func ImportSCIP(in *scip.Index) (Index, error) {
 			for _, a := range in.Metadata.ToolInfo.Arguments {
 				if v, ok := strings.CutPrefix(a, commitArgPrefix); ok {
 					idx.Metadata.CommitID = v
+				}
+				if v, ok := strings.CutPrefix(a, scipRepositoryArgPrefix); ok {
+					idx.Metadata.RepoIdentity = v
 				}
 			}
 		}

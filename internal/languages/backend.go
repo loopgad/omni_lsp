@@ -22,6 +22,7 @@ package languages
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/omnilsp/omni/internal/identity"
 )
@@ -38,25 +39,58 @@ const (
 
 // CompletionRequest contains parameters for a completion query.
 type CompletionRequest struct {
-	URI         string
-	Content     []byte
-	SnapshotRev uint64
-	Line        uint32
-	Column      uint32
-	Encoding    int // 0=UTF8, 1=UTF16, 2=UTF32
-	EncodingSet bool
+	URI             string
+	Content         []byte
+	SnapshotRev     uint64
+	Line            uint32
+	Column          uint32
+	Encoding        int // 0=UTF8, 1=UTF16, 2=UTF32
+	EncodingSet     bool
+	ParentRequestID json.RawMessage `json:"-"`
 }
 
 // CompletionItem represents a single completion candidate.
 type CompletionItem struct {
-	Label         string
-	Kind          int
-	Detail        string
-	Documentation string
-	InsertText    string
-	SortText      string
-	FilterText    string
-	Evidence      EvidenceLevel
+	Label               string
+	Kind                int
+	Detail              string
+	Documentation       string
+	InsertText          string
+	SortText            string
+	FilterText          string
+	TextEdit            *CompletionTextEdit
+	AdditionalTextEdits []TextEdit
+	InsertTextFormat    int
+	Evidence            EvidenceLevel
+}
+
+// CompletionTextEdit is the LSP CompletionItem.textEdit union. Exactly one
+// form is set: Range for TextEdit or InsertReplace for InsertReplaceEdit.
+type CompletionTextEdit struct {
+	Range         *Range
+	InsertReplace *CompletionInsertReplaceEdit
+	NewText       string
+}
+
+// CompletionInsertReplaceEdit preserves the distinct insertion and replace
+// ranges supported by LSP InsertReplaceEdit.
+type CompletionInsertReplaceEdit struct {
+	Insert  Range
+	Replace Range
+}
+
+// CompletionList is a language backend's complete LSP completion response.
+// Backend.Completion remains the stable item-only interface; adapters that
+// can forward upstream list metadata may implement CompletionListProvider.
+type CompletionList struct {
+	Items        []CompletionItem
+	IsIncomplete bool
+}
+
+// CompletionListProvider is an optional per-request capability for preserving
+// completion-list metadata without storing request state on a shared backend.
+type CompletionListProvider interface {
+	CompletionList(ctx context.Context, req CompletionRequest) (CompletionList, error)
 }
 
 // HoverRequest contains parameters for a hover query.
@@ -119,10 +153,12 @@ type ReferencesRequest struct {
 
 // DocumentSymbolRequest contains parameters for document symbols.
 type DocumentSymbolRequest struct {
-	URI         string
-	Content     []byte
-	Encoding    int
-	EncodingSet bool
+	URI             string
+	Content         []byte
+	SnapshotRev     uint64
+	Encoding        int
+	EncodingSet     bool
+	ParentRequestID json.RawMessage `json:"-"`
 }
 
 // SymbolKind mirrors LSP SymbolKind.
@@ -179,16 +215,19 @@ const (
 
 // DocumentSymbol represents a symbol inside a document.
 type DocumentSymbol struct {
-	Name               string
-	Detail             string
-	Kind               SymbolKind
-	StartLine          uint32
-	StartCharacter     uint32
-	EndLine            uint32
-	EndCharacter       uint32
-	SelectionLine      uint32
-	SelectionCharacter uint32
-	Children           []DocumentSymbol
+	Name                  string
+	Detail                string
+	Kind                  SymbolKind
+	StartLine             uint32
+	StartCharacter        uint32
+	EndLine               uint32
+	EndCharacter          uint32
+	SelectionLine         uint32
+	SelectionCharacter    uint32
+	SelectionEndLine      uint32
+	SelectionEndCharacter uint32
+	SelectionRangeSet     bool
+	Children              []DocumentSymbol
 }
 
 // Diagnostic represents a compiler diagnostic.
@@ -304,8 +343,43 @@ type Backend interface {
 	Close() error
 }
 
+// WithBackendEpoch stamps every evidence record in a semantic result with the
+// worker generation that produced it. In-process backends use epoch zero.
+func WithBackendEpoch[T any](result identity.SemanticResult[T], epoch identity.BackendEpoch) identity.SemanticResult[T] {
+	for i := range result.Evidence {
+		result.Evidence[i].BackendEpoch = epoch
+	}
+	return result
+}
+
 type EncodedDiagnosticsProvider interface {
 	DiagnosticsWithEncoding(ctx context.Context, uri string, content []byte, snapshotRev uint64, encoding int) ([]Diagnostic, error)
+}
+
+// WorkspaceDocument is one immutable editor document in a captured workspace
+// snapshot. Content is owned by the caller and must be treated as read-only.
+type WorkspaceDocument struct {
+	URI        string
+	LanguageID string
+	Version    int64
+	Content    []byte
+}
+
+// WorkspaceSnapshot carries the open-document overlay a child language server
+// must observe before answering a request bound to Revision.
+type WorkspaceSnapshot struct {
+	Revision  uint64
+	Documents []WorkspaceDocument
+}
+
+// WorkspaceSnapshotSynchronizer is an optional capability for mutable child
+// language servers. BeginWorkspaceSnapshot reconciles the full open-document
+// overlay and returns a finish function that releases the snapshot lease and
+// reports whether the workspace changed while the caller used it. The base
+// Backend contract remains unchanged.
+type WorkspaceSnapshotSynchronizer interface {
+	BeginWorkspaceSnapshot(ctx context.Context, snapshot WorkspaceSnapshot) (leaseCtx context.Context, finish func() error, err error)
+	WorkspaceSnapshotGeneration() uint64
 }
 
 type EncodedSemanticTokensProvider interface {
