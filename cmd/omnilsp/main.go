@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,9 +22,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/omnilsp/omni/internal/index/model"
 	mcpserver "github.com/omnilsp/omni/internal/protocol/mcp"
 	"github.com/omnilsp/omni/internal/security"
 
@@ -30,6 +34,7 @@ import (
 	"github.com/omnilsp/omni/internal/languages"
 	ccls "github.com/omnilsp/omni/internal/languages/ccls"
 	"github.com/omnilsp/omni/internal/languages/golang"
+	"github.com/omnilsp/omni/internal/languages/nested"
 	pyright "github.com/omnilsp/omni/internal/languages/pyright"
 	rustanalyzer "github.com/omnilsp/omni/internal/languages/rustanalyzer"
 	typescript "github.com/omnilsp/omni/internal/languages/typescript"
@@ -74,6 +79,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "plugins: %v\n", err)
 			os.Exit(1)
 		}
+	case "index":
+		if err := cmdIndex(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "index: %s\n", security.RedactString(err.Error()))
+			os.Exit(1)
+		}
 	case "version", "--version", "-v":
 		fmt.Println("omnilsp v" + version)
 	default:
@@ -88,12 +98,13 @@ func usage() {
 	fmt.Println()
 	fmt.Println("Usage: omnilsp <command> [flags]")
 	fmt.Println()
-	fmt.Println("Commands: serve | doctor | verify | replay | version")
+	fmt.Println("Commands: serve | doctor | verify | replay | index | version")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  serve    Start the LSP server (--config, --transport stdio|tcp, --addr, --workspace)")
 	fmt.Println("  doctor   Probe the environment (PASS/WARN/FAIL/SKIP)")
 	fmt.Println("  replay   Replay a recorded session file")
+	fmt.Println("  index    Import or export a verified persistent semantic scope")
 	fmt.Println("  repro    Build a reproducible bug-report bundle (.zip)")
 	fmt.Println("  plugins  Manage out-of-process plugins (list/validate)")
 	fmt.Println("  version  Show version information")
@@ -133,12 +144,7 @@ func cmdServe(args []string) {
 		fatal("%v", err)
 	}
 
-	srvCfg := server.DefaultConfig()
-	srvCfg.Scheduler.MaxConcurrent = cfg.MaxConcurrentRequests
-	srvCfg.Scheduler.MaxQueueSize = cfg.MaxQueueSize
-	srvCfg.IndexDir = cfg.IndexDir
-	srvCfg.IndexDiskBudgetBytes = cfg.IndexDiskBudgetBytes
-	srv := server.New(srvCfg)
+	srv := server.New(serverConfigFrom(cfg))
 
 	registerBackends(srv, cfg)
 
@@ -216,7 +222,7 @@ func cmdServe(args []string) {
 				fmt.Fprintf(os.Stderr, "omnilsp: tcp accept: %v\n", aerr)
 				continue
 			}
-			sessionSrv := server.New(srvCfg)
+			sessionSrv := server.New(serverConfigFrom(cfg))
 			registerBackends(sessionSrv, cfg)
 			sharedCore.srv.Store(sessionSrv)
 			tr = transport.NewTCPTransport(conn)
@@ -236,6 +242,7 @@ func cmdServe(args []string) {
 			fatal("record: %v", rerr)
 		}
 		defer rec.Close()
+		srv.SetSemanticResponseObserver(indexedSemanticResponseBinder(srv, rec))
 		tr = rec
 		info("recording session to %s", *recordPath)
 	}
@@ -328,8 +335,104 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 		if st.be.LanguageID() != st.e.short {
 			srv.RegisterBackend(st.e.short, st.be) // short alias, e.g. "py" → python
 		}
+		if backend, ok := st.be.(*rustanalyzer.Backend); ok {
+			toolConfig, configErr := rustSemanticIndexToolConfig()
+			if configErr != nil {
+				warn("Rust semantic index unavailable: %v", configErr)
+			} else {
+				planner := rustanalyzer.NewSemanticIndexRequestBuilder(backend, toolConfig)
+				srv.RegisterSemanticIndexProvider("rust", backend, planner)
+				info("Rust semantic index provider registered with pinned tool identities")
+			}
+		}
+		if backend, ok := st.be.(*typescript.Backend); ok {
+			provider, providerErr := typescript.NewPinnedSemanticIndexProvider(context.Background(), backend)
+			if providerErr != nil {
+				warn("TypeScript/JavaScript semantic index unavailable: %v", providerErr)
+			} else {
+				srv.RegisterSemanticIndexProvider("typescript", provider, provider)
+				info("TypeScript/JavaScript semantic index provider registered with pinned Node, compiler, and candidate identities")
+			}
+		}
+		if backend, ok := st.be.(*pyright.Backend); ok {
+			provider, providerErr := pyright.NewRuntimeSemanticIndexProvider(context.Background(), backend)
+			if providerErr != nil {
+				warn("Python semantic index unavailable: %v", providerErr)
+			} else {
+				srv.RegisterSemanticIndexProvider("python", provider, provider)
+				info("Python semantic index provider registered with pinned analyzer identities")
+			}
+		}
 		info("%s backend registered (%s bridge)", st.e.langID, st.e.binary)
 	}
+}
+
+func rustSemanticIndexToolConfig() (rustanalyzer.RustIndexToolConfig, error) {
+	rustupPath, err := exec.LookPath("rustup")
+	if err != nil {
+		return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("rustup toolchain resolver not found: %w", err)
+	}
+	toolchainPaths := make(map[string]string, 3)
+	for _, name := range []string{"cargo", "rustc", "rust-analyzer"} {
+		output, runErr := exec.Command(rustupPath, "which", name).Output()
+		if runErr != nil {
+			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("rustup which %s: %w", name, runErr)
+		}
+		toolchainPaths[name] = filepath.Clean(strings.TrimSpace(string(output)))
+		if toolchainPaths[name] == "" || !filepath.IsAbs(toolchainPaths[name]) {
+			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("rustup returned an invalid %s path", name)
+		}
+	}
+
+	tools := make([]model.ToolIdentity, 0, 3)
+	versions := make(map[string]string, 2)
+	for _, name := range []string{"cargo", "rustc", "rust-analyzer"} {
+		path, digest, identityErr := nested.ExecutableIdentity(toolchainPaths[name])
+		if identityErr != nil {
+			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("identify pinned %s: %w", name, identityErr)
+		}
+		output, versionErr := exec.Command(path, "--version").Output()
+		if versionErr != nil || strings.TrimSpace(string(output)) == "" {
+			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("probe pinned %s version: %w", name, versionErr)
+		}
+		version := strings.TrimSpace(string(output))
+		versions[name] = version
+		if name != "rust-analyzer" {
+			tools = append(tools, model.ToolIdentity{Name: name, Path: path, Version: version, SHA256: digest})
+		}
+	}
+	sysrootOutput, err := exec.Command(toolchainPaths["rustc"], "--print", "sysroot").Output()
+	if err != nil {
+		return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("find pinned Rust sysroot: %w", err)
+	}
+	procMacroPath := filepath.Join(strings.TrimSpace(string(sysrootOutput)), "libexec", "rust-analyzer-proc-macro-srv.exe")
+	procMacroPath, procMacroDigest, err := nested.ExecutableIdentity(procMacroPath)
+	if err != nil {
+		return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("identify pinned Rust proc-macro server: %w", err)
+	}
+	tools = append(tools, model.ToolIdentity{
+		// rust-analyzer-proc-macro-srv uses a protocol on stdin and has no
+		// standalone --version mode; its exact file hash and containing pinned
+		// rustc toolchain version identify it without starting a server process.
+		Name: "proc-macro-srv", Path: procMacroPath, Version: "bundled with " + versions["rustc"], SHA256: procMacroDigest,
+	})
+	rustcIdentity := sha256.Sum256([]byte(versions["rustc"] + "\x00" + versions["cargo"] + "\x00" + versions["rust-analyzer"]))
+	helperPath := os.Getenv("OMNILSP_RUST_SCIP_HELPER_PATH")
+	helperVersion := os.Getenv("OMNILSP_RUST_SCIP_HELPER_VERSION")
+	helperSHA := os.Getenv("OMNILSP_RUST_SCIP_HELPER_SHA256")
+	var helper model.ToolIdentity
+	if helperPath != "" || helperVersion != "" || helperSHA != "" {
+		if helperPath == "" || helperVersion == "" || helperSHA == "" {
+			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("Rust semantic helper requires path, version and SHA-256 together")
+		}
+		helper = model.ToolIdentity{Name: "rust-analyzer-semantic-helper", Path: helperPath, Version: helperVersion, SHA256: strings.ToLower(helperSHA)}
+	}
+	return rustanalyzer.RustIndexToolConfig{
+		SemanticHelper: helper,
+		Tools:          tools,
+		Build:          model.BuildInputs{Options: map[string]string{"procMacros": "true", "buildScripts": "true"}},
+		Toolchain:      "sha256:" + hex.EncodeToString(rustcIdentity[:]),
+	}, nil
 }
 
 func fatal(f string, args ...any) {
