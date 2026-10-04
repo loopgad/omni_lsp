@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: OmniLSP Acceptance TypeScript
+file_extensions: [ts]
+scope: source.ts
+version: 2
+contexts:
+  main:
+    - match: '.+'
+      scope: source.ts

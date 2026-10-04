@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Windows release-acceptance host toolchain; keep fixed for one candidate run",
+  "host": "windows/amd64",
+  "observed": {
+    "go": "go1.26.1",
+    "gopls": "golang.org/x/tools/gopls v0.21.1",
+    "vscode": "1.140.0",
+    "clangd": "22.1.5",
+    "clang": "22.1.5",
+    "clang++": "22.1.5",
+    "rustAnalyzer": "1.97.0 (2d8144b7 2026-07-07)",
+    "rustAnalyzerSemanticHelper": "1.97.0+omnilsp-semantic.9428079df0958e6a541ffc73ba0b71ab4919761f6a5ff48dabfddc4052edc188 (2d8144b7 2026-07-07)",
+    "rustc": "1.97.0 (2d8144b78 2026-07-07)",
+    "python": "3.13.13",
+    "node": "v24.14.0",
+    "npm": "11.19.0",
+    "cargo": "1.97.0 (c980f4866 2026-06-30)",
+    "helix": "25.07.1 (a05c151b)"
+  },
+  "resolvedBinaries": {
+    "sublime-text": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-text-4215\\sublime_text.exe", "sha256": "b3bba60bf219501996fe5349ec659eff25daf0072c0ae81f2ceac8b0c06788f2" },
+    "sublime-lsp-package": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-lsp-2.13.0.zip", "sha256": "225b1edbc8a48b2b69b3ac9e2127536646908091936b629cc81d65a7d707d81a" },
+    "sublime-bracex": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-bracex-3.0.1-py3-none-any.whl", "sha256": "6523ad83aeb5098a4ee597cff0f964442ff74e460bd3fafaffab6a013ff2288c" },
+    "sublime-wcmatch": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-wcmatch-11.0.1-py3-none-any.whl", "sha256": "fd149ecddb9f0a88ea780017d6dde17c994e494e7f7303d4e3c9d6251f978f4b" },
+    "sublime-typing-extensions": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-typing_extensions-4.16.0-py3-none-any.whl", "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8" },
+    "sublime-orjson": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-orjson-3.12.0-cp314-cp314-win_amd64.whl", "sha256": "0b1ac5bf6609b2716c7954011c5fef6254922df029f45d032ee4ebf5d363cbed" },
+    "sublime-mdpopups": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-mdpopups-5.1.2-py3-none-any.whl", "sha256": "0ee53e9d24b1846f5b7f4b3a83e493e3aa28a825e26206617fa6e6b2abd6bd03" },
+    "rust-analyzer-semantic-helper": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\rust-analyzer-semantic-1.97.0.exe", "sha256": "f402ac788979848f306d56d2027d6dec9212ed23ce04ed23b802923f5390ea64" },
+    "go": { "path": "D:\\Program Files\\Go\\bin\\go.exe", "sha256": "a8f114f8a0a7e057fee64152b76ac50c7289981de2a76455b4baee1a034734fa" },
+    "gopls": { "path": "C:\\Users\\32806\\go\\bin\\gopls.exe", "sha256": "63feae64809f9ef57cbff79e09bb8aedfc6e891e2fdb24d0aae08f41b512dba3" },
+    "vscode": { "path": "C:\\Users\\32806\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe", "sha256": "96851792952c34ead53462ad36d973356af2e737b5ed4e433e23c4647e0d6318" },
+    "clang": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\clang.exe", "sha256": "af4d3c9f07dbcaea5f008cfa6e7974a42a55ff482296bd36d2bd00dfb92e742d" },
+    "clang++": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\clang++.exe", "sha256": "af4d3c9f07dbcaea5f008cfa6e7974a42a55ff482296bd36d2bd00dfb92e742d" },
+    "clangd": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\clangd.exe", "sha256": "6b5e3a6dc685358e55c522af7984e24d9fef47799ed7de3d6426c8a7bba24b34" },
+    "libclang": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\libclang.dll", "sha256": "68ba999bd2be3558a6dbf4db9cb39b7d784676b330b251e9fe4a41d99552d104" },
+    "rust-analyzer": { "path": "C:\\Users\\32806\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\rust-analyzer.exe", "sha256": "2b8cd9b623e4a253713992adf7ec6fbd09f83d20be8d06e5f28e5fe6cc71a3cc" },
+    "rustc": { "path": "C:\\Users\\32806\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\rustc.exe", "sha256": "6d1c5543ed3a45cfbc1c1332d42d6550d883c14d3c2e323427e631c331cebeeb" },
+    "cargo": { "path": "C:\\Users\\32806\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\cargo.exe", "sha256": "3cd119fe81dfedb9dce4573696bf65058f16b57c9e5babe415b71624315cbb7d" },
+    "rust-analyzer-proc-macro-srv": { "path": "C:\\Users\\32806\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\libexec\\rust-analyzer-proc-macro-srv.exe", "sha256": "c83bd1488f830a0138ae45d43259c8ad9e8339b2de2e9a0e14bd69f943680e78" },
+    "python": { "path": "C:\\Users\\32806\\AppData\\Roaming\\uv\\python\\cpython-3.13.13-windows-x86_64-none\\python.exe", "sha256": "8b4c0adb8d4f51d5dc8709f34543f78014ee142ae3c25ae480f34046aa5f986b" },
+    "node": { "path": "D:\\Program Files\\nodejs\\node.exe", "sha256": "63c259c81e5d472b5f11c8d506070130cb04a1ecf84b80377a34ed6ec9048088" },
+    "npm": { "path": "C:\\Users\\32806\\AppData\\Roaming\\npm\\node_modules\\npm\\bin\\npm-cli.js", "sha256": "8e5f6f3429f8cdbe693cdc29904e9d5a7b127a494bd15c804bd54c7403bfcbe7" },
+    "neovim": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\nvim-0.12.5\\nvim-win64\\bin\\nvim.exe", "sha256": "6f1fd849f6be3d0bff7bcf433ca91e0ba7481d3cc31b34601e4a29d8fad5bbdd" },
+    "helix": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\helix-25.07.1\\hx.exe", "sha256": "2e1c9583b295f55c2bca55f1ee9793640f9af61accdbef6ea15e31679ea9ab76" },
+    "emacs": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\emacs-30.2\\bin\\emacs.exe", "sha256": "24848ae901463e3c56dac17031ddd45d58220723aa35102fc778458d17ff2f0b" },
+    "pyright-langserver": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\pyright\\langserver.index.js", "sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1" },
+    "pyright-internal": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\pyright\\dist\\pyright-internal.js", "sha256": "41fb260ad72f2a16c5657e1f2fe837104d7529255d0fcd955f48432b276e7cae" },
+    "pyright-vendor": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\pyright\\dist\\vendor.js", "sha256": "1c691bf9e3fa954dec751ace203beb5591b46a73e3848af5d1ee011d62540798" },
+    "typescript-language-server": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\typescript-language-server\\lib\\cli.mjs", "sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46" },
+    "typescript": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\typescript\\lib\\typescript.js", "sha256": "569177652966bd528c319171c7dd22860dbf72bde116cbc4f644f1d02bb12e39" }
+  },
+  "acceptanceTools": {
+    "rustAnalyzerSemanticHelper": {
+      "version": "1.97.0+omnilsp-semantic.9428079df0958e6a541ffc73ba0b71ab4919761f6a5ff48dabfddc4052edc188",
+      "sourceCommit": "2d8144b7880597b6e6d3dfd63a9a9efae3f533d3",
+      "sourceSha256": "032ebc1ca7f32c5f2bbe1cf2a84f41ff40972fc33b18ce6c3e26ecaff2df507c",
+      "patchSha256": "9428079df0958e6a541ffc73ba0b71ab4919761f6a5ff48dabfddc4052edc188",
+      "modifiedTreeSha256": "1dbe96a2950d33e5a5f0d9eb90b60209316ac4626f2033e4c0b0ec2a97553391",
+      "patch": "../../../internal/languages/rustanalyzer/scip-relations.patch"
+    },
+    "rustAnalyzerSource": {
+      "version": "1.97.0",
+      "repositoryCommit": "2d8144b7880597b6e6d3dfd63a9a9efae3f533d3",
+      "repositoryPath": "src/tools/rust-analyzer",
+      "url": "https://rust.googlesource.com/rust-lang/rust/+archive/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/src/tools/rust-analyzer.tar.gz",
+      "sha256": "032ebc1ca7f32c5f2bbe1cf2a84f41ff40972fc33b18ce6c3e26ecaff2df507c",
+      "path": "bin/rust-analyzer-source-1.97.0"
+    },
+    "vscodeLanguageClient": {
+      "version": "9.0.1",
+      "lockfile": "../../editors/vscode/package-lock.json"
+    },
+    "pyright": {
+      "version": "1.1.414",
+      "registry": "https://registry.npmjs.org/",
+      "lockfile": "package-lock.json"
+    },
+    "typescriptLanguageServer": {
+      "version": "6.0.0",
+      "registry": "https://registry.npmjs.org/",
+      "lockfile": "package-lock.json"
+    },
+    "typescript": {
+      "version": "6.0.3",
+      "registry": "https://registry.npmjs.org/",
+      "lockfile": "package-lock.json"
+    },
+    "neovim": {
+      "version": "0.12.5",
+      "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-win64.zip",
+      "sha256": "de8625ba8cf65ebf40eb80a388ba1ec8e9c15b30218821e2c639119b05920de1",
+      "checksumSource": "https://github.com/baulk/bucket/blob/master/bucket/neovim.json"
+    },
+    "helix": {
+      "version": "25.07.1",
+      "url": "https://github.com/helix-editor/helix/releases/download/25.07.1/helix-25.07.1-x86_64-windows.zip",
+      "sha256": "5c8325ced8bacd8418d62706f669e96d9c3578a9237526e34d546900cbc049b6",
+      "runtimeTreeSha256": "ae4ba30b80da8d90b3016ed279d0b08e8ca19ece28f3d6ac13e761d9ffe3d54e",
+      "checksumSource": "https://github.com/helix-editor/helix/releases/tag/25.07.1"
+    },
+    "emacs": {
+      "version": "30.2",
+      "url": "https://ftp.gnu.org/pub/gnu/emacs/windows/emacs-30/emacs-30.2.zip",
+      "sha256": "414d3a1a21147af257ebd98bdd15976fdcb5ed0563f6de89f76d4a4b5dad9c72",
+      "checksumSource": "https://ftp.gnu.org/pub/gnu/emacs/windows/emacs-30/emacs-30.2-sha256sum.txt"
+    },
+    "sublimeLspPythonDependencies": {
+      "pythonVersion": "3.14",
+      "packageIndex": "https://packages.sublimetext.com/channel_v4.json",
+      "packages": {
+        "bracex": {
+          "version": "3.0.1",
+          "url": "https://files.pythonhosted.org/packages/b8/8f/6f7273a7adb8d73fc8d21ede4376a3e475e52f98435c6007f69100dec8ca/bracex-3.0.1-py3-none-any.whl",
+          "sha256": "6523ad83aeb5098a4ee597cff0f964442ff74e460bd3fafaffab6a013ff2288c",
+          "checksumSource": "https://pypi.org/pypi/bracex/3.0.1/json"
+        },
+        "wcmatch": {
+          "version": "11.0.1",
+          "url": "https://files.pythonhosted.org/packages/ce/77/7a02b0f05b3ffcdbef9719ce3ee0b508d6a29b58e95299f1580055671db3/wcmatch-11.0.1-py3-none-any.whl",
+          "sha256": "fd149ecddb9f0a88ea780017d6dde17c994e494e7f7303d4e3c9d6251f978f4b",
+          "checksumSource": "https://pypi.org/pypi/wcmatch/11.0.1/json"
+        },
+        "typingExtensions": {
+          "version": "4.16.0",
+          "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+          "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+          "checksumSource": "https://pypi.org/pypi/typing-extensions/4.16.0/json"
+        },
+        "orjson": {
+          "version": "3.12.0",
+          "url": "https://files.pythonhosted.org/packages/41/2b/395b36fa2b4ce7af70b651d715e88f80d884b2c2b14a6b53e84d554fb5f0/orjson-3.12.0-cp314-cp314-win_amd64.whl",
+          "sha256": "0b1ac5bf6609b2716c7954011c5fef6254922df029f45d032ee4ebf5d363cbed",
+          "checksumSource": "https://pypi.org/pypi/orjson/3.12.0/json"
+        },
+        "mdpopups": {
+          "version": "5.1.2",
+          "url": "https://github.com/facelessuser/sublime-markdown-popups/releases/download/5.1.2/mdpopups-5.1.2-py3-none-any.whl",
+          "sha256": "0ee53e9d24b1846f5b7f4b3a83e493e3aa28a825e26206617fa6e6b2abd6bd03",
+          "sourceCommit": "769b7eabdc3ab710861d139d7eba3fdd5cbb098c",
+          "checksumSource": "https://api.github.com/repos/facelessuser/sublime-markdown-popups/releases/tags/5.1.2"
+        }
+      }
+    }
+  }
+}

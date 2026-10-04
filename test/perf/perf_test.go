@@ -15,10 +15,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -28,8 +30,10 @@ import (
 
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/internal/languages/golang"
 	"github.com/omnilsp/omni/internal/protocol/lsp"
 	"github.com/omnilsp/omni/internal/runtime/server"
+	"github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 // --- 固定语料 -------------------------------------------------------------------
@@ -393,10 +397,10 @@ func percentile(sortedAsc []time.Duration, q float64) time.Duration {
 // ponytail: 固定批量 256；需要真分布而非均值近似时换 QPC/平台高精度时钟。
 const batchOps = 256
 
-// TestS18_InteractiveSLO 预热后各操作测 ≥200 个批量样本的 P50/P95/P99 并对照
-// §S18 目标。被测路径为确定性伪路径（fake 后端 + 同步门面），实际在微秒级，远低于
-// 毫秒级目标，断言余量充分、可安全通过。
-func TestS18_InteractiveSLO(t *testing.T) {
+// TestS18_FacadeOverhead measures batch-mean quantiles for the synchronous
+// facade with a fake backend. Passing only bounds facade overhead; it does
+// not establish end-to-end S18 SLOs on a representative Tier S corpus.
+func TestS18_FacadeOverhead(t *testing.T) {
 	const sloIters = 250 // ≥200（§S18 样本量要求）
 	cases := []struct {
 		name                            string
@@ -447,88 +451,80 @@ func TestS18_InteractiveSLO(t *testing.T) {
 	}
 }
 
-// --- §S19: large-query throughput scaling ------------------------------------
+// --- §S19: real Go backend reference scaling ---------------------------------
 
-// TestS19_ReferencesScalingCurve drives references over three corpus sizes
-// and asserts the §S19 shape properties: cost grows monotonically but far
-// below quadratic blowup, and the operation stays cancelable (a cancelled
-// context returns promptly instead of blocking).
+// TestS19_ReferencesScalingCurve exercises the actual Go reference walk over
+// valid sources with a growing number of results. It measures warm query cost
+// and verifies that a canceled request returns a canceled terminal outcome.
 func TestS19_ReferencesScalingCurve(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode")
 	}
 	sizes := []int{200, 800, 3200}
 	perOp := make([]time.Duration, 0, len(sizes))
-	for _, lines := range sizes {
-		h := newHarnessSized(lines)
-		params := map[string]any{
-			"textDocument": map[string]any{"uri": docURI},
-			"position":     map[string]any{"line": 0, "character": 4},
-			"context":      map[string]any{"includeDeclaration": true},
+	for _, count := range sizes {
+		be, req := newGoReferencesFixture(t, count)
+		ctx := context.Background()
+		check := func() {
+			res, err := be.References(ctx, req)
+			if err != nil || len(res.Value) < count {
+				t.Fatalf("references@%d: %d locations, status=%v, err=%v", count, len(res.Value), res.Status, err)
+			}
 		}
-		best := time.Hour
-		const batch, samples = 50, 10 // batch timing: single calls are below clock resolution
+		check() // warm the package loader
+		var total time.Duration
+		const samples = 10
 		for i := 0; i < samples; i++ {
 			start := time.Now()
-			for j := 0; j < batch; j++ {
-				res, err := h.call("textDocument/references", params)
-				if err := ensure(res, err, fmt.Sprintf("references@%d", lines)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if d := time.Since(start) / batch; d < best {
-				best = d
-			}
+			check()
+			total += time.Since(start)
 		}
-		perOp = append(perOp, best)
+		perOp = append(perOp, total/samples)
 	}
 	for i := 1; i < len(perOp); i++ {
-		// Loose superlinearity guard: 16x size growth must not cost >64x.
-		// (Zero readings mean the op is below clock resolution at that size;
-		// the guard only applies when the baseline itself was measurable.)
-		if perOp[i-1] > 0 && perOp[i] > perOp[i-1]*64 {
+		// Fourfold growth may be noisy on shared CI hosts; flag clear blowup.
+		if perOp[i-1] > 0 && perOp[i] > perOp[i-1]*20 {
 			t.Errorf("superlinear blowup: %v -> %v at size %d->%d",
 				perOp[i-1], perOp[i], sizes[i-1], sizes[i])
 		}
 	}
-	t.Logf("references scaling: %v/op @%d, %v/op @%d, %v/op @%d lines",
+	t.Logf("Go references scaling: %v/op @%d, %v/op @%d, %v/op @%d references",
 		perOp[0], sizes[0], perOp[1], sizes[1], perOp[2], sizes[2])
 
-	// Cancelability (§S19): a pre-cancelled context must return fast.
-	h := newHarnessSized(800)
+	be, req := newGoReferencesFixture(t, 800)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
-	_, _ = h.srv.CallMethod(ctx, "textDocument/references", map[string]any{
-		"textDocument": map[string]any{"uri": docURI},
-		"position":     map[string]any{"line": 0, "character": 4},
-	})
+	_, err := be.References(ctx, req)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled references returned %v, want context.Canceled", err)
+	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("cancelled references took %v; cancellation must be honored promptly", d)
 	}
 }
 
-// newHarnessSized builds a harness whose document has `lines` generated
-// function declarations (throughput-oriented corpus, §S19).
-func newHarnessSized(lines int) *harness {
+func newGoReferencesFixture(t *testing.T, count int) (*golang.Backend, languages.ReferencesRequest) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module perf\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	var b strings.Builder
-	b.WriteString("module bench\n\n")
-	for i := 0; i < lines; i++ {
-		fmt.Fprintf(&b, "fn f%d(x: i32) -> i32 {\n    x + %d\n}\n\n", i, i)
+	b.WriteString("package perf\nvar target int\nfunc use() {\n")
+	for i := 0; i < count; i++ {
+		b.WriteString("_ = target\n")
 	}
-	srv := server.New(server.DefaultConfig())
-	srv.RegisterBackend("go", fakeBackend{})
-	h := &harness{srv: srv, ctx: context.Background(), ver: 1}
-	if _, err := h.call("initialize", map[string]any{"processId": 1, "rootUri": "file:///w"}); err != nil {
-		panic("initialize failed: " + err.Error())
+	b.WriteString("}\n")
+	content := []byte(b.String())
+	path := filepath.Join(dir, "references.go")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := h.call("initialized", map[string]any{}); err != nil {
-		panic("initialized failed: " + err.Error())
+	be := golang.New(dir)
+	t.Cleanup(func() { _ = be.Close() })
+	return be, languages.ReferencesRequest{
+		URI: uri.FromPath(path).String(), Content: content,
+		Line: 1, Column: 5, SnapshotRev: 1, IncludeDecl: true,
 	}
-	if _, err := h.call("textDocument/didOpen", server.DidOpenTextDocumentParams{
-		TextDocument: lsp.TextDocumentItem{URI: docURI, LanguageID: "go", Version: 1, Text: b.String()},
-	}); err != nil {
-		panic("didOpen failed: " + err.Error())
-	}
-	return h
 }

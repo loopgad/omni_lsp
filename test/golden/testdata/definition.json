@@ -15,7 +15,10 @@
         },
         "declarationProvider": true,
         "definitionProvider": true,
-        "diagnosticProvider": true,
+        "diagnosticProvider": {
+          "interFileDependencies": true,
+          "workspaceDiagnostics": false
+        },
         "documentFormattingProvider": true,
         "documentSymbolProvider": true,
         "hoverProvider": true,
@@ -44,7 +47,7 @@
             ]
           }
         },
-        "signatureHelpProvider": true,
+        "signatureHelpProvider": {},
         "textDocumentSync": {
           "change": 2,
           "openClose": true,

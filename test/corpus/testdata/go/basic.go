@@ -14,3 +14,5 @@ func Add[T int | float64](a, b T) T {
 }
 
 type point struct{ x, y int }
+
+func main() { _ = Greet("world") }

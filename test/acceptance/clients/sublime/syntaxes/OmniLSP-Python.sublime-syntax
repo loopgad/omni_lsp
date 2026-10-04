@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: OmniLSP Acceptance Python
+file_extensions: [py]
+scope: source.python
+version: 2
+contexts:
+  main:
+    - match: '.+'
+      scope: source.python

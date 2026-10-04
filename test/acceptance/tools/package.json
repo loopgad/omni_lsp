@@ -1,0 +1,11 @@
+{
+  "name": "omnilsp-acceptance-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned upstream language servers used only by OmniLSP release acceptance",
+  "devDependencies": {
+    "pyright": "1.1.414",
+    "typescript": "6.0.3",
+    "typescript-language-server": "6.0.0"
+  }
+}

@@ -11,3 +11,5 @@ func Σ(values ...float64) float64 {
 	}
 	return total
 }
+
+func useΣ() { _ = Σ(1, 2) }

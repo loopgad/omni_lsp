@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: OmniLSP Acceptance TSX
+file_extensions: [tsx]
+scope: source.tsx
+version: 2
+contexts:
+  main:
+    - match: '.+'
+      scope: source.tsx

@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: OmniLSP Acceptance Rust
+file_extensions: [rs]
+scope: source.rust
+version: 2
+contexts:
+  main:
+    - match: '.+'
+      scope: source.rust

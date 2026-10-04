@@ -6,6 +6,7 @@ package conformance_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/omnilsp/omni/internal/conformance"
@@ -28,6 +29,20 @@ const baselinePath = "testdata/baseline.json"
 // registry (S6 explicit-update rule).
 func TestGenerateDocs(t *testing.T) {
 	want := conformance.GenerateDocs()
+	seenDomains := make(map[string]struct{})
+	for _, check := range conformance.Registry.Checks {
+		if _, seen := seenDomains[check.Domain]; seen {
+			continue
+		}
+		seenDomains[check.Domain] = struct{}{}
+		heading := "## Deferred domain " + strings.ToUpper(check.Domain) + " (independent denominator)"
+		if check.Domain == "core" {
+			heading = "## Core domain (gated)"
+		}
+		if !strings.Contains(want, heading) {
+			t.Errorf("generated conformance docs omit registry domain %q", check.Domain)
+		}
+	}
 	got, err := os.ReadFile(docPath)
 	if os.IsNotExist(err) || updateRequested() {
 		writeDoc(t, want)

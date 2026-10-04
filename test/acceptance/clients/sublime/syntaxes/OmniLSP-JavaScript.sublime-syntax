@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: OmniLSP Acceptance JavaScript
+file_extensions: [js]
+scope: source.js
+version: 2
+contexts:
+  main:
+    - match: '.+'
+      scope: source.js

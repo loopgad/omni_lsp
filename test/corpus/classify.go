@@ -22,6 +22,7 @@ import (
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/workspace/position"
+	"github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 // ErrorBuckets aggregates §S21 zero-error classification counters.
@@ -122,7 +123,7 @@ func ClassifyResponse(req ClassifyRequest, resp LSPResponse) []string {
 
 	// Wrong-file location: every returned URI must name the requested doc.
 	for _, u := range resp.URIs {
-		if u != "" && u != req.URI {
+		if u != "" && !sameURIIdentity(u, req.URI) {
 			hit("wrongFileLocation")
 			break
 		}
@@ -156,6 +157,12 @@ func ClassifyResponse(req ClassifyRequest, resp LSPResponse) []string {
 		hit("snapshotMixing")
 	}
 	return hits
+}
+
+func sameURIIdentity(a, b string) bool {
+	left, leftErr := uri.Parse(a)
+	right, rightErr := uri.Parse(b)
+	return leftErr == nil && rightErr == nil && left.Canonical() == right.Canonical()
 }
 
 // Record classifies resp and increments every bucket it hit.

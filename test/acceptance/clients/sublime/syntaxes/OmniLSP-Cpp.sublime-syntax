@@ -1,0 +1,10 @@
+%YAML 1.2
+---
+name: OmniLSP Acceptance C++
+file_extensions: [cpp]
+scope: source.c++
+version: 2
+contexts:
+  main:
+    - match: '.+'
+      scope: source.c++
