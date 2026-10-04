@@ -5,6 +5,7 @@ package ccls
 // run before any RPC is issued.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,73 @@ func TestX3_CompileDbDetectedWhenPresent(t *testing.T) {
 	}
 }
 
+func TestX3_CompileCommandsDirectorySelection(t *testing.T) {
+	tests := []struct {
+		name       string
+		rootDB     bool
+		buildDB    bool
+		wantDir    string
+		wantExists bool
+	}{
+		{name: "workspace root", rootDB: true, wantDir: "root", wantExists: true},
+		{name: "build fallback", buildDB: true, wantDir: "build", wantExists: true},
+		{name: "missing", wantExists: false},
+		{name: "root takes precedence", rootDB: true, buildDB: true, wantDir: "root", wantExists: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			writeDB := func(dir string) {
+				t.Helper()
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "compile_commands.json"), []byte("[]"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.rootDB {
+				writeDB(workDir)
+			}
+			if tt.buildDB {
+				writeDB(filepath.Join(workDir, "build"))
+			}
+
+			wantDir := ""
+			switch tt.wantDir {
+			case "root":
+				wantDir = workDir
+			case "build":
+				wantDir = filepath.Join(workDir, "build")
+			}
+			gotDir, gotExists := resolveCompileCommandsDir(workDir)
+			if gotDir != wantDir || gotExists != tt.wantExists {
+				t.Fatalf("resolveCompileCommandsDir() = (%q, %t), want (%q, %t)", gotDir, gotExists, wantDir, tt.wantExists)
+			}
+
+			backend := &Backend{workDir: workDir}
+			if got := backend.compileDbPresent(); got != tt.wantExists {
+				t.Errorf("compileDbPresent() = %t, want %t", got, tt.wantExists)
+			}
+
+			gotCompileDirArgs := []string{}
+			for _, arg := range clangdArgs(workDir) {
+				if strings.HasPrefix(arg, "--compile-commands-dir=") {
+					gotCompileDirArgs = append(gotCompileDirArgs, arg)
+				}
+			}
+			wantCompileDirArgs := []string{}
+			if wantDir != "" {
+				wantCompileDirArgs = append(wantCompileDirArgs, "--compile-commands-dir="+wantDir)
+			}
+			if len(gotCompileDirArgs) != len(wantCompileDirArgs) ||
+				(len(wantCompileDirArgs) == 1 && gotCompileDirArgs[0] != wantCompileDirArgs[0]) {
+				t.Errorf("clangd compile database args = %v, want %v", gotCompileDirArgs, wantCompileDirArgs)
+			}
+		})
+	}
+}
+
 func TestX3_HeaderAmbiguitySurfaced(t *testing.T) {
 	cases := map[string]bool{
 		"file:///w/a.hpp": true,
@@ -107,5 +175,38 @@ func TestX3_MacroSuspectSurfaced(t *testing.T) {
 	diag := macroSuspectDiag([]byte("#define FOO(x) x\nFOO(1)"), 1, 0)
 	if len(diag) != 1 || diag[0] != "possible-macro-expansion-site" {
 		t.Errorf("diag = %v, want [possible-macro-expansion-site]", diag)
+	}
+}
+
+func TestReferencesDeduplicateCanonicalLocations(t *testing.T) {
+	var raw lspLocationList
+	if err := json.Unmarshal([]byte(`[
+		{"uri":"file:///w/a.cpp","range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}}},
+		{"uri":"file:///w/a.cpp","range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}}},
+		{"uri":"file:///w/a.cpp","range":{"start":{"line":1,"character":3},"end":{"line":1,"character":5}}},
+		{"uri":"file:///w/b.cpp","range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}}},
+		{"uri":"file:///C:/w/drive.cpp","range":{"start":{"line":0,"character":4},"end":{"line":0,"character":9}}},
+		{"uri":"file:///c:/w/drive.cpp","range":{"start":{"line":0,"character":4},"end":{"line":0,"character":9}}}
+	]`), &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	all := toLocations(raw)
+	if len(all) != 6 {
+		t.Fatalf("toLocations collapsed upstream duplicates: got %d, want 6", len(all))
+	}
+	deduped := toReferenceLocations(raw)
+	if len(deduped) != 4 {
+		t.Fatalf("toReferenceLocations() = %d, want 4", len(deduped))
+	}
+	for i := range deduped {
+		for j := i + 1; j < len(deduped); j++ {
+			if deduped[i] == deduped[j] {
+				t.Fatalf("duplicate canonical reference locations remain: %+v", deduped)
+			}
+		}
+	}
+	if deduped[0].URI != "file:///w/a.cpp" || deduped[1].Range.StartCharacter != 3 || deduped[2].URI != "file:///w/b.cpp" || deduped[3].URI != "file:///C:/w/drive.cpp" {
+		t.Fatalf("deduped order/data = %+v", deduped)
 	}
 }

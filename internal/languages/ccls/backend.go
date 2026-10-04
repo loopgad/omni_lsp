@@ -22,9 +22,12 @@ import (
 	"strings"
 	"sync"
 
+	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/internal/languages/lspwire"
 	"github.com/omnilsp/omni/internal/languages/nested"
+	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 type Backend struct {
@@ -43,6 +46,17 @@ type Backend struct {
 // buildContextProvider interface.
 func (b *Backend) BuildContextID() identity.BuildContextID {
 	return b.conn.BuildContextID()
+}
+
+func (b *Backend) SupervisorEpoch() uint64 {
+	if b.conn == nil {
+		return 0
+	}
+	return b.conn.SupervisorEpoch()
+}
+
+func (b *Backend) currentBackendEpoch() identity.BackendEpoch {
+	return identity.BackendEpoch(b.SupervisorEpoch())
 }
 
 // parseClangdVersion extracts the semantic version token from
@@ -88,11 +102,7 @@ func New(workDir string) (*Backend, error) {
 // a shell string). Process plumbing lives in the shared nested bridge.
 func spawnClangd(c *nested.Conn) error {
 	workDir := c.WorkDir()
-	cmd := exec.Command("clangd",
-		"--log=error",
-		"--pch-storage=memory",
-		"--compile-commands-dir="+filepath.Join(workDir, "build"),
-	)
+	cmd := exec.Command("clangd", clangdArgs(workDir)...)
 	cmd.Dir = workDir
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -122,36 +132,31 @@ func (b *Backend) LanguageID() string       { return "cpp" }
 func (b *Backend) FileExtensions() []string { return []string{".c", ".cpp", ".cc", ".h", ".hpp"} }
 
 func (b *Backend) Completion(ctx context.Context, req languages.CompletionRequest) ([]languages.CompletionItem, error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/completion", map[string]interface{}{
-		"textDocument": map[string]string{"uri": req.URI},
-		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
-	})
-	if err != nil {
-		return nil, err
-	}
-	var items []languages.CompletionItem
-	var raw []struct {
-		Label  string `json:"label"`
-		Kind   int    `json:"kind"`
-		Detail string `json:"detail"`
-	}
-	if err := json.Unmarshal(result, &raw); err == nil {
-		for _, r := range raw {
-			items = append(items, languages.CompletionItem{Label: r.Label, Kind: r.Kind, Detail: r.Detail})
-		}
-	}
-	return items, nil
+	result, err := b.CompletionList(ctx, req)
+	return result.Items, err
 }
 
-func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/hover", map[string]interface{}{
+func (b *Backend) CompletionList(ctx context.Context, req languages.CompletionRequest) (languages.CompletionList, error) {
+	result, err := b.conn.SendRequestAtRevision(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/completion", map[string]interface{}{
+		"textDocument": map[string]string{"uri": req.URI},
+		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
+	}, req.ParentRequestID)
+	if err != nil {
+		return languages.CompletionList{}, err
+	}
+	return lspwire.DecodeCompletionList(result)
+}
+
+func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (envelope identity.SemanticResult[*languages.HoverResult], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/hover", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return unknownHover(req, "clangd request failed: "+err.Error()), nil
+		return unknownHover(req, "clangd request failed: "+err.Error()), err
 	}
 	if result == nil {
 		return identity.SemanticResult[*languages.HoverResult]{
@@ -166,7 +171,7 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 		} `json:"contents"`
 	}
 	if err := json.Unmarshal(result, &hover); err != nil {
-		return unknownHover(req, "hover decode failed"), nil
+		return unknownHover(req, "hover decode failed"), err
 	}
 	return identity.SemanticResult[*languages.HoverResult]{
 		Status: identity.ResultExact,
@@ -306,14 +311,48 @@ func toLocations(raw lspLocationList) []languages.Location {
 	return locs
 }
 
-func (b *Backend) Definition(ctx context.Context, req languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/definition", map[string]interface{}{
+// toReferenceLocations removes only exact duplicate references while
+// preserving upstream order. Definition and other location projections keep
+// using toLocations so their cardinality remains an upstream fact.
+func toReferenceLocations(raw lspLocationList) []languages.Location {
+	locs := make([]languages.Location, 0, len(raw))
+	type referenceKey struct {
+		URI   string
+		Range languages.Range
+	}
+	seen := make(map[referenceKey]struct{}, len(raw))
+	for _, l := range raw {
+		location := languages.Location{
+			URI: l.URI,
+			Range: languages.Range{
+				StartLine: l.Range.Start.Line, StartCharacter: l.Range.Start.Character,
+				EndLine: l.Range.End.Line, EndCharacter: l.Range.End.Character,
+			},
+		}
+		canonicalURI := location.URI
+		if parsed, err := workspaceuri.Parse(location.URI); err == nil {
+			canonicalURI = parsed.Canonical()
+		}
+		key := referenceKey{URI: canonicalURI, Range: location.Range}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		locs = append(locs, location)
+	}
+	return locs
+}
+
+func (b *Backend) Definition(ctx context.Context, req languages.DefinitionRequest) (envelope identity.SemanticResult[[]languages.Location], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/definition", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd request failed: "+err.Error()), nil
+		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd request failed: "+err.Error()), err
 	}
 	if result == nil {
 		return identity.SemanticResult[[]languages.Location]{
@@ -324,7 +363,7 @@ func (b *Backend) Definition(ctx context.Context, req languages.DefinitionReques
 	}
 	var raw lspLocationList
 	if err := json.Unmarshal(result, &raw); err != nil {
-		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "definition decode failed"), nil
+		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "definition decode failed"), err
 	}
 	return identity.SemanticResult[[]languages.Location]{
 		Status:              identity.ResultExact,
@@ -344,15 +383,17 @@ func unknownLocsCcls(rev uint64, bc identity.BuildContextID, content []byte, det
 	}
 }
 
-func (b *Backend) References(ctx context.Context, req languages.ReferencesRequest) (identity.SemanticResult[[]languages.Location], error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/references", map[string]interface{}{
+func (b *Backend) References(ctx context.Context, req languages.ReferencesRequest) (envelope identity.SemanticResult[[]languages.Location], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/references", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 		"context":      map[string]bool{"includeDeclaration": req.IncludeDecl},
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd request failed: "+err.Error()), nil
+		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd request failed: "+err.Error()), err
 	}
 	if result == nil {
 		return identity.SemanticResult[[]languages.Location]{
@@ -363,13 +404,13 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 	}
 	var raw lspLocationList
 	if err := json.Unmarshal(result, &raw); err != nil {
-		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "references decode failed"), nil
+		return unknownLocsCcls(req.SnapshotRev, req.BuildContext, req.Content, "references decode failed"), err
 	}
 	// clangd enumerates across its loaded index; the bridge inherits that
 	// proof but cannot independently verify scope (§G1 normalization).
 	return identity.SemanticResult[[]languages.Location]{
 		Status:              identity.ResultPartial,
-		Value:               toLocations(raw),
+		Value:               toReferenceLocations(raw),
 		Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd-index-scope"),
 		InternalDiagnostics: macroSuspectDiag(req.Content, req.Line, req.Column),
 		Completeness:        identity.IncompleteKnownSubset,
@@ -377,38 +418,112 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 }
 
 func (b *Backend) DocumentSymbols(ctx context.Context, req languages.DocumentSymbolRequest) ([]languages.DocumentSymbol, error) {
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/documentSymbol", map[string]interface{}{
+	result, err := b.conn.SendRequestAtRevision(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/documentSymbol", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
-	})
+	}, req.ParentRequestID)
 	if err != nil || result == nil {
 		return nil, err
 	}
-	var syms []languages.DocumentSymbol
-	var raw []struct {
-		Name  string `json:"name"`
-		Kind  int    `json:"kind"`
-		Range struct {
-			Start struct {
-				Line      uint32 `json:"line"`
-				Character uint32 `json:"character"`
-			} `json:"start"`
-			End struct {
-				Line      uint32 `json:"line"`
-				Character uint32 `json:"character"`
-			} `json:"end"`
-		} `json:"range"`
+	return decodeDocumentSymbols(result)
+}
+
+type documentSymbolPosition struct {
+	Line      uint32 `json:"line"`
+	Character uint32 `json:"character"`
+}
+
+type documentSymbolRange struct {
+	Start documentSymbolPosition `json:"start"`
+	End   documentSymbolPosition `json:"end"`
+}
+
+type documentSymbolWire struct {
+	Name           string               `json:"name"`
+	Detail         string               `json:"detail"`
+	Kind           int                  `json:"kind"`
+	Range          documentSymbolRange  `json:"range"`
+	SelectionRange *documentSymbolRange `json:"selectionRange"`
+	Children       []documentSymbolWire `json:"children"`
+}
+
+type symbolInformationWire struct {
+	Name     string `json:"name"`
+	Kind     int    `json:"kind"`
+	Location struct {
+		Range documentSymbolRange `json:"range"`
+	} `json:"location"`
+}
+
+// decodeDocumentSymbols accepts both LSP document symbol response forms.
+// Nested DocumentSymbol entries retain their selection range and children;
+// flat SymbolInformation entries can only prove the location range, so that
+// range is used for both the symbol span and its selection position.
+func decodeDocumentSymbols(result []byte) ([]languages.DocumentSymbol, error) {
+	if len(result) == 0 {
+		return nil, nil
 	}
-	if err := json.Unmarshal(result, &raw); err == nil {
-		for _, s := range raw {
-			syms = append(syms, languages.DocumentSymbol{
-				Name: s.Name, Kind: languages.SymbolKind(s.Kind),
-				StartLine: s.Range.Start.Line, StartCharacter: s.Range.Start.Character,
-				EndLine: s.Range.End.Line, EndCharacter: s.Range.End.Character,
-			})
+	var entries []json.RawMessage
+	if err := json.Unmarshal(result, &entries); err != nil {
+		return nil, fmt.Errorf("document symbol decode: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	syms := make([]languages.DocumentSymbol, 0, len(entries))
+	for i, entry := range entries {
+		var shape struct {
+			Location json.RawMessage `json:"location"`
 		}
+		if err := json.Unmarshal(entry, &shape); err != nil {
+			return nil, fmt.Errorf("document symbol %d decode: %w", i, err)
+		}
+		if len(shape.Location) != 0 && string(shape.Location) != "null" {
+			var info symbolInformationWire
+			if err := json.Unmarshal(entry, &info); err != nil {
+				return nil, fmt.Errorf("symbol information %d decode: %w", i, err)
+			}
+			syms = append(syms, projectSymbolInformation(info))
+			continue
+		}
+		var symbol documentSymbolWire
+		if err := json.Unmarshal(entry, &symbol); err != nil {
+			return nil, fmt.Errorf("document symbol %d decode: %w", i, err)
+		}
+		syms = append(syms, projectDocumentSymbol(symbol))
 	}
 	return syms, nil
+}
+
+func projectDocumentSymbol(raw documentSymbolWire) languages.DocumentSymbol {
+	selection := raw.Range
+	if raw.SelectionRange != nil {
+		selection = *raw.SelectionRange
+	}
+	children := make([]languages.DocumentSymbol, 0, len(raw.Children))
+	for _, child := range raw.Children {
+		children = append(children, projectDocumentSymbol(child))
+	}
+	return languages.DocumentSymbol{
+		Name: raw.Name, Detail: raw.Detail, Kind: languages.SymbolKind(raw.Kind),
+		StartLine: raw.Range.Start.Line, StartCharacter: raw.Range.Start.Character,
+		EndLine: raw.Range.End.Line, EndCharacter: raw.Range.End.Character,
+		SelectionLine: selection.Start.Line, SelectionCharacter: selection.Start.Character,
+		SelectionEndLine: selection.End.Line, SelectionEndCharacter: selection.End.Character,
+		SelectionRangeSet: true,
+		Children:          children,
+	}
+}
+
+func projectSymbolInformation(raw symbolInformationWire) languages.DocumentSymbol {
+	rangeValue := raw.Location.Range
+	return languages.DocumentSymbol{
+		Name: raw.Name, Kind: languages.SymbolKind(raw.Kind),
+		StartLine: rangeValue.Start.Line, StartCharacter: rangeValue.Start.Character,
+		EndLine: rangeValue.End.Line, EndCharacter: rangeValue.End.Character,
+		SelectionLine: rangeValue.Start.Line, SelectionCharacter: rangeValue.Start.Character,
+		SelectionEndLine: rangeValue.End.Line, SelectionEndCharacter: rangeValue.End.Character,
+		SelectionRangeSet: true,
+	}
 }
 
 func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceSymbolRequest) ([]languages.WorkspaceSymbol, error) {
@@ -443,15 +558,48 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 }
 
 func (b *Backend) Diagnostics(ctx context.Context, uri string, content []byte) ([]languages.Diagnostic, error) {
-	b.didOpen(uri, content)
-	return nil, nil // push diagnostics not yet consumed; explicit empty (Q3)
+	return b.DiagnosticsWithEncoding(ctx, uri, content, 0, 1)
+}
+
+func (b *Backend) BeginWorkspaceSnapshot(ctx context.Context, snapshot languages.WorkspaceSnapshot) (context.Context, func() error, error) {
+	documents := make([]nested.SnapshotDocument, 0, len(snapshot.Documents))
+	for _, doc := range snapshot.Documents {
+		if doc.LanguageID == "c" || doc.LanguageID == "cpp" {
+			// All clangd semantic and diagnostic operations address documents as
+			// "cpp". Use that same ID for snapshot didOpen so the scoped lease
+			// validates those later requests for both C and C++ files.
+			documents = append(documents, nested.SnapshotDocument{URI: doc.URI, LangID: "cpp", Content: doc.Content})
+		}
+	}
+	return b.conn.BeginWorkspaceSnapshot(ctx, snapshot.Revision, documents)
+}
+
+func (b *Backend) WorkspaceSnapshotGeneration() uint64 {
+	return b.conn.WorkspaceSnapshotGeneration()
+}
+
+// DiagnosticsWithEncoding keeps the revision-aware document state in sync
+// while C++ diagnostics remain explicitly deferred; clangd push diagnostics
+// are not captured by this backend.
+func (b *Backend) DiagnosticsWithEncoding(ctx context.Context, uri string, content []byte, snapshotRev uint64, encoding int) ([]languages.Diagnostic, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := b.conn.SyncDocumentAtRevisionContext(ctx, "cpp", uri, content, snapshotRev); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte) ([]languages.SemanticToken, error) {
 	return nil, nil
 }
 
-func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (identity.SemanticResult[languages.ValidatedEdit], error) {
+func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {
+	epoch := b.currentBackendEpoch()
+	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
 	// X3/R4.1: without a compile database clangd works in single-file mode —
 	// it cannot see all translation units, so project-wide rename completeness
 	// is unprovable. Fail closed with an actionable diagnostic.
@@ -461,31 +609,47 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 			Evidence: evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content,
 				"no-compile-commands"),
 			InternalDiagnostics: []string{
-				"no compile_commands.json under build/ — project-wide rename cannot be proven complete; " +
+				"no compile_commands.json at the workspace root or under build/ — project-wide rename cannot be proven complete; " +
 					"generate one (cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON) and retry",
 			},
 		}, nil
 	}
-	b.didOpen(req.URI, req.Content)
-	result, err := b.conn.SendRequest(ctx, "textDocument/rename", map[string]interface{}{
+	kind, refusal, err := b.classifyRenameTarget(ctx, req)
+	if refusal != "" {
+		message := "rename refused: C/C++ target classification is unavailable (SEM-SAFE-001)"
+		if refusal == "rename-target-outside-document" {
+			message = "rename refused: C/C++ target is outside the current document; collision analysis is not proven (SEM-SAFE-001)"
+		} else if refusal == "rename-target-ambiguous" {
+			message = "rename refused: C/C++ target is ambiguous; collision analysis is not proven (SEM-SAFE-001)"
+		}
+		return unavailableCclsRename(req, refusal, message), nil
+	}
+	if err != nil {
+		if ierrors.IsKind(err, ierrors.ErrContentModified) {
+			return unavailableCclsRename(req, "rename-target-revision-changed", "rename refused: C/C++ target classification changed with the document revision (SEM-SAFE-001)"), err
+		}
+		return unavailableCclsRename(req, "rename-target-classification-failed", "rename refused: C/C++ target classification is unavailable (SEM-SAFE-001)"), err
+	}
+	if cclsRenameNeedsCollisionProof(kind) {
+		return unavailableCclsRename(req, "rename-function-collision-unproven", "rename refused: C/C++ function/method collision analysis is not proven (SEM-SAFE-001)"), nil
+	}
+	result, requestEpoch, err := b.conn.SendRequestAtRevisionWithEpoch(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/rename", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
 		"newName":      req.NewName,
 	})
+	epoch = identity.BackendEpoch(requestEpoch)
 	if err != nil {
-		return identity.SemanticResult[languages.ValidatedEdit]{
+		result := identity.SemanticResult[languages.ValidatedEdit]{
 			Status:              identity.ResultUnavailable,
 			Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd request failed"),
 			InternalDiagnostics: []string{err.Error()},
-		}, nil
+		}
+		return result, err
 	}
-	if result == nil {
+	if len(strings.TrimSpace(string(result))) == 0 || strings.TrimSpace(string(result)) == "null" {
 		// clangd itself refuses renames it cannot prove; inherit the refusal.
-		return identity.SemanticResult[languages.ValidatedEdit]{
-			Status:              identity.ResultUnavailable,
-			Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd-refused"),
-			InternalDiagnostics: []string{"upstream language service refused rename"},
-		}, nil
+		return unavailableCclsRename(req, "clangd-refused", "upstream language service refused rename"), nil
 	}
 	var edits []languages.TextEdit
 	var workspaceEdit struct {
@@ -508,7 +672,7 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 			Status:              identity.ResultUnavailable,
 			Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, "rename decode failed"),
 			InternalDiagnostics: []string{err.Error()},
-		}, nil
+		}, err
 	}
 	for uri, changes := range workspaceEdit.Changes {
 		for _, c := range changes {
@@ -520,8 +684,9 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 			})
 		}
 	}
-	// G9 Phase 1: clangd is the compiler-grade source of truth and refuses
-	// unprovable renames itself; a non-null WorkspaceEdit carries that proof.
+	// clangd's edit is accepted only after the target classification gate above;
+	// function-like targets are refused because clangd does not prove overload-
+	// set collision safety for this bridge.
 	return identity.SemanticResult[languages.ValidatedEdit]{
 		Status: identity.ResultExact,
 		Value: languages.ValidatedEdit{
@@ -533,17 +698,190 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 	}, nil
 }
 
-func (b *Backend) didOpen(uri string, content []byte) {
-	b.conn.DidOpen("cpp", uri, content)
+const cclsFunctionLikeSymbolOperator languages.SymbolKind = 25 // LSP SymbolKind::Operator.
+
+// classifyRenameTarget uses the same revision-bound child connection as the
+// eventual edit request. Definition resolution must identify one in-document
+// declaration, and document symbols must classify its selection range; without
+// both facts the bridge cannot safely apply the non-function rename policy.
+func (b *Backend) classifyRenameTarget(ctx context.Context, req languages.RenameRequest) (languages.SymbolKind, string, error) {
+	definition, err := b.Definition(ctx, languages.DefinitionRequest{
+		URI: req.URI, Content: req.Content, SnapshotRev: req.SnapshotRev,
+		BuildContext: req.BuildContext, Line: req.Line, Column: req.Column,
+		Encoding: req.Encoding, EncodingSet: req.EncodingSet,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	if definition.Status != identity.ResultExact || definition.Completeness != identity.Complete || len(definition.Value) != 1 {
+		return 0, "rename-target-unclassified", nil
+	}
+	target := definition.Value[0]
+	if target.URI != req.URI {
+		return 0, "rename-target-outside-document", nil
+	}
+	if !validCclsRange(target.Range) {
+		return 0, "rename-target-unclassified", nil
+	}
+	symbols, err := b.DocumentSymbols(ctx, languages.DocumentSymbolRequest{
+		URI: req.URI, Content: req.Content, SnapshotRev: req.SnapshotRev,
+		Encoding: req.Encoding, EncodingSet: req.EncodingSet,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	kind, ok := classifyCclsSymbolAtDefinition(symbols, target.Range)
+	if !ok {
+		return 0, "rename-target-unclassified", nil
+	}
+	return kind, "", nil
 }
 
-// compileDbPresent reports whether a compile database exists for this
-// workspace (§X3). Checked once per process and cached: the file appears at
-// configure time, not mid-session.
+func unavailableCclsRename(req languages.RenameRequest, detailCode, message string) identity.SemanticResult[languages.ValidatedEdit] {
+	return identity.SemanticResult[languages.ValidatedEdit]{
+		Status:              identity.ResultUnavailable,
+		Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, detailCode),
+		InternalDiagnostics: []string{message},
+		Completeness:        identity.CompletenessUnknown,
+	}
+}
+
+func cclsRenameNeedsCollisionProof(kind languages.SymbolKind) bool {
+	return kind == languages.SymbolFunction || kind == languages.SymbolMethod ||
+		kind == languages.SymbolConstructor || kind == cclsFunctionLikeSymbolOperator
+}
+
+func classifyCclsSymbolAtDefinition(symbols []languages.DocumentSymbol, target languages.Range) (languages.SymbolKind, bool) {
+	var candidates []languages.DocumentSymbol
+	var visit func([]languages.DocumentSymbol)
+	visit = func(items []languages.DocumentSymbol) {
+		for _, item := range items {
+			selection := languages.Range{
+				StartLine: item.SelectionLine, StartCharacter: item.SelectionCharacter,
+				EndLine: item.SelectionEndLine, EndCharacter: item.SelectionEndCharacter,
+			}
+			if item.SelectionRangeSet && validCclsRange(selection) && cclsRangeContains(selection, target) {
+				candidates = append(candidates, item)
+			}
+			visit(item.Children)
+		}
+	}
+	visit(symbols)
+	if len(candidates) == 0 {
+		return 0, false
+	}
+	// Prefer a unique narrowest selection range so a containing namespace or
+	// type cannot mask the declaration at the target position.
+	narrowest := make([]languages.DocumentSymbol, 0, len(candidates))
+	for i, candidate := range candidates {
+		candidateRange := cclsSymbolSelection(candidate)
+		isNarrowest := true
+		for j, other := range candidates {
+			if i == j {
+				continue
+			}
+			otherRange := cclsSymbolSelection(other)
+			if cclsRangeStrictlyContains(candidateRange, otherRange) {
+				isNarrowest = false
+				break
+			}
+		}
+		if isNarrowest {
+			narrowest = append(narrowest, candidate)
+		}
+	}
+	if len(narrowest) == 0 {
+		return 0, false
+	}
+	kind := narrowest[0].Kind
+	if kind < languages.SymbolFile || kind > 26 { // LSP SymbolKind currently spans 1 through 26.
+		return 0, false
+	}
+	for _, candidate := range narrowest[1:] {
+		if candidate.Kind != kind {
+			return 0, false
+		}
+	}
+	return kind, true
+}
+
+func cclsSymbolSelection(symbol languages.DocumentSymbol) languages.Range {
+	return languages.Range{
+		StartLine: symbol.SelectionLine, StartCharacter: symbol.SelectionCharacter,
+		EndLine: symbol.SelectionEndLine, EndCharacter: symbol.SelectionEndCharacter,
+	}
+}
+
+func validCclsRange(r languages.Range) bool {
+	return cclsPositionLess(r.StartLine, r.StartCharacter, r.EndLine, r.EndCharacter)
+}
+
+func cclsRangeContains(outer, inner languages.Range) bool {
+	return !cclsPositionLess(inner.StartLine, inner.StartCharacter, outer.StartLine, outer.StartCharacter) &&
+		!cclsPositionLess(outer.EndLine, outer.EndCharacter, inner.EndLine, inner.EndCharacter)
+}
+
+func cclsRangeStrictlyContains(outer, inner languages.Range) bool {
+	return cclsRangeContains(outer, inner) &&
+		(outer.StartLine != inner.StartLine || outer.StartCharacter != inner.StartCharacter ||
+			outer.EndLine != inner.EndLine || outer.EndCharacter != inner.EndCharacter)
+}
+
+func cclsPositionLess(lineA, charA, lineB, charB uint32) bool {
+	return lineA < lineB || (lineA == lineB && charA < charB)
+}
+
+func (b *Backend) didOpen(uri string, content []byte, revision ...uint64) error {
+	var snapshotRevision uint64
+	if len(revision) != 0 {
+		snapshotRevision = revision[0]
+	}
+	_, err := b.conn.SyncDocumentAtRevision("cpp", uri, content, snapshotRevision)
+	return err
+}
+
+// DidCloseDocument is an optional lifecycle hook used by the runtime server
+// when an editor closes a document. It does not change the frozen Backend
+// method set.
+func (b *Backend) DidCloseDocument(uri string, snapshotRevision uint64) error {
+	return b.conn.CloseDocument(uri, snapshotRevision)
+}
+
+// resolveCompileCommandsDir selects the directory clangd should use for this
+// workspace (§X3). Prefer the root database used by the acceptance corpus and
+// editor setup, while retaining compatibility with CMake's build/ layout.
+func resolveCompileCommandsDir(workDir string) (string, bool) {
+	if strings.TrimSpace(workDir) == "" {
+		return "", false
+	}
+	for _, dir := range []string{workDir, filepath.Join(workDir, "build")} {
+		info, err := os.Stat(filepath.Join(dir, "compile_commands.json"))
+		if err == nil && !info.IsDir() {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
+func clangdArgs(workDir string) []string {
+	args := []string{"--log=error", "--pch-storage=memory"}
+	if dir, ok := resolveCompileCommandsDir(workDir); ok {
+		args = append(args, "--compile-commands-dir="+dir)
+	}
+	return args
+}
+
+// CommandArgs returns the production clangd arguments for a workspace. The
+// acceptance oracle uses the same settings so its direct upstream comparison
+// measures the same clangd configuration as the ccls backend.
+func CommandArgs(workDir string) []string { return clangdArgs(workDir) }
+
+// compileDbPresent reports whether the selected compile database exists for
+// this workspace (§X3). Checked once per process and cached: the file appears
+// at configure time, not mid-session. It shares path precedence with startup.
 func (b *Backend) compileDbPresent() bool {
 	b.dbOnce.Do(func() {
-		_, err := os.Stat(filepath.Join(b.workDir, "build", "compile_commands.json"))
-		b.hasCompileDb = err == nil
+		_, b.hasCompileDb = resolveCompileCommandsDir(b.workDir)
 	})
 	return b.hasCompileDb
 }
