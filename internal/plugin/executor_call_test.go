@@ -132,78 +132,67 @@ func TestCall_RoundTripAndRPCError(t *testing.T) {
 	})
 }
 
-// TestCall_PluginDies pins the EOF path (§O crash containment input): when
-// the child dies mid-call the host must get an error — not a hang, not a
-// partial parse. The 5s timeout branch is deliberately not exercised:
-// callTimeout is a const and waiting it out tests the clock.
+// TestCall_ConcurrentRequests pins ID-based correlation when concurrently
+// issued calls receive responses in reverse order.
 func TestCall_ConcurrentRequests(t *testing.T) {
 	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
-	t.Setenv("GO_PLUGIN_MODE", "slow-roundtrip")
+	t.Setenv("GO_PLUGIN_MODE", "reverse-roundtrip")
 	m := newValidManifest([]byte("x"))
 	m.Capabilities = []Capability{CapIndexQuery}
-	p := spawnHelper(t, "slow-roundtrip", m, NewGrant(CapIndexQuery))
+	p := spawnHelper(t, "reverse-roundtrip", m, NewGrant(CapIndexQuery))
 
 	resCh := make(chan struct {
-		res json.RawMessage
-		err error
+		uri  string
+		line int
+		res  json.RawMessage
+		err  error
 	}, 2)
 
-	go func() {
-		res, err := p.Call("index/query", map[string]any{"uri": "file:///slow.go", "line": 1})
-		resCh <- struct {
-			res json.RawMessage
-			err error
-		}{res: res, err: err}
-	}()
-
-	// Give the slow request time to reach the child before the second request is sent;
-	// that creates the in-flight overlap the fix is meant to handle.
-	time.Sleep(50 * time.Millisecond)
-
-	go func() {
-		res, err := p.Call("index/query", map[string]any{"uri": "file:///fast.go", "line": 2})
-		resCh <- struct {
-			res json.RawMessage
-			err error
-		}{res: res, err: err}
-	}()
-
-	first := <-resCh
-	if first.err != nil {
-		t.Fatalf("first call failed: %v", first.err)
-	}
-	second := <-resCh
-	if second.err != nil {
-		t.Fatalf("second call failed: %v", second.err)
+	for _, call := range []struct {
+		uri  string
+		line int
+	}{
+		{uri: "file:///slow.go", line: 1},
+		{uri: "file:///fast.go", line: 2},
+	} {
+		call := call
+		go func() {
+			params := map[string]any{"uri": call.uri, "line": call.line}
+			res, err := p.Call("index/query", params)
+			resCh <- struct {
+				uri  string
+				line int
+				res  json.RawMessage
+				err  error
+			}{uri: call.uri, line: call.line, res: res, err: err}
+		}()
 	}
 
-	var a struct {
-		Pong struct {
-			URI  string `json:"uri"`
-			Line int    `json:"line"`
-		} `json:"pong"`
-	}
-	if err := json.Unmarshal(first.res, &a); err != nil {
-		t.Fatalf("first result unparsable: %v (%s)", err, first.res)
-	}
-	if a.Pong.URI != "file:///slow.go" || a.Pong.Line != 1 {
-		t.Fatalf("first result mismatch: %+v", a.Pong)
-	}
-
-	var b struct {
-		Pong struct {
-			URI  string `json:"uri"`
-			Line int    `json:"line"`
-		} `json:"pong"`
-	}
-	if err := json.Unmarshal(second.res, &b); err != nil {
-		t.Fatalf("second result unparsable: %v (%s)", err, second.res)
-	}
-	if b.Pong.URI != "file:///fast.go" || b.Pong.Line != 2 {
-		t.Fatalf("second result mismatch: %+v", b.Pong)
+	want := map[string]int{"file:///slow.go": 1, "file:///fast.go": 2}
+	for range 2 {
+		got := <-resCh
+		if got.err != nil {
+			t.Fatalf("Call(%q) failed: %v", got.uri, got.err)
+		}
+		var response struct {
+			Pong struct {
+				URI  string `json:"uri"`
+				Line int    `json:"line"`
+			} `json:"pong"`
+		}
+		if err := json.Unmarshal(got.res, &response); err != nil {
+			t.Fatalf("result for %q unparsable: %v (%s)", got.uri, err, got.res)
+		}
+		if response.Pong.URI != got.uri || response.Pong.Line != want[got.uri] {
+			t.Fatalf("Call(%q) got mismatched response: %+v", got.uri, response.Pong)
+		}
 	}
 }
 
+// TestCall_PluginDies pins the EOF path (§O crash containment input): when
+// the child dies mid-call the host must get an error — not a hang, not a
+// partial parse. The timeout branch is deliberately not exercised because
+// callTimeout is a const and waiting it out tests the clock.
 func TestCall_PluginDies(t *testing.T) {
 	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
 	t.Setenv("GO_PLUGIN_MODE", "die")

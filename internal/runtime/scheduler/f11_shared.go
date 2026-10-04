@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -15,9 +16,9 @@ var errRejected = errors.New("scheduler: leader rejected before execution")
 // leader and is queued normally; later submitters receive the leader's
 // result when it is delivered.
 //
-// Waiter-side cancellation is NOT handled here: waiters select on their own
-// Request.wakeCh (closed by Cancel), so a cancelled waiter stops waiting
-// without disturbing the leader or other waiters.
+// Each admitted request holds one waiter reference. Releasing an individual
+// reference leaves the shared context alive; releasing the last reference
+// removes the key and cancels the shared execution.
 type InFlightTracker struct {
 	mu       sync.Mutex
 	inFlight map[string]*sharedCall
@@ -25,9 +26,13 @@ type InFlightTracker struct {
 
 // sharedCall is one in-flight computation and its result broadcast.
 type sharedCall struct {
-	done  chan struct{} // closed exactly once when the result is set
-	value any
-	err   error
+	key       string
+	done      chan struct{} // closed exactly once when the result is set
+	value     any
+	err       error
+	waiters   int
+	cancel    context.CancelFunc
+	completed bool
 }
 
 func NewInFlightTracker() *InFlightTracker {
@@ -42,23 +47,73 @@ func (t *InFlightTracker) acquire(key string) (*sharedCall, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if sc, ok := t.inFlight[key]; ok {
+		sc.waiters++
 		return sc, false
 	}
-	sc := &sharedCall{done: make(chan struct{})}
+	sc := &sharedCall{key: key, done: make(chan struct{}), waiters: 1}
 	t.inFlight[key] = sc
 	return sc, true
 }
 
-// Deliver completes the leader's call and broadcasts value/err to all
-// waiters. Unknown keys are ignored.
-func (t *InFlightTracker) Deliver(coalesceKey string, value any, err error) {
-	t.mu.Lock()
-	sc := t.inFlight[coalesceKey]
-	delete(t.inFlight, coalesceKey)
-	t.mu.Unlock()
+// release drops one request's interest. The shared execution is canceled and
+// removed from admission only when its final waiter leaves.
+func (t *InFlightTracker) release(sc *sharedCall) {
 	if sc == nil {
 		return
 	}
-	sc.value, sc.err = value, err
+	t.mu.Lock()
+	if sc.waiters > 0 {
+		sc.waiters--
+	}
+	var cancel context.CancelFunc
+	if sc.waiters == 0 && !sc.completed {
+		if t.inFlight[sc.key] == sc {
+			delete(t.inFlight, sc.key)
+		}
+		cancel = sc.cancel
+	}
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (t *InFlightTracker) setCancel(sc *sharedCall, cancel context.CancelFunc) {
+	t.mu.Lock()
+	if sc.completed {
+		t.mu.Unlock()
+		cancel()
+		return
+	}
+	sc.cancel = cancel
+	shouldCancel := sc.waiters == 0
+	t.mu.Unlock()
+	if shouldCancel {
+		cancel()
+	}
+}
+
+func (t *InFlightTracker) waiterCount(sc *sharedCall) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return sc.waiters
+}
+
+// Deliver completes the leader's call and broadcasts value/err to all
+// waiters. Unknown keys are ignored.
+func (t *InFlightTracker) Deliver(sc *sharedCall, value any, err error) {
+	if sc == nil {
+		return
+	}
+	t.mu.Lock()
+	if sc.completed {
+		t.mu.Unlock()
+		return
+	}
+	if t.inFlight[sc.key] == sc {
+		delete(t.inFlight, sc.key)
+	}
+	sc.value, sc.err, sc.completed = value, err, true
 	close(sc.done)
+	t.mu.Unlock()
 }

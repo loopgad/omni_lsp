@@ -26,6 +26,7 @@ func TestMain(m *testing.M) {
 //   - echo-hello: 首行吞掉 plugin/hello 通知帧，之后每个请求都以该帧的
 //     params 作为 result 回复（用于验证握手 grants 过滤）；
 //   - rpc-error : 第一个请求回复 error 帧；
+//   - reverse-roundtrip: 收到两次请求后按相反顺序回复（验证并发请求按 ID 匹配）；
 //   - die       : 立即退出（覆盖宿主的 EOF/进程死亡路径）；
 //   - roundtrip : 默认。回显 {"pong": <原样 params>}，id 与请求一致。
 func helperMain() {
@@ -41,6 +42,10 @@ func helperMain() {
 
 	var helloParams json.RawMessage
 	sawHello := false
+	var reverseBatch []struct {
+		ID   int64
+		Args json.RawMessage
+	}
 	for {
 		line, err := readHelperFrame(reader)
 		if err != nil {
@@ -65,6 +70,27 @@ func helperMain() {
 			Args json.RawMessage `json:"params"`
 		}
 		_ = json.Unmarshal(line, &req)
+		if mode == "reverse-roundtrip" {
+			reverseBatch = append(reverseBatch, struct {
+				ID   int64
+				Args json.RawMessage
+			}{ID: req.ID, Args: req.Args})
+			if len(reverseBatch) < 2 {
+				continue
+			}
+			for i := len(reverseBatch) - 1; i >= 0; i-- {
+				queued := reverseBatch[i]
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", queued.ID, queued.Args)
+				if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg); err != nil {
+					return
+				}
+			}
+			reverseBatch = reverseBatch[:0]
+			if err := w.Flush(); err != nil {
+				return
+			}
+			continue
+		}
 
 		switch mode {
 		case "echo-hello":

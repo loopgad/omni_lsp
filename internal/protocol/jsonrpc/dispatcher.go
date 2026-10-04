@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	ierrors "github.com/omnilsp/omni/internal/errors"
 )
 
 // HandlerFunc handles a request or notification.
@@ -83,6 +85,9 @@ func (d *Dispatcher) dispatchRequest(ctx context.Context, msg *Message) *Message
 	if err != nil {
 		if rpcErr, ok := err.(*ResponseError); ok {
 			return NewErrorResponse(*msg.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
+		}
+		if ierrors.IsKind(err, ierrors.ErrContentModified) {
+			return NewErrorResponse(*msg.ID, ContentModified, err.Error(), nil)
 		}
 		return NewErrorResponse(*msg.ID, InternalError, err.Error(), nil)
 	}

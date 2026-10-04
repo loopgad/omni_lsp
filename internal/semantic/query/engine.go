@@ -3,7 +3,7 @@ package query
 import (
 	"context"
 	"fmt"
-	"sync"
+	"sync/atomic"
 )
 
 // Engine is the incremental query engine (§J0).
@@ -19,7 +19,7 @@ import (
 const maxQueryEntries = 4096
 
 type Engine struct {
-	mu       sync.Mutex
+	mu       chan struct{}
 	entries  map[string]*entry
 	inflight map[string]*inflightCall
 	depIndex map[Dep]map[string]struct{}
@@ -35,12 +35,36 @@ type Engine struct {
 }
 
 func NewEngine(expectedSnapshotRev uint64) *Engine {
-	return &Engine{
+	e := &Engine{
+		mu:          make(chan struct{}, 1),
 		entries:     map[string]*entry{},
 		inflight:    map[string]*inflightCall{},
 		depIndex:    map[Dep]map[string]struct{}{},
 		expectedRev: expectedSnapshotRev,
 	}
+	e.mu <- struct{}{}
+	return e
+}
+
+func (e *Engine) lock()   { <-e.mu }
+func (e *Engine) unlock() { e.mu <- struct{}{} }
+
+// lockContext makes query admission interruptible while another short table
+// update owns the engine lock. Once admitted, critical sections remain small.
+func (e *Engine) lockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.mu:
+	}
+	if err := ctx.Err(); err != nil {
+		e.unlock()
+		return err
+	}
+	return nil
 }
 
 // Stats is a point-in-time counter snapshot.
@@ -54,13 +78,28 @@ type Stats struct {
 }
 
 func (e *Engine) Stats() Stats {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	return Stats{
 		Hits: e.hits, Misses: e.misses,
 		Computations: e.computations, CyclesDetected: e.cyclesFound,
 		Evictions: e.evictions, StalePublishRejected: e.stalePublishRejected,
 	}
+}
+
+// InFlightWaiters returns the number of callers currently waiting on shared
+// computations. It is useful for lifecycle diagnostics and deterministic
+// concurrency tests; it is intentionally separate from the status payload.
+func (e *Engine) InFlightWaiters() uint64 {
+	e.lock()
+	defer e.unlock()
+	var waiters uint64
+	for _, call := range e.inflight {
+		if n := call.waiters.Load(); n > 0 {
+			waiters += uint64(n)
+		}
+	}
+	return waiters
 }
 
 func (e *Engine) removeKeyFromDeps(key string, deps DepSet) {
@@ -87,9 +126,13 @@ type entry struct {
 }
 
 type inflightCall struct {
-	done chan struct{}
-	res  Result
-	err  error
+	done       chan struct{}
+	res        Result
+	err        error
+	ctx        context.Context
+	cancel     context.CancelFunc
+	waiters    atomic.Int64
+	panicValue any
 }
 
 // callChainKey carries the active query-key stack in the Context so nested

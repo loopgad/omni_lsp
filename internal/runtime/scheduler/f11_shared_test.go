@@ -6,6 +6,8 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,7 +36,7 @@ func TestInFlightDeliverBroadcastsToWaiters(t *testing.T) {
 
 	go func() {
 		time.Sleep(5 * time.Millisecond)
-		tr.Deliver("k", "payload", nil)
+		tr.Deliver(sc, "payload", nil)
 	}()
 
 	select {
@@ -49,18 +51,18 @@ func TestInFlightDeliverBroadcastsToWaiters(t *testing.T) {
 
 func TestInFlightDeliverUnknownKeyNoOp(t *testing.T) {
 	tr := NewInFlightTracker()
-	tr.Deliver("missing", "x", nil) // must not panic
+	tr.Deliver(nil, "x", nil) // must not panic
 }
 
 func TestInFlightDeliverCleansUpForNewLeader(t *testing.T) {
 	tr := NewInFlightTracker()
-	tr.acquire("k")
-	tr.Deliver("k", 1, nil)
+	sc1, _ := tr.acquire("k")
+	tr.Deliver(sc1, 1, nil)
 	sc2, leader := tr.acquire("k")
 	if !leader {
 		t.Fatal("after Deliver the next submitter must become a new leader")
 	}
-	tr.Deliver("k", 2, nil)
+	tr.Deliver(sc2, 2, nil)
 	<-sc2.done
 }
 
@@ -175,6 +177,221 @@ func TestF11_WaiterCancellationWakesWithoutDisturbingLeader(t *testing.T) {
 	}
 }
 
+func TestF11_LeaderCancellationKeepsSharedWorkForLiveWaiter(t *testing.T) {
+	s := New(DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+	defer s.Shutdown()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	sharedCanceled := make(chan struct{})
+	leader := &Request{
+		Priority:    PriorityHover,
+		CoalesceKey: "hover|leader-cancel",
+		Execute: func(ctx context.Context, _ *snapshot.Snapshot) (any, error) {
+			close(started)
+			select {
+			case <-release:
+				return "shared", nil
+			case <-ctx.Done():
+				close(sharedCanceled)
+				return nil, ctx.Err()
+			}
+		},
+	}
+	if got := s.Submit(leader); got != Admitted {
+		t.Fatalf("leader admission = %v", got)
+	}
+	<-started
+	waiter := blockingReq("hover|leader-cancel", release, new(int32))
+	if got := s.Submit(waiter); got != Admitted {
+		t.Fatalf("waiter admission = %v", got)
+	}
+	leader.Cancel()
+	select {
+	case got := <-leader.Result:
+		if got.Err != context.Canceled {
+			t.Fatalf("leader result = %+v, want cancellation", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled leader did not receive an independent terminal result")
+	}
+	close(release)
+	select {
+	case got := <-waiter.Result:
+		if got.Err != nil || got.Value != "shared" {
+			t.Fatalf("remaining waiter result = %+v, want shared success", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live waiter did not receive shared result")
+	}
+	select {
+	case <-sharedCanceled:
+		t.Fatal("leader cancellation canceled shared work needed by a waiter")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestF11_LastWaiterCancellationCancelsSharedWork(t *testing.T) {
+	s := New(DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+	defer s.Shutdown()
+
+	started := make(chan struct{})
+	sharedCanceled := make(chan struct{})
+	leader := &Request{
+		Priority:    PriorityHover,
+		CoalesceKey: "hover|all-cancel",
+		Execute: func(ctx context.Context, _ *snapshot.Snapshot) (any, error) {
+			close(started)
+			<-ctx.Done()
+			close(sharedCanceled)
+			return nil, ctx.Err()
+		},
+	}
+	if got := s.Submit(leader); got != Admitted {
+		t.Fatalf("leader admission = %v", got)
+	}
+	<-started
+	waiter := blockingReq("hover|all-cancel", make(chan struct{}), new(int32))
+	if got := s.Submit(waiter); got != Admitted {
+		t.Fatalf("waiter admission = %v", got)
+	}
+	leader.Cancel()
+	waiter.Cancel()
+	for _, req := range []*Request{leader, waiter} {
+		select {
+		case got := <-req.Result:
+			if !errors.Is(got.Err, context.Canceled) {
+				t.Errorf("request result = %+v, want cancellation", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("canceled shared request remained blocked")
+		}
+	}
+	select {
+	case <-sharedCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shared execution context stayed live after its last waiter canceled")
+	}
+}
+
+func TestF11_WaiterDeadlineDoesNotCancelLeaderWork(t *testing.T) {
+	s := New(DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+	defer s.Shutdown()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	sharedCanceled := make(chan struct{})
+	leader := &Request{
+		Priority:    PriorityHover,
+		CoalesceKey: "hover|waiter-deadline",
+		Execute: func(ctx context.Context, _ *snapshot.Snapshot) (any, error) {
+			close(started)
+			select {
+			case <-release:
+				return "shared", nil
+			case <-ctx.Done():
+				close(sharedCanceled)
+				return nil, ctx.Err()
+			}
+		},
+	}
+	if got := s.Submit(leader); got != Admitted {
+		t.Fatalf("leader admission = %v", got)
+	}
+	<-started
+	waiter := &Request{
+		Priority:    PriorityHover,
+		CoalesceKey: "hover|waiter-deadline",
+		Deadline:    time.Now().Add(30 * time.Millisecond),
+		Execute:     leader.Execute,
+	}
+	if got := s.Submit(waiter); got != Admitted {
+		t.Fatalf("waiter admission = %v", got)
+	}
+	select {
+	case got := <-waiter.Result:
+		if !errors.Is(got.Err, context.DeadlineExceeded) {
+			t.Fatalf("waiter result = %+v, want deadline exceeded", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter deadline was not enforced independently")
+	}
+	select {
+	case <-sharedCanceled:
+		t.Fatal("waiter deadline canceled work still needed by the leader")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case got := <-leader.Result:
+		if got.Err != nil || got.Value != "shared" {
+			t.Fatalf("leader result = %+v, want shared success", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader did not receive shared result")
+	}
+}
+
+func TestF11_PanicCompletesWaitersAndWorkerSurvives(t *testing.T) {
+	s := New(DefaultConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+	defer s.Shutdown()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	leader := &Request{
+		Priority:    PriorityHover,
+		CoalesceKey: "hover|panic",
+		Execute: func(context.Context, *snapshot.Snapshot) (any, error) {
+			close(started)
+			<-release
+			panic("scheduler boom")
+		},
+	}
+	if got := s.Submit(leader); got != Admitted {
+		t.Fatalf("leader admission = %v", got)
+	}
+	<-started
+	waiter := blockingReq("hover|panic", release, new(int32))
+	if got := s.Submit(waiter); got != Admitted {
+		t.Fatalf("waiter admission = %v", got)
+	}
+	close(release)
+	for _, req := range []*Request{leader, waiter} {
+		select {
+		case got := <-req.Result:
+			if got.Err == nil || !strings.Contains(got.Err.Error(), "panicked") {
+				t.Errorf("request result = %+v, want panic error", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("panic stranded a shared waiter")
+		}
+	}
+	next := &Request{Priority: PriorityCompletion, Execute: func(context.Context, *snapshot.Snapshot) (any, error) { return "alive", nil }}
+	if got := s.Submit(next); got != Admitted {
+		t.Fatalf("post-panic request admission = %v", got)
+	}
+	select {
+	case got := <-next.Result:
+		if got.Err != nil || got.Value != "alive" {
+			t.Fatalf("worker after panic = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not survive a panicking request")
+	}
+}
+
 // TestF11_LeaderRejectedRollsBack proves a leader whose admission fails
 // delivers the error to its waiters instead of hanging them forever.
 // (End-to-end queue overflow cannot reliably stage — workers drain queues
@@ -191,7 +408,7 @@ func TestF11_LeaderRejectedRollsBack(t *testing.T) {
 		t.Fatalf("second acquire must join the same call")
 	}
 
-	s.deliverRollback(&Request{CoalesceKey: "k|full"}, errRejected)
+	s.deliverRollback(&Request{CoalesceKey: "k|full", sharedCall: sc}, errRejected)
 
 	select {
 	case <-sc.done:

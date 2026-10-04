@@ -22,12 +22,15 @@ import (
 type RecorderTransport struct {
 	transport.Transport
 
-	mu       sync.Mutex
-	f        *os.File
-	w        *bufio.Writer
-	seq      int
-	firstErr error
-	revFn    func() uint64
+	mu              sync.Mutex
+	f               *os.File
+	w               *bufio.Writer
+	seq             int
+	firstErr        error
+	revFn           func() uint64
+	bindings        map[string]SemanticResponseBinding
+	identities      map[string]SemanticIdentity
+	requestIdentity map[string]SemanticIdentity
 }
 
 // NewRecorder opens path for writing, emits the meta header, and returns the
@@ -40,10 +43,16 @@ func NewRecorder(inner transport.Transport, path string, meta Meta, revFn func()
 		return nil, err
 	}
 	r := &RecorderTransport{
-		Transport: inner,
-		f:         f,
-		w:         bufio.NewWriter(f),
-		revFn:     revFn,
+		Transport:       inner,
+		f:               f,
+		w:               bufio.NewWriter(f),
+		revFn:           revFn,
+		bindings:        make(map[string]SemanticResponseBinding),
+		identities:      make(map[string]SemanticIdentity),
+		requestIdentity: make(map[string]SemanticIdentity),
+	}
+	if validRegisteredSemanticIdentity(meta.SemanticIdentity) {
+		_, _ = registerSemanticIdentity(r.identities, *meta.SemanticIdentity)
 	}
 	if err := r.log("meta", json.RawMessage(mustJSON(meta))); err != nil {
 		f.Close()
@@ -62,9 +71,65 @@ func (r *RecorderTransport) Read(ctx context.Context) (*jsonrpc.Message, error) 
 
 func (r *RecorderTransport) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	if msg != nil {
-		_ = r.log("out", raw(msg))
+		_ = r.logOutbound(msg)
 	}
 	return r.Transport.Write(ctx, msg)
+}
+
+// RegisterSemanticIdentity associates an identity with the request whose
+// response will use it. Generation
+// identities are recorded once per generation; tool-only identities are
+// recorded once per distinct tool set. Call it before binding a response that
+// used the identity. The event lets recordings started before indexing pin
+// the identity that later responses actually consumed.
+func (r *RecorderTransport) RegisterSemanticIdentity(id jsonrpc.RequestID, identity SemanticIdentity) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	requestKey := requestIDKey(id)
+	if _, exists := r.requestIdentity[requestKey]; exists {
+		return fmt.Errorf("replay: semantic identity for request %s already exists", requestKey)
+	}
+	updated := make(map[string]SemanticIdentity, len(r.identities)+1)
+	for key, known := range r.identities {
+		updated[key] = known
+	}
+	key, err := registerSemanticIdentity(updated, identity)
+	if err != nil {
+		return err
+	}
+	if _, exists := r.identities[key]; !exists {
+		if err := r.logLocked("identity", mustJSON(identity), nil); err != nil {
+			return err
+		}
+		r.identities = updated
+	}
+	r.requestIdentity[requestKey] = cloneSemanticIdentity(identity)
+	return nil
+}
+
+// BindSemanticResponse records the provenance selected while handling the
+// request. Call RegisterSemanticIdentity first, then call this after the
+// request's semantic result is known and before Write sends the response.
+// semantic=false explicitly marks a live response that used no index facts;
+// semantic=true requires the exact immutable generation and content digest.
+func (r *RecorderTransport) BindSemanticResponse(id jsonrpc.RequestID, semantic bool, generation uint64, indexContentDigest string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := requestIDKey(id)
+	identity, exists := r.requestIdentity[key]
+	if !exists {
+		return fmt.Errorf("%w: register the response identity before binding request %s", ErrSemanticIdentityUnverified, requestIDKey(id))
+	}
+	binding, err := newSemanticResponseBinding(id, semantic, generation, indexContentDigest, &identity)
+	if err != nil {
+		return err
+	}
+	if _, exists := r.bindings[key]; exists {
+		return fmt.Errorf("replay: response binding for request %s already exists", key)
+	}
+	r.bindings[key] = binding
+	delete(r.requestIdentity, key)
+	return nil
 }
 
 // Close flushes and releases the session file.
@@ -91,13 +156,32 @@ func (r *RecorderTransport) Err() error {
 func (r *RecorderTransport) log(dir string, payload json.RawMessage) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.logLocked(dir, payload, nil)
+}
+
+func (r *RecorderTransport) logOutbound(msg *jsonrpc.Message) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var binding *SemanticResponseBinding
+	if msg.IsResponse() {
+		key := requestIDKey(*msg.ID)
+		if recorded, ok := r.bindings[key]; ok {
+			copy := recorded
+			binding = &copy
+			delete(r.bindings, key)
+		}
+	}
+	return r.logLocked("out", raw(msg), binding)
+}
+
+func (r *RecorderTransport) logLocked(dir string, payload json.RawMessage, binding *SemanticResponseBinding) error {
 	r.seq++
 	var rev uint64
 	if r.revFn != nil {
 		rev = r.revFn()
 	}
 	err := json.NewEncoder(r.w).Encode(Entry{
-		Seq: r.seq, Dir: dir, SnapRev: rev, Payload: payload,
+		Seq: r.seq, Dir: dir, SnapRev: rev, SemanticBinding: binding, Payload: payload,
 	})
 	if err != nil && r.firstErr == nil {
 		r.firstErr = fmt.Errorf("replay: record %s #%d: %w", dir, r.seq, err)

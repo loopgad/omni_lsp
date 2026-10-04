@@ -8,6 +8,9 @@ package replay
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -218,6 +221,511 @@ func TestP9_RecordReplayRoundTrip(t *testing.T) {
 
 	if err := player.CompareOut(sess.Entries); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPlayerTransportReadEOFThenCloseIsIdempotent(t *testing.T) {
+	player := NewPlayer()
+	player.EndFeed()
+	if _, err := player.Transport().Read(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after EndFeed = %v, want EOF", err)
+	}
+
+	const closeCallers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, closeCallers)
+	for i := 0; i < closeCallers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- player.Transport().Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("repeated concurrent transport close: %v", err)
+		}
+	}
+
+	select {
+	case <-player.Transport().Done():
+	default:
+		t.Fatal("transport Done channel remains open after EOF and Close")
+	}
+}
+
+func TestPlayerTransportCloseUnblocksRead(t *testing.T) {
+	player := NewPlayer()
+	readStarted := make(chan struct{})
+	readResult := make(chan error, 1)
+	go func() {
+		close(readStarted)
+		_, err := player.Transport().Read(context.Background())
+		readResult <- err
+	}()
+	<-readStarted
+
+	if err := player.Transport().Close(); err != nil {
+		t.Fatalf("close transport: %v", err)
+	}
+	select {
+	case err := <-readResult:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("blocked read after Close = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not unblock Read")
+	}
+}
+
+func TestPlayerReplayPreservesResponseBeforeShutdown(t *testing.T) {
+	player := NewPlayer()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	entries := []Entry{
+		{Seq: 1, Dir: "in", Payload: json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"query"}`)},
+		{Seq: 2, Dir: "out", Payload: json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":true}`)},
+		{Seq: 3, Dir: "in", Payload: json.RawMessage(`{"jsonrpc":"2.0","method":"exit"}`)},
+	}
+	done := make(chan error, 1)
+	go func() { done <- player.Replay(ctx, entries) }()
+	request, err := player.Transport().Read(ctx)
+	if err != nil || request.Method != "query" {
+		t.Fatalf("first request: %v, %v", request, err)
+	}
+	if len(player.t.in) != 0 {
+		t.Fatal("later exit was fed before its recorded response barrier")
+	}
+	if err := player.Transport().Write(ctx, jsonrpc.NewResponse(*request.ID, json.RawMessage(`true`))); err != nil {
+		t.Fatal(err)
+	}
+	exit, err := player.Transport().Read(ctx)
+	if err != nil || exit.Method != "exit" {
+		t.Fatalf("exit: %v, %v", exit, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlayerDrainNotificationsCannotAnswerRequests(t *testing.T) {
+	player := NewPlayer()
+	ctx := context.Background()
+	var request jsonrpc.Message
+	if err := json.Unmarshal([]byte(`{"jsonrpc":"2.0","id":1,"method":"query"}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	player.Feed(&request)
+	if _, err := player.Transport().Read(ctx); err != nil {
+		t.Fatal(err)
+	}
+	player.t.drainWait = time.Millisecond
+	player.EndFeed()
+	if err := player.Transport().Write(ctx, &jsonrpc.Message{Method: "notification"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := player.Transport().Read(ctx); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("unanswered request was treated as successful EOF: %v", err)
+	}
+}
+
+func TestReplayNormalizeEvidenceClockPreservesIdentityAndUserFields(t *testing.T) {
+	raw := json.RawMessage(`{"method":"workspace/symbol","status":"exact","completeness":"complete","Timestamp":"user-value","user":{"Timestamp":"2026-10-02T10:43:40Z","Kind":3,"Snapshot":{},"Assurance":2},"evidence":[{"Timestamp":"2026-10-02T10:43:39.065346Z","Kind":3,"Snapshot":{"Revision":7},"Assurance":2,"IndexGen":9,"SourceHash":"sha256:source"}]}`)
+	got := string(normalize(&jsonrpc.Message{Result: raw}).Result)
+	for _, field := range []string{`"Timestamp":"user-value"`, `"IndexGen":9`, `"SourceHash":"sha256:source"`, `"Revision":7`} {
+		if !strings.Contains(got, field) {
+			t.Fatalf("normalization removed identity or user field %s: %s", field, got)
+		}
+	}
+	if !strings.Contains(got, "2026-10-02T10:43:40Z") {
+		t.Fatalf("opaque user timestamp was removed: %s", got)
+	}
+	if strings.Contains(got, "2026-10-02T10:43:39") {
+		t.Fatalf("evidence clock was retained: %s", got)
+	}
+}
+
+func TestPlayerClosedTransportRejectsBufferedInputAndFeed(t *testing.T) {
+	player := NewPlayer()
+	player.Feed(&jsonrpc.Message{Method: "queued"})
+	if err := player.Transport().Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := player.Transport().Read(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("closed transport delivered buffered input: %v", err)
+	}
+	if err := player.FeedContext(context.Background(), &jsonrpc.Message{Method: "later"}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("closed transport accepted input: %v", err)
+	}
+}
+
+func TestLegacySessionLoadsAsPartialUnverified(t *testing.T) {
+	path := t.TempDir() + "/legacy.jsonl"
+	legacy := &Session{
+		Meta:    Meta{FormatVersion: legacyFormatVersion, ConfigHash: "legacy-config"},
+		Entries: []Entry{{Seq: 1, Dir: "in", Payload: json.RawMessage(`{"jsonrpc":"2.0"}`)}},
+	}
+	if err := Save(path, legacy); err != nil {
+		t.Fatalf("save legacy session: %v", err)
+	}
+
+	loaded, err := LoadSession(path)
+	if err != nil {
+		t.Fatalf("legacy session should remain readable: %v", err)
+	}
+	if len(loaded.Entries) != 1 {
+		t.Fatalf("loaded entries = %d, want 1", len(loaded.Entries))
+	}
+	if got := loaded.SemanticReproductionStatus(); got != ReproductionPartialUnverified {
+		t.Fatalf("legacy semantic status = %q, want %q", got, ReproductionPartialUnverified)
+	}
+	got, err := loaded.VerifySemanticReproduction(nil)
+	if got != ReproductionPartialUnverified || !errors.Is(err, ErrSemanticIdentityUnverified) {
+		t.Fatalf("legacy verification = (%q, %v), want partial/unverified", got, err)
+	}
+}
+
+func TestLoadSessionRequiresFirstUniqueMetaHeader(t *testing.T) {
+	validMeta := `{"seq":0,"dir":"meta","payload":{"formatVersion":2}}`
+	request := `{"seq":1,"dir":"in","payload":{"jsonrpc":"2.0","id":1,"method":"initialize"}}`
+	cases := []struct {
+		name string
+		data string
+	}{
+		{name: "missing", data: request + "\n"},
+		{name: "late", data: request + "\n" + validMeta + "\n"},
+		{name: "duplicate", data: validMeta + "\n" + validMeta + "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir() + "/session.jsonl"
+			if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
+				t.Fatalf("write session: %v", err)
+			}
+			if _, err := LoadSession(path); err == nil {
+				t.Fatal("LoadSession succeeded without exactly one first-line meta header")
+			}
+		})
+	}
+}
+
+func TestLegacyFormatCannotUseNewResponseIdentityEvidence(t *testing.T) {
+	identity := replayTestIdentity(9, "sha256:"+strings.Repeat("a", 64))
+	id := jsonrpc.RequestID{Num: 7}
+	request, err := json.Marshal(jsonrpc.NewRequest(id, "textDocument/hover", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := json.Marshal(jsonrpc.NewResponse(id, json.RawMessage(`null`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{
+		Meta: Meta{FormatVersion: legacyFormatVersion, SemanticIdentity: identity},
+		Entries: []Entry{
+			{Seq: 1, Dir: "identity", Payload: mustJSON(identity)},
+			{Seq: 2, Dir: "in", Payload: request},
+			{Seq: 3, Dir: "out", Payload: response, SemanticBinding: &SemanticResponseBinding{
+				RequestID: id, Kind: SemanticBindingGeneration, Generation: identity.Generation,
+				IndexContentDigest: identity.IndexContentDigest,
+			}},
+		},
+	}
+	if err := session.VerifyResponseBindings(identity); !errors.Is(err, ErrSemanticResponseBindingUnverified) {
+		t.Fatalf("v1 response evidence error = %v, want fail-closed unverified", err)
+	}
+}
+
+func replayTestIdentity(generation uint64, digest string) *SemanticIdentity {
+	return &SemanticIdentity{
+		Generation:         generation,
+		IndexContentDigest: digest,
+		BuildContexts:      map[string]string{"go:workspace": "go:sha256:" + strings.Repeat("b", 32)},
+		Tools:              []ToolIdentity{{Name: "go", Path: "C:/tools/go.exe", Version: "go1.26", SHA256: strings.Repeat("c", 64)}},
+	}
+}
+
+func TestSemanticResponseBindingRoundTripCompletesReplay(t *testing.T) {
+	path := t.TempDir() + "/bound.jsonl"
+	identity := replayTestIdentity(23, "sha256:"+strings.Repeat("a", 64))
+	id := jsonrpc.RequestID{Num: 19}
+	request := jsonrpc.NewRequest(id, "textDocument/hover", json.RawMessage(`{"textDocument":{"uri":"file:///w/a.go"}}`))
+	response := jsonrpc.NewResponse(id, json.RawMessage(`{"contents":"ok"}`))
+
+	recorder, err := NewRecorder(newFeedTransport(request), path, Meta{}, nil)
+	if err != nil {
+		t.Fatalf("create recorder: %v", err)
+	}
+	if _, err := recorder.Read(context.Background()); err != nil {
+		t.Fatalf("record request: %v", err)
+	}
+	if err := recorder.RegisterSemanticIdentity(id, *identity); err != nil {
+		t.Fatalf("register recorded generation identity: %v", err)
+	}
+	if err := recorder.BindSemanticResponse(id, true, identity.Generation, identity.IndexContentDigest); err != nil {
+		t.Fatalf("bind recorded response: %v", err)
+	}
+	if err := recorder.Write(context.Background(), response); err != nil {
+		t.Fatalf("record response: %v", err)
+	}
+	if err := recorder.Close(); err != nil {
+		t.Fatalf("close recorder: %v", err)
+	}
+
+	session, err := LoadSession(path)
+	if err != nil {
+		t.Fatalf("load recording: %v", err)
+	}
+	if session.Meta.FormatVersion != FormatVersion {
+		t.Fatalf("recorded format = %d, want %d", session.Meta.FormatVersion, FormatVersion)
+	}
+	if err := session.VerifyResponseBindings(identity); err != nil {
+		t.Fatalf("verify recorded bindings: %v", err)
+	}
+	if !session.hasIdentityEvent() {
+		t.Fatal("recording did not persist a response-time identity event")
+	}
+
+	player := NewPlayer()
+	player.Feed(request)
+	player.EndFeed()
+	if err := player.RegisterSemanticIdentity(id, *identity); err != nil {
+		t.Fatalf("register replay generation identity: %v", err)
+	}
+	if err := player.BindSemanticResponse(id, true, identity.Generation, identity.IndexContentDigest); err != nil {
+		t.Fatalf("bind replayed response: %v", err)
+	}
+	if err := player.Transport().Write(context.Background(), response); err != nil {
+		t.Fatalf("capture replayed response: %v", err)
+	}
+	status, err := player.CompareSession(session, identity)
+	if err != nil || status != ReproductionComplete {
+		t.Fatalf("matching response provenance = (%q, %v), want complete", status, err)
+	}
+}
+
+func TestSemanticResponseBindingRejectsMissingMismatchedAndPrunedProvenance(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	identity := replayTestIdentity(31, digest)
+	id := jsonrpc.RequestID{Str: "hover-31", IsStr: true}
+	request, _ := json.Marshal(jsonrpc.NewRequest(id, "textDocument/hover", nil))
+	response, _ := json.Marshal(jsonrpc.NewResponse(id, json.RawMessage(`{"contents":"ok"}`)))
+	base := &Session{Meta: Meta{FormatVersion: FormatVersion, SemanticIdentity: identity}, Entries: []Entry{
+		{Seq: 1, Dir: "in", Payload: request},
+		{Seq: 2, Dir: "out", Payload: response, SemanticBinding: &SemanticResponseBinding{
+			RequestID: id, Kind: SemanticBindingGeneration, Generation: identity.Generation, IndexContentDigest: digest,
+		}},
+	}}
+
+	tests := []struct {
+		name    string
+		mutate  func(*Session)
+		wantErr error
+	}{
+		{
+			name:    "legacy missing binding",
+			mutate:  func(s *Session) { s.Entries[1].SemanticBinding = nil },
+			wantErr: ErrSemanticResponseBindingUnverified,
+		},
+		{
+			name: "response binding ID mismatch",
+			mutate: func(s *Session) {
+				s.Entries[1].SemanticBinding.RequestID = jsonrpc.RequestID{Num: 99}
+			},
+			wantErr: ErrSemanticResponseBindingMismatch,
+		},
+		{
+			name:    "generation pruned from available state",
+			mutate:  func(*Session) {},
+			wantErr: ErrSemanticGenerationUnavailable,
+		},
+		{
+			name: "content digest mismatch",
+			mutate: func(s *Session) {
+				s.Entries[1].SemanticBinding.IndexContentDigest = "sha256:" + strings.Repeat("d", 64)
+			},
+			wantErr: ErrSemanticIdentityMismatch,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			copy := *base
+			copy.Entries = append([]Entry(nil), base.Entries...)
+			binding := *base.Entries[1].SemanticBinding
+			copy.Entries[1].SemanticBinding = &binding
+			tt.mutate(&copy)
+			available := identity
+			if tt.name == "generation pruned from available state" {
+				available = replayTestIdentity(identity.Generation+1, digest)
+			}
+			err := copy.VerifyResponseBindings(available)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("verify response binding error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLiveSemanticResponseRequiresExplicitNoneAndMatchingTools(t *testing.T) {
+	baseIdentity := replayTestIdentity(0, "")
+	identity := &SemanticIdentity{Tools: append([]ToolIdentity(nil), baseIdentity.Tools...)}
+	id := jsonrpc.RequestID{Str: "live-hover", IsStr: true}
+	request, _ := json.Marshal(jsonrpc.NewRequest(id, "textDocument/hover", json.RawMessage(`{"textDocument":{"uri":"file:///w/a.go"}}`)))
+	response, _ := json.Marshal(jsonrpc.NewResponse(id, json.RawMessage(`{"contents":"from live backend"}`)))
+	session := &Session{Meta: Meta{FormatVersion: FormatVersion}, Entries: []Entry{
+		{Seq: 1, Dir: "identity", Payload: mustJSON(identity)},
+		{Seq: 2, Dir: "in", Payload: request},
+		{Seq: 3, Dir: "out", Payload: response, SemanticBinding: &SemanticResponseBinding{RequestID: id, Kind: SemanticBindingNone, ToolIdentityDigest: toolIdentityDigest(identity.Tools)}},
+	}}
+	if err := session.VerifyResponseBindings(identity); err != nil {
+		t.Fatalf("explicit live-path binding should verify without an index generation: %v", err)
+	}
+
+	player := NewPlayer()
+	if err := player.RegisterSemanticIdentity(id, *identity); err != nil {
+		t.Fatalf("register replay tool identity: %v", err)
+	}
+	if err := player.BindSemanticResponse(id, false, 0, ""); err != nil {
+		t.Fatalf("bind live replay response: %v", err)
+	}
+	if err := player.Transport().Write(context.Background(), jsonrpc.NewResponse(id, json.RawMessage(`{"contents":"from live backend"}`))); err != nil {
+		t.Fatalf("write live replay response: %v", err)
+	}
+	status, err := player.CompareSession(session, identity)
+	if err != nil || status != ReproductionComplete {
+		t.Fatalf("matching live-tool provenance = (%q, %v), want complete", status, err)
+	}
+
+	changedTools := &SemanticIdentity{Tools: append([]ToolIdentity(nil), identity.Tools...)}
+	changedTools.Tools[0].SHA256 = strings.Repeat("f", 64)
+	status, err = player.CompareSession(session, changedTools)
+	if status != ReproductionPartialUnverified || !errors.Is(err, ErrSemanticIdentityMismatch) {
+		t.Fatalf("changed live backend identity = (%q, %v), want identity mismatch", status, err)
+	}
+}
+
+func TestPinnedSemanticGenerationMustBeAvailableForIdentityVerification(t *testing.T) {
+	path := t.TempDir() + "/pinned.jsonl"
+	recorded := SemanticIdentity{
+		Generation:         17,
+		IndexContentDigest: "sha256:" + strings.Repeat("a", 64),
+		BuildContexts: map[string]string{
+			"go:workspace": "go:sha256:" + strings.Repeat("b", 32),
+		},
+		Tools: []ToolIdentity{
+			{Name: "go", Path: "C:/tools/go.exe", Version: "go1.26", SHA256: strings.Repeat("c", 64)},
+			{Name: "extractor", Path: "C:/tools/extractor.exe", Version: "v2", SHA256: strings.Repeat("d", 64)},
+		},
+	}
+	recorder, err := NewRecorder(newFeedTransport(), path, Meta{
+		FormatVersion:    FormatVersion,
+		ConfigHash:       "pinned-config",
+		SemanticIdentity: &recorded,
+	}, nil)
+	if err != nil {
+		t.Fatalf("create pinned recording: %v", err)
+	}
+	if err := recorder.Close(); err != nil {
+		t.Fatalf("close pinned recording: %v", err)
+	}
+	loaded, err := LoadSession(path)
+	if err != nil {
+		t.Fatalf("load pinned session: %v", err)
+	}
+	if loaded.Meta.SemanticIdentity == nil || loaded.Meta.SemanticIdentity.Generation != recorded.Generation {
+		t.Fatalf("semantic generation was not preserved: %+v", loaded.Meta.SemanticIdentity)
+	}
+	if got := loaded.SemanticReproductionStatus(); got != ReproductionIdentityPinned {
+		t.Fatalf("pinned semantic status = %q, want %q", got, ReproductionIdentityPinned)
+	}
+
+	missing := *loaded.Meta.SemanticIdentity
+	missing.Generation = recorded.Generation + 1 // another generation is present, but the recorded one is missing
+	got, err := loaded.VerifySemanticReproduction(&missing)
+	if got != ReproductionPartialUnverified || !errors.Is(err, ErrSemanticGenerationUnavailable) {
+		t.Fatalf("missing generation verification = (%q, %v), want partial/unavailable", got, err)
+	}
+	got, err = NewPlayer().CompareSession(loaded, &missing)
+	if got != ReproductionPartialUnverified || !errors.Is(err, ErrSemanticGenerationUnavailable) {
+		t.Fatalf("missing generation comparison = (%q, %v), want partial/refused", got, err)
+	}
+
+	available := *loaded.Meta.SemanticIdentity
+	available.Tools = []ToolIdentity{recorded.Tools[1], recorded.Tools[0]}
+	got, err = loaded.VerifySemanticReproduction(&available)
+	if err != nil || got != ReproductionIdentityVerified {
+		t.Fatalf("matching semantic identity = (%q, %v), want identity-verified", got, err)
+	}
+	got, err = NewPlayer().CompareSession(loaded, &available)
+	if got != ReproductionComplete || err != nil {
+		t.Fatalf("empty nonsemantic recording = (%q, %v), want complete", got, err)
+	}
+
+	available.IndexContentDigest = "sha256:" + strings.Repeat("e", 64)
+	got, err = loaded.VerifySemanticReproduction(&available)
+	if got != ReproductionPartialUnverified || !errors.Is(err, ErrSemanticIdentityMismatch) {
+		t.Fatalf("content mismatch verification = (%q, %v), want partial/mismatch", got, err)
+	}
+}
+
+func TestCompareSessionDoesNotClaimCompleteWithoutResponseGenerationBinding(t *testing.T) {
+	identity := &SemanticIdentity{
+		Generation:         3,
+		IndexContentDigest: "sha256:" + strings.Repeat("a", 64),
+		BuildContexts:      map[string]string{"go:workspace": "go:sha256:" + strings.Repeat("b", 32)},
+		Tools:              []ToolIdentity{{Name: "go", Path: "C:/tools/go.exe", Version: "go1.26", SHA256: strings.Repeat("c", 64)}},
+	}
+	id := jsonrpc.RequestID{Num: 9}
+	request := jsonrpc.NewRequest(id, "textDocument/hover", json.RawMessage(`{"textDocument":{"uri":"file:///w/a.go"}}`))
+	response := jsonrpc.NewResponse(id, json.RawMessage(`{"contents":"ok"}`))
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	session := &Session{
+		Meta: Meta{FormatVersion: FormatVersion, SemanticIdentity: identity},
+		Entries: []Entry{
+			{Seq: 1, Dir: "in", Payload: mustJSON(request)},
+			{Seq: 2, Dir: "out", Payload: payload},
+		},
+	}
+	player := NewPlayer()
+	if err := player.Transport().Write(context.Background(), response); err != nil {
+		t.Fatalf("write replayed response: %v", err)
+	}
+
+	status, err := player.CompareSession(session, identity)
+	if status != ReproductionPartialUnverified || !errors.Is(err, ErrSemanticResponseBindingUnverified) {
+		t.Fatalf("matching response without semantic binding = (%q, %v), want partial/unverified", status, err)
+	}
+}
+
+func TestCompareSessionAllowsLegacyNonsemanticResponseWithoutBinding(t *testing.T) {
+	identity := replayTestIdentity(41, "sha256:"+strings.Repeat("a", 64))
+	id := jsonrpc.RequestID{Num: 1}
+	request := jsonrpc.NewRequest(id, "initialize", json.RawMessage(`{"capabilities":{}}`))
+	response := jsonrpc.NewResponse(id, json.RawMessage(`{"capabilities":{}}`))
+	requestPayload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responsePayload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Meta: Meta{FormatVersion: FormatVersion, SemanticIdentity: identity}, Entries: []Entry{
+		{Seq: 1, Dir: "in", Payload: requestPayload},
+		{Seq: 2, Dir: "out", Payload: responsePayload},
+	}}
+	player := NewPlayer()
+	if err := player.Transport().Write(context.Background(), response); err != nil {
+		t.Fatal(err)
+	}
+	status, err := player.CompareSession(session, identity)
+	if err != nil || status != ReproductionComplete {
+		t.Fatalf("legacy nonsemantic response = (%q, %v), want complete", status, err)
 	}
 }
 

@@ -106,15 +106,33 @@ const (
 	CompletionTypeParameter CompletionItemKind = 25
 )
 
+// InsertTextFormat indicates whether insertText is plain text or a snippet.
+type InsertTextFormat int
+
+const (
+	InsertTextFormatPlainText InsertTextFormat = 1
+	InsertTextFormatSnippet   InsertTextFormat = 2
+)
+
+// InsertReplaceEdit is the LSP completion-specific edit form.
+type InsertReplaceEdit struct {
+	Insert  Range  `json:"insert"`
+	Replace Range  `json:"replace"`
+	NewText string `json:"newText"`
+}
+
 // CompletionItem represents a completion item.
 type CompletionItem struct {
-	Label         string             `json:"label"`
-	Kind          CompletionItemKind `json:"kind,omitempty"`
-	Detail        string             `json:"detail,omitempty"`
-	Documentation string             `json:"documentation,omitempty"`
-	InsertText    string             `json:"insertText,omitempty"`
-	SortText      string             `json:"sortText,omitempty"`
-	FilterText    string             `json:"filterText,omitempty"`
+	Label               string             `json:"label"`
+	Kind                CompletionItemKind `json:"kind,omitempty"`
+	Detail              string             `json:"detail,omitempty"`
+	Documentation       string             `json:"documentation,omitempty"`
+	InsertText          string             `json:"insertText,omitempty"`
+	SortText            string             `json:"sortText,omitempty"`
+	FilterText          string             `json:"filterText,omitempty"`
+	TextEdit            any                `json:"textEdit,omitempty"`
+	AdditionalTextEdits []TextEdit         `json:"additionalTextEdits,omitempty"`
+	InsertTextFormat    InsertTextFormat   `json:"insertTextFormat,omitempty"`
 }
 
 // CompletionList represents a list of completion items.

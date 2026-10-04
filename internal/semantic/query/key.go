@@ -5,7 +5,7 @@
 // Owned mutable state: entries map (mu-protected), inflight table,
 // depIndex (dep → dependent keys), stats counters (atomics).
 //
-// Concurrency model: one RWMutex guards the entry/inflight tables; compute
+// Concurrency model: one gate guards the entry/inflight tables; compute
 // functions run OUTSIDE the lock; waiters park on per-query channels.
 //
 // Invariants:
@@ -22,17 +22,20 @@ import "fmt"
 // Key identifies a memoizable query (§J1). Semantic identity only:
 // timestamps and request IDs MUST NOT appear in any field.
 type Key struct {
-	Kind         string // e.g. "hover", "references", "index.symbol"
-	Workspace    string
-	SnapshotRev  uint64
-	BuildContext string
-	Subject      string // URI, symbol ID, …
-	OptionsHash  string // hash over options that affect the result
+	Kind             string // e.g. "hover", "references", "index.symbol"
+	Workspace        string
+	SnapshotRev      uint64
+	SnapshotInstance uint64 // process-local immutable snapshot identity; guards revision aliases
+	IndexGeneration  uint64 // committed persistent semantic generation (zero means none)
+	BuildContext     string
+	BackendEpoch     uint64 // lifecycle generation of an external backend; in-process is zero
+	Subject          string // URI, symbol ID, …
+	OptionsHash      string // hash over options that affect the result
 }
 
 func (k Key) String() string {
-	return fmt.Sprintf("%s|%s|%d|%s|%s|%s",
-		k.Kind, k.Workspace, k.SnapshotRev, k.BuildContext, k.Subject, k.OptionsHash)
+	return fmt.Sprintf("%s|%s|%d:%d|g%d|%s|%d|%s|%s",
+		k.Kind, k.Workspace, k.SnapshotRev, k.SnapshotInstance, k.IndexGeneration, k.BuildContext, k.BackendEpoch, k.Subject, k.OptionsHash)
 }
 
 // Dep is one content-addressed dependency identity (§J3).

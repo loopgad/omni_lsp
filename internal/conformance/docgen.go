@@ -28,6 +28,18 @@ func GenerateDocs() string {
 	}
 
 	order := []string{"core", "x5", "x7", "x8", "x9"}
+	seenDomains := make(map[string]struct{}, len(order))
+	for _, dom := range order {
+		seenDomains[dom] = struct{}{}
+	}
+	var extraDomains []string
+	for dom := range domains {
+		if _, seen := seenDomains[dom]; !seen {
+			extraDomains = append(extraDomains, dom)
+		}
+	}
+	sort.Strings(extraDomains)
+	order = append(order, extraDomains...)
 	for _, dom := range order {
 		checks := domains[dom]
 		if len(checks) == 0 {

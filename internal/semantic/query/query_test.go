@@ -30,6 +30,21 @@ func TestJ1_KeyDeterminism(t *testing.T) {
 	if a.String() == c.String() {
 		t.Fatal("different revisions must not collide")
 	}
+	e := a
+	e.SnapshotInstance = 2
+	if a.String() == e.String() {
+		t.Fatal("different immutable snapshot instances must not collide")
+	}
+	f := a
+	f.IndexGeneration = 3
+	if a.String() == f.String() {
+		t.Fatal("different persistent index generations must not collide")
+	}
+	d := a
+	d.BackendEpoch = 2
+	if a.String() == d.String() {
+		t.Fatal("different backend epochs must not collide")
+	}
 	for _, part := range strings.Split(a.String(), "|") {
 		if part == "" {
 			t.Error("empty component would make encodings ambiguous")
@@ -117,6 +132,34 @@ func TestJ4_StateTransitions(t *testing.T) {
 	st := e.Stats()
 	if st.Computations < 4 || st.Hits < 2 || st.Evictions < 1 {
 		t.Errorf("stats off: %+v", st)
+	}
+}
+
+// A canceled leader cannot turn a retryable request failure into stable
+// negative knowledge shared by later callers on the same snapshot.
+func TestJ4_CanceledComputeIsNotMemoized(t *testing.T) {
+	for _, failed := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(failed.Error(), func(t *testing.T) {
+			e := NewEngine(1)
+			k := key("hover", "canceled", 1)
+			calls := 0
+			_, err := e.Query(context.Background(), k, nil,
+				func(context.Context, Bindings) (any, DepSet, error) {
+					calls++
+					return nil, nil, fmt.Errorf("backend: %w", failed)
+				})
+			if !errors.Is(err, failed) {
+				t.Fatalf("first query: got %v, want %v", err, failed)
+			}
+			res, err := e.Query(context.Background(), k, nil,
+				func(context.Context, Bindings) (any, DepSet, error) {
+					calls++
+					return "recovered", nil, nil
+				})
+			if err != nil || res.Value != "recovered" || calls != 2 {
+				t.Fatalf("retry: value=%v err=%v calls=%d", res.Value, err, calls)
+			}
+		})
 	}
 }
 
@@ -229,6 +272,331 @@ func TestJ6_SingleflightIndependentCancel(t *testing.T) {
 	}
 }
 
+func TestJ6_LeaderCancelKeepsSharedComputeForRemainingWaiter(t *testing.T) {
+	e := NewEngine(0)
+	k := key("sf", "leader-cancel", 1)
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	sharedCanceled := make(chan struct{})
+	fn := func(ctx context.Context, _ Bindings) (any, DepSet, error) {
+		close(started)
+		select {
+		case <-release:
+			return "shared result", nil, nil
+		case <-ctx.Done():
+			close(sharedCanceled)
+			return nil, nil, ctx.Err()
+		}
+	}
+
+	type outcome struct {
+		result Result
+		err    error
+	}
+	leaderDone := make(chan outcome, 1)
+	go func() {
+		res, err := e.Query(leaderCtx, k, nil, fn)
+		leaderDone <- outcome{res, err}
+	}()
+	<-started
+	waiterDone := make(chan outcome, 1)
+	go func() {
+		res, err := e.Query(context.Background(), k, nil, fn)
+		waiterDone <- outcome{res, err}
+	}()
+	waitForQueryWaiters(t, e, k.String(), 2)
+
+	cancelLeader()
+	select {
+	case got := <-leaderDone:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("leader err = %v, want context.Canceled", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled leader did not return independently")
+	}
+
+	close(release)
+	select {
+	case got := <-waiterDone:
+		if got.err != nil || got.result.Value != "shared result" {
+			t.Fatalf("remaining waiter = (%v, %v), want (shared result, nil)", got.result.Value, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remaining waiter did not receive the shared result")
+	}
+	select {
+	case <-sharedCanceled:
+		t.Fatal("leader cancellation canceled shared work while another waiter remained")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestJ6_LastWaiterCancelStopsSharedCompute(t *testing.T) {
+	e := NewEngine(0)
+	k := key("sf", "all-cancel", 1)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	started := make(chan struct{})
+	sharedCanceled := make(chan struct{})
+	fn := func(ctx context.Context, _ Bindings) (any, DepSet, error) {
+		close(started)
+		<-ctx.Done()
+		close(sharedCanceled)
+		return nil, nil, ctx.Err()
+	}
+	done1 := make(chan error, 1)
+	go func() { _, err := e.Query(ctx1, k, nil, fn); done1 <- err }()
+	<-started
+	done2 := make(chan error, 1)
+	go func() { _, err := e.Query(ctx2, k, nil, fn); done2 <- err }()
+	waitForQueryWaiters(t, e, k.String(), 2)
+	cancel1()
+	cancel2()
+	for i, done := range []chan error{done1, done2} {
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("waiter %d err = %v, want context.Canceled", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waiter %d remained blocked", i)
+		}
+	}
+	select {
+	case <-sharedCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shared compute context was not canceled after its last waiter left")
+	}
+}
+
+func TestJ6_LastWaiterCancelAllowsFreshSameKey(t *testing.T) {
+	e := NewEngine(0)
+	k := key("sf", "fresh-after-cancel", 1)
+	firstStarted := make(chan struct{})
+	sharedCanceled := make(chan struct{})
+	releaseOldCompute := make(chan struct{})
+	var releaseOldOnce sync.Once
+	releaseOld := func() { releaseOldOnce.Do(func() { close(releaseOldCompute) }) }
+	defer releaseOld()
+	oldFn := func(ctx context.Context, _ Bindings) (any, DepSet, error) {
+		close(firstStarted)
+		<-ctx.Done()
+		close(sharedCanceled)
+		<-releaseOldCompute // Keep the abandoned computation in flight deliberately.
+		return nil, nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := e.Query(ctx, k, nil, oldFn)
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first computation did not start")
+	}
+
+	e.lock()
+	oldCall := e.inflight[k.String()]
+	e.unlock()
+	if oldCall == nil {
+		t.Fatal("first computation was not registered")
+	}
+
+	cancel()
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("first waiter err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled waiter did not return")
+	}
+	select {
+	case <-sharedCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("last waiter did not cancel shared computation")
+	}
+
+	freshStarted := make(chan struct{})
+	freshDone := make(chan struct {
+		result Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := e.Query(context.Background(), k, nil,
+			func(context.Context, Bindings) (any, DepSet, error) {
+				close(freshStarted)
+				return "fresh", nil, nil
+			})
+		freshDone <- struct {
+			result Result
+			err    error
+		}{result, err}
+	}()
+
+	var fresh struct {
+		result Result
+		err    error
+	}
+	select {
+	case fresh = <-freshDone:
+	case <-time.After(time.Second):
+		releaseOld()
+		<-oldCall.done
+		<-freshDone
+		t.Fatal("fresh same-key request joined canceled computation and did not complete")
+	}
+	select {
+	case <-freshStarted:
+	default:
+		t.Fatal("fresh request completed without running its fresh computation")
+	}
+	if fresh.err != nil || fresh.result.Value != "fresh" {
+		t.Fatalf("fresh request = (%v, %v), want (fresh, nil)", fresh.result.Value, fresh.err)
+	}
+
+	releaseOld()
+	select {
+	case <-oldCall.done:
+	case <-time.After(time.Second):
+		t.Fatal("abandoned computation did not finish cleanup")
+	}
+	// The detached old computation must not delete or overwrite the newer memo.
+	var recomputed atomic.Bool
+	got, err := e.Query(context.Background(), k, nil,
+		func(context.Context, Bindings) (any, DepSet, error) {
+			recomputed.Store(true)
+			return "wrong", nil, nil
+		})
+	if err != nil || got.Value != "fresh" || recomputed.Load() {
+		t.Fatalf("memo after old compute cleanup = (%v, %v), recomputed=%v; want fresh cached result", got.Value, err, recomputed.Load())
+	}
+}
+
+func TestJ6_QueryLockWaitHonorsCancellation(t *testing.T) {
+	e := NewEngine(0)
+	e.lock()
+	defer e.unlock()
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &queryObservedContext{Context: base, observed: make(chan struct{}), observeAt: 2}
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.Query(ctx, key("lock", "wait", 1), nil,
+			func(context.Context, Bindings) (any, DepSet, error) { return "ran", nil, nil })
+		done <- err
+	}()
+	select {
+	case <-ctx.observed:
+	case <-time.After(time.Second):
+		t.Fatal("query never reached the lock wait")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Query err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("query remained blocked on the engine lock after cancellation")
+	}
+}
+
+func TestJ6_PanicCompletesInflightWaitersAndAllowsRetry(t *testing.T) {
+	e := NewEngine(0)
+	k := key("sf", "panic", 1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fn := func(context.Context, Bindings) (any, DepSet, error) {
+		close(started)
+		<-release
+		panic("compute boom")
+	}
+	leaderPanic := make(chan any, 1)
+	go func() {
+		defer func() { leaderPanic <- recover() }()
+		_, _ = e.Query(context.Background(), k, nil, fn)
+	}()
+	<-started
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := e.Query(context.Background(), k, nil, fn)
+		waiterDone <- err
+	}()
+	waitForQueryWaiters(t, e, k.String(), 2)
+	close(release)
+	select {
+	case got := <-leaderPanic:
+		if got != "compute boom" {
+			t.Fatalf("leader panic = %v, want original panic", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader did not observe compute panic after cleanup")
+	}
+	select {
+	case err := <-waiterDone:
+		if err == nil || !strings.Contains(err.Error(), "compute panicked") {
+			t.Fatalf("waiter err = %v, want a panic error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("panic left an in-flight waiter stranded")
+	}
+	res, err := e.Query(context.Background(), k, nil,
+		func(context.Context, Bindings) (any, DepSet, error) { return "retry", nil, nil })
+	if err != nil || res.Value != "retry" {
+		t.Fatalf("retry after panic = (%v, %v), want (retry, nil)", res.Value, err)
+	}
+}
+
+func waitForQueryWaiters(t *testing.T, e *Engine, key string, want int64) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		e.lock()
+		call := e.inflight[key]
+		got := int64(0)
+		if call != nil {
+			got = call.waiters.Load()
+		}
+		e.unlock()
+		if got == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("in-flight waiters = %d, want %d", got, want)
+		case <-ticker.C:
+		}
+	}
+}
+
+type queryObservedContext struct {
+	context.Context
+	observed  chan struct{}
+	observeAt int32
+	calls     atomic.Int32
+	once      sync.Once
+}
+
+func (c *queryObservedContext) Err() error {
+	if c.calls.Add(1) == c.observeAt {
+		c.once.Do(func() { close(c.observed) })
+	}
+	return c.Context.Err()
+}
+
 func toString(v any) string {
 	s, _ := v.(string)
 	return s
@@ -265,7 +633,6 @@ func TestJ7_StalePublishRejected(t *testing.T) {
 	e := NewEngine(1) // engine expects revision >= 1
 
 	block := make(chan struct{})
-	var once sync.Once
 	k := key("stale", "doc.go", 3) // computed against an older revision
 
 	started := make(chan struct{})
@@ -281,10 +648,9 @@ func TestJ7_StalePublishRejected(t *testing.T) {
 	}()
 
 	<-started
-	once.Do(func() { close(block) }) // bump via invalidation below
-
 	// Raise the expectation while compute is parked.
 	e.InvalidateSnapshot(5)
+	close(block)
 	err := <-errCh
 	if err == nil || !strings.Contains(err.Error(), "stale publish") {
 		t.Fatalf("want stale-publish rejection, got %v", err)

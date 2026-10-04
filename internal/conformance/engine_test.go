@@ -46,6 +46,37 @@ func TestFastReport_ScoreBoundsAndShape(t *testing.T) {
 	}
 }
 
+func TestPERF3_SkippedS21ProbeCannotEarnFullCredit(t *testing.T) {
+	var perf3 *Check
+	for i := range Registry.Checks {
+		if Registry.Checks[i].ID == "PERF-3" {
+			perf3 = &Registry.Checks[i]
+			break
+		}
+	}
+	if perf3 == nil {
+		t.Fatal("PERF-3 is missing from the conformance registry")
+	}
+	if perf3.Status != StatusPartial || perf3.Probe == nil || len(perf3.Probe.Groups) != 1 {
+		t.Fatalf("PERF-3 must remain partial while candidate-bound S21 evidence is external: %+v", perf3)
+	}
+	if !strings.Contains(perf3.Reason, "skipping without OMNILSP_BIN") {
+		t.Fatalf("PERF-3 reason does not identify the missing-candidate skip: %q", perf3.Reason)
+	}
+
+	group := perf3.Probe.Groups[0]
+	symbols := map[string][]string{group.Pkg: append([]string(nil), group.Tests...)}
+	// A nil execution error models go test's exit 0 when the S21 test skips.
+	// The partial status must prevent that exit from earning a pass.
+	execution := map[string]error{
+		group.Pkg + "\x00" + strings.Join(group.Tests, "\x00"): nil,
+	}
+	result := checkResult(perf3, symbols, execution, "full")
+	if result.Result != creditPartial {
+		t.Fatalf("PERF-3 result after a green (possibly skipped) probe = %v, want partial credit %v", result.Result, creditPartial)
+	}
+}
+
 // TestRenderText_ContainsDomainsAndScores checks the human scorecard on a
 // hand-built Report: a zero category must render FAILED, a half category
 // must render partial.

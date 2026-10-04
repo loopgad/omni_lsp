@@ -139,9 +139,17 @@ type Request struct {
 
 	// Cancellation support (C7/F11). cancelMu guards cancel/cancelled so a
 	// Cancel() racing with worker start is not lost.
-	cancelMu  sync.Mutex
-	cancel    context.CancelFunc
-	cancelled atomic.Bool
+	cancelMu          sync.Mutex
+	cancel            context.CancelFunc
+	cancelled         atomic.Bool
+	cancelErr         error
+	finished          chan struct{}
+	finishedOnce      sync.Once
+	finishedFlag      bool // guarded by cancelMu
+	sharedCall        *sharedCall
+	sharedRelease     func()
+	sharedReleaseOnce sync.Once
+	resultOnce        sync.Once
 
 	// F11: lazily created broadcast channel closed on Cancel so waiters that
 	// joined a shared computation wake up instead of waiting for its result.
@@ -150,20 +158,117 @@ type Request struct {
 	closeOnce sync.Once
 }
 
-// Cancel cancels the request. If it is still queued the worker will skip it;
-// if it is running its context is cancelled; if it joined a shared
-// computation (F11) its waiter goroutine wakes with Canceled. Safe to call
-// multiple times and from any goroutine.
+// Cancel completes this request independently. Non-shared work receives the
+// cancellation directly; shared work continues until its final waiter leaves.
+// Safe to call multiple times and from any goroutine.
 func (r *Request) Cancel() {
+	r.cancelWithError(context.Canceled)
+}
+
+func (r *Request) cancelWithError(err error) {
 	r.cancelMu.Lock()
-	r.cancelled.Store(true)
-	if r.cancel != nil {
-		r.cancel()
+	if r.finishedFlag || r.cancelled.Load() {
+		r.cancelMu.Unlock()
+		return
 	}
+	r.cancelled.Store(true)
+	r.cancelErr = err
+	cancel := r.cancel
+	r.cancel = nil
+	r.finishLocked(Result{Err: err})
 	r.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 
 	r.wakeOnce.Do(func() { r.wake = make(chan struct{}) })
 	r.closeWake()
+}
+
+func (r *Request) setCancel(cancel context.CancelFunc) {
+	r.cancelMu.Lock()
+	if r.finishedFlag || r.cancelled.Load() {
+		r.cancelMu.Unlock()
+		cancel()
+		return
+	}
+	r.cancel = cancel
+	r.cancelMu.Unlock()
+}
+
+func (r *Request) clearCancel() {
+	r.cancelMu.Lock()
+	r.cancel = nil
+	r.cancelMu.Unlock()
+}
+
+func (r *Request) setSharedCall(sc *sharedCall, release func()) {
+	releaseOnce := func() { r.sharedReleaseOnce.Do(release) }
+	r.cancelMu.Lock()
+	r.sharedCall = sc
+	r.sharedRelease = releaseOnce
+	if r.finishedFlag || r.cancelled.Load() {
+		r.cancelMu.Unlock()
+		releaseOnce()
+		return
+	}
+	r.cancel = releaseOnce
+	r.cancelMu.Unlock()
+}
+
+func (r *Request) releaseSharedWaiter() {
+	r.cancelMu.Lock()
+	release := r.sharedRelease
+	r.cancelMu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+func (r *Request) cancelError() error {
+	r.cancelMu.Lock()
+	defer r.cancelMu.Unlock()
+	if r.cancelErr != nil {
+		return r.cancelErr
+	}
+	return context.Canceled
+}
+
+func (r *Request) finish(result Result) {
+	r.cancelMu.Lock()
+	r.finishLocked(result)
+	r.cancelMu.Unlock()
+}
+
+func (r *Request) finishLocked(result Result) {
+	if r.finishedFlag || r.Result == nil {
+		return
+	}
+	r.finishedFlag = true
+	if r.finished != nil {
+		r.finishedOnce.Do(func() { close(r.finished) })
+	}
+	r.resultOnce.Do(func() {
+		select {
+		case r.Result <- result:
+		default:
+		}
+	})
+}
+
+func (r *Request) watchDeadline() {
+	delay := time.Until(r.Deadline)
+	if delay <= 0 {
+		r.cancelWithError(context.DeadlineExceeded)
+		return
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-r.finished:
+	case <-timer.C:
+		r.cancelWithError(context.DeadlineExceeded)
+	}
 }
 
 // wakeCh returns the lazily created cancellation broadcast channel (F11).
@@ -299,6 +404,9 @@ func (s *Scheduler) trySend(pq int, req *Request) bool {
 	}
 	s.queueMu.RLock()
 	defer s.queueMu.RUnlock()
+	if s.closed.Load() {
+		return false
+	}
 	select {
 	case s.queues[pq] <- req:
 		return true
@@ -319,19 +427,32 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 	if req.Result == nil {
 		req.Result = make(chan Result, 1)
 	}
+	if req.finished == nil {
+		req.finished = make(chan struct{})
+	}
+	if req.Cancelled() {
+		req.finish(Result{Err: req.cancelError()})
+		return RejectedCancelled
+	}
+	if !req.Deadline.IsZero() {
+		go req.watchDeadline()
+	}
 
 	// F11/J6: identical coalescable requests join the in-flight twin instead
 	// of duplicating work. Waiters do not occupy worker or in-flight budget.
 	if req.CoalesceKey != "" {
 		sc, leader := s.tracker.acquire(req.CoalesceKey)
+		req.setSharedCall(sc, func() { s.tracker.release(sc) })
 		if !leader {
 			s.totalJoined.Add(1)
 			go func() {
 				select {
 				case <-sc.done:
-					req.Result <- Result{Value: sc.value, Err: sc.err}
+					req.releaseSharedWaiter()
+					req.finish(Result{Value: sc.value, Err: sc.err})
 				case <-req.wakeCh():
-					req.Result <- Result{Err: context.Canceled}
+					req.releaseSharedWaiter()
+					req.finish(Result{Err: req.cancelError()})
 				}
 			}()
 			return Admitted
@@ -341,7 +462,10 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 	// In-flight budget check (F5 admission control).
 	if int(s.inFlight.Load()) >= s.config.MaxInFlight {
 		s.totalRejected.Add(1)
-		s.deliverResult(req, nil, fmt.Errorf("scheduler: in-flight budget exceeded"))
+		err := fmt.Errorf("scheduler: in-flight budget exceeded")
+		s.deliverRollback(req, err)
+		req.releaseSharedWaiter()
+		req.finish(Result{Err: err})
 		return RejectedQueueFull
 	}
 
@@ -359,15 +483,18 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 		return Admitted
 	}
 	s.totalRejected.Add(1)
-	s.deliverResult(req, nil, fmt.Errorf("scheduler: queue full"))
+	err := fmt.Errorf("scheduler: queue full")
+	s.deliverRollback(req, err)
+	req.releaseSharedWaiter()
+	req.finish(Result{Err: err})
 	return RejectedQueueFull
 }
 
 // deliverResult completes the leader's shared call, broadcasting (val, err)
 // to all joined waiters. Called on EVERY worker exit path (F11 duty).
 func (s *Scheduler) deliverResult(req *Request, val any, err error) {
-	if req.CoalesceKey != "" {
-		s.tracker.Deliver(req.CoalesceKey, val, err)
+	if req.sharedCall != nil {
+		s.tracker.Deliver(req.sharedCall, val, err)
 	}
 }
 
@@ -387,83 +514,108 @@ func (s *Scheduler) worker(ctx context.Context) {
 		// Check cancellation before executing.
 		select {
 		case <-ctx.Done():
+			req.releaseSharedWaiter()
 			s.deliverRollback(req, ctx.Err())
-			select { // non-blocking: caller may have abandoned req.Result
-			case req.Result <- Result{Err: ctx.Err()}:
-			default:
-			}
+			req.finish(Result{Err: ctx.Err()})
 			continue
 		default:
 		}
 
-		// Check deadline.
+		// Deadlines belong to each request. A timed-out leader still runs for
+		// its live joiners; shared work is skipped only after its last waiter
+		// has left.
 		if !req.Deadline.IsZero() && time.Now().After(req.Deadline) {
-			err := fmt.Errorf("scheduler: request deadline exceeded")
+			req.cancelWithError(context.DeadlineExceeded)
+		}
+		if req.Cancelled() && (req.sharedCall == nil || s.tracker.waiterCount(req.sharedCall) == 0) {
+			err := req.cancelError()
+			req.releaseSharedWaiter()
 			s.deliverRollback(req, err)
-			select { // non-blocking: caller may have abandoned req.Result
-			case req.Result <- Result{Err: err}:
-			default:
-			}
+			req.finish(Result{Err: err})
 			continue
 		}
 
 		s.inFlight.Add(1)
 
 		execCtx, cancelExec := context.WithCancel(ctx)
-		req.cancelMu.Lock()
-		if req.cancelled.Load() {
-			// Cancelled while queued (C7): skip execution entirely.
-			req.cancelMu.Unlock()
+		if req.sharedCall != nil {
+			s.tracker.setCancel(req.sharedCall, cancelExec)
+		} else {
+			req.setCancel(cancelExec)
+		}
+		if req.Cancelled() && (req.sharedCall == nil || s.tracker.waiterCount(req.sharedCall) == 0) {
+			err := req.cancelError()
 			cancelExec()
+			req.clearCancel()
 			s.inFlight.Add(-1)
-			s.deliverRollback(req, context.Canceled)
-			select {
-			case req.Result <- Result{Err: context.Canceled}:
-			default:
-			}
+			req.releaseSharedWaiter()
+			s.deliverRollback(req, err)
+			req.finish(Result{Err: err})
 			continue
 		}
-		req.cancel = cancelExec
-		req.cancelMu.Unlock()
 
 		s.totalExecuted.Add(1)
 
-		// Execute with request-scoped context for cancellation propagation (C7).
-		val, err := req.Execute(execCtx, req.Snapshot)
+		// Shared execution uses a context canceled only when its final waiter
+		// leaves. Panics are converted into a terminal error so worker and
+		// singleflight cleanup always run.
+		val, err := executeSafely(req, execCtx)
 		cancelExec()
+		req.clearCancel()
 		// Note: cancelExec() cancels execCtx after Execute returns. We must NOT
 		// check execCtx.Err() here — it will always be cancelled at this point.
 		// The only case where err should be ctx.Err() is if Execute itself
 		// observed the parent ctx cancellation during execution.
 
 		s.deliverResult(req, val, err) // F11: broadcast real values to joined waiters
-
-		res := Result{Value: val, Err: err}
-		// Try buffered send first (non-blocking), then blocking with context awareness.
-		select {
-		case req.Result <- res:
-		default:
-			// Result channel already consumed or full; request is done.
-		}
+		req.finish(Result{Value: val, Err: err})
+		req.releaseSharedWaiter()
 		s.inFlight.Add(-1)
 	}
 }
 
-// pickRequest selects the highest-priority ready request. Idle workers block
-// on the notify signal instead of polling — Submit wakes one immediately.
+func executeSafely(req *Request, ctx context.Context) (value any, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			value = nil
+			err = fmt.Errorf("scheduler: request execution panicked (%T)", recovered)
+		}
+	}()
+	return req.Execute(ctx, req.Snapshot)
+}
+
+// pickRequest selects the highest-priority ready request. It skips closed
+// empty queues so shutdown drains buffered requests at every priority before
+// workers exit. Idle workers block on the notify signal instead of polling —
+// Submit wakes one immediately.
 func (s *Scheduler) pickRequest(ctx context.Context) *Request {
+	draining := false
 	for {
 		for pq := 0; pq < len(s.queues); pq++ {
 			select {
-			case req := <-s.queues[pq]:
-				return req
+			case req, ok := <-s.queues[pq]:
+				if ok {
+					return req
+				}
 			default:
 			}
+		}
+		if draining {
+			return nil
+		}
+		// Prefer an already-canceled context before waiting. If cancellation
+		// races the wait below, either selected case loops through one final
+		// queue scan before the worker exits.
+		select {
+		case <-ctx.Done():
+			draining = true
+			continue
+		default:
 		}
 		// No requests ready; sleep until a Submit signals or shutdown.
 		select {
 		case <-ctx.Done():
-			return nil
+			draining = true
 		case <-s.notify:
 		}
 	}
@@ -532,25 +684,25 @@ func (s *Scheduler) rejectDropped(req *Request, msg string) {
 	err := errors.New(msg)
 	s.totalRejected.Add(1)
 	s.deliverRollback(req, err)
-	select {
-	case req.Result <- Result{Err: err}:
-	default:
-	}
+	req.releaseSharedWaiter()
+	req.finish(Result{Err: err})
 }
 
 // Shutdown gracefully stops the scheduler.
 func (s *Scheduler) Shutdown() {
-	if s.closed.CompareAndSwap(false, true) {
-		if s.cancel != nil {
-			s.cancel()
-		}
-		// Close all queues to unblock workers. The write lock excludes
-		// concurrent trySend senders, making close-vs-send race-free.
-		s.queueMu.Lock()
-		for i := range s.queues {
-			close(s.queues[i])
-		}
-		s.queueMu.Unlock()
+	// Linearize shutdown with queue sends: a sender holding RLock must finish
+	// its closed check and send before closed becomes visible or workers are
+	// cancelled. Later senders acquire RLock after this and reject on closed.
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if !s.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	for i := range s.queues {
+		close(s.queues[i])
 	}
 }
 

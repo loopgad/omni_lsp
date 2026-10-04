@@ -22,7 +22,7 @@ func Transient(err error) error { return &TransientError{Err: err} }
 
 func isTransient(err error) bool {
 	var t *TransientError
-	return errors.As(err, &t)
+	return errors.As(err, &t) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // Query resolves k: cached hit, in-flight join (singleflight §J6), or
@@ -32,17 +32,24 @@ func (e *Engine) Query(ctx context.Context, k Key, declared DepSet, fn ComputeFn
 }
 
 func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn ComputeFn, recursion bool) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	key := k.String()
 
 	if !recursion && chainHas(ctx, key) {
-		e.mu.Lock()
+		if err := e.lockContext(ctx); err != nil {
+			return Result{}, err
+		}
 		e.cyclesFound++
-		e.mu.Unlock()
+		e.unlock()
 		return Result{}, fmt.Errorf("%w: %s", ErrQueryCycle, key)
 	}
 
 	for {
-		e.mu.Lock()
+		if err := e.lockContext(ctx); err != nil {
+			return Result{}, err
+		}
 		if en := e.entries[key]; en != nil {
 			if en.snapshotRev < e.expectedRev {
 				e.removeKeyFromDeps(key, en.deps)
@@ -55,85 +62,142 @@ func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn Compu
 			case Ready:
 				e.hits++
 				res := Result{Value: en.value, Evidence: en.evidence, SafetyClass: en.safety}
-				e.mu.Unlock()
+				e.unlock()
 				return res, nil
 			case FailedStable:
 				e.hits++
 				err := en.err
-				e.mu.Unlock()
+				e.unlock()
 				return Result{}, err
 			}
 		}
 		if call := e.inflight[key]; call != nil {
-			// Singleflight join (§J6): park until the leader finishes.
-			e.mu.Unlock()
-			select {
-			case <-call.done:
-				return call.res, call.err
-			case <-ctx.Done():
-				// Independent waiter cancellation: leader and siblings are
-				// unaffected; this waiter simply gives up (§J6).
-				return Result{}, ctx.Err()
-			}
+			// Each caller owns one reference. The shared context is canceled
+			// only when its last waiter leaves (§F11/J6).
+			call.waiters.Add(1)
+			e.unlock()
+			return e.waitForCall(ctx, key, call, false)
 		}
 
-		// We are the leader: register in-flight and compute outside the lock.
+		// Register shared work outside the request's cancellation lifetime.
+		// The request still waits independently; other waiters can keep the
+		// compute alive if this caller cancels.
 		e.misses++
 		e.computations++
-		call := &inflightCall{done: make(chan struct{})}
+		sharedCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		call := &inflightCall{done: make(chan struct{}), ctx: sharedCtx, cancel: cancel}
+		call.waiters.Store(1)
 		e.inflight[key] = call
-		e.mu.Unlock()
+		e.unlock()
+		go e.compute(key, k, declared, fn, call)
+		return e.waitForCall(ctx, key, call, true)
+	}
+}
 
-		val, gotDeps, err := func() (any, DepSet, error) {
-			defer func() {
-				if r := recover(); r != nil {
-					panic(r) // compute panics propagate; F16 boundary is upstream
-				}
-			}()
-			return fn(withKey(ctx, key), Bindings{e: e})
-		}()
+func (e *Engine) waitForCall(ctx context.Context, key string, call *inflightCall, leader bool) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		e.releaseWaiter(key, call)
+		return Result{}, err
+	}
+	select {
+	case <-call.done:
+		if leader && call.panicValue != nil {
+			panic(call.panicValue) // preserve the leader's panic boundary after cleanup
+		}
+		return call.res, call.err
+	case <-ctx.Done():
+		e.releaseWaiter(key, call)
+		return Result{}, ctx.Err()
+	}
+}
 
-		e.mu.Lock()
+func (e *Engine) releaseWaiter(key string, call *inflightCall) {
+	e.lock()
+	lastWaiter := call.waiters.Add(-1) == 0
+	if lastWaiter && e.inflight[key] == call {
+		// Remove canceled work before allowing a new same-key caller to join.
+		// The pointer check prevents a late waiter from removing a replacement.
 		delete(e.inflight, key)
+	}
+	e.unlock()
+	if lastWaiter {
+		call.cancel()
+	}
+}
 
+// compute runs outside the table lock so callers can cancel independently.
+// It completes its call even if the last waiter already detached it, and only
+// publishes when it still owns the key's in-flight slot.
+func (e *Engine) compute(key string, k Key, declared DepSet, fn ComputeFn, call *inflightCall) {
+	var val any
+	var gotDeps DepSet
+	var err error
+	var panicValue any
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicValue = r
+				err = fmt.Errorf("query: compute panicked (%T)", r)
+			}
+		}()
+		val, gotDeps, err = fn(withKey(call.ctx, key), Bindings{e: e})
+	}()
+	if panicValue != nil {
+		val = nil
+		gotDeps = nil
+	} else if canceled := call.ctx.Err(); canceled != nil {
+		// Work abandoned by its last waiter must not publish a stable result.
+		val, gotDeps, err = nil, nil, canceled
+	}
+
+	e.lock()
+	if panicValue == nil {
+		if canceled := call.ctx.Err(); canceled != nil {
+			val, gotDeps, err = nil, nil, canceled
+		}
+	}
+	current := e.inflight[key] == call
+	if current {
+		delete(e.inflight, key)
+	}
+
+	if current {
 		// §J7 freshness gate: revision moved while computing → discard.
 		if k.SnapshotRev != 0 && e.expectedRev > k.SnapshotRev {
 			e.stalePublishRejected++
 			err = fmt.Errorf("query: stale publish for %s (computed@%d want>=%d): %w", key, k.SnapshotRev, e.expectedRev, ErrStalePublish)
-			call.err = err
-			close(call.done)
-			e.mu.Unlock()
-			return Result{}, err
+			val = nil
+			gotDeps = nil
 		}
 
-		deps := gotDeps.Union(declared)
-		en := &entry{deps: deps, snapshotRev: k.SnapshotRev}
-		if err != nil {
-			if isTransient(err) {
-				delete(e.entries, key) // retryable: drop entirely
+		if panicValue == nil && !errors.Is(err, ErrStalePublish) {
+			deps := gotDeps.Union(declared)
+			en := &entry{deps: deps, snapshotRev: k.SnapshotRev}
+			if err != nil {
+				if isTransient(err) {
+					delete(e.entries, key) // retryable: drop entirely
+				} else {
+					en.state = FailedStable
+					en.err = err
+					e.entries[key] = en
+					e.indexDeps(key, deps)
+				}
 			} else {
-				en.state = FailedStable
-				en.err = err
+				en.state = Ready
+				en.value = val
 				e.entries[key] = en
 				e.indexDeps(key, deps)
 			}
-		} else {
-			en.state = Ready
-			en.value = val
-			e.entries[key] = en
-			e.indexDeps(key, deps)
+			e.evictBounded(key)
 		}
-		e.evictBounded(key)
-		call.res = Result{Value: val}
-		call.err = err
-		close(call.done)
-		e.mu.Unlock()
-
-		// The value travels with the error on transient failures so a caller
-		// can project a computed envelope (e.g. §B6 Unknown) without a
-		// second backend call; the entry is never memoized.
-		return call.res, err
 	}
+
+	call.res = Result{Value: val}
+	call.err = err
+	call.panicValue = panicValue
+	call.cancel()
+	close(call.done)
+	e.unlock()
 }
 
 // indexDeps records dep → dependent-key edges for selective invalidation.
@@ -148,8 +212,8 @@ func (e *Engine) indexDeps(key string, deps DepSet) {
 
 // Invalidate drops every cached entry depending on dep (§J2-J3).
 func (e *Engine) Invalidate(dep Dep) int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	keys, ok := e.depIndex[dep]
 	if !ok {
 		return 0
@@ -170,8 +234,8 @@ func (e *Engine) Invalidate(dep Dep) int {
 // InvalidateSnapshot drops all entries bound to revisions older than rev and
 // raises the freshness expectation for publishes in flight (§J7).
 func (e *Engine) InvalidateSnapshot(rev uint64) int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	n := 0
 	for k, en := range e.entries {
 		if en.state != Ready && en.state != FailedStable {
