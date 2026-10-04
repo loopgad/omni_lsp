@@ -33,11 +33,11 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| PERF-S19 | Large-query throughput scaling + cancelability measured | S19 large queries | `TestS19_ReferencesScalingCurve` | AUTO |
+| PERF-S19 | Go references scale over real result sets and honor pre-cancellation; full S19 gate pending | S19 large queries | `TestS19_ReferencesScalingCurve` | PARTIAL (Go-only scaling and pre-cancel tested; progress, memory bounds, and priority isolation unverified) |
 | PERF-S20 | Accuracy KPI formulas canonical and NaN-safe | S20 accuracy KPI | `TestS20_KPIFormulas`, `TestS20_KPIZeroDenominatorSafe` | AUTO |
 | PERF-1 | Benchmark reports carry mandatory metadata banner | §S17 | `TestS17_MetadataPresent` | AUTO |
-| PERF-2 | Interactive SLO targets met (hot hover/definition/completion/syntax-update P50+P95+P99) | §S18 | `TestS18_InteractiveSLO` | AUTO |
-| PERF-3 | Qualified corpus zero-error goals (six-bucket classification all-zero) | §S21 | `TestS21_ZeroErrorClassification` | AUTO |
+| PERF-2 | Interactive SLO: facade overhead measured; representative Tier S end-to-end latency unverified | §S18 | `TestS18_FacadeOverhead` | PARTIAL (fake backend and batch means do not establish real single-request P50/P95/P99) |
+| PERF-3 | Qualified known-symbol positive results plus six-bucket zero-error classification | §S21 | `TestS21_ZeroErrorClassification` | PARTIAL (The generic conformance probe cannot distinguish a successful candidate run from TestS21_ZeroErrorClassification skipping without OMNILSP_BIN; candidate-bound structured S21 evidence remains external) |
 | PERF-4 | Metamorphic invariance (whitespace / line endings / comment injection) | §S22 | `TestS22_MetamorphicWhitespaceInvariance`, `TestS22_MetamorphicLineEndingInvariance`, `TestS22_MetamorphicCommentInjectionInvariance` | AUTO |
 
 ### PLUGIN
@@ -78,7 +78,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| WS-D14 | Zero-dependency poller detects create/modify/delete; vendored dirs ignored | D14 file watcher (polling) | `TestWatcherDetectsCreateModifyDelete`, `TestWatcherIgnoresVendoredAndBaselineSilence` | AUTO |
+| WS-D14 | External changes invalidate semantic state without overwriting editor buffers | D14 file watcher (polling) | `TestWatcherDetectsCreateModifyDelete`, `TestWatcherIgnoresVendoredAndBaselineSilence`, `TestWatchedExternalDependencyInvalidatesGoDefinitionCache`, `TestUnnotifiedExternalDependencyInvalidatesGoDefinitionCache`, `TestRunStartsPollerAfterInitializeAndStopsOnExit`, `TestExternalFileHintsValidateBeforeAdvancingRevision` | PARTIAL (Initialized sessions now poll and invalidate semantic revisions without replacing editor buffers; complete file-operation transitions and candidate-wide external-dependency coverage still require release evidence) |
 
 ### Y0
 
@@ -120,7 +120,7 @@
 | Y2-3 | Position encoding negotiation tested | §C4 | `TestCJKCharacters`, `TestEmojiEncoding` | AUTO |
 | Y2-6a | Optional capabilities negotiated (signatureHelp/formatting/inlayHint) | I16/I20/I22 feature negotiation | `TestI16_SignatureHelpNegotiatedAndUnsupported`, `TestI20_FormattingFullDocumentEdit`, `TestFeatures_GolangBridgeSyntaxTier` | AUTO |
 | Y2-4 | WorkspaceEdit capability differences tested (documentChanges negotiation + legacy form) | C9 workspace edits | `TestY24_WorkspaceEditCapabilityMatrix` | AUTO |
-| Y2-5 | Client compatibility matrix current (VS Code/Neovim/Emacs/Helix/Zed) | S11/X8 client matrix | `TestX8_ClientDocsPresent` | AUTO |
+| Y2-5 | Client profile documentation exists for all six required clients; complete native operation evidence remains pending | S11/X8 client matrix | `TestX8_ClientDocsPresent` | PARTIAL (Profiles are present; Helix, Zed and Sublime LSP still lack complete native acceptance, and all 42 cells must be verified against the frozen candidate) |
 | Y2-6 | MCP revision pinned | A7/§C14 | `TestInitializePinsProtocolRevision`, `TestToolsListIsFiveReadOnly` | AUTO |
 | Y2-7 | Public API schemas versioned | R4/W2/P8/P9 | `TestRenderJSON` | AUTO |
 | T2-DECL | textDocument/declaration declared and served through DeclarationProvider (ADR-0009 D2) | T2/I14 declaration served via optional capability | `TestT2_DeclarationServedAndDeclared` | AUTO |
@@ -181,14 +181,15 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| X5-1 | Persistent index with transactional integrity (atomic publish/quarantine/recovery) | T5/L4-L8 persistent index | `TestL4_CrashBeforePublishKeepsOldGeneration`, `TestL6_TXN002_HalfWrittenSegmentNotDiscoverable`, `TestCompact_ReducesSegmentsAndPreservesReads` | AUTO |
+| X5-1 | Persistent storage primitives with atomic generation publish, corruption quarantine, and recovery | L4-L8 transactional persistence | `TestL4_CrashBeforePublishKeepsOldGeneration`, `TestL6_TXN002_HalfWrittenSegmentNotDiscoverable`, `TestCompact_ReducesSegmentsAndPreservesReads` | AUTO |
+| X5-7 | Typed semantic generations persist and serve fresh-only workspace-symbol/definition/reference queries | T5 semantic persistent-index content | `TestSemanticReindexStatsAndPersistentWorkspaceSymbols`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestPersistentLocationsAllowDiskEquivalentOpenOverlay`, `TestPersistentLocationsFallBackForOpenUnsavedDocument`, `TestPersistentLocationsFallBackWhenDiskOrBuildContextChanges`, `TestHandleDefinitionUsesDirtyGoOverlayBeforeLiveBackend`, `TestWorkspaceSymbolsQueriesAllUniqueBackends`, `TestPersistentWorkspaceSymbolResponseCarriesItsLeasedGeneration`, `TestGenerationLeasePinsSegmentsDuringCompaction`, `TestCommitCancellationRacingCommitHasOneTerminalOutcome` | PARTIAL (Pinned language providers include a Pyright semantic exporter and current Go snapshot definition/reference queries; required seven-language fact coverage, other-language dynamic overlays, and complete cross-process query/replay evidence remain incomplete) |
 | X5-6 | Schema forward-compat reader + freshness tuple gates visibility | L9/L10 migration+freshness | `TestL9_FutureSchemaQuarantinesAndFallsBack`, `TestL10_FreshnessTupleGatesVisibility` | AUTO |
 
 ### INTEROP
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| X5-2 | SCIP+LSIF import/export adapters (provenance preserved) | L14/L15 interop adapters | `TestL14_SCIPRoundTrip`, `TestL15_LSIFRoundTrip`, `TestImportProvenanceMarked` | AUTO |
+| X5-2 | SCIP/LSIF conversions preserve supported provenance and report conversion losses | L14/L15 interop adapters | `TestL14_SCIPRoundTrip`, `TestL15_LSIFRoundTrip`, `TestImportProvenanceMarked`, `TestImportSCIPToModelNormalizesPositionsAndDeclaresLosses`, `TestImportSCIPToModelRejectsInvalidUTF16LocationsAndLanguage`, `TestImportSCIPToModelAcceptsUTF16UnicodeCRLFLocations`, `TestImportSCIPToModelAcceptsBareCRLineBreaks`, `TestImportSCIPToModelRejectsUnsafeDocumentPath`, `TestPersistentSemanticSCIPModelRoundTripAndDeclaredLoss`, `TestSemanticSCIPImportExportUsesOneVerifiedScopeAndPreservesStore`, `TestCmdIndexRejectsUnboundOrUnsupportedImports`, `TestSCIPFileHelpersBoundReadsAndRefuseOverwrite`, `TestValidateArtifactPathOutsideWorkspace`, `TestValidateArtifactPathOutsideWorkspaceResolvesSymlinks` | PARTIAL (Scoped local SCIP import/export is wired to verified persistent generations and server-level round-trip tests pass; candidate-binary CLI execution and LSIF command integration remain unverified) |
 
 ### QUERY
 
@@ -224,7 +225,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| X8-2 | Full client compatibility matrix (VS Code/Neovim/Emacs/Helix/Zed) | S11/X8 client profiles | `TestX8_ClientDocsPresent` | AUTO |
+| X8-2 | 42 real-client combinations: VS Code, Neovim, Emacs/Eglot, Helix, Zed, and Sublime LSP × seven languages | S11/X8 client profiles | — | PARTIAL (VS Code, Neovim and Emacs/Eglot have native drivers; Emacs passed seven development-candidate cells. Helix, Zed and Sublime LSP remain not_verified, and no complete frozen-candidate matrix has passed) |
 
 ### DIST
 
@@ -240,6 +241,112 @@
 |---|---|---|---|---|
 | X9-1 | Sustained soak + differential mismatch triage pipeline | T7/S6 release duty | — | PARTIAL→x9 |
 | X9-2 | Protocol reproducibility check (manifest fingerprint; -check mode in CI form) | C17/U4 reproducibility | — | PARTIAL→x9+ |
+
+## Deferred domain POST-X8 (independent denominator)
+
+### GRPC
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| X6-C15GRPC | gRPC v1 projection of the read API | C15 gRPC v1 | — | DEFERRED→post-X8 |
+
+## Deferred domain POST-X9 (independent denominator)
+
+### BUILDCTX
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-E2E3 | Multiple BuildContexts per document + active-context selection entry points | E2/E3 multi-context per file | — | DEFERRED→post-X9 |
+
+### COMPATIBILITY
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-A7GATE | Per-feature version gate mechanism for 3.18+ additions | A7 LSP 3.18 feature gating | — | DEFERRED→post-X9 |
+
+### DISTRIBUTION
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-W7UPD | update availability command/check | W7 self-update checks | — | DEFERRED→X10 |
+
+### GOVERNANCE
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-EDITORS | Live editor interop evidence for six clients across seven languages | X2/S11 editor compatibility matrix | — | PARTIAL→x9 |
+| DEF-POLICYDOCS | Operating modes, Go toolchain floor policy, bootstrap language strategy as standalone docs | A6/A8/G9 policy documentation pages | — | DEFERRED→post-X9 |
+
+### INDEX
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-REMOTEIDX | remote index fetch with availability degradation | L12/L13 remote index | — | DEFERRED→X10 |
+| DEF-I5GRAPH | Cross-language symbol graph (Go<->TS etc.) over the persistent index | I5 cross-language reference graph | — | DEFERRED→post-X9 |
+| DEF-IDXWIRE | Read-only status and trusted transactional semantic reindex for registered providers, with fresh-only persisted query fallback | C12 indexStats/reindex live wiring | `TestC12_IndexStatsDisabled`, `TestC12_IndexStatsAndReindexLifecycle`, `TestC12_IndexStatsFreshnessSurvivesServerRestart`, `TestC12_CorruptHistoryDoesNotBlockInitialize`, `TestC12_SharedIndexDirSerializesServers`, `TestC12_ReindexTrustGate`, `TestC12_ReindexCancel`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestMCPIndexStatusInitializesWorkspace`, `TestL8_NullHistoryEntryDegradesWithoutPanic`, `TestL4_IndependentStoresSerializeWriters` | PARTIAL (typed generations and pinned Pyright export are wired; current Go snapshot definition/reference queries have focused regression proof, while seven-language fact completeness, remaining overlays, and complete cross-process replay proof remain open) |
+| DEF-COMPACT | background-triggered generation compaction | L16 compaction scheduling | — | DEFERRED→X10 |
+
+### LANGS
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-JAVA | jdtls nested bridge with classpath/project model | E11/H6 Java backend (Tier S) | — | DEFERRED→post-X9 |
+| DEF-TIERA | Kotlin/C#/Lua/Bash/CMake/Proto bridges | H7 Tier A languages | — | DEFERRED→post-X9 |
+| DEF-DATA | JSON/YAML/TOML/XML/Dockerfile semantic support | H8 data/config/markup | — | DEFERRED→post-X9 |
+
+### LANGUAGE-PACKS
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-CCLSDIAG | Forward clangd publishDiagnostics notifications from the nested bridge to clients | T3/I17 ccls diagnostics forwarding | — | DEFERRED→X3 |
+| DEF-E6CTX | standard/target/sysroot/includes fields in BuildContextID for C/C++ | E6 build-context field completeness | — | DEFERRED→X3 |
+
+### OBSERVABILITY
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-TRACEEXP | structured span-tree export format and sampling-rate configuration | P1/P5 trace export + sampling | — | DEFERRED→post-X9 |
+| DEF-P2METRICS | ~20 missing counters (latency/cancelled/quarantine/cache/index) and production telemetry.Recorder activation | P2 full metrics set + Recorder wiring | — | DEFERRED→post-X9 |
+| DEF-APPEREQ | Decoded→Admitted→SnapshotCaptured→Queued→Running→Validating stage observability | Appendix E request state machine stages | — | DEFERRED→post-X9 |
+
+### PLUGIN
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-PLUGMOUNT | plugin-declared capabilities gate runtime API mount points | O2 capability-to-API mounting | — | DEFERRED→post-X9 |
+
+### SECURITY
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-SANDBOX | rlimit/job-object/env-allowlist around backend and plugin processes | N6 OS process sandbox | — | DEFERRED→post-X9 |
+| DEF-TENANT | Tests proving cache keys cannot leak across tenants/build contexts | N10/S23 cross-tenant cache isolation tests | — | DEFERRED→post-X9 |
+
+### SEMANTIC
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-HIER | prepareCallHierarchy/incoming/outgoing + type hierarchy handlers | I23 call/type hierarchies | — | DEFERRED→post-X9 |
+
+### TESTING
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-INVNAMES | INV-ARCH-003/OPS-PRIV-001 dedicated tests; rename 5 covered-but-unnamed tests to carry INV IDs | Appendix A invariant test naming | — | DEFERRED→post-X9 |
+| DEF-S15MIXED | Concurrent completion/hover/definition stress with backend-restart injection and tail-latency tracking | S15 mixed-workload stress | — | DEFERRED→post-X9 |
+| DEF-X3LARGE | Index performance/correctness tests against a real large repository corpus | X3 large-repository index tests | — | DEFERRED→X3 |
+
+### UX
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-COMPRESOLVE | Lazy resolution of completion detail/documentation via completionItem/resolve | I13 completionItem/resolve | — | DEFERRED→post-X9 |
+
+### WORKSPACE
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-NOTEBOOK | notebookDocument/* synchronization over the existing cell model | D13 notebook LSP sync | — | DEFERRED→post-X9 |
 
 ## Score dimensions
 

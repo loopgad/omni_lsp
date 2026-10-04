@@ -319,6 +319,7 @@ All major state MUST have explicit identity. Process memory addresses MUST NEVER
 type WorkspaceID string
 type SessionID string
 type SnapshotRevision uint64
+type SnapshotInstanceID uint64 // process-local immutable publication identity
 type DocumentVersion int64
 type BackendEpoch uint64
 type IndexGeneration uint64
@@ -350,6 +351,7 @@ A Snapshot is a logical immutable view containing references to:
 ```go
 type Snapshot struct {
     ID             SnapshotID
+    Instance       SnapshotInstanceID
     VFSRoot        VFSRevision
     BuildSet       BuildContextSetID
     WorkspaceModel WorkspaceModelRevision
@@ -358,6 +360,7 @@ type Snapshot struct {
 ```
 
 `CreatedAt` is diagnostic metadata only and MUST NOT participate in semantic equality.
+`Instance` disambiguates distinct immutable snapshot objects if a caller reuses a revision; it is process-local, MUST participate in in-process query memo identity, and MUST NOT be persisted or exposed on the product protocol.
 
 **INV-SNAPSHOT-001**: After publication, a Snapshot MUST be logically immutable.
 
@@ -2620,6 +2623,7 @@ Freshness validation: PASS
 It SHOULD answer:
 
 - what source of truth was used?
+- which backend epoch produced each semantic result? The JSON evidence record exposes this as `backendEpoch`; in-process backends use the stable value `0`.
 - why this build context?
 - which fallback, if any?
 - why was a result rejected?
@@ -2663,7 +2667,9 @@ type QueryKey struct {
     Kind         QueryKind
     Workspace    WorkspaceID
     Snapshot     SnapshotID
+    SnapshotInstance SnapshotInstanceID // internal cache disambiguator for revision aliases
     BuildContext BuildContextID
+    BackendEpoch BackendEpoch
     Subject      CanonicalSubject
     OptionsHash  ContentHash
 }
@@ -4385,9 +4391,9 @@ error rate
 
 ## S16. Soak testing
 
-Release Candidate SHOULD sustain at least 24 hours of representative mixed workload.
-
-Stable release MUST have a defined soak duration; 24h is the initial minimum target.
+The local Windows release-candidate gate requires one uninterrupted hour of
+representative mixed workload after its 30-second and 10-minute preflights.
+This proves only the tested hour; it must not be reported as 24-hour coverage.
 
 Failure conditions:
 
@@ -4655,7 +4661,7 @@ differential triaged
 protocol conformance pass
 client compatibility pass
 fault injection pass
-24h+ soak pass
+1h continuous release soak pass
 memory leak pass
 cancellation pass
 Unicode/position pass

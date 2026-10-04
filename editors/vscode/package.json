@@ -9,7 +9,17 @@
     "vscode": "^1.85.0"
   },
   "categories": ["Programming Languages", "Other"],
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:go",
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:rust",
+    "onLanguage:python",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact"
+  ],
   "main": "./extension.js",
   "contributes": {
     "configuration": {
@@ -37,6 +47,6 @@
     ]
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "9.0.1"
   }
 }
