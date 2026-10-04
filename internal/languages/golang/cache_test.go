@@ -52,3 +52,33 @@ func TestK0_PackageCacheHits(t *testing.T) {
 		t.Error("changed content must not be served from the old cache entry")
 	}
 }
+
+func TestK0_FileSetAndPackageCacheRotateAcrossRevisions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires go toolchain")
+	}
+	b := newTestBackend(t)
+	defer b.Close()
+	uri := writeGoFile(t, b, "main.go", "package main\n\nvar target int\n")
+	src := []byte("package main\n\nvar target int\n")
+	if _, err := b.Definition(context.Background(), languages.DefinitionRequest{URI: uri, Content: src, SnapshotRev: 1, Line: 2, Column: 5}); err != nil {
+		t.Fatalf("initial definition: %v", err)
+	}
+	oldFset := b.fset
+	if len(b.pkgCache) == 0 {
+		t.Fatal("expected the first revision to populate the package cache")
+	}
+
+	// Model a FileSet generation at its configured high-water mark. The next
+	// document revision must drop old ASTs and start a fresh position table.
+	b.fsetBase = b.fset.Base() - maxPackageFsetBytes
+	if _, err := b.Definition(context.Background(), languages.DefinitionRequest{URI: uri, Content: src, SnapshotRev: 2, Line: 2, Column: 5}); err != nil {
+		t.Fatalf("next-revision definition: %v", err)
+	}
+	if b.fset == oldFset {
+		t.Fatal("FileSet was retained after its memory budget was reached")
+	}
+	if len(b.pkgCache) != 1 || len(b.pkgOrder) != 1 {
+		t.Fatalf("package cache after rotation = %d entries, order %d; want only the new revision", len(b.pkgCache), len(b.pkgOrder))
+	}
+}
