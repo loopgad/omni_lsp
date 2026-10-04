@@ -2,9 +2,21 @@
 *.exe
 *.test
 coverage.out
+/.tmp-gocache/
 dist/
 dist-smoke/
 sbom.cdx.json
+/test/acceptance/tools/node_modules/
+/editors/vscode/node_modules/
+/test/acceptance/tools/.npm-cache/
+/test/acceptance/tools/bin/
+/test/acceptance/evidence/
+
+# Local editor / test scratch; do not commit.
+/.tmp-client-native-evidence/
+/.tmp-helix-native-evidence/
+/.tmp-ra-patchbase/
+nvim.log
 
 # Per-user tool configuration; keep local ZCode settings out of the repository.
 /.zcodeignore
