@@ -153,6 +153,7 @@ func TestDirectCompilerRunnerUsesPinnedProgramAndUTF16Ranges(t *testing.T) {
 }
 
 func TestDirectCompilerRunnerKeepsStableModuleGraphIdentityAndInterfaceDeclarationOnly(t *testing.T) {
+	t.Parallel()
 	tools := localDirectTools(t)
 	root := "file:///repo/direct-module-identity"
 	configURI := root + "/tsconfig.json"
@@ -388,6 +389,7 @@ func TestDirectCompilerRunnerKeepsDynamicTypeScriptModuleLoadsPartial(t *testing
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := exportDirectTypeScriptFixture
 			if tc.compilerOptions != "" {
 				fixture = func(t *testing.T, sources map[string][]byte) (model.Report, *semanticTestSink) {
@@ -879,6 +881,7 @@ func TestDirectCompilerRunnerKeepsUnprovenReferenceScopesIncomplete(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			files := make(map[string][]byte, len(tc.files)+1)
 			files["main.ts"] = []byte(tc.source)
 			for name, content := range tc.files {
@@ -1221,6 +1224,7 @@ func TestDirectCompilerRunnerKeepsCheckJSRuntimeAndTypeEscapesPartial(t *testing
 	tools := localDirectTools(t)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			sources := map[string][]byte{"main.js": []byte(tc.source)}
 			report, sink, _ := exportDirectJavaScriptFixture(t, sources, options)
 			for _, fact := range []model.FactKind{model.FactSymbol, model.FactDeclaration, model.FactDefinition, model.FactReference} {

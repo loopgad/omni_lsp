@@ -16,7 +16,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -race -count=1 ./...
+      # The timeout only decides what a hang reports; it never changes what runs, so
+      # err wide. Measured 341s on 22 cores; a 2-core runner is ~11x that, and
+      # internal/languages/typescript alone drives that through real tsc runs.
+      # A timeout that cuts a healthy run is worse than a slow hang report.
+      - run: go test -race -count=1 -timeout 90m ./...
       - run: go vet ./...
       - run: go build ./...
       # U1/INV-ARCH-002: dependency direction — semantic core must not import
@@ -60,5 +64,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -coverprofile=coverage.out ./...
+      # Same reasoning as the race job above, minus the detector's constant factor.
+      - run: go test -coverprofile=coverage.out -timeout 90m ./...
       - run: go tool cover -func=coverage.out | tail -1
