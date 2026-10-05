@@ -7,6 +7,9 @@
 #   make short    skip the packages that shell out to language toolchains
 #
 # Every recipe is a plain `go` invocation, so nothing needs installing.
+#
+# Not covered here: test/soak, which is behind the `soak` build tag and runs on
+# its own schedule -- see the nightly workflow for `go test -tags soak`.
 
 GO ?= go
 TIMEOUT ?= 90m

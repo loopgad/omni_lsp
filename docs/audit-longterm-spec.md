@@ -165,15 +165,25 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 **第一步不是写代码**，是先决定语义：拒绝并保持连接，还是实现批量。两者都
 可接受，但必须有一个测试钉住选定的那一个。
 
-### 3.2 `test/soak/` 在默认 `go test ./...` 下根本不参与编译 `[已复核]`
+### 3.2 `test/soak/` 在默认 `go test ./...` 下不参与编译 `[已复核，已降级]`
 
 全部 10 个文件都有 `//go:build soak` ⇒ `go vet ./test/soak/` 报
 `build constraints exclude all Go files`。`resource_trend_test.go` 里的资源
-泄漏闸门**默认零执行**。
+泄漏闸门在本地与 PR CI 下**零执行**。
 
-这是全仓最大的一处「看起来有闸门，实际没跑」。修法取决于 §7 的裁决：要么把
-`soak` 加进 `scripts/test.sh` 与 CI 的默认矩阵，要么把那些不需要长跑也能给出
-信号的测试移出 build tag。
+**这不是缺陷，是设计** —— 已复核：`.github/workflows/nightly.yml:29` 用
+`go test -tags soak -timeout 70m -count=1 ./test/soak/` 显式跑了它，
+`scripts/acceptance.ps1` 也在多处引用该目录的测试文件。长跑闸门不进默认矩阵
+是对的：单次默认运行要几分钟到几十分钟，而它本该按 nightly 节奏产出证据。
+
+剩下的真实问题只有**文档层面**：`scripts/test.sh` 与 `Makefile` 都没有提
+`soak`，读它们的人不会知道存在这条 nightly 路径。最小的修法是在两个入口的
+注释里加一行指向 `nightly.yml:29`，让「默认不跑、nightly 跑」这件事在入口处
+可见，而不是要读到 CI 配置才知道。
+
+若要让资源趋势断言在 PR 阶段也有信号，方向是把**不需要长跑也能判定**的那部分
+（`resource_trend_test.go` 的纯阈值断言）移出 build tag。这是新增覆盖而非修
+缺陷，优先级低于上面那行注释。
 
 ### 3.3 C/C++ 的 semanticTokens 是假声明 `[推断]`
 

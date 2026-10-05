@@ -8,6 +8,9 @@
 #
 # Every step is a plain `go` invocation, so this needs nothing beyond the Go
 # toolchain: no make, no task runner, nothing to install first.
+#
+# Not covered here: test/soak, which is behind the `soak` build tag and runs on
+# its own schedule -- see the nightly workflow for `go test -tags soak`.
 
 set -uo pipefail
 
