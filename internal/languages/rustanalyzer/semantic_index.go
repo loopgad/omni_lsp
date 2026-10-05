@@ -1058,6 +1058,22 @@ func singleScopeRequest(request model.Request, scope model.Scope, provenance mod
 	}
 }
 
+// rustSemanticHelperWitnessMarker identifies the same-source semantic helper
+// generation whose patch implements the --coverage-root flag and the
+// schema-2 completeness sidecar. The currently locked patch
+// (scip-relations.patch, schema_version 1 relations sidecar) rejects the
+// flag outright — "unexpected flag: --coverage-root" fails the whole SCIP
+// export — so the flag is sent only to helpers advertising this marker in
+// their version. Legacy helpers degrade to the relations-only sidecar and
+// the completeness witness reports itself unavailable instead
+// (validateRustCompletenessWitness). Relocking a witness-capable helper
+// adds the marker to its version string.
+const rustSemanticHelperWitnessMarker = "omnilsp-semantic-witness"
+
+func rustSemanticHelperSupportsWitness(helper model.ToolIdentity) bool {
+	return strings.Contains(helper.Version, rustSemanticHelperWitnessMarker)
+}
+
 func exportRustScope(
 	ctx context.Context,
 	request model.Request,
@@ -1128,7 +1144,9 @@ func exportRustScope(
 		if _, err := rustSCIPDocumentURI(scope.RootURI, targetRoot); err != nil {
 			return fmt.Errorf("Rust completeness witness target source path is invalid: %w", err)
 		}
-		args = append(args, "--coverage-root", filepath.FromSlash(targetRoot))
+		if rustSemanticHelperSupportsWitness(helper) {
+			args = append(args, "--coverage-root", filepath.FromSlash(targetRoot))
+		}
 	}
 	env := rustCommandEnv(request.Scopes[0], tools, buildTargetPath, tempRoot)
 	invocation := scipInvocation{

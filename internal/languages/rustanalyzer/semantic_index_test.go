@@ -1650,8 +1650,13 @@ func rustTestSemanticHelper(t *testing.T) model.ToolIdentity {
 	}
 	sum := sha256.Sum256(data)
 	return model.ToolIdentity{
-		Name: rustSemanticHelperToolName, Path: path, Version: "rust-analyzer 1.97.0+omnilsp-semantic.test",
-		SHA256: hex.EncodeToString(sum[:]),
+		Name: rustSemanticHelperToolName, Path: path,
+		// The witness marker advertises the helper generation that implements
+		// --coverage-root and the schema-2 completeness sidecar (see
+		// rustSemanticHelperWitnessMarker); the exporter sends the flag only
+		// to this generation.
+		Version: "rust-analyzer 1.97.0+omnilsp-semantic-witness.test",
+		SHA256:  hex.EncodeToString(sum[:]),
 	}
 }
 
