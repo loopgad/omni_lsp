@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -179,6 +180,7 @@ func TestX8_ClientDocsPresent(t *testing.T) {
 		"docs/editors/emacs.md",
 		"docs/editors/helix.md",
 		"docs/editors/zed.md",
+		"docs/editors/sublime.md",
 	}
 	for _, d := range docs {
 		fi, err := os.Stat(filepath.Join(moduleRoot(), filepath.FromSlash(d)))
@@ -192,5 +194,33 @@ func TestX8_ClientDocsPresent(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(moduleRoot(), "editors", "vscode")); err != nil {
 		t.Error("editors/vscode extension missing from client matrix")
+	}
+}
+
+// TestRegistry_ProbeSymbolsExist is the root-cause lock for probe drift.
+// checkResult used to verify probe symbols only for AUTO checks, so a PARTIAL
+// check could name a test that had been renamed or deleted and keep its entry
+// looking live while proving nothing. Two such names had already drifted. This
+// walks every check that declares a probe, whatever its Status, and fails with
+// the whole drift list at once.
+func TestRegistry_ProbeSymbolsExist(t *testing.T) {
+	sym, err := testSymbols(moduleRoot())
+	if err != nil {
+		t.Fatalf("index test symbols: %v", err)
+	}
+	var drift []string
+	for i := range Registry.Checks {
+		c := &Registry.Checks[i]
+		if c.Probe == nil {
+			continue
+		}
+		for _, missing := range hasAllGroups(sym, c.Probe.Groups) {
+			drift = append(drift, c.ID+": "+missing)
+		}
+	}
+	if len(drift) > 0 {
+		sort.Strings(drift)
+		t.Errorf("%d registry probe(s) name tests that no longer exist:\n  %s",
+			len(drift), strings.Join(drift, "\n  "))
 	}
 }

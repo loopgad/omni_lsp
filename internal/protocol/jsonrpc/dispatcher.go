@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
@@ -41,6 +42,19 @@ func (d *Dispatcher) Register(method string, handler HandlerFunc) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.handlers[method] = handler
+}
+
+// Methods 返回已注册的方法名（排序后拷贝）。存在的唯一理由是让注册表与
+// protocol.manifest 的方法指纹对账——生产路径不依赖它。
+func (d *Dispatcher) Methods() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]string, 0, len(d.handlers))
+	for m := range d.handlers {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Dispatch routes a message to the appropriate handler.

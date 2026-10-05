@@ -32,6 +32,7 @@ const DiagnosticInformation
 const DiagnosticWarning
 const InsertTextFormatPlainText
 const InsertTextFormatSnippet
+const LSPBaseline
 const SymbolArray
 const SymbolBoolean
 const SymbolClass
@@ -121,8 +122,44 @@ func projectCompletionTextEdit(edit *languages.CompletionTextEdit) (any, error)
 func projectLocations(locs []languages.Location) []lsp.Location
 func projectSemanticCoverage(coverage []model.Coverage) []semanticCoverageStat
 func rawJSONRPCRequestID(id *jsonrpc.RequestID) json.RawMessage
+func recordRefusal(s *Server, ctx context.Context, method string, uri string, r identity.SemanticResult[T])
 func reindexResponseError(err error) *jsonrpc.ResponseError
 func skipIndexDir(name string) bool
+method "$/cancelRequest"
+method "exit"
+method "initialize"
+method "initialized"
+method "omnilsp/backendStatus"
+method "omnilsp/explain"
+method "omnilsp/indexStats"
+method "omnilsp/queryTrace"
+method "omnilsp/reindex"
+method "omnilsp/resultMeta"
+method "omnilsp/status"
+method "shutdown"
+method "textDocument/codeAction"
+method "textDocument/completion"
+method "textDocument/declaration"
+method "textDocument/definition"
+method "textDocument/diagnostic"
+method "textDocument/didChange"
+method "textDocument/didClose"
+method "textDocument/didOpen"
+method "textDocument/didSave"
+method "textDocument/documentSymbol"
+method "textDocument/formatting"
+method "textDocument/hover"
+method "textDocument/inlayHint"
+method "textDocument/prepareRename"
+method "textDocument/references"
+method "textDocument/rename"
+method "textDocument/semanticTokens/full"
+method "textDocument/signatureHelp"
+method "workspace/didChangeWatchedFiles"
+method "workspace/didCreateFiles"
+method "workspace/didDeleteFiles"
+method "workspace/didRenameFiles"
+method "workspace/symbol"
 type CompletionItem struct{Label string json:"label", Kind CompletionItemKind json:"kind,omitempty", Detail string json:"detail,omitempty", Documentation string json:"documentation,omitempty", InsertText string json:"insertText,omitempty", SortText string json:"sortText,omitempty", FilterText string json:"filterText,omitempty", TextEdit any json:"textEdit,omitempty", AdditionalTextEdits []TextEdit json:"additionalTextEdits,omitempty", InsertTextFormat InsertTextFormat json:"insertTextFormat,omitempty"}
 type CompletionItemKind int
 type CompletionList struct{IsIncomplete bool json:"isIncomplete", Items []CompletionItem json:"items"}

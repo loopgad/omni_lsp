@@ -253,17 +253,25 @@ func (b *Backend) loadPackageWithOverlays(ctx context.Context, uri string, conte
 	}
 	fingerprint, complete, fingerprintErr := packageInputFingerprint(ctx, pkgs[0], filePath, overlays, buildContext, b.goWorkPath, b.goFlags)
 	if fingerprintErr == nil && complete {
-		b.pkgCache[key] = packageCacheEntry{
-			pkg: pkgs[0], inputFingerprint: fingerprint,
-		}
-		b.pkgOrder = append(b.pkgOrder, key)
-		if len(b.pkgOrder) > pkgCacheLimit { // FIFO eviction
-			old := b.pkgOrder[0]
-			b.pkgOrder = b.pkgOrder[1:]
-			delete(b.pkgCache, old)
-		}
+		b.cachePackage(key, pkgs[0], fingerprint)
 	}
 	return pkgs[0], nil
+}
+
+// cachePackage inserts one entry and evicts FIFO past pkgCacheLimit.
+// §K0 requires bounded caches; the eviction lives here so the bound is
+// reachable without driving 65 real packages.Load calls.
+func (b *Backend) cachePackage(key string, pkg *packages.Package, fingerprint identity.ContentHash) {
+	if b.pkgCache == nil {
+		b.pkgCache = make(map[string]packageCacheEntry)
+	}
+	b.pkgCache[key] = packageCacheEntry{pkg: pkg, inputFingerprint: fingerprint}
+	b.pkgOrder = append(b.pkgOrder, key)
+	if len(b.pkgOrder) > pkgCacheLimit {
+		old := b.pkgOrder[0]
+		b.pkgOrder = b.pkgOrder[1:]
+		delete(b.pkgCache, old)
+	}
 }
 
 func (b *Backend) removePackageCacheOrderKey(key string) {
@@ -561,6 +569,13 @@ func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (identi
 	ident := findIdentAt(f, b.fset, pos)
 	if ident == nil {
 		// Exact negative: the query resolved; there is genuinely no symbol here.
+		// ponytail: Definition/References report the same fact as Unknown, and
+		// the two are deliberately NOT unified. Unknown is never memoized
+		// (§J4), so making hover Unknown would re-run loadPackage on every
+		// pointer move over whitespace; making Definition Exact would defeat
+		// SEM-SAFE-001, whose rename path (below) refuses to publish unless
+		// References came back Unknown. Both directions regress; keep the split
+		// and record it rather than trade one invariant for another.
 		return identity.SemanticResult[*languages.HoverResult]{
 			Status:   identity.ResultExact,
 			Value:    nil,
@@ -1324,6 +1339,7 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 		Line:         req.Line,
 		Column:       req.Column,
 		Encoding:     req.Encoding,
+		EncodingSet:  req.EncodingSet,
 		IncludeDecl:  true,
 	})
 	if err != nil {

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
+	"github.com/omnilsp/omni/internal/workspace/vfs"
 )
 
 // hoverCountingBackend counts hover invocations to prove memo semantics.
@@ -138,6 +140,68 @@ func (b *failingHoverBackend) Hover(_ context.Context, _ languages.HoverRequest)
 		Status: identity.ResultExact,
 		Value:  &languages.HoverResult{Contents: "recovered"},
 	}, nil
+}
+
+// dualReturnHoverBackend is the shape every subprocess backend uses on an
+// upstream failure: it returns BOTH a Go error and an in-band Unknown envelope
+// carrying the refusal reason (see typescript/backend.go unknownHover callers).
+type dualReturnHoverBackend struct {
+	mockBackend
+	calls int64
+}
+
+func (b *dualReturnHoverBackend) Hover(_ context.Context, _ languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
+	b.calls++
+	return identity.SemanticResult[*languages.HoverResult]{
+		Status:              identity.ResultUnknown,
+		Completeness:        identity.CompletenessUnknown,
+		InternalDiagnostics: []string{"tsserver request failed: connection closed"},
+	}, ierrors.New(ierrors.ErrBackendUnavailable, "tsserver", "connection closed")
+}
+
+// TestQ4_BackendErrorStillRecordsEvidence pins §Q4 ("Fallback MUST be
+// observable in Evidence") against §Q3 (operational errors still propagate).
+// A dual-return backend must produce BOTH: a non-nil LSP error AND one explain
+// ring entry holding the refusal reason. Before the fix the handler returned on
+// `err != nil` before recordEvidence, so the diagnostics never reached the ring.
+func TestQ4_BackendErrorStillRecordsEvidence(t *testing.T) {
+	be := &dualReturnHoverBackend{mockBackend: mockBackend{langID: "typescript", exts: []string{".ts"}}}
+	s := New(DefaultConfig())
+	s.RegisterBackend("typescript", be)
+	const uriTS = "file:///w/main.ts"
+	s.vfs.Open(uriTS, "typescript", 1, []byte("let x = 1;\n"), vfs.SourceEditor)
+	s.publishSnapshot()
+
+	params := `{"textDocument":{"uri":"` + uriTS + `"},"position":{"line":0,"character":4}}`
+	resp := s.dispatcher.Dispatch(withSnapshot(context.Background(), s.snapMgr.Current()),
+		jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, "textDocument/hover", json.RawMessage(params)))
+	if resp == nil {
+		t.Fatal("dispatch returned nil response")
+	}
+	// §Q3: the operational failure must NOT be swallowed into a null result.
+	if resp.Error == nil {
+		t.Fatal("backend error was swallowed: want an LSP error, got result " + string(resp.Result))
+	}
+
+	// §Q4: the refusal reason must be visible in the explain ring.
+	var found *evidenceRecord
+	for _, r := range s.recentEvidence() {
+		if r.Method == "textDocument/hover" {
+			r := r
+			found = &r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no hover entry in the evidence ring: the backend's InternalDiagnostics never landed")
+	}
+	if found.Status != identity.ResultUnknown {
+		t.Errorf("recorded status = %v, want unknown", found.Status)
+	}
+	joined := strings.Join(found.Diag, "\n")
+	if !strings.Contains(joined, "connection closed") {
+		t.Errorf("evidence diagnostics = %v, want the backend refusal reason", found.Diag)
+	}
 }
 
 // staleThenRecoveringHoverBackend reports a nested snapshot-generation race

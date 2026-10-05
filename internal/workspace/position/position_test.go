@@ -249,3 +249,26 @@ func TestUTF16Len(t *testing.T) {
 		t.Errorf("UTF16Len(\"中文\") = %d, want 2", got)
 	}
 }
+
+// TestPositionToOffsetPastLineEndClampsWithinLine locks the clamp that keeps a
+// past-the-end column inside its own line. Returning the next line's start made
+// golang's validSourceMapRange accept an out-of-range end as legal, weakening
+// the Y0-9/D12 gate that blocks edits on unmapped generated regions.
+func TestPositionToOffsetPastLineEndClampsWithinLine(t *testing.T) {
+	for _, enc := range []Encoding{UTF8, UTF16} {
+		t.Run(enc.String(), func(t *testing.T) {
+			content := []byte("hello\nworld")
+			idx := NewIndex(content, enc)
+			got, err := idx.PositionToOffset(content, 0, 6, enc)
+			if err != nil {
+				t.Fatalf("PositionToOffset(0,6): %v", err)
+			}
+			if got != 5 {
+				t.Errorf("PositionToOffset(0,6) = %d, want 5 (end of line 0 content)", got)
+			}
+			if got >= uint32(len(content)) && content[got-1] == '\n' {
+				t.Errorf("PositionToOffset(0,6) landed on the line terminator at %d", got)
+			}
+		})
+	}
+}

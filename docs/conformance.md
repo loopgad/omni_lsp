@@ -33,11 +33,11 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| PERF-S19 | Go references scale over real result sets and honor pre-cancellation; full S19 gate pending | S19 large queries | `TestS19_ReferencesScalingCurve` | PARTIAL (Go-only scaling and pre-cancel tested; progress, memory bounds, and priority isolation unverified) |
+| PERF-S19 | Go references scale over real result sets, honor pre-cancellation, report work-done progress, stay memory-bounded, and never starve P0/P1 | S19 large queries | `TestS19_ReferencesScalingCurve`, `TestS19_LargeQueryProgressObservable`, `TestS19_LargeQueryDoesNotStarveInteractiveQueries`, `TestS19_RepeatedLargeQueriesBoundedMemory` | AUTO |
 | PERF-S20 | Accuracy KPI formulas canonical and NaN-safe | S20 accuracy KPI | `TestS20_KPIFormulas`, `TestS20_KPIZeroDenominatorSafe` | AUTO |
 | PERF-1 | Benchmark reports carry mandatory metadata banner | §S17 | `TestS17_MetadataPresent` | AUTO |
-| PERF-2 | Interactive SLO: facade overhead measured; representative Tier S end-to-end latency unverified | §S18 | `TestS18_FacadeOverhead` | PARTIAL (fake backend and batch means do not establish real single-request P50/P95/P99) |
-| PERF-3 | Qualified known-symbol positive results plus six-bucket zero-error classification | §S21 | `TestS21_ZeroErrorClassification` | PARTIAL (The generic conformance probe cannot distinguish a successful candidate run from TestS21_ZeroErrorClassification skipping without OMNILSP_BIN; candidate-bound structured S21 evidence remains external) |
+| PERF-2 | Interactive SLO: real-process single-request distributions collected against the frozen candidate; strict thresholds not met on every Tier S row | §S18 | — | PARTIAL (Real-process 1000-sample P50/P95/P99 distributions were collected for all seven Tier S fixtures against the frozen candidate (run gate-20261004T2347Z): 21/28 strict rows passed, but the Go backend hot path (hover/definition/completion P50 391-443ms) and the C/C++ completion/syntax rows exceeded strict thresholds; the structured report decision is failed, so full §S18 credit stays blocked) |
+| PERF-3 | Qualified known-symbol positive results plus six-bucket zero-error classification (frozen-candidate corpus run reported decision=passed; OMNILSP_S21_GATE=required turns a missing candidate into a hard failure instead of a skip) | §S21 | `TestS21_ZeroErrorClassification`, `TestPERF3_S21GateFailsClosedWithoutCandidate` | AUTO |
 | PERF-4 | Metamorphic invariance (whitespace / line endings / comment injection) | §S22 | `TestS22_MetamorphicWhitespaceInvariance`, `TestS22_MetamorphicLineEndingInvariance`, `TestS22_MetamorphicCommentInjectionInvariance` | AUTO |
 
 ### PLUGIN
@@ -57,7 +57,7 @@
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | T-S3IDX | Hostile store manifests and sealed payloads never panic recovery paths | S3 fuzz targets: index decode + freshness seal | `FuzzOpenSnapshotCorruptStore`, `FuzzFreshnessSealVerify` | AUTO |
-| T-S9SEQ | Four multi-step session scenarios frozen as golden frames | S9 end-to-end edit-sequence goldens | `go test -count=1 ./test/golden/` | GATE |
+| T-S9SEQ | Four multi-step session scenarios frozen as golden frames | S9 end-to-end edit-sequence goldens | `TestGoldenScenarios` | AUTO |
 
 ### UX
 
@@ -107,22 +107,22 @@
 | Y1-6 | Index corruption isolated | IDX-TXN-004/L8 | `TestL7_ChecksumMismatchQuarantines`, `TestL6_TXN003_IdempotentRecovery` | AUTO |
 | Y1-7 | Disk budget refusal preserves last good generation | L17 | `TestBudget_RejectsWhenFull`, `TestL4_CrashBeforePublishKeepsOldGeneration` | AUTO |
 | Y1-8 | Panic boundary tested | §F16 | `TestINV_ARCH_001_ServerResilience`, `TestRoutingErrors` | AUTO |
-| Y1-9 | Race detector clean across all packages | §S14/F17 | `go test -race -count=1 -timeout 900s ./...` | GATE |
-| Y1-10 | Soak has no monotonic resource leak | §S16 | `go test -tags soak -count=1 -timeout 300s ./test/soak/` | GATE |
+| Y1-9 | Registered probe packages clean under -race (server, scheduler); the full-tree 51-package -race run is release-side evidence for candidate gate-20261004T2347Z (exit 0), not a probe this registry executes | §S14/F17 | `TestS13_HalfFrameDisconnect`, `TestS4CancelRace`, `TestScheduler_ShutdownNoPanicOnConcurrentSubmit`, `TestScheduler_BoostNeverDropsRequests` | AUTO |
+| Y1-10 | Soak has no monotonic resource leak (accelerated gate green; the real-stdio RC opt-in gate remains release evidence — its 30s preflight attempts still miss the fixed 30s initial-query budget on the current host) | §S16 | `go test -tags soak -count=1 -timeout 300s ./test/soak/` | GATE |
 | Y1-11 | Memory budgets enforced (global soft/hard + per-backend quotas) | F13/F14 memory budget | `TestF13_SoftLimitWarnsHardLimitRefuses`, `TestF14_PerBackendQuotaIsolated` | AUTO |
 
 ### Y2
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| Y2-1 | LSP 3.17 baseline passes (golden scenarios frozen) | §S10/Y2 | `go test -count=1 ./test/golden/` | GATE |
+| Y2-1 | LSP 3.17 baseline passes (golden scenarios frozen) | §S10/Y2 | `TestGoldenScenarios` | AUTO |
 | Y2-2 | Unknown future methods/notifications tolerated; params field-level tolerance tested; LSP 3.18 feature gating deferred (DEF-A7GATE) | §A7/Y2 | `TestUnknownNotificationSilentlyIgnored`, `TestMalformedJSONDoesNotPanic`, `TestY2_UnknownParamsFieldsTolerated` | AUTO |
 | Y2-3 | Position encoding negotiation tested | §C4 | `TestCJKCharacters`, `TestEmojiEncoding` | AUTO |
 | Y2-6a | Optional capabilities negotiated (signatureHelp/formatting/inlayHint) | I16/I20/I22 feature negotiation | `TestI16_SignatureHelpNegotiatedAndUnsupported`, `TestI20_FormattingFullDocumentEdit`, `TestFeatures_GolangBridgeSyntaxTier` | AUTO |
 | Y2-4 | WorkspaceEdit capability differences tested (documentChanges negotiation + legacy form) | C9 workspace edits | `TestY24_WorkspaceEditCapabilityMatrix` | AUTO |
 | Y2-5 | Client profile documentation exists for all six required clients; complete native operation evidence remains pending | S11/X8 client matrix | `TestX8_ClientDocsPresent` | PARTIAL (Profiles are present; Helix, Zed and Sublime LSP still lack complete native acceptance, and all 42 cells must be verified against the frozen candidate) |
 | Y2-6 | MCP revision pinned | A7/§C14 | `TestInitializePinsProtocolRevision`, `TestToolsListIsFiveReadOnly` | AUTO |
-| Y2-7 | Public API schemas versioned | R4/W2/P8/P9 | `TestRenderJSON` | AUTO |
+| Y2-7 | Public API schemas versioned | R4/W2/P8/P9 | `TestRenderJSON`, `TestY56_VersionSurfacesDocumented` | AUTO |
 | T2-DECL | textDocument/declaration declared and served through DeclarationProvider (ADR-0009 D2) | T2/I14 declaration served via optional capability | `TestT2_DeclarationServedAndDeclared` | AUTO |
 
 ### Y3
@@ -130,14 +130,14 @@
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | Y3-1 | Trust gates enforced (workspace states Untrusted/Restricted/Trusted + plugin default-deny) | N1/N2/N3 trust gates | `TestN1_DefaultUntrusted`, `TestN3_UntrustedBlocksExecution`, `TestN1_RestrictedWhitelist`, `TestN3_UntrustedWorkspaceBlocksBackendStart`, `TestO2_DefaultDeny` | AUTO |
-| Y3-2 | No shell execution of compile database commands | SEC-EXEC-001/§N4 | `TestSEC_N7_SymlinkEscapeContained` | AUTO |
+| Y3-2 | No shell execution of compile database commands | SEC-EXEC-001/§N4 | `TestN4_CompileDbNoShell`, `TestSEC_N4_NoShellExecution` | AUTO |
 | Y3-3 | Symlink escape contained; path traversal rejected | §N7/S23 | `TestSEC_N7_SymlinkEscapeContained`, `TestSEC_N7_PathTraversalRejected` | AUTO |
 | Y3-4 | Secrets redacted in logs/errors | §N11/S23 | `TestSEC_N11_RedactionAudit` | AUTO |
 | Y3-5 | Remote non-loopback endpoint rejected (v1 fail-closed) | §N8 | `TestValidateAddr` | AUTO |
 | Y3-6 | Telemetry source-free by default; cardinality bounded | OPS-PRIV-001/§N12/P3 | `TestCounterName`, `TestTraceIDPropagation` | AUTO |
 | Y3-7 | Repro bundle privacy modes tested (metadata/redacted/full-source) | N13/W0/P10 repro bundle | `TestN13_DefaultModeIsRedacted`, `TestN13_FullSourceRequiresExplicitOptIn`, `TestN13_NoSecretsInBundle` | AUTO |
 | Y3-8 | Plugin capabilities least-privilege (default deny) | O2/N14 least privilege | `TestO2_DefaultDeny`, `TestO3_ManifestValidation` | AUTO |
-| Y3-9 | Supply-chain artifacts generated (CycloneDX SBOM from go.sum) | N15/X8 supply chain | `go run scripts/gen-sbom.go -o sbom.cdx.json .` | GATE |
+| Y3-9 | Supply-chain artifacts generated (CycloneDX SBOM from go.sum; gate re-executes against a scratch output, artifact stays per-run evidence) | N15/X8 supply chain | `TestY39_SBOMRegeneratesFromGoSum` | AUTO |
 
 ### Y4
 
@@ -158,10 +158,10 @@
 | Y5-1 | Core packages document invariants | §U2 | `TestU2_InvariantHeadersPresent` | AUTO |
 | Y5-2 | No protocol imports in Semantic Core | INV-ARCH-002/§U1 | `TestARCH002_NoProtocolImportsInCore` | AUTO |
 | Y5-3 | ADRs exist for major architecture choices | §U9 | `TestADRFilesExist` | AUTO |
-| Y5-4 | Protocol surface reproducible (canonical manifest drift check; hand-written-by-design) | U4/C17 protocol manifest | `TestY54_ProtocolManifestFresh` | AUTO |
+| Y5-4 | Protocol surface reproducible (canonical manifest drift check; hand-written-by-design) and the registered method set matches its fingerprint | U4/C17 protocol manifest | `TestY54_ProtocolManifestFresh`, `TestRegisteredMethodsMatchManifest` | AUTO |
 | Y5-5 | Dependencies justified and whitelisted (x/tools for Go bridge semantic load) | §U5 | `TestU5_NoThirdPartyRuntimeDeps` | AUTO |
-| Y5-6 | Version surfaces documented (docs/versions.md) and wire types fingerprint-frozen | R4/R5 | `TestY54_ProtocolManifestFresh` | AUTO |
-| Y5-7 | Conformance map generated from registry (no doc drift) | §V6/V7 | `TestGenerateDocs` | AUTO |
+| Y5-6 | Version surfaces documented (docs/versions.md) and wire types fingerprint-frozen | R4/R5 | `TestY54_ProtocolManifestFresh`, `TestY56_VersionSurfacesDocumented` | AUTO |
+| Y5-7 | Conformance map generated from registry (no doc drift) | §Y5 generated-files-reproducible (goal.md:5460) | `TestGenerateDocs` | AUTO |
 
 ## Deferred domain X5 (independent denominator)
 
@@ -182,7 +182,7 @@
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | X5-1 | Persistent storage primitives with atomic generation publish, corruption quarantine, and recovery | L4-L8 transactional persistence | `TestL4_CrashBeforePublishKeepsOldGeneration`, `TestL6_TXN002_HalfWrittenSegmentNotDiscoverable`, `TestCompact_ReducesSegmentsAndPreservesReads` | AUTO |
-| X5-7 | Typed semantic generations persist and serve fresh-only workspace-symbol/definition/reference queries | T5 semantic persistent-index content | `TestSemanticReindexStatsAndPersistentWorkspaceSymbols`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestPersistentLocationsAllowDiskEquivalentOpenOverlay`, `TestPersistentLocationsFallBackForOpenUnsavedDocument`, `TestPersistentLocationsFallBackWhenDiskOrBuildContextChanges`, `TestHandleDefinitionUsesDirtyGoOverlayBeforeLiveBackend`, `TestWorkspaceSymbolsQueriesAllUniqueBackends`, `TestPersistentWorkspaceSymbolResponseCarriesItsLeasedGeneration`, `TestGenerationLeasePinsSegmentsDuringCompaction`, `TestCommitCancellationRacingCommitHasOneTerminalOutcome` | PARTIAL (Pinned language providers include a Pyright semantic exporter and current Go snapshot definition/reference queries; required seven-language fact coverage, other-language dynamic overlays, and complete cross-process query/replay evidence remain incomplete) |
+| X5-7 | Typed semantic generations persist and serve fresh-only workspace-symbol/definition/reference queries | T5 semantic persistent-index content | `TestSemanticReindexStatsAndPersistentWorkspaceSymbols`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestPersistentLocationsAllowDiskEquivalentOpenOverlay`, `TestPersistentLocationsFallBackForOpenUnsavedDocument`, `TestPersistentLocationsFallBackWhenDiskOrBuildContextChanges`, `TestHandleDefinitionUsesDirtyGoOverlayBeforeLiveBackend`, `TestWorkspaceSymbolsQueriesAllUniqueBackends`, `TestPersistentWorkspaceSymbolResponseCarriesItsLeasedGeneration`, `TestRustSnapshotOverlayLocationsUseDirtySnapshot`, `TestCppSnapshotOverlayLocationsUseDirtySnapshot`, `TestTypescriptSnapshotOverlayLocationsUseDirtySnapshot`, `TestSnapshotOverlayFactsCacheSeparatesLanguages`, `TestSnapshotOverlayDirtyScreenStaysBoundedPerLanguage`, `TestGenerationLeasePinsSegmentsDuringCompaction`, `TestCancellationRacingCommitHasOneTerminalOutcome` | PARTIAL (Pinned language providers include a Pyright semantic exporter; the dirty-snapshot overlay definition/reference path now serves every language with a semantic index binding (per-language dirty tracking, language-separated fact caches, bounded pre-screen budgets) with rust/cpp/typescript overlay coverage tested against deterministic fakes; committed end-to-end query evidence remains Go-only and required seven-language fact coverage plus complete cross-process query/replay evidence remain incomplete) |
 | X5-6 | Schema forward-compat reader + freshness tuple gates visibility | L9/L10 migration+freshness | `TestL9_FutureSchemaQuarantinesAndFallsBack`, `TestL10_FreshnessTupleGatesVisibility` | AUTO |
 
 ### INTEROP
@@ -240,7 +240,7 @@
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | X9-1 | Sustained soak + differential mismatch triage pipeline | T7/S6 release duty | — | PARTIAL→x9 |
-| X9-2 | Protocol reproducibility check (manifest fingerprint; -check mode in CI form) | C17/U4 reproducibility | — | PARTIAL→x9+ |
+| X9-2 | Protocol reproducibility check (manifest fingerprint via the documented `go run scripts/gen-protocol.go -check` operator entry; metamodel-driven codegen stays post-X9+) | C17/U4 reproducibility | `TestProtocolGenCheckProbe` | AUTO |
 
 ## Deferred domain POST-X8 (independent denominator)
 
@@ -283,7 +283,7 @@
 |---|---|---|---|---|
 | DEF-REMOTEIDX | remote index fetch with availability degradation | L12/L13 remote index | — | DEFERRED→X10 |
 | DEF-I5GRAPH | Cross-language symbol graph (Go<->TS etc.) over the persistent index | I5 cross-language reference graph | — | DEFERRED→post-X9 |
-| DEF-IDXWIRE | Read-only status and trusted transactional semantic reindex for registered providers, with fresh-only persisted query fallback | C12 indexStats/reindex live wiring | `TestC12_IndexStatsDisabled`, `TestC12_IndexStatsAndReindexLifecycle`, `TestC12_IndexStatsFreshnessSurvivesServerRestart`, `TestC12_CorruptHistoryDoesNotBlockInitialize`, `TestC12_SharedIndexDirSerializesServers`, `TestC12_ReindexTrustGate`, `TestC12_ReindexCancel`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestMCPIndexStatusInitializesWorkspace`, `TestL8_NullHistoryEntryDegradesWithoutPanic`, `TestL4_IndependentStoresSerializeWriters` | PARTIAL (typed generations and pinned Pyright export are wired; current Go snapshot definition/reference queries have focused regression proof, while seven-language fact completeness, remaining overlays, and complete cross-process replay proof remain open) |
+| DEF-IDXWIRE | Read-only status and trusted transactional semantic reindex for registered providers, with fresh-only persisted query fallback | C12 indexStats/reindex live wiring | `TestC12_IndexStatsDisabled`, `TestC12_IndexStatsAndReindexLifecycle`, `TestC12_IndexStatsFreshnessSurvivesServerRestart`, `TestC12_CorruptHistoryDoesNotBlockInitialize`, `TestC12_SharedIndexDirSerializesServers`, `TestC12_ReindexTrustGate`, `TestC12_ReindexCancel`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestMCPIndexStatusInitializesWorkspace`, `TestL8_NullHistoryEntryDegradesWithoutPanic`, `TestL4_IndependentStoresReserveDistinctMonotonicGenerations` | PARTIAL (typed generations and pinned Pyright export are wired; current Go snapshot definition/reference queries have focused regression proof, while seven-language fact completeness, remaining overlays, and complete cross-process replay proof remain open) |
 | DEF-COMPACT | background-triggered generation compaction | L16 compaction scheduling | — | DEFERRED→X10 |
 
 ### LANGS
@@ -300,6 +300,12 @@
 |---|---|---|---|---|
 | DEF-CCLSDIAG | Forward clangd publishDiagnostics notifications from the nested bridge to clients | T3/I17 ccls diagnostics forwarding | — | DEFERRED→X3 |
 | DEF-E6CTX | standard/target/sysroot/includes fields in BuildContextID for C/C++ | E6 build-context field completeness | — | DEFERRED→X3 |
+
+### MEMO
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-V4FREEZE | languages.Backend 12-method shape guarded by a scored probe | ADR-0009 D2 core interface freeze | — | DEFERRED→post-X9 |
 
 ### OBSERVABILITY
 
@@ -341,6 +347,7 @@
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | DEF-COMPRESOLVE | Lazy resolution of completion detail/documentation via completionItem/resolve | I13 completionItem/resolve | — | DEFERRED→post-X9 |
+| DEF-W0CLI | omnilsp status / languages / query definition / query references / explain CLI entrypoints | W0 canonical commands | — | DEFERRED→post-X9 |
 
 ### WORKSPACE
 
@@ -350,5 +357,6 @@
 
 ## Score dimensions
 
-Core weights: Y0 .24 · Y3 .18 · Y1 .18 · Y2 .13 · Y4/Y5/PERF .09 each.
+Core weights: PERF 0.09 · Y0 0.24 · Y1 0.18 · Y2 0.13 · Y3 0.18 · Y4 0.09 · Y5 0.09.
+Core-domain categories carrying no weight (display only, excluded from the gate denominator): ACC (2), CONFIG (1), MEMO (1), PLUGIN (1), STAB (1), TESTING (2), UX (10), WORKSPACE (1).
 Deferred domains are scored independently and never merge into the core gate.

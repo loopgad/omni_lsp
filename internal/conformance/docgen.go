@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -89,6 +90,51 @@ func GenerateDocs() string {
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString("## Score dimensions\n\nCore weights: Y0 .24 · Y3 .18 · Y1 .18 · Y2 .13 · Y4/Y5/PERF .09 each.\nDeferred domains are scored independently and never merge into the core gate.\n")
+	b.WriteString("## Score dimensions\n\n")
+	b.WriteString(coreWeightsSummary())
+	b.WriteString("Deferred domains are scored independently and never merge into the core gate.\n")
 	return b.String()
+}
+
+// coreWeightsSummary renders the core weighting straight from coreWeights plus
+// the categories that actually appear under Domain:"core". Hardcoding the list
+// was a silent-lie risk: adding an eighth weighted category would leave the
+// generated page claiming the old seven, and TestGenerateDocs would stay green.
+// Deriving it makes this page the guard for its own accounting.
+func coreWeightsSummary() string {
+	var weighted, unweighted []string
+	counts := map[string]int{}
+	for _, c := range Registry.Checks {
+		if c.Domain != "core" {
+			continue
+		}
+		counts[c.Category]++
+		if _, ok := coreWeights[c.Category]; ok {
+			continue
+		}
+		if !slices.Contains(unweighted, c.Category) {
+			unweighted = append(unweighted, c.Category)
+		}
+	}
+	sort.Strings(unweighted)
+
+	cats := make([]string, 0, len(coreWeights))
+	for cat := range coreWeights {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+	for _, cat := range cats {
+		weighted = append(weighted, fmt.Sprintf("%s %g", cat, coreWeights[cat]))
+	}
+
+	out := "Core weights: " + strings.Join(weighted, " · ") + ".\n"
+	if len(unweighted) > 0 {
+		parts := make([]string, 0, len(unweighted))
+		for _, cat := range unweighted {
+			parts = append(parts, fmt.Sprintf("%s (%d)", cat, counts[cat]))
+		}
+		out += fmt.Sprintf("Core-domain categories carrying no weight (display only, excluded from the gate denominator): %s.\n",
+			strings.Join(parts, ", "))
+	}
+	return out
 }

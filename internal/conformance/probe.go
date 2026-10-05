@@ -82,6 +82,13 @@ func hasAllGroups(sym map[string][]string, groups []ProbeGroup) (missing []strin
 
 // runTestsBatch executes one go test invocation covering every probe in a
 // package. Returns the combined output tail on failure.
+// probeRequiredEnv forces the environment a probe package needs before its
+// tests will actually run. Without it a gated test skips, `go test` exits 0,
+// and the probe collects full credit for measuring nothing.
+var probeRequiredEnv = map[string][]string{
+	"test/corpus": {"OMNILSP_S21_GATE=required"},
+}
+
 func runTestsBatch(pkg string, tests []string, timeout string) error {
 	args := []string{"test", "-race", "-count=1"}
 	if timeout != "" {
@@ -91,6 +98,13 @@ func runTestsBatch(pkg string, tests []string, timeout string) error {
 	args = append(args, "-run", pattern, "./"+pkg)
 	cmd := exec.Command("go", args...)
 	cmd.Dir = moduleRoot()
+	// A probe that skips because an env gate is unset still exits 0, which
+	// checkResult would score as a pass. PERF-3's S21 gate is the one place
+	// that happens: test/corpus skips without OMNILSP_BIN, so the probe must
+	// require it rather than inherit the environment.
+	if required, ok := probeRequiredEnv[pkg]; ok {
+		cmd.Env = append(os.Environ(), required...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		tail := string(out)

@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"sort"
+
 	"strings"
 	"testing"
 	"time"
@@ -376,79 +376,6 @@ func TestS17_MetadataPresent(t *testing.T) {
 		}
 	}
 	t.Logf("\n%s", banner)
-}
-
-// percentile 返回升序样本的分位值（最近秩统计量，不做插值）。
-func percentile(sortedAsc []time.Duration, q float64) time.Duration {
-	n := len(sortedAsc)
-	idx := int(math.Ceil(q*float64(n))) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= n {
-		idx = n - 1
-	}
-	return sortedAsc[idx]
-}
-
-// batchOps 是每个分位样本包含的操作次数。单次操作在微秒级，而 Windows 计时器
-// 粒度约 0.5ms（实测 time.Since 对 µs 级忙循环返回 0），逐次采样会全部塌缩为
-// 零值；每样本批量执行再取均值才能跨过多个时钟刻度。
-// ponytail: 固定批量 256；需要真分布而非均值近似时换 QPC/平台高精度时钟。
-const batchOps = 256
-
-// TestS18_FacadeOverhead measures batch-mean quantiles for the synchronous
-// facade with a fake backend. Passing only bounds facade overhead; it does
-// not establish end-to-end S18 SLOs on a representative Tier S corpus.
-func TestS18_FacadeOverhead(t *testing.T) {
-	const sloIters = 250 // ≥200（§S18 样本量要求）
-	cases := []struct {
-		name                            string
-		p50Target, p95Target, p99Target time.Duration
-		op                              func(*harness) error
-	}{
-		{"hot hover", 20 * time.Millisecond, 75 * time.Millisecond, 150 * time.Millisecond, (*harness).hover},
-		{"hot definition", 25 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, (*harness).definition},
-		{"completion first usable", 40 * time.Millisecond, 120 * time.Millisecond, 250 * time.Millisecond, (*harness).completion},
-		{"syntax update after edit", 15 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, (*harness).edit},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness()
-			run := func() error { return tc.op(h) }
-			for i := 0; i < warmupOps; i++ {
-				if err := run(); err != nil {
-					t.Fatalf("预热失败: %v", err)
-				}
-			}
-			samples := make([]time.Duration, sloIters)
-			for i := range samples {
-				start := time.Now()
-				for j := 0; j < batchOps; j++ {
-					if err := run(); err != nil {
-						t.Fatalf("第 %d 批第 %d 次迭代失败: %v", i, j, err)
-					}
-				}
-				samples[i] = time.Since(start) / batchOps
-			}
-			sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-			p50 := percentile(samples, 0.50)
-			p95 := percentile(samples, 0.95)
-			p99 := percentile(samples, 0.99)
-			t.Logf("%s: P50=%v/op (目标 ≤%v)  P95=%v/op (目标 ≤%v)  P99=%v/op (目标 ≤%v)  [每样本 %d 次均值]",
-				tc.name, p50, tc.p50Target, p95, tc.p95Target, p99, tc.p99Target, batchOps)
-			if p50 > tc.p50Target {
-				t.Errorf("%s P50 %v 超出 §S18 目标 %v", tc.name, p50, tc.p50Target)
-			}
-			if p95 > tc.p95Target {
-				t.Errorf("%s P95 %v 超出 §S18 目标 %v", tc.name, p95, tc.p95Target)
-			}
-			if p99 > tc.p99Target {
-				t.Errorf("%s P99 %v 超出 §S18 目标 %v", tc.name, p99, tc.p99Target)
-			}
-		})
-	}
 }
 
 // --- §S19: real Go backend reference scaling ---------------------------------

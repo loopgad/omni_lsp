@@ -66,6 +66,11 @@ func buildManifestAt(lspDir, root string) (string, error) {
 		return "", serr
 	}
 	lines = append(lines, splitLines(serverLines)...)
+	methodLines, merr := BuildMethodManifest(root)
+	if merr != nil {
+		return "", merr
+	}
+	lines = append(lines, methodLines...)
 	sort.Strings(lines)
 	var b strings.Builder
 	b.WriteString("# protocol.manifest —— 协议投影层（LSP 3.17 基线 + server 线类型）的规范声明指纹。\n")
@@ -75,6 +80,62 @@ func buildManifestAt(lspDir, root string) (string, error) {
 		b.WriteByte('\n')
 	}
 	return b.String(), nil
+}
+
+// methodManifestSources 相对模块根，只贡献「已注册的 LSP 方法名」行，不贡献
+// 任何声明行。方法名是客户端可见的那一半（§C17 要求 pin 具体的协议修订），
+// 而 manifestLinesFor 只看顶层签名、不进函数体，所以把 server.go 整体加进
+// serverManifestSources 只能多抓到签名漂移，抓不到 Register 字面量的增删。
+// 这里单独抽这一个字符串实参，缺口才是闭合的。
+var methodManifestSources = []string{
+	"internal/runtime/server/server.go",
+}
+
+// BuildMethodManifest 抽出 `.dispatcher.Register("<method>", …)` 的第一个
+// 字符串实参。匹配条件极窄（选择器 X 为 dispatcher、方法名为 Register），
+// 仓库内 registerHandlers 是唯一注册点，零误报。
+func BuildMethodManifest(root string) ([]string, error) {
+	var lines []string
+	for _, rel := range methodManifestSources {
+		src := filepath.Join(root, rel)
+		fileLines, err := methodLinesFor(src)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, fileLines...)
+	}
+	sort.Strings(lines)
+	return lines, nil
+}
+
+func methodLinesFor(src string) ([]string, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Register" {
+			return true
+		}
+		recv, ok := sel.X.(*ast.SelectorExpr)
+		if !ok || recv.Sel.Name != "dispatcher" {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		out = append(out, "method "+lit.Value)
+		return true
+	})
+	return out, nil
 }
 
 // serverManifestSources 相对模块根，由 BuildServerManifest 覆盖。

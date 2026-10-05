@@ -537,6 +537,7 @@ func (s *Server) handleHover(ctx context.Context, msg *jsonrpc.Message) (json.Ra
 					})
 				})
 			if err != nil {
+				recordRefusal(s, ctx, "textDocument/hover", params.TextDocument.URI, result)
 				return nil, err
 			}
 			s.recordEvidence(ctx, "textDocument/hover", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
@@ -755,6 +756,7 @@ func (s *Server) handleDefinition(ctx context.Context, msg *jsonrpc.Message) (js
 					})
 				})
 			if err != nil {
+				recordRefusal(s, ctx, "textDocument/definition", params.TextDocument.URI, result)
 				return nil, err
 			}
 			s.recordEvidence(ctx, "textDocument/definition", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
@@ -796,6 +798,7 @@ func (s *Server) handleDeclaration(ctx context.Context, msg *jsonrpc.Message) (j
 					})
 				})
 			if err != nil {
+				recordRefusal(s, ctx, "textDocument/declaration", params.TextDocument.URI, result)
 				return nil, err
 			}
 			s.recordEvidence(ctx, "textDocument/declaration", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
@@ -949,6 +952,7 @@ func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (js
 					})
 				})
 			if err != nil {
+				recordRefusal(s, ctx, "textDocument/references", params.TextDocument.URI, result)
 				return nil, err
 			}
 			s.recordEvidence(ctx, "textDocument/references", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
@@ -1280,6 +1284,19 @@ func (s *Server) workspaceBackends() []languages.Backend {
 		}
 	}
 	return backends
+}
+
+// recordRefusal records §B4 evidence for an operation that both failed and
+// produced an envelope, so a refusal stays observable (§Q4) while the error
+// still propagates (§Q3). It records nothing when the envelope carries no
+// reason: a zero envelope is a server-side rejection (stale lease, closed
+// document), which deliberately leaves no evidence — see
+// TestExplainOmitsEvidenceWhenWorkspaceLeaseFinishRejectsResponse.
+func recordRefusal[T any](s *Server, ctx context.Context, method, uri string, r identity.SemanticResult[T]) {
+	if len(r.InternalDiagnostics) == 0 && len(r.Evidence) == 0 {
+		return
+	}
+	s.recordEvidence(ctx, method, uri, r.Status, r.Completeness, r.Evidence, r.InternalDiagnostics)
 }
 
 // dispatchSemanticRequest is the unified dispatch path for all semantic

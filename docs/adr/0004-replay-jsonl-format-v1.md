@@ -35,6 +35,14 @@ Replay recordings are **JSONL files** (`internal/replay/session.go`,
 `internal/replay/recorder.go`), format version **1**
 (`FormatVersion = 1`):
 
+> **Amendment (format version, added later).** The decision above stands — the
+> JSONL line framing, the meta header on line 1, and the add-only field evolution
+> rule are all unchanged. Only the version literal moved: `FormatVersion` is now
+> **2** (`internal/replay/session.go`), which adds response-identity evidence to
+> the meta payload. v1 recordings stay readable but cannot carry that evidence —
+> replaying one returns `ErrSemanticResponseBindingUnverified`. The live
+> version surface is `docs/versions.md`; this ADR records the original decision.
+
 - **Line 1 is a meta entry** — `{"seq":0,"dir":"meta","payload":{...}}`
   whose payload carries:
   - `formatVersion` (schema version, currently 1);

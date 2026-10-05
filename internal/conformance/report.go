@@ -227,7 +227,25 @@ type res struct {
 func checkResult(c *Check, sym map[string][]string, exec map[string]error, mode string) res {
 	switch c.Status {
 	case StatusPartial:
-		return res{Result: creditPartial, Detail: c.Reason}
+		// A PARTIAL check keeps its 0.5 credit whether or not its probe
+		// exists, so a renamed or deleted test used to linger here with a
+		// live-looking entry and zero coverage. Report the drift without
+		// rescoring: the credit stands for the acknowledged partial work,
+		// not for the probe.
+		detail := c.Reason
+		if p := c.Probe; p != nil && len(p.Groups) > 0 {
+			if missing := hasAllGroups(sym, p.Groups); len(missing) > 0 {
+				detail += " | missing probe symbols: " + strings.Join(missing, ",")
+			} else if mode == "full" {
+				for _, g := range p.Groups {
+					if err := exec[g.Pkg+"\x00"+strings.Join(g.Tests, "\x00")]; err != nil {
+						detail += " | probe failed: " + truncate(err.Error(), 200)
+						break
+					}
+				}
+			}
+		}
+		return res{Result: creditPartial, Detail: detail}
 	case StatusDeferred:
 		return res{Result: 0, Detail: c.Reason}
 	case StatusGate:

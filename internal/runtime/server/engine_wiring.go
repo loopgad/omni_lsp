@@ -108,6 +108,12 @@ func semanticViaEngine[T any](s *Server, ctx context.Context, be languages.Backe
 				return envelope, nil
 			}
 		}
+		// A real backend error (transport, decode, timeout) travels WITH the
+		// envelope the backend already produced, so the handler can still record
+		// §B4 evidence for the refusal (§Q4) before propagating the error (§Q3).
+		if envelope, ok := res.Value.(identity.SemanticResult[T]); ok {
+			return envelope, err
+		}
 		var zero identity.SemanticResult[T]
 		return zero, err
 	}
@@ -158,7 +164,12 @@ func finishBackendWorkspaceSnapshot(finish func() error) (err error, panicValue 
 // errUnknownEnvelope marks an in-band Unknown/Unavailable result as retryable
 // (never memoized); the caller still projects the envelope, so the wire answer
 // is unchanged — only the memoization policy differs.
-var errUnknownEnvelope = ierrors.New(ierrors.ErrBackendUnavailable, "semantic", "backend returned unknown/unavailable envelope")
+//
+// Bare sentinel on purpose: (*errors.Error).Is compares only Kind, so an ierrors
+// sentinel here would make errors.Is match EVERY backend_unavailable error — a
+// genuine transport failure included — and the projection branch above would
+// swallow it into a null result. Pointer identity keeps the two apart.
+var errUnknownEnvelope = errors.New("semantic: backend returned unknown/unavailable envelope")
 
 // wrapTransient marks retryable backend failures so the memo engine drops
 // them instead of caching (a crashed-but-restarting backend must not have its

@@ -3,6 +3,11 @@
 //  2. Declarations only - no behavior lives in this package.
 package lsp
 
+// LSPBaseline pins the wire protocol revision this package mirrors
+// (§U4/§C17). docs/versions.md carries the same value and is checked against
+// it by internal/conformance/versions_test.go — keep the two in step.
+const LSPBaseline = "3.17"
+
 // DocumentURI is a URI identifying a document.
 type DocumentURI = string
 

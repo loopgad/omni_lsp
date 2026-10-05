@@ -17,6 +17,26 @@ import (
 type envelopeBackend struct {
 	mockBackend
 	hoverStatus identity.ResultStatus
+	defStatus   identity.ResultStatus
+	declStatus  identity.ResultStatus
+}
+
+func (m *envelopeBackend) Definition(_ context.Context, _ languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
+	return identity.SemanticResult[[]languages.Location]{
+		Status:              m.defStatus,
+		Value:               nil,
+		Evidence:            []identity.Evidence{{Kind: identity.EvidenceSyntax}},
+		InternalDiagnostics: []string{"driven-by-test"},
+	}, nil
+}
+
+func (m *envelopeBackend) Declaration(_ context.Context, _ languages.DefinitionRequest) (identity.SemanticResult[[]languages.Location], error) {
+	return identity.SemanticResult[[]languages.Location]{
+		Status:              m.declStatus,
+		Value:               nil,
+		Evidence:            []identity.Evidence{{Kind: identity.EvidenceSyntax}},
+		InternalDiagnostics: []string{"driven-by-test"},
+	}, nil
 }
 
 func (m *envelopeBackend) Hover(_ context.Context, _ languages.HoverRequest) (identity.SemanticResult[*languages.HoverResult], error) {
@@ -171,6 +191,37 @@ func TestEvidenceQueriesAcceptEquivalentDocumentURIs(t *testing.T) {
 			var entries []json.RawMessage
 			if err := json.Unmarshal(raw, &entries); err != nil || len(entries) != 1 {
 				t.Fatalf("%s alias evidence missing: %s err=%v", method, raw, err)
+			}
+		}
+	}
+}
+
+// TestB5_UnknownDefinitionAndDeclarationProjectNull covers the two handlers
+// that project absence as protocol null. Hover already had this lock
+// (TestB5_UnknownHoverProjectsNull) and references projects an empty array
+// instead, so definition and declaration were the only two projections with
+// no test at all — a change from null to [] or to a fabricated location would
+// have gone unnoticed. mockBackend already satisfies languages.DeclarationProvider
+// (server_test.go), so declaration reaches the backend instead of taking the
+// MethodNotFound refusal path.
+func TestB5_UnknownDefinitionAndDeclarationProjectNull(t *testing.T) {
+	for _, st := range []identity.ResultStatus{identity.ResultUnknown, identity.ResultUnavailable} {
+		for _, method := range []string{"textDocument/definition", "textDocument/declaration"} {
+			s := New(DefaultConfig())
+			s.RegisterBackend("go", &envelopeBackend{
+				mockBackend: mockBackend{langID: "go", exts: []string{".go"}},
+				defStatus:   st,
+				declStatus:  st,
+			})
+			s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
+			params := `{"textDocument":{"uri":"file:///x.go"},"position":{"line":0,"character":0}}`
+			msg := jsonrpc.NewRequest(jsonrpc.RequestID{Num: 1}, method, json.RawMessage(params))
+			resp := s.dispatcher.Dispatch(context.Background(), msg)
+			if resp == nil || resp.Error != nil {
+				t.Fatalf("%s status %v: unexpected error %v", method, st, resp.Error)
+			}
+			if string(resp.Result) != "null" {
+				t.Errorf("%s status %v: result = %s, want null", method, st, resp.Result)
 			}
 		}
 	}

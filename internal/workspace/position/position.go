@@ -151,11 +151,6 @@ func (idx *Index) OffsetToPosition(content []byte, offset uint32) (Pos, error) {
 		var col uint32
 		if offset > 0 {
 			col = idx.offsetCol[offset-1]
-			// Advance past the last character.
-			_, s := utf8.DecodeRune(content[offset-uint32(1):])
-			if s > 1 {
-				// Multi-byte char at end; col already set to char start.
-			}
 			// Column after last char is the start col of last char + its width.
 			// We need to compute it.
 			r2, _ := utf8.DecodeRune(content[offset-uint32(1):])
@@ -235,9 +230,22 @@ func (idx *Index) PositionToOffset(content []byte, line, col uint32, enc Encodin
 			return uint32(i), nil
 		}
 	}
-	// col is past the end of the line: return le.
-	return le, nil
+	// col is past the end of the line. Clamp to the last byte before the line
+	// terminator rather than jumping to the next line's start: returning `le`
+	// made a caller using this as a validator (golang validSourceMapRange)
+	// accept an out-of-range end as legal, and it contradicted the strict
+	// OffsetOfLineChar contract in this same file (never clamp) while doing
+	// worse than Clamp, which also stops before the terminator.
+	end := le
+	for end > ls && isLineTerminator(content[end-uint32(1)]) {
+		end--
+	}
+	return end, nil
 }
+
+// isLineTerminator reports whether b ends a line, so callers can strip CRLF,
+// LF or CR without leaving the terminator inside a line's content.
+func isLineTerminator(b byte) bool { return b == '\n' || b == '\r' }
 
 func (idx *Index) ConvertPosition(content []byte, pos LSPPosition, from, to Encoding) (LSPPosition, error) {
 	if from == to {

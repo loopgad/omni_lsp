@@ -93,16 +93,6 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 		pending: make(map[int]chan response),
 		OnExit:  onExit,
 	}
-	go p.readLoop()
-	go func() {
-		werr := cmd.Wait()
-		p.onExitOnce.Do(func() {
-			if p.OnExit != nil {
-				p.OnExit(werr)
-			}
-		})
-	}()
-
 	hf := helloFrame{JSONRPC: "2.0", Method: "plugin/hello"}
 	hf.Params.APIVersion = SupportedAPIVersion
 	for _, c := range m.Capabilities {
@@ -113,8 +103,26 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 	b, _ := json.Marshal(hf)
 	if err := writeFrame(stdin, b); err != nil {
 		_ = cmd.Process.Kill()
+		// The Wait goroutine starts only after a successful handshake, so
+		// nothing else reaps this child or closes the stdio pipes. Reap it here
+		// or the plugin leaks as a zombie holding two pipe handles (§O4).
+		_ = cmd.Wait()
 		return nil, fmt.Errorf("plugin: 握手写入失败: %w", err)
 	}
+	// The reader and the Wait goroutine start only after the handshake lands.
+	// Starting them earlier meant a handshake failure killed the process while
+	// the Wait goroutine was already live, so OnExit fired once for a process
+	// the caller never received — a launch failure counted as a plugin crash
+	// against MaxConsecutivePluginCrashes (§O4).
+	go p.readLoop()
+	go func() {
+		werr := cmd.Wait()
+		p.onExitOnce.Do(func() {
+			if p.OnExit != nil {
+				p.OnExit(werr)
+			}
+		})
+	}()
 	return p, nil
 }
 

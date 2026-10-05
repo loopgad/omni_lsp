@@ -67,8 +67,13 @@ func (e *Engine) queryOnce(ctx context.Context, k Key, declared DepSet, fn Compu
 			case FailedStable:
 				e.hits++
 				err := en.err
+				res := Result{Value: en.value, Evidence: en.evidence, SafetyClass: en.safety}
 				e.unlock()
-				return Result{}, err
+				// A stable failure still carries the envelope the compute fn
+				// built. The leader returned it (call.res holds Value), so
+				// dropping it here made two calls of the same failing query
+				// disagree on Result.Value and starved the evidence ring.
+				return res, err
 			}
 		}
 		if call := e.inflight[key]; call != nil {
@@ -179,6 +184,7 @@ func (e *Engine) compute(key string, k Key, declared DepSet, fn ComputeFn, call 
 				} else {
 					en.state = FailedStable
 					en.err = err
+					en.value = val
 					e.entries[key] = en
 					e.indexDeps(key, deps)
 				}

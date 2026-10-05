@@ -741,3 +741,40 @@ func TestJ4_TransientErrorCarriesComputedValue(t *testing.T) {
 		t.Fatalf("retry: calls=%d value=%v err=%v", calls, r2.Value, err2)
 	}
 }
+
+// TestJ4_StableErrorCarriesValueOnCacheHit pins the same contract for a
+// non-transient failure. A stable failure is memoized, so the second call
+// returns from cache rather than from the leader's call.res. Both paths must
+// agree: dropping the value on the cache-hit path made two calls of the same
+// failing query disagree on Result.Value and left the evidence ring empty on
+// the second observation, so handlers could not record why they refused.
+func TestJ4_StableErrorCarriesValueOnCacheHit(t *testing.T) {
+	e := NewEngine(0)
+	k := key("k", "sv", 1)
+	calls := 0
+	compute := func(ctx context.Context, b Bindings) (any, DepSet, error) {
+		calls++
+		return "envelope", nil, errors.New("invalid request")
+	}
+	r, err := e.Query(context.Background(), k, nil, compute)
+	if err == nil {
+		t.Fatal("want stable failure, got nil")
+	}
+	if isTransient(err) {
+		t.Fatalf("want non-transient error, got %v", err)
+	}
+	if r.Value != "envelope" {
+		t.Fatalf("first call value = %v, want computed envelope carried with err", r.Value)
+	}
+
+	r2, err2 := e.Query(context.Background(), k, nil, compute)
+	if err2 == nil || isTransient(err2) {
+		t.Fatalf("cache hit: err = %v, want the same stable failure", err2)
+	}
+	if r2.Value != "envelope" {
+		t.Fatalf("cache hit value = %v, want the same envelope as the first call", r2.Value)
+	}
+	if calls != 1 {
+		t.Errorf("stable failure recomputed: %d calls, want 1 (memoized)", calls)
+	}
+}

@@ -754,26 +754,6 @@ func TestSEM_SAFE_001_RenameFailsClosed(t *testing.T) {
 	}
 }
 
-func TestAllHandlersRegistered(t *testing.T) {
-	s := New(DefaultConfig())
-	s.registerHandlers()
-	for _, method := range []string{
-		"initialize", "initialized", "shutdown", "exit",
-		"$/cancelRequest",
-		"textDocument/didOpen", "textDocument/didChange",
-		"textDocument/didSave", "textDocument/didClose",
-		"textDocument/hover", "textDocument/completion",
-		"textDocument/definition", "textDocument/documentSymbol",
-		"textDocument/references", "textDocument/rename",
-		"textDocument/semanticTokens/full", "workspace/symbol",
-		"omnilsp/status", "omnilsp/explain", "omnilsp/backendStatus",
-	} {
-		if !s.dispatcher.HasHandler(method) {
-			t.Errorf("handler not registered for %s", method)
-		}
-	}
-}
-
 func TestDispatchSemanticRequestNilSourceFallback(t *testing.T) {
 	s := New(DefaultConfig())
 	be := &mockBackend{langID: "go", exts: []string{".go"}}

@@ -35,6 +35,16 @@ func TestCorpus_GoFilesProduceGroundedSemantics(t *testing.T) {
 	var buckets corpus.ErrorBuckets
 	const rev = uint64(1)
 
+	// §S21 staleEdit / snapshotMixing are unreachable from this runner by
+	// design, not by accident: the Go backend is in-process (ADR-0001), so
+	// goal.md:2626 pins its BackendEpoch to the stable value 0, and req.Rev is
+	// pinned below. classify.go therefore sees an always-matching epoch. The
+	// buckets' negative controls live where an epoch can actually move:
+	// test/corpus/classify_test.go (stale_revision / epoch_mismatch fixtures)
+	// and test/corpus/s21_stdio_test.go. Do not "fix" this by writing a
+	// non-zero epoch — that breaks semantic_index.go's verified-rebuild
+	// provenance check.
+
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
 			continue
@@ -97,6 +107,11 @@ func TestCorpus_GoFilesProduceGroundedSemantics(t *testing.T) {
 			req := corpus.ClassifyRequest{URI: uri, Content: src, Symbol: sym, Rev: rev}
 			hresp := corpus.HoverEnvelope(hres, herr)
 			req.Epoch = hresp.Epoch // baseline from first response of this session
+			if req.Epoch != 0 {
+				// Pinned by goal.md:2626 (in-process ⇒ stable epoch 0) and by
+				// semantic_index.go, which rejects a non-zero provenance epoch.
+				t.Fatalf("in-process Go backend reported epoch %d, want the stable 0", req.Epoch)
+			}
 			logBucketHits(t, "hover", buckets.Record(req, hresp))
 			logBucketHits(t, "definition", buckets.Record(req,
 				corpus.LocationsEnvelope("definition", dres, derr)))
