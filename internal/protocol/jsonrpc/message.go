@@ -114,21 +114,55 @@ type Message struct {
 
 	// Error is set on error responses.
 	Error *ResponseError `json:"error,omitempty"`
+
+	// methodPresent records that the wire form carried a method field at
+	// all, which an empty Method cannot express. Set by every
+	// constructor that names a method, and by UnmarshalJSON.
+	methodPresent bool
+}
+
+// UnmarshalJSON records whether the wire form carried a method field. The
+// decoder cannot tell an absent field from an empty one once both land in
+// one string, and the three message kinds hinge on that difference.
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type alias Message
+	var shadow alias
+	if err := json.Unmarshal(data, &shadow); err != nil {
+		return err
+	}
+	var probe struct {
+		Method *json.RawMessage `json:"method"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	*m = Message(shadow)
+	m.methodPresent = probe.Method != nil
+	return nil
 }
 
 // IsRequest returns true if this message is a request (has ID and Method).
 func (m *Message) IsRequest() bool {
-	return m.ID != nil && m.Method != ""
+	return m.ID != nil && m.methodPresent
 }
 
 // IsNotification returns true if this message is a notification (has Method, no ID).
 func (m *Message) IsNotification() bool {
-	return m.ID == nil && m.Method != ""
+	return m.ID == nil && m.methodPresent
 }
 
-// IsResponse returns true if this message is a response (has ID, no Method).
+// IsResponse returns true if this is a response (has ID, no method field).
+//
+// methodPresent, not Method alone, is what separates a response from a
+// malformed request: {"id":1,"result":{...}} omits method entirely, while
+// {"id":1,"method":""} carries it but leaves the name empty. Both decode
+// to an empty Method. Deciding by the field alone classified the second as a
+// response, and server.Run drops responses, so that request was discarded in
+// silence and the client waited forever. JSON-RPC 2.0 wants one terminal
+// outcome per request, and a name that resolves to nothing gets
+// MethodNotFound.
 func (m *Message) IsResponse() bool {
-	return m.ID != nil && m.Method == ""
+	return m.ID != nil && !m.methodPresent
 }
 
 // IsError returns true if this is an error response.
@@ -150,19 +184,21 @@ func (e *ResponseError) Error() string {
 // NewRequest creates a request message.
 func NewRequest(id RequestID, method string, params json.RawMessage) *Message {
 	return &Message{
-		JSONRPC: Version,
-		ID:      &id,
-		Method:  method,
-		Params:  params,
+		JSONRPC:       Version,
+		ID:            &id,
+		Method:        method,
+		methodPresent: true,
+		Params:        params,
 	}
 }
 
 // NewNotification creates a notification message.
 func NewNotification(method string, params json.RawMessage) *Message {
 	return &Message{
-		JSONRPC: Version,
-		Method:  method,
-		Params:  params,
+		JSONRPC:       Version,
+		Method:        method,
+		methodPresent: true,
+		Params:        params,
 	}
 }
 
