@@ -409,10 +409,17 @@ func TestS19_ReferencesScalingCurve(t *testing.T) {
 		perOp = append(perOp, total/samples)
 	}
 	for i := 1; i < len(perOp); i++ {
-		// Fourfold growth may be noisy on shared CI hosts; flag clear blowup.
-		if perOp[i-1] > 0 && perOp[i] > perOp[i-1]*20 {
-			t.Errorf("superlinear blowup: %v -> %v at size %d->%d",
-				perOp[i-1], perOp[i], sizes[i-1], sizes[i])
+		// sizes grow fourfold, so linear time gives 4x, n^1.5 gives 8x, and
+		// n^2 gives 16x. 8x leaves a factor of two over linear for noise on a
+		// shared host while still catching anything past n^1.5. The previous
+		// threshold of 20x sat between n^2.16 and n^2.32 -- above the 16x of a
+		// genuine quadratic blowup, so it could not fire on one. A noise
+		// margin cannot be bought by raising the bound: wall-clock averages
+		// scatter in both directions, and a bound high enough to swallow the
+		// noise also swallows the regression.
+		if perOp[i-1] > 0 && perOp[i] > perOp[i-1]*8 {
+			t.Errorf("superlinear blowup: %v -> %v at size %d->%d (linear would be %dx)",
+				perOp[i-1], perOp[i], sizes[i-1], sizes[i], sizes[i]/sizes[i-1])
 		}
 	}
 	t.Logf("Go references scaling: %v/op @%d, %v/op @%d, %v/op @%d references",
