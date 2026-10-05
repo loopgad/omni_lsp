@@ -652,8 +652,11 @@ func TestJ7_StalePublishRejected(t *testing.T) {
 	e.InvalidateSnapshot(5)
 	close(block)
 	err := <-errCh
-	if err == nil || !strings.Contains(err.Error(), "stale publish") {
-		t.Fatalf("want stale-publish rejection, got %v", err)
+	// errors.Is, not a substring match: engine_wiring.go:100 falls back on a
+	// stale snapshot by testing this sentinel, so dropping the %w in core.go
+	// would silently disable that recovery while the message still reads right.
+	if !errors.Is(err, ErrStalePublish) {
+		t.Fatalf("want ErrStalePublish (errors.Is), got %v", err)
 	}
 
 	// The rejected value must NOT be cached: next query recomputes fresh.

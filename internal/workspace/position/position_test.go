@@ -255,20 +255,43 @@ func TestUTF16Len(t *testing.T) {
 // golang's validSourceMapRange accept an out-of-range end as legal, weakening
 // the Y0-9/D12 gate that blocks edits on unmapped generated regions.
 func TestPositionToOffsetPastLineEndClampsWithinLine(t *testing.T) {
-	for _, enc := range []Encoding{UTF8, UTF16} {
-		t.Run(enc.String(), func(t *testing.T) {
-			content := []byte("hello\nworld")
-			idx := NewIndex(content, enc)
-			got, err := idx.PositionToOffset(content, 0, 6, enc)
-			if err != nil {
-				t.Fatalf("PositionToOffset(0,6): %v", err)
-			}
-			if got != 5 {
-				t.Errorf("PositionToOffset(0,6) = %d, want 5 (end of line 0 content)", got)
-			}
-			if got >= uint32(len(content)) && content[got-1] == '\n' {
-				t.Errorf("PositionToOffset(0,6) landed on the line terminator at %d", got)
-			}
-		})
+	// Each case names a line terminator and the offset that must be returned:
+	// the last byte of the line's own content, never a terminator byte and
+	// never the next line's start. A bare \r and a CRLF pair both have to be
+	// stripped whole, otherwise a CRLF document clamps onto the '\r' and the
+	// caller's range validation accepts an end that is really out of bounds.
+	for _, tc := range []struct {
+		name      string
+		content   string
+		wantLine0 uint32
+	}{
+		{"lf", "hello\nworld", 5},
+		{"cr", "hello\rworld", 5},
+		{"crlf", "hello\r\nworld", 5},
+		{"no terminator at EOF", "hello", 5},
+	} {
+		for _, enc := range []Encoding{UTF8, UTF16} {
+			t.Run(tc.name+"/"+enc.String(), func(t *testing.T) {
+				content := []byte(tc.content)
+				idx := NewIndex(content, enc)
+				// Ask for a column far past the line's width in this encoding.
+				got, err := idx.PositionToOffset(content, 0, 999, enc)
+				if err != nil {
+					t.Fatalf("PositionToOffset(0,999): %v", err)
+				}
+				if got != tc.wantLine0 {
+					t.Errorf("PositionToOffset(0,999) = %d, want %d (end of line 0 content)",
+						got, tc.wantLine0)
+				}
+				// got is a boundary, not a byte: content[got] is the terminator
+				// for every terminated case, which is exactly right. What must
+				// hold is that the boundary stays inside line 0 — the old code
+				// returned the next line start (le), which lands on line 1.
+				if idx.findLine(got) != 0 {
+					t.Errorf("clamped offset %d resolves to line %d, want line 0",
+						got, idx.findLine(got))
+				}
+			})
+		}
 	}
 }
