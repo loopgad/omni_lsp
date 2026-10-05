@@ -21,22 +21,29 @@ func (s *Server) notifyClient(method string, params any) {
 }
 
 // extractWorkDoneToken pulls the optional workDoneToken from request params.
-func extractWorkDoneToken(raw json.RawMessage) string {
+// It returns the token as raw JSON rather than a string because LSP 3.17
+// defines ProgressToken as integer | string, and the token has to go back out
+// exactly as it arrived. Decoding to string first would drop a numeric token
+// on the floor, and the client would then never see the $/progress pair it
+// asked for.
+func extractWorkDoneToken(raw json.RawMessage) json.RawMessage {
 	var p struct {
-		WorkDoneToken json.Token `json:"workDoneToken"`
+		WorkDoneToken json.RawMessage `json:"workDoneToken"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return ""
+		return nil
 	}
-	if s, ok := p.WorkDoneToken.(string); ok {
-		return s
+	// An explicit null is as absent as a missing key: there is no token to
+	// report progress against.
+	if len(p.WorkDoneToken) == 0 || string(p.WorkDoneToken) == "null" {
+		return nil
 	}
-	return ""
+	return p.WorkDoneToken
 }
 
 // progressBegin reports a $/progress begin for the given token.
-func (s *Server) progressBegin(token, title string) {
-	if token == "" {
+func (s *Server) progressBegin(token json.RawMessage, title string) {
+	if len(token) == 0 {
 		return
 	}
 	s.notifyClient("$/progress", map[string]any{
@@ -46,8 +53,8 @@ func (s *Server) progressBegin(token, title string) {
 }
 
 // progressEnd reports a $/progress end for the given token.
-func (s *Server) progressEnd(token string) {
-	if token == "" {
+func (s *Server) progressEnd(token json.RawMessage) {
+	if len(token) == 0 {
 		return
 	}
 	s.notifyClient("$/progress", map[string]any{"token": token, "value": map[string]any{"kind": "end"}})

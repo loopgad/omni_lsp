@@ -19,18 +19,10 @@ func TestC8_ProgressNotifications(t *testing.T) {
 	s.RegisterBackend("go", &mockBackend{langID: "go", exts: []string{".go"}})
 	s.vfs.Open(uri, "go", 1, []byte("package main\n"), 0)
 
-	var notifications []*jsonrpc.Message
-	s.mu.Lock()
-	// Capture outbound traffic by wrapping the transport send path.
-	orig := s.send
-	if orig == nil {
-		s.mu.Unlock()
-		t.Fatal("send nil")
-	}
-	s.mu.Unlock()
-
-	// The server has no transport until Run; drive the notification helpers
-	// directly and inspect what they emit through a recording transport.
+	// The server has no transport until Run, so outbound traffic cannot be
+	// captured by wrapping the send path -- there is nothing to wrap until the
+	// loop that will call it exists. Attach a recording transport instead and
+	// read the notifications off it.
 	rt := &recordingTransport{}
 	s.mu.Lock()
 	s.transport = rt
@@ -68,8 +60,53 @@ func TestC8_ProgressNotifications(t *testing.T) {
 			t.Errorf("unexpected progress notifications without token: %d", n)
 		}
 	})
-	_ = notifications
-	_ = orig
+
+	// LSP 3.17 defines ProgressToken as integer | string. A numeric token used
+	// to be dropped, so a client that sent one waited forever for the
+	// $/progress pair it had explicitly requested.
+	for _, tc := range []struct {
+		name     string
+		token    string
+		wantEcho string
+	}{
+		{"string token", `"str-token"`, `"token":"str-token"`},
+		{"integer token", `4242`, `"token":4242`},
+	} {
+		t.Run(tc.name+" reaches the client verbatim", func(t *testing.T) {
+			rt.reset()
+			resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(
+				jsonrpc.RequestID{Num: 3}, "workspace/symbol",
+				json.RawMessage(`{"query":"x","workDoneToken":`+tc.token+`}`)))
+			if resp == nil || resp.Error != nil {
+				t.Fatalf("workspaceSymbol failed: %+v", resp)
+			}
+			progress := rt.filterMethod("$/progress")
+			if len(progress) < 2 {
+				t.Fatalf("expected >=2 $/progress notifications for token %s, got %d",
+					tc.token, len(progress))
+			}
+			// The token must come back byte-identical, not stringified: a client
+			// matches the notification against the value it sent.
+			for i, msg := range progress {
+				if !jsonContains(msg, tc.wantEcho) {
+					t.Errorf("notification %d carries the wrong token: %s", i, msg.Params)
+				}
+			}
+		})
+	}
+
+	t.Run("an explicit null token stays silent", func(t *testing.T) {
+		rt.reset()
+		resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(
+			jsonrpc.RequestID{Num: 4}, "workspace/symbol",
+			json.RawMessage(`{"query":"x","workDoneToken":null}`)))
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("workspaceSymbol failed: %+v", resp)
+		}
+		if n := len(rt.filterMethod("$/progress")); n != 0 {
+			t.Errorf("progress reported for a null token: %d notifications", n)
+		}
+	})
 }
 
 // recordingTransport captures outbound messages (async notification writers
