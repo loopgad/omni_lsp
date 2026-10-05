@@ -197,7 +197,18 @@ func (idx *Index) OffsetToPosition(content []byte, offset uint32) (Pos, error) {
 	return Pos{Line: uint32(line), Col: col, Offset: offset}, nil
 }
 
+// PositionToOffset resolves a line and column to a byte offset. The column must
+// be in the encoding the Index was built with, which is the only unit offsetCol
+// records. An earlier signature took an Encoding and ignored it, so a caller
+// naming the wrong unit got an offset for the wrong column with no error; the
+// encoding is now checked instead of discarded.
 func (idx *Index) PositionToOffset(content []byte, line, col uint32, enc Encoding) (uint32, error) {
+	if enc != idx.encoding {
+		return 0, fmt.Errorf(
+			"column is in %v but the index was built for %v; "+
+				"build the index with the source encoding instead of mixing them",
+			enc, idx.encoding)
+	}
 	if int(line) >= len(idx.lines) {
 		return 0, fmt.Errorf("line %d out of range (total %d lines)", line, len(idx.lines))
 	}
