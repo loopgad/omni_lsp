@@ -12,7 +12,7 @@ import (
 // checks instead of failing.
 //
 // As of this test, 7 categories (59 of 78 core checks) carry weight and these
-// 9 (19 checks, UX alone is 10) do not. That predates this file and is
+// 8 (19 checks, UX alone is 10) do not. That predates this file and is
 // recorded, not endorsed: score() adds 0 for a missing key on both the
 // weighted and unweighted branches, so every check below is invisible to
 // coreScore while still being listed as satisfied in docs/conformance.md.
