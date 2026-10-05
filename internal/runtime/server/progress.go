@@ -46,13 +46,9 @@ func (s *Server) progressBegin(token, title string) {
 }
 
 // progressEnd reports a $/progress end for the given token.
-func (s *Server) progressEnd(token, message string) {
+func (s *Server) progressEnd(token string) {
 	if token == "" {
 		return
 	}
-	value := map[string]any{"kind": "end"}
-	if message != "" {
-		value["message"] = message
-	}
-	s.notifyClient("$/progress", map[string]any{"token": token, "value": value})
+	s.notifyClient("$/progress", map[string]any{"token": token, "value": map[string]any{"kind": "end"}})
 }

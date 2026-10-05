@@ -26,6 +26,7 @@ package vfs
 import (
 	"bytes"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -201,7 +202,11 @@ func (v *VFS) Content(uri string) []byte {
 	return cp
 }
 
-// OpenFiles returns URIs of all open files.
+// OpenFiles returns URIs of all open files, sorted.
+//
+// Sorted by contract: callers compare this list positionally against
+// snapshot.Snapshot.Documents() (same sort key, same contract) to decide
+// whether a captured snapshot still describes the live open set.
 func (v *VFS) OpenFiles() []string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -209,6 +214,7 @@ func (v *VFS) OpenFiles() []string {
 	for uri := range v.files {
 		uris = append(uris, v.files[uri].URI)
 	}
+	sort.Strings(uris)
 	return uris
 }
 

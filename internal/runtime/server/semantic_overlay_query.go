@@ -337,12 +337,6 @@ func (s *Server) snapshotOverlayMightBeDirty(
 		}
 	}
 	documents := captured.Documents()
-	// Snapshot.Documents ranges a map, so its order changes every run. The
-	// per-language budget below screens only the first N documents, which
-	// would make an otherwise identical query answer from the overlay on one
-	// run and fall back to the live backend on the next. Sort so the screened
-	// subset is a function of the document set alone.
-	sort.Strings(documents)
 	if len(documents) > overlayDirtyScreenMaxDocuments {
 		return semanticOverlayIdentity{}, nil
 	}

@@ -15,7 +15,7 @@ const (
 	scipProvenance    = "scip"
 	scipFreshnessNote = "静态索引快照：数据可能已过时，不反映工作区当前状态（SCIP 导入）"
 
-	commitArgPrefix       = "omnilsp.commit="
+	commitArgPrefix         = "omnilsp.commit="
 	scipRepositoryArgPrefix = "omnilsp.repository="
 )
 

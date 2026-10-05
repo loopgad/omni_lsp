@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -89,6 +90,25 @@ func TestOpenFiles(t *testing.T) {
 	files := v.OpenFiles()
 	if len(files) != 2 {
 		t.Fatalf("expected 2 files, got %d", len(files))
+	}
+}
+
+// TestOpenFilesAreSorted locks the ordering contract shared with
+// snapshot.Snapshot.Documents(): the two lists are compared positionally to
+// decide whether a captured snapshot still describes the live open set, so
+// both sides must be ordered by the same key. Map iteration order is randomized
+// per range — repeat so one lucky pass cannot hide a regression.
+func TestOpenFilesAreSorted(t *testing.T) {
+	v := New()
+	want := []string{"file:///a.go", "file:///b.go", "file:///c.go", "file:///d.go", "file:///e.go"}
+	for i, uri := range want {
+		v.Open(uri, "go", int64(i+1), []byte("package main"), SourceEditor)
+	}
+
+	for i := range 32 {
+		if got := v.OpenFiles(); !slices.Equal(got, want) {
+			t.Fatalf("pass %d: OpenFiles() = %v, want sorted %v", i, got, want)
+		}
 	}
 }
 
@@ -188,5 +208,53 @@ func TestNonExistentFile(t *testing.T) {
 	c := v.Content("file:///nonexistent.go")
 	if c != nil {
 		t.Error("non-existent file content should return nil")
+	}
+}
+
+// TestAdvanceRevisionInvalidatesWithoutTouchingDocuments pins the external
+// change contract. Unlike Open/Update/Save/Close, AdvanceRevision must move the
+// revision counter and nothing else: the server keys its semantic memo tables
+// and its overlay identity checks on vfs.Revision(), so bumping it is what
+// retires answers computed from the previous disk state. Content and versions
+// must survive byte-for-byte, because an external disk write must never
+// overwrite an editor-authoritative buffer (D1 editor overlay precedence).
+func TestAdvanceRevisionInvalidatesWithoutTouchingDocuments(t *testing.T) {
+	v := New()
+	const uri = "file:///main.go"
+	v.Open(uri, "go", 7, []byte("package main"), SourceEditor)
+	before := v.Revision()
+	beforeFile := v.Get(uri)
+	if beforeFile == nil {
+		t.Fatal("fixture document missing")
+	}
+
+	got := v.AdvanceRevision()
+
+	if got != before+1 {
+		t.Fatalf("AdvanceRevision() = %d, want %d (strict +1)", got, before+1)
+	}
+	if v.Revision() != got {
+		t.Fatalf("Revision() = %d, want %d", v.Revision(), got)
+	}
+	if got == before {
+		t.Fatal("revision-keyed cache entries would survive; stale memo reused")
+	}
+
+	after := v.Get(uri)
+	if after == nil {
+		t.Fatal("AdvanceRevision dropped the document")
+	}
+	if after.Version != beforeFile.Version {
+		t.Errorf("version changed: %d -> %d", beforeFile.Version, after.Version)
+	}
+	if string(after.Content) != string(beforeFile.Content) {
+		t.Errorf("content changed: %q -> %q", beforeFile.Content, after.Content)
+	}
+	if after.Source != SourceEditor || !after.Dirty {
+		t.Errorf("editor authority lost on a pure revision bump: source=%v dirty=%v",
+			after.Source, after.Dirty)
+	}
+	if files := v.OpenFiles(); len(files) != 1 || files[0] != uri {
+		t.Errorf("OpenFiles() = %v, want just %q", files, uri)
 	}
 }

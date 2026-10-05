@@ -63,11 +63,9 @@ func (c *Codec) ReadMessage(r io.Reader) (*Message, error) {
 
 	var msg Message
 	if err := json.Unmarshal(body, &msg); err != nil {
-		// Return a parse error but with raw body for diagnostics.
 		return nil, &CodecError{
 			Code:    ParseError,
 			Message: fmt.Sprintf("parse error: %v", err),
-			Raw:     body,
 		}
 	}
 
@@ -152,11 +150,10 @@ func (c *Codec) readHeader(r io.Reader) (int, error) {
 	return contentLength, nil
 }
 
-// CodecError is an error returned by the codec with optional raw data.
+// CodecError is an error returned by the codec.
 type CodecError struct {
 	Code    int
 	Message string
-	Raw     []byte
 }
 
 func (e *CodecError) Error() string { return e.Message }

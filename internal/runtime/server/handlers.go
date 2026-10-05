@@ -925,7 +925,7 @@ func (s *Server) handleReferences(ctx context.Context, msg *jsonrpc.Message) (js
 	// §C8: report progress when the client opted in with a workDoneToken.
 	token := extractWorkDoneToken(msg.Params)
 	s.progressBegin(token, "Finding references")
-	defer s.progressEnd(token, "")
+	defer s.progressEnd(token)
 	return s.dispatchSemanticRequest(withEvidenceStage(ctx, &evidenceStage{}), msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
 		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
 			if result, used := s.goSnapshotSemanticLocations(ctx, params.TextDocument.URI, params.Position.Line, params.Position.Character,
@@ -1120,7 +1120,7 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message
 	// §C8: report progress when the client opted in with a workDoneToken.
 	token := extractWorkDoneToken(msg.Params)
 	s.progressBegin(token, "Searching workspace symbols")
-	defer s.progressEnd(token, "")
+	defer s.progressEnd(token)
 	revision := s.currentRevision()
 	if captured := snapshotFromCtx(ctx); captured != nil {
 		revision = captured.ID().Revision

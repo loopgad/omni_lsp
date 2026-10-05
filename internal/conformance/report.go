@@ -291,13 +291,6 @@ func checkResult(c *Check, sym map[string][]string, exec map[string]error, mode 
 	}
 }
 
-func testsOr(one string) []string {
-	if one == "" {
-		return nil
-	}
-	return []string{one}
-}
-
 func truncate(s string, n int) string {
 	if len(s) > n {
 		s = s[:n] + "…"

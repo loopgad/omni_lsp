@@ -15,9 +15,6 @@ import (
 // For notifications: return (nil, nil).
 type HandlerFunc func(ctx context.Context, msg *Message) (json.RawMessage, error)
 
-// ErrorHandler creates an error response for a given request.
-type ErrorHandler func(id RequestID, code int, message string, data json.RawMessage) *Message
-
 // Dispatcher routes incoming messages to registered handlers.
 //
 // Invariants:

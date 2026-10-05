@@ -52,10 +52,6 @@ func TestGenerateDocs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(got) != want {
-		if updateRequested() {
-			writeDoc(t, want)
-			return
-		}
 		t.Error("docs/conformance.md drifted from registry; regenerate with OMNISP_UPDATE_CONFORMANCE=1")
 	}
 }

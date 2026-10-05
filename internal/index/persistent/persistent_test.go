@@ -231,6 +231,18 @@ func TestCancellationRacingCommitHasOneTerminalOutcome(t *testing.T) {
 		default:
 			t.Fatalf("unexpected commit result: %v", err)
 		}
+		// Rollback must leave nothing behind. No other code path reads staging,
+		// so a residue only burns disk: WriteSegment counts staging bytes
+		// against the budget and cleanupOrphanSegments never descends into
+		// staging-*, so the leak is permanent and eventually starves commits
+		// with ErrDiskBudgetExceeded. A stranded manifest.tmp would also shadow
+		// the next publish.
+		if staging, globErr := filepath.Glob(filepath.Join(s.root, "staging-*")); globErr != nil || len(staging) != 0 {
+			t.Fatalf("round %d left staging directories behind: %v (%v)", i, staging, globErr)
+		}
+		if _, statErr := os.Stat(s.tmpManifestPath()); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("round %d left manifest.tmp behind: %v", i, statErr)
+		}
 	}
 }
 

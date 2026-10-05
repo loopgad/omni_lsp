@@ -473,27 +473,3 @@ func LineCharAt(content []byte, offset uint32) (line, character uint32, err erro
 	}
 	return line, idx.columnWidth(lc, UTF16), nil
 }
-
-// utf16ColToOffset converts a UTF-16 code-unit column to a byte offset within
-// one line's content. Errors when col falls inside a surrogate pair or past
-// the end of the line.
-func utf16ColToOffset(lineContent []byte, col uint32) (uint32, error) {
-	var w uint32
-	i := 0
-	for i < len(lineContent) {
-		if w == col {
-			return uint32(i), nil
-		}
-		r, s := utf8.DecodeRune(lineContent[i:])
-		if r <= 0xFFFF {
-			w++
-		} else {
-			w += 2
-		}
-		i += s
-	}
-	if w == col {
-		return uint32(i), nil
-	}
-	return 0, fmt.Errorf("character %d out of range (line width %d UTF-16 units)", col, w)
-}

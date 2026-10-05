@@ -221,9 +221,6 @@ func (b *Backend) loadPackageWithOverlays(ctx context.Context, uri string, conte
 	}
 	b.cacheMisses.Add(1)
 	b.rotateFileSetIfNeeded()
-	if b.pkgCache == nil {
-		b.pkgCache = make(map[string]packageCacheEntry)
-	}
 
 	dir := filepath.Dir(filePath)
 	cfg := &packages.Config{
@@ -262,9 +259,6 @@ func (b *Backend) loadPackageWithOverlays(ctx context.Context, uri string, conte
 // §K0 requires bounded caches; the eviction lives here so the bound is
 // reachable without driving 65 real packages.Load calls.
 func (b *Backend) cachePackage(key string, pkg *packages.Package, fingerprint identity.ContentHash) {
-	if b.pkgCache == nil {
-		b.pkgCache = make(map[string]packageCacheEntry)
-	}
 	b.pkgCache[key] = packageCacheEntry{pkg: pkg, inputFingerprint: fingerprint}
 	b.pkgOrder = append(b.pkgOrder, key)
 	if len(b.pkgOrder) > pkgCacheLimit {
@@ -1250,8 +1244,12 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 	}
 	var tokens []languages.SemanticToken
 	var lastLine, lastCol uint32
-	// UTF-16 columns/lengths over the parsed content (INV-POS-001).
-	idx := position.NewIndex(content, requestEncoding(encoding, true))
+	// Columns and lengths must share one basis: the client decodes the delta
+	// stream with the encoding it negotiated in general.positionEncodings, so
+	// a length measured in UTF-16 units while the column is a UTF-8 byte offset
+	// lands every token at the wrong extent.
+	enc := requestEncoding(encoding, true)
+	idx := position.NewIndex(content, enc)
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -1303,7 +1301,7 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 		ep := fset.Position(end)
 		line := uint32(sp.Line - 1)
 		col := idx.UTF16ColumnAt(uint32(sp.Offset))
-		length := uint32(position.UTF16Len(content[sp.Offset:ep.Offset]))
+		length := tokenLength(content[sp.Offset:ep.Offset], enc)
 		if length == 0 {
 			return true
 		}
@@ -1323,6 +1321,19 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 		return true
 	})
 	return tokens, nil
+}
+
+// tokenLength measures a token's extent in the encoding the client negotiated,
+// so a token's length shares the basis of the column that positions it.
+func tokenLength(b []byte, enc position.Encoding) uint32 {
+	switch enc {
+	case position.UTF8:
+		return uint32(len(b))
+	case position.UTF32:
+		return uint32(position.RuneLength(b))
+	default:
+		return uint32(position.UTF16Len(b))
+	}
 }
 
 func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (identity.SemanticResult[languages.ValidatedEdit], error) {

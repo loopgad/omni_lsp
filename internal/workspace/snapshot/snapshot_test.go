@@ -6,6 +6,7 @@ package snapshot
 //   INV-SNAPSHOT-003: old Snapshot not mutated by new publication
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -34,6 +35,26 @@ func TestSnapshotDocuments(t *testing.T) {
 	uris := snap.Documents()
 	if len(uris) != 2 {
 		t.Errorf("expected 2 documents, got %d", len(uris))
+	}
+}
+
+// TestSnapshotDocumentsAreSorted locks the ordering contract. Documents used
+// to come back in map order, which let server-side callers that compare this
+// list positionally (against vfs.OpenFiles) or screen only its first N entries
+// flip between identical runs. Map iteration order is randomized per range, so
+// one pass can pass by luck — repeat.
+func TestSnapshotDocumentsAreSorted(t *testing.T) {
+	docs := map[string]DocumentSnapshot{}
+	want := []string{"file:///a.go", "file:///b.go", "file:///c.go", "file:///d.go", "file:///e.go"}
+	for _, uri := range want {
+		docs[uri] = DocumentSnapshot{URI: uri, Content: []byte("package main")}
+	}
+	snap := New("ws", 1, docs)
+
+	for i := range 32 {
+		if got := snap.Documents(); !slices.Equal(got, want) {
+			t.Fatalf("pass %d: Documents() = %v, want sorted %v", i, got, want)
+		}
 	}
 }
 

@@ -21,6 +21,7 @@
 package snapshot
 
 import (
+	"sort"
 	"sync/atomic"
 
 	"github.com/omnilsp/omni/internal/workspace/uri"
@@ -106,12 +107,18 @@ func (s *Snapshot) Document(uri string) *DocumentSnapshot {
 	return &d
 }
 
-// Documents returns all document URIs in this snapshot.
+// Documents returns all document URIs in this snapshot, sorted.
+//
+// Sorted by contract, not by accident of map order: callers compare this list
+// positionally against vfs.OpenFiles() to decide whether a captured snapshot
+// still describes the live open set, and screen only its first N entries. An
+// unsorted return made those decisions flip between identical runs.
 func (s *Snapshot) Documents() []string {
 	uris := make([]string, 0, len(s.documents))
 	for _, doc := range s.documents {
 		uris = append(uris, doc.URI)
 	}
+	sort.Strings(uris)
 	return uris
 }
 

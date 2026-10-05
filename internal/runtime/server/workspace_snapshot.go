@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"sort"
 
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
@@ -27,7 +26,6 @@ func (s *Server) beginBackendWorkspaceSnapshot(ctx context.Context, be languages
 	}
 
 	uris := captured.Documents()
-	sort.Strings(uris)
 	documents := make([]languages.WorkspaceDocument, 0, len(uris))
 	for _, documentURI := range uris {
 		doc := captured.Document(documentURI)

@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"errors"
 	"go/parser"
 	"go/token"
 	"os"
@@ -222,5 +223,97 @@ func TestRegistry_ProbeSymbolsExist(t *testing.T) {
 		sort.Strings(drift)
 		t.Errorf("%d registry probe(s) name tests that no longer exist:\n  %s",
 			len(drift), strings.Join(drift, "\n  "))
+	}
+}
+
+// TestPartialDetailReportsDriftWithoutRescoring locks the PARTIAL branch of
+// checkResult. Its contract has two halves that pull in opposite directions:
+// the credit stays at 0.5 whatever the probe does (the credit stands for the
+// acknowledged partial work, not for the probe), while the Detail must say
+// exactly why the probe is unsound. Both halves drifted silently before —
+// a renamed test kept a live-looking PARTIAL entry with no signal at all.
+func TestPartialDetailReportsDriftWithoutRescoring(t *testing.T) {
+	const pkg = "example/pkg"
+	probe := &Probe{Groups: []ProbeGroup{{Pkg: pkg, Tests: []string{"TestPresent", "TestAbsent"}}}}
+
+	tests := []struct {
+		name    string
+		check   Check
+		sym     map[string][]string
+		exec    map[string]error
+		mode    string
+		wantSub string
+	}{
+		{
+			name:    "no probe keeps Reason verbatim",
+			check:   Check{Status: StatusPartial, Reason: "acknowledged partial work"},
+			mode:    "fast",
+			wantSub: "acknowledged partial work",
+		},
+		{
+			name:    "missing probe symbol is named",
+			check:   Check{Status: StatusPartial, Reason: "ack", Probe: probe},
+			sym:     map[string][]string{pkg: {"TestPresent"}},
+			mode:    "fast",
+			wantSub: "missing probe symbols: " + pkg + "/TestAbsent",
+		},
+		{
+			name:  "probe failure is reported in full mode",
+			check: Check{Status: StatusPartial, Reason: "ack", Probe: probe},
+			sym:   map[string][]string{pkg: {"TestPresent"}},
+			exec:  map[string]error{pkg + "\x00" + strings.Join(probe.Groups[0].Tests, "\x00"): errors.New("boom")},
+			mode:  "full",
+			// A missing symbol outranks the failure text, so name the symbol
+			// rather than pretending the probe ran clean.
+			wantSub: "missing probe symbols: " + pkg + "/TestAbsent",
+		},
+		{
+			name:  "probe failure is reported when every symbol exists",
+			check: Check{Status: StatusPartial, Reason: "ack", Probe: &Probe{Groups: []ProbeGroup{{Pkg: pkg, Tests: []string{"TestPresent"}}}}},
+			sym:   map[string][]string{pkg: {"TestPresent"}},
+			// checkResult keys the exec map on pkg\x00join(Tests,\x00), so the
+			// key must name exactly this group's tests.
+			exec:    map[string]error{pkg + "\x00TestPresent": errors.New("boom")},
+			mode:    "full",
+			wantSub: "probe failed: boom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := checkResult(&tt.check, tt.sym, tt.exec, tt.mode)
+			if got.Result != creditPartial {
+				t.Errorf("Result = %v, want %v; PARTIAL credit must not move with the probe",
+					got.Result, creditPartial)
+			}
+			if !strings.Contains(got.Detail, tt.wantSub) {
+				t.Errorf("Detail = %q, want it to contain %q", got.Detail, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestPartialDetailSkipsProbeRunOutsideFullMode pins that fast mode reports
+// drift from the symbol index alone. Fast mode never spawns a subprocess, so a
+// probe that exists but fails must not be reported as failed there; doing so
+// would make the fast score depend on the machine.
+func TestPartialDetailSkipsProbeRunOutsideFullMode(t *testing.T) {
+	const pkg = "example/pkg"
+	groups := []ProbeGroup{{Pkg: pkg, Tests: []string{"TestPresent"}}}
+	c := &Check{
+		Status: StatusPartial,
+		Reason: "ack",
+		Probe:  &Probe{Groups: groups},
+	}
+	sym := map[string][]string{pkg: {"TestPresent"}}
+	exec := map[string]error{pkg + "\x00TestPresent": errors.New("boom")}
+
+	for _, mode := range []string{"fast", ""} {
+		got := checkResult(c, sym, exec, mode)
+		if strings.Contains(got.Detail, "probe failed") {
+			t.Errorf("mode %q reported a probe failure it never observed: Detail = %q", mode, got.Detail)
+		}
+	}
+	if got := checkResult(c, sym, exec, "full"); !strings.Contains(got.Detail, "probe failed: boom") {
+		t.Errorf("full mode Detail = %q, want it to contain %q", got.Detail, "probe failed: boom")
 	}
 }

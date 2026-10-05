@@ -76,11 +76,9 @@ func captureSemanticOverlayIdentity(s *Server, ctx context.Context, revision uin
 	}
 	vfsRevision := s.vfs.Revision()
 	openURIs := s.vfs.OpenFiles()
-	sort.Strings(openURIs)
 	var snapshotURIs []string
 	if captured != nil {
 		snapshotURIs = captured.Documents()
-		sort.Strings(snapshotURIs)
 	}
 	if len(openURIs) != len(snapshotURIs) {
 		return zero, false
