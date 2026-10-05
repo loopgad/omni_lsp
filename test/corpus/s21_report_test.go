@@ -17,6 +17,17 @@ import (
 
 const s21ReportPathEnv = "OMNILSP_S21_REPORT"
 
+// s21GateEnv mirrors OMNILSP_SOAK_GATE (docs/soak-nightly.md): a release-evidence
+// invocation explicitly opts in with OMNILSP_S21_GATE=required. Under the opt-in
+// a missing candidate or a -short invocation is a hard failure, never a skip;
+// without it the test stays an environmental skip so form-only CI invocations
+// do not fail on preconditions they cannot satisfy.
+const s21GateEnv = "OMNILSP_S21_GATE"
+
+func s21GateRequired() bool {
+	return strings.TrimSpace(os.Getenv(s21GateEnv)) == "required"
+}
+
 const (
 	s21Passed      s21Decision = "passed"
 	s21NotVerified s21Decision = "not_verified"

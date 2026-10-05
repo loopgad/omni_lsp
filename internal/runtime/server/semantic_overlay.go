@@ -34,7 +34,7 @@ var (
 	errGoSemanticOverlayIncomplete  = errors.New("Go semantic overlay is incomplete")
 )
 
-// goSnapshotSemanticView overlays the exact open Go documents from one LSP
+// goSnapshotSemanticView overlays the exact open documents from one LSP
 // snapshot on an immutable disk view. It does not copy the whole workspace:
 // reads use the disk capture or bounded editor buffers, and only a compiler
 // materialization copies files (at most goSemanticOverlayMaxMaterialized bytes
@@ -48,7 +48,6 @@ type goSnapshotSemanticView struct {
 	overlayFiles map[string]goSemanticOverlayFile
 	newFiles     []model.File
 	changedLangs []string
-	changedGo    bool
 	mu           sync.Mutex
 	materialized int64
 	closed       bool
@@ -198,9 +197,6 @@ func captureGoSnapshotSemanticViewForIdentityExcluding(
 	view.identity.SnapshotRev = revision
 	for language := range changedLanguages {
 		view.changedLangs = append(view.changedLangs, language)
-		if language == "go" {
-			view.changedGo = true
-		}
 	}
 	sort.Strings(view.changedLangs)
 	sort.Slice(view.newFiles, func(i, j int) bool { return view.newFiles[i].URI < view.newFiles[j].URI })
@@ -254,7 +250,21 @@ func (v *goSnapshotSemanticView) ChangedLanguages() []string {
 	return append([]string(nil), v.changedLangs...)
 }
 
-func (v *goSnapshotSemanticView) HasGoChanges() bool { return v != nil && v.changedGo }
+// HasLanguageChanges reports whether at least one open document of the given
+// language differs from its disk file in this view. The dirty languages are a
+// set: a request is served from the overlay only for languages actually
+// changed in the captured editor snapshot.
+func (v *goSnapshotSemanticView) HasLanguageChanges(language string) bool {
+	if v == nil || language == "" {
+		return false
+	}
+	for _, changed := range v.changedLangs {
+		if changed == language {
+			return true
+		}
+	}
+	return false
+}
 
 func (v *goSnapshotSemanticView) SnapshotInstanceID() uint64 {
 	if v == nil || v.snapshot == nil {
@@ -275,10 +285,11 @@ func (v *goSnapshotSemanticView) DiskStillCurrent(ctx context.Context) bool {
 	return err == nil && ctx.Err() == nil && digest == v.base.identity.DiskDigest
 }
 
-// exportGoSnapshotOverlay plans and exports all Go scopes from the exact
-// request view. The supplied sink must be request-local staging; this helper
-// never publishes an index generation. It rejects stale snapshots and reports
-// whose symbol/declaration/definition/reference coverage is not complete.
+// exportGoSnapshotOverlay plans and exports all scopes of the given language
+// from the exact request view. The supplied sink must be request-local
+// staging; this helper never publishes an index generation. It rejects stale
+// snapshots and reports whose symbol/declaration/definition/reference coverage
+// is not complete.
 func exportGoSnapshotOverlay(
 	ctx context.Context,
 	s *Server,
@@ -286,12 +297,13 @@ func exportGoSnapshotOverlay(
 	builder languages.SemanticIndexRequestBuilder,
 	provider languages.SemanticIndexProvider,
 	sink model.Sink,
+	language string,
 ) (model.Request, model.Report, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if s == nil || view == nil || builder == nil || provider == nil || sink == nil ||
-		!view.HasGoChanges() || !view.changedLanguagesAreGo() {
+		!view.HasLanguageChanges(language) {
 		return model.Request{}, model.Report{}, errGoSemanticOverlayUnavailable
 	}
 	if !view.StillCurrent(s, ctx) {
@@ -301,7 +313,7 @@ func exportGoSnapshotOverlay(
 	if err != nil {
 		return model.Request{}, model.Report{}, err
 	}
-	return exportGoSnapshotOverlayWithRequest(ctx, s, view, request, provider, sink)
+	return exportGoSnapshotOverlayWithRequest(ctx, s, view, request, provider, sink, language)
 }
 
 func exportGoSnapshotOverlayWithRequest(
@@ -311,17 +323,18 @@ func exportGoSnapshotOverlayWithRequest(
 	request model.Request,
 	provider languages.SemanticIndexProvider,
 	sink model.Sink,
+	language string,
 ) (model.Request, model.Report, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if s == nil || view == nil || provider == nil || sink == nil || !view.HasGoChanges() || !view.changedLanguagesAreGo() {
+	if s == nil || view == nil || provider == nil || sink == nil || language == "" || !view.HasLanguageChanges(language) {
 		return model.Request{}, model.Report{}, errGoSemanticOverlayUnavailable
 	}
 	if !view.StillCurrent(s, ctx) {
 		return model.Request{}, model.Report{}, errGoSemanticOverlayStale
 	}
-	if err := validateGoSnapshotOverlayPlan(ctx, view, request); err != nil {
+	if err := validateGoSnapshotOverlayPlan(ctx, view, request, language); err != nil {
 		return model.Request{}, model.Report{}, err
 	}
 	report, err := provider.ExportIndex(ctx, request, sink)
@@ -346,7 +359,7 @@ func exportGoSnapshotOverlayWithRequest(
 	return request, report, nil
 }
 
-func validateGoSnapshotOverlayPlan(ctx context.Context, view *goSnapshotSemanticView, request model.Request) error {
+func validateGoSnapshotOverlayPlan(ctx context.Context, view *goSnapshotSemanticView, request model.Request, language string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -356,51 +369,39 @@ func validateGoSnapshotOverlayPlan(ctx context.Context, view *goSnapshotSemantic
 	if view == nil || view.base == nil || request.View == nil || request.View.Identity() != view.Identity() ||
 		request.WorkspaceRootURI != view.base.rootURI || len(request.Scopes) == 0 ||
 		len(request.Provenance) != len(request.Scopes) {
-		return fmt.Errorf("%w: Go planner did not bind scopes and provenance to the request view", errGoSemanticOverlayUnavailable)
+		return fmt.Errorf("%w: %s planner did not bind scopes and provenance to the request view", errGoSemanticOverlayUnavailable, language)
 	}
 	seen := make(map[string]struct{}, len(request.Scopes))
 	for _, scope := range request.Scopes {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if scope.Language != "go" || scope.ID == "" || scope.BuildContext == "" ||
+		if scope.Language != language || scope.ID == "" || scope.BuildContext == "" ||
 			!semanticScopeWithinWorkspace(view.base.rootPath, scope.RootURI) {
-			return fmt.Errorf("%w: invalid Go scope %q", errGoSemanticOverlayUnavailable, scope.ID)
+			return fmt.Errorf("%w: invalid %s scope %q", errGoSemanticOverlayUnavailable, language, scope.ID)
 		}
 		if _, duplicate := seen[scope.ID]; duplicate {
-			return fmt.Errorf("%w: duplicate Go scope %q", errGoSemanticOverlayIncomplete, scope.ID)
+			return fmt.Errorf("%w: duplicate %s scope %q", errGoSemanticOverlayIncomplete, language, scope.ID)
 		}
 		seen[scope.ID] = struct{}{}
 		provenance, ok := request.Provenance[scope.ID]
 		if !ok || provenance.SchemaVersion != model.SchemaVersion || provenance.Identity != view.Identity() ||
 			!reflect.DeepEqual(provenance.Scope, scope) || provenance.Extractor == "" || provenance.ExtractorVer == "" ||
-			provenance.Toolchain == "" || provenance.Backend.Name == "" || provenance.Backend.Language != "go" ||
+			provenance.Toolchain == "" || provenance.Backend.Name == "" || provenance.Backend.Language != language ||
 			scope.BuildContext != model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, provenance.Tools) {
-			return fmt.Errorf("%w: invalid provenance for Go scope %q", errGoSemanticOverlayUnavailable, scope.ID)
+			return fmt.Errorf("%w: invalid provenance for %s scope %q", errGoSemanticOverlayUnavailable, language, scope.ID)
 		}
 		if len(provenance.Tools) == 0 {
-			return fmt.Errorf("%w: Go scope %q has no pinned tool", errGoSemanticOverlayUnavailable, scope.ID)
+			return fmt.Errorf("%w: %s scope %q has no pinned tool", errGoSemanticOverlayUnavailable, language, scope.ID)
 		}
 		for _, tool := range provenance.Tools {
 			if tool.Name == "" || tool.Path == "" || tool.Version == "" || tool.SHA256 == "" ||
 				!toolIdentityStillMatches(ctx, tool) {
-				return fmt.Errorf("%w: pinned tool for Go scope %q changed or is unavailable", errGoSemanticOverlayStale, scope.ID)
+				return fmt.Errorf("%w: pinned tool for %s scope %q changed or is unavailable", errGoSemanticOverlayStale, language, scope.ID)
 			}
 		}
 	}
 	return nil
-}
-
-func (v *goSnapshotSemanticView) changedLanguagesAreGo() bool {
-	if v == nil || !v.changedGo || len(v.changedLangs) == 0 {
-		return false
-	}
-	for _, language := range v.changedLangs {
-		if language != "go" {
-			return false
-		}
-	}
-	return true
 }
 
 func scopeFactComplete(report model.Report, scopeID string, fact model.FactKind) bool {

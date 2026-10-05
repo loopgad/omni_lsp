@@ -3,7 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,9 +17,25 @@ import (
 	"github.com/omnilsp/omni/internal/workspace/uri"
 )
 
+// Bounded read-only budgets for the dirty overlay pre-screen, mirroring the
+// request budget constants of semantic_overlay_facts.go. The screen walks at
+// most overlayDirtyScreenMaxDocuments open documents overall and
+// overlayDirtyScreenMaxPerLanguage documents of any one language, comparing at
+// most overlayDirtyScreenMaxBytes of disk content. Anything beyond those
+// budgets stays unscreened: the request falls back to the live backend instead
+// of degrading the pre-screen into an unbounded scan.
+const (
+	overlayDirtyScreenMaxDocuments   = 2048
+	overlayDirtyScreenMaxPerLanguage = 512
+	overlayDirtyScreenMaxBytes       = int64(32 << 20)
+)
+
 // goSnapshotSemanticLocations answers a definition or references request from
-// a complete, type-checked export of the exact dirty Go snapshot. Any failure
-// returns used=false so the caller can preserve the live-backend fallback.
+// a complete, type-checked export of the exact dirty snapshot for the query
+// file's own language. The language is taken from the open query document's
+// LanguageID, the matching semantic index binding is selected by it, and any
+// failure returns used=false so the caller can preserve the live-backend
+// fallback.
 func (s *Server) goSnapshotSemanticLocations(
 	ctx context.Context,
 	queryURI string,
@@ -50,19 +66,21 @@ func (s *Server) goSnapshotSemanticLocations(
 		return zero, false
 	}
 	queryURI = parsed.Canonical()
-	requestOverlay, dirty := s.goSnapshotOverlayMightBeDirty(ctx, idx, queryURI, revision)
-	if !dirty {
+	captured := snapshotFromCtx(ctx)
+	if captured == nil {
 		return zero, false
 	}
-	var binding semanticIndexBinding
-	foundBinding := false
-	for _, candidate := range s.semanticIndexBindings() {
-		if candidate.language == "go" {
-			binding, foundBinding = candidate.binding, true
-			break
-		}
+	queryDocument := captured.Document(queryURI)
+	if queryDocument == nil || queryDocument.URI != queryURI || queryDocument.LanguageID == "" {
+		return zero, false
 	}
-	if !foundBinding || binding.provider == nil || binding.planner == nil || s.overlayFacts == nil {
+	language := queryDocument.LanguageID
+	binding, foundBinding := s.semanticIndexBindingForLanguage(language)
+	if !foundBinding || s.overlayFacts == nil {
+		return zero, false
+	}
+	requestOverlay, dirtyLanguages := s.snapshotOverlayMightBeDirty(ctx, idx, queryURI, revision)
+	if _, dirty := dirtyLanguages[language]; !dirty {
 		return zero, false
 	}
 
@@ -76,10 +94,10 @@ func (s *Server) goSnapshotSemanticLocations(
 		return zero, false
 	}
 	defer view.Close()
-	if !view.HasGoChanges() || !view.changedLanguagesAreGo() || !view.StillCurrent(s, ctx) {
+	if !view.HasLanguageChanges(language) || !view.StillCurrent(s, ctx) {
 		return zero, false
 	}
-	facts, err := s.overlayFacts.GetOrExport(ctx, s, view, binding.planner, binding.provider)
+	facts, err := s.overlayFacts.GetOrExport(ctx, s, view, binding.planner, binding.provider, language)
 	if err != nil || ctx.Err() != nil || !view.StillCurrent(s, ctx) {
 		return zero, false
 	}
@@ -88,12 +106,12 @@ func (s *Server) goSnapshotSemanticLocations(
 		return zero, false
 	}
 	provenance, ok := facts.provenance[scope.ID]
-	if !ok || provenance.Backend.Name == "" || provenance.Backend.Language != "go" || scope.BuildContext == "" {
+	if !ok || provenance.Backend.Name == "" || provenance.Backend.Language != facts.language || scope.BuildContext == "" {
 		return zero, false
 	}
-	detail := "go-snapshot-overlay-definition"
+	detail := language + "-snapshot-overlay-definition"
 	if query == persistentReferences {
-		detail = "go-snapshot-overlay-references"
+		detail = language + "-snapshot-overlay-references"
 	}
 	if ctx.Err() != nil || !view.StillCurrent(s, ctx) || !view.DiskStillCurrent(ctx) {
 		return zero, false
@@ -121,8 +139,23 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 	revision uint64,
 	encoding int,
 ) (identity.SemanticResult[[]languages.WorkspaceSymbol], bool) {
+	return s.snapshotSemanticWorkspaceSymbols(ctx, query, revision, encoding, "go")
+}
+
+// snapshotSemanticWorkspaceSymbols returns complete workspace symbols of one
+// language from the exact dirty editor snapshot. The language selects the
+// semantic index binding; used is true for every established dirty overlay of
+// that language, including an explicit unknown result when the export cannot
+// prove a complete answer; callers must not substitute disk-only symbols then.
+func (s *Server) snapshotSemanticWorkspaceSymbols(
+	ctx context.Context,
+	query string,
+	revision uint64,
+	encoding int,
+	language string,
+) (identity.SemanticResult[[]languages.WorkspaceSymbol], bool) {
 	var zero identity.SemanticResult[[]languages.WorkspaceSymbol]
-	if s == nil || revision == 0 || encoding < int(position.UTF8) || encoding > int(position.UTF32) {
+	if s == nil || revision == 0 || language == "" || encoding < int(position.UTF8) || encoding > int(position.UTF32) {
 		return zero, false
 	}
 	var current bool
@@ -134,8 +167,8 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 	if idx == nil {
 		return zero, false
 	}
-	requestOverlay, dirty := s.goSnapshotOverlayMightBeDirty(ctx, idx, "", revision)
-	if !dirty {
+	requestOverlay, dirtyLanguages := s.snapshotOverlayMightBeDirty(ctx, idx, "", revision)
+	if _, dirty := dirtyLanguages[language]; !dirty {
 		return zero, false
 	}
 	unknown := func(reason string) (identity.SemanticResult[[]languages.WorkspaceSymbol], bool) {
@@ -148,16 +181,9 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 		}
 		return result, true
 	}
-	var binding semanticIndexBinding
-	foundBinding := false
-	for _, candidate := range s.semanticIndexBindings() {
-		if candidate.language == "go" {
-			binding, foundBinding = candidate.binding, true
-			break
-		}
-	}
-	if !foundBinding || binding.provider == nil || binding.planner == nil || s.overlayFacts == nil {
-		return unknown("dirty Go snapshot has no complete semantic exporter")
+	binding, foundBinding := s.semanticIndexBindingForLanguage(language)
+	if !foundBinding || s.overlayFacts == nil {
+		return unknown(fmt.Sprintf("dirty %s snapshot has no complete semantic exporter", language))
 	}
 	base, err := captureSemanticView(ctx, idx.root, idx.workspaceID, revision, idx.dir)
 	if err != nil {
@@ -169,15 +195,15 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 		return unknown(err.Error())
 	}
 	defer view.Close()
-	if !view.HasGoChanges() || !view.changedLanguagesAreGo() || !view.StillCurrent(s, ctx) {
-		return unknown("dirty Go snapshot changed during capture")
+	if !view.HasLanguageChanges(language) || !view.StillCurrent(s, ctx) {
+		return unknown(fmt.Sprintf("dirty %s snapshot changed during capture", language))
 	}
-	facts, err := s.overlayFacts.GetOrExport(ctx, s, view, binding.planner, binding.provider)
+	facts, err := s.overlayFacts.GetOrExport(ctx, s, view, binding.planner, binding.provider, language)
 	if err != nil || ctx.Err() != nil || !view.StillCurrent(s, ctx) {
 		if err == nil {
 			err = ctx.Err()
 		}
-		return unknown(errorString(err))
+		return unknown(errorString(err, language))
 	}
 
 	candidates := facts.WorkspaceSymbols(query, maxPersistentWorkspaceSymbols)
@@ -189,9 +215,9 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 		}
 		occurrence := candidate.Definition
 		file, ok := view.file(occurrence.URI)
-		if !ok || file.LanguageID != "go" || file.SHA256 == "" || file.SHA256 != occurrence.SourceHash ||
+		if !ok || file.LanguageID != facts.language || file.SHA256 == "" || file.SHA256 != occurrence.SourceHash ||
 			candidate.Symbol.ScopeID != occurrence.ScopeID || candidate.Symbol.ID != occurrence.SymbolID {
-			return unknown("workspace symbol definition does not match its captured Go source")
+			return unknown(fmt.Sprintf("workspace symbol definition does not match its captured %s source", language))
 		}
 		content, cached := contentByURI[occurrence.URI]
 		if !cached {
@@ -203,7 +229,7 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 		}
 		startOffset, endOffset, valid := persistedOccurrenceOffsets(content, occurrence.Range)
 		if !valid || string(content[startOffset:endOffset]) != candidate.Symbol.Name {
-			return unknown("workspace symbol range does not identify its captured Go name")
+			return unknown(fmt.Sprintf("workspace symbol range does not identify its captured %s name", language))
 		}
 		start, valid := persistedPositionInEncoding(content, occurrence.Range.StartLine, occurrence.Range.StartChar, position.Encoding(encoding))
 		if !valid {
@@ -217,25 +243,25 @@ func (s *Server) goSnapshotSemanticWorkspaceSymbols(
 	evidence := make([]identity.Evidence, 0, len(facts.scopes))
 	for _, scope := range facts.scopes {
 		provenance, ok := facts.provenance[scope.ID]
-		if !ok || provenance.Backend.Name == "" || provenance.Backend.Language != "go" || scope.BuildContext == "" {
-			return unknown("Go workspace symbol provenance is incomplete")
+		if !ok || provenance.Backend.Name == "" || provenance.Backend.Language != facts.language || scope.BuildContext == "" {
+			return unknown(fmt.Sprintf("%s workspace symbol provenance is incomplete", language))
 		}
 		evidence = append(evidence, identity.Evidence{
 			Kind: identity.EvidenceCompiler, Assurance: identity.AssuranceCompilerResolved,
 			Snapshot:     identity.SnapshotID{Workspace: facts.identity.Workspace, Revision: identity.SnapshotRevision(revision)},
 			BuildContext: scope.BuildContext, Backend: provenance.Backend, BackendEpoch: provenance.BackendEpoch,
-			SourceHash: view.Identity().DiskDigest, DetailCode: "go-snapshot-overlay-workspace-symbols", Timestamp: time.Now().UTC(),
+			SourceHash: view.Identity().DiskDigest, DetailCode: language + "-snapshot-overlay-workspace-symbols", Timestamp: time.Now().UTC(),
 		})
 	}
 	if ctx.Err() != nil || !view.StillCurrent(s, ctx) || !view.DiskStillCurrent(ctx) {
-		return unknown("workspace changed while verifying dirty Go symbols")
+		return unknown(fmt.Sprintf("workspace changed while verifying dirty %s symbols", language))
 	}
 	return identity.NewExactResult(symbols, evidence), true
 }
 
-func errorString(err error) string {
+func errorString(err error, language string) string {
 	if err == nil {
-		return "dirty Go semantic overlay could not be verified"
+		return fmt.Sprintf("dirty %s semantic overlay could not be verified", language)
 	}
 	return err.Error()
 }
@@ -259,128 +285,169 @@ func goOverlayContextAtRevision(s *Server, ctx context.Context, revision uint64)
 		captured.ID().Revision == revision && current.ID().Revision == revision && s.currentRevision() == revision
 }
 
-// goSnapshotOverlayMightBeDirty cheaply screens normal requests before the
-// immutable workspace capture. It only reads bounded open Go documents and
-// returns true when at least one differs from the corresponding disk file.
-func (s *Server) goSnapshotOverlayMightBeDirty(
+// semanticIndexBindingForLanguage returns the registered semantic index
+// binding for one language, if that language has a complete provider/planner
+// capability.
+func (s *Server) semanticIndexBindingForLanguage(language string) (semanticIndexBinding, bool) {
+	if language == "" {
+		return semanticIndexBinding{}, false
+	}
+	for _, candidate := range s.semanticIndexBindings() {
+		if candidate.language == language && candidate.binding.provider != nil && candidate.binding.planner != nil {
+			return candidate.binding, true
+		}
+	}
+	return semanticIndexBinding{}, false
+}
+
+// snapshotOverlayMightBeDirty cheaply screens normal requests before the
+// immutable workspace capture. It only reads a bounded set of open documents —
+// at most overlayDirtyScreenMaxDocuments overall and
+// overlayDirtyScreenMaxPerLanguage per language, comparing at most
+// overlayDirtyScreenMaxBytes of disk content — and returns the languages with
+// at least one open document differing from the corresponding disk file.
+// Documents that are excluded, over budget, or whose declared language cannot
+// be confirmed from the file extension are not attributed to any language, so
+// those languages stay out of the result and the caller falls back to the live
+// backend instead of scanning without bound. Structural anomalies (documents
+// outside the workspace, unreadable targets, missing snapshots) abort the
+// whole screen exactly as before.
+func (s *Server) snapshotOverlayMightBeDirty(
 	ctx context.Context,
 	idx *indexService,
 	queryURI string,
 	revision uint64,
-) (semanticOverlayIdentity, bool) {
-	var zero semanticOverlayIdentity
+) (semanticOverlayIdentity, map[string]struct{}) {
 	if s == nil || idx == nil || ctx == nil || ctx.Err() != nil || revision == 0 {
-		return zero, false
+		return semanticOverlayIdentity{}, nil
 	}
 	if s.snapMgr == nil {
-		return zero, false
+		return semanticOverlayIdentity{}, nil
 	}
 	captured := snapshotFromCtx(ctx)
 	current := s.snapMgr.Current()
 	if captured == nil || current == nil || captured.InstanceID() != current.InstanceID() ||
 		captured.ID().Revision != revision || s.currentRevision() != revision {
-		return zero, false
+		return semanticOverlayIdentity{}, nil
 	}
 	if queryURI != "" {
 		queryDocument := captured.Document(queryURI)
-		if queryDocument == nil || queryDocument.URI != queryURI || queryDocument.LanguageID != "go" {
-			return zero, false
+		if queryDocument == nil || queryDocument.URI != queryURI {
+			return semanticOverlayIdentity{}, nil
 		}
 	}
-	hasOpenGoDocument := false
-	for _, documentURI := range captured.Documents() {
-		document := captured.Document(documentURI)
-		if document != nil && document.LanguageID == "go" {
-			hasOpenGoDocument = true
-			break
-		}
-	}
-	if !hasOpenGoDocument {
-		return zero, false
+	documents := captured.Documents()
+	// Snapshot.Documents ranges a map, so its order changes every run. The
+	// per-language budget below screens only the first N documents, which
+	// would make an otherwise identical query answer from the overlay on one
+	// run and fall back to the live backend on the next. Sort so the screened
+	// subset is a function of the document set alone.
+	sort.Strings(documents)
+	if len(documents) > overlayDirtyScreenMaxDocuments {
+		return semanticOverlayIdentity{}, nil
 	}
 	root, err := filepath.Abs(idx.root)
 	if err != nil {
-		return zero, false
+		return semanticOverlayIdentity{}, nil
 	}
 	rootReal, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return zero, false
+		return semanticOverlayIdentity{}, nil
 	}
-	for _, documentURI := range captured.Documents() {
+	dirtyLanguages := make(map[string]struct{})
+	screenedPerLanguage := make(map[string]int)
+	var screenedBytes int64
+	for _, documentURI := range documents {
 		if err := ctx.Err(); err != nil {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		open := captured.Document(documentURI)
-		if open == nil {
-			return zero, false
-		}
-		if open.LanguageID != "go" {
-			continue
-		}
-		if open.URI != documentURI {
-			return zero, false
+		if open == nil || open.URI != documentURI {
+			return semanticOverlayIdentity{}, nil
 		}
 		parsed, err := uri.Parse(open.URI)
 		if err != nil || !parsed.IsFile() {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		path, err := parsed.Path()
 		if err != nil {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		path, err = filepath.Abs(path)
 		if err != nil || ensureContained(root, path) != nil {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		if semanticOverlayPathExcluded(root, filepath.ToSlash(rel)) {
 			continue
 		}
-		if semanticLanguageID(path) != open.LanguageID {
-			return zero, false
+		// Only documents whose declared language matches the workspace file
+		// extension can be attributed to a language cheaply. Others (plain
+		// text, unknown extensions, editors overriding the extension) are
+		// skipped without aborting the screen for every other language.
+		if inferred := semanticLanguageID(path); inferred == "" || inferred != open.LanguageID {
+			continue
 		}
+		if screenedPerLanguage[open.LanguageID] >= overlayDirtyScreenMaxPerLanguage {
+			continue
+		}
+		screenedPerLanguage[open.LanguageID]++
 		parentReal, err := filepath.EvalSymlinks(filepath.Dir(path))
 		if err != nil {
 			if os.IsNotExist(err) {
-				return captureDirtyGoOverlayIdentity(s, ctx, revision)
+				dirtyLanguages[open.LanguageID] = struct{}{}
+				continue
 			}
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		if ensureContained(rootReal, parentReal) != nil {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		target := filepath.Join(parentReal, filepath.Base(path))
 		info, err := os.Lstat(target)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return captureDirtyGoOverlayIdentity(s, ctx, revision)
+				dirtyLanguages[open.LanguageID] = struct{}{}
+				continue
 			}
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
 		if info.Size() != int64(len(open.Content)) {
-			return captureDirtyGoOverlayIdentity(s, ctx, revision)
+			dirtyLanguages[open.LanguageID] = struct{}{}
+			continue
 		}
 		if info.Size() > goSemanticOverlayMaxOpenBytes {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
+		}
+		if screenedBytes+info.Size() > overlayDirtyScreenMaxBytes {
+			return semanticOverlayIdentity{}, nil
 		}
 		diskContent, err := os.ReadFile(target)
 		if err != nil {
-			return zero, false
+			return semanticOverlayIdentity{}, nil
 		}
+		screenedBytes += info.Size()
 		if !bytes.Equal(diskContent, open.Content) {
-			return captureDirtyGoOverlayIdentity(s, ctx, revision)
+			dirtyLanguages[open.LanguageID] = struct{}{}
 		}
 	}
-	return zero, false
+	if len(dirtyLanguages) == 0 {
+		return semanticOverlayIdentity{}, nil
+	}
+	requestOverlay, ok := captureDirtyOverlayIdentity(s, ctx, revision)
+	if !ok {
+		return semanticOverlayIdentity{}, nil
+	}
+	return requestOverlay, dirtyLanguages
 }
 
-func captureDirtyGoOverlayIdentity(s *Server, ctx context.Context, revision uint64) (semanticOverlayIdentity, bool) {
+func captureDirtyOverlayIdentity(s *Server, ctx context.Context, revision uint64) (semanticOverlayIdentity, bool) {
 	if ctx == nil || ctx.Err() != nil {
 		return semanticOverlayIdentity{}, false
 	}
@@ -411,10 +478,10 @@ func (f *goSnapshotSemanticFacts) locations(
 	}
 	if encoding < position.UTF8 || encoding > position.UTF32 ||
 		query != persistentDefinition && query != persistentReferences {
-		return nil, noFile, noScope, false, errors.New("unsupported Go snapshot semantic query")
+		return nil, noFile, noScope, false, fmt.Errorf("unsupported %s snapshot semantic query", f.language)
 	}
 	file, ok := view.file(queryURI)
-	if !ok || file.LanguageID != "go" {
+	if !ok || file.LanguageID != f.language {
 		return nil, noFile, noScope, false, nil
 	}
 	content, err := readGoSnapshotViewFile(ctx, view, file)
@@ -483,7 +550,7 @@ func (f *goSnapshotSemanticFacts) locations(
 		}
 		if occurrence.URI != sourceURI {
 			sourceFile, exists := view.file(occurrence.URI)
-			if !exists || sourceFile.LanguageID != "go" || sourceFile.SHA256 != occurrence.SourceHash {
+			if !exists || sourceFile.LanguageID != f.language || sourceFile.SHA256 != occurrence.SourceHash {
 				return nil, noFile, noScope, false, errGoSemanticOverlayStale
 			}
 			sourceContent, err = readGoSnapshotViewFile(ctx, view, sourceFile)

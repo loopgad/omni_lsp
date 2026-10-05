@@ -75,7 +75,7 @@ func TestGoSnapshotSemanticOverlayExportsCurrentFactsAndRejectsStaleSnapshot(t *
 		_ = diskView.Close()
 		t.Fatalf("capture Go request overlay: %v", err)
 	}
-	if !view.HasGoChanges() || !view.StillCurrent(s, ctx) {
+	if !view.HasLanguageChanges("go") || !view.StillCurrent(s, ctx) {
 		t.Fatal("captured overlay did not identify current Go changes")
 	}
 
@@ -95,7 +95,7 @@ func TestGoSnapshotSemanticOverlayExportsCurrentFactsAndRejectsStaleSnapshot(t *
 
 	overlayBackend := golang.New(root)
 	overlaySink := &overlayTestSink{}
-	request, report, err := exportGoSnapshotOverlay(ctx, s, view, overlayBackend, overlayBackend, overlaySink)
+	request, report, err := exportGoSnapshotOverlay(ctx, s, view, overlayBackend, overlayBackend, overlaySink, "go")
 	if err != nil {
 		t.Fatalf("export snapshot Go overlay: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestGoSnapshotSemanticOverlayExportsCurrentFactsAndRejectsStaleSnapshot(t *
 	if view.StillCurrent(s, ctx) {
 		t.Fatal("overlay remained current after the request snapshot advanced")
 	}
-	if _, _, err := exportGoSnapshotOverlay(ctx, s, view, overlayBackend, overlayBackend, &overlayTestSink{}); !errors.Is(err, errGoSemanticOverlayStale) {
+	if _, _, err := exportGoSnapshotOverlay(ctx, s, view, overlayBackend, overlayBackend, &overlayTestSink{}, "go"); !errors.Is(err, errGoSemanticOverlayStale) {
 		t.Fatalf("export after snapshot advance error = %v, want stale overlay", err)
 	}
 }
@@ -178,7 +178,7 @@ func TestGoOverlayPositionLookupDoesNotSortBySymbolName(t *testing.T) {
 			{SymbolID: "a", ScopeID: "go", URI: fileURI, Role: "reference", SourceHash: "sha256:source", BuildContext: "context", Range: model.Position{StartLine: 8, StartChar: 1, EndLine: 8, EndChar: 2}},
 		},
 	}
-	facts, err := buildGoSnapshotSemanticFacts(view, request, model.Report{}, sink)
+	facts, err := buildGoSnapshotSemanticFacts(view, request, model.Report{}, sink, "go")
 	if err != nil {
 		t.Fatal(err)
 	}

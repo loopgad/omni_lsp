@@ -1,10 +1,13 @@
 package conformance
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFastReport_ScoreBoundsAndShape runs the engine entry on this module
@@ -46,7 +49,13 @@ func TestFastReport_ScoreBoundsAndShape(t *testing.T) {
 	}
 }
 
-func TestPERF3_SkippedS21ProbeCannotEarnFullCredit(t *testing.T) {
+// TestPERF3_S21GateFailsClosedWithoutCandidate pins the upgraded PERF-3
+// contract: the S21 classification earned AUTO with frozen-candidate evidence
+// (decision=passed, run gate-20261004T2347Z), and the corpus test's
+// OMNILSP_S21_GATE=required opt-in must turn a missing candidate into a hard
+// failure — the conformance probe must never be able to earn PERF-3 credit
+// from a silently skipped S21 run again.
+func TestPERF3_S21GateFailsClosedWithoutCandidate(t *testing.T) {
 	var perf3 *Check
 	for i := range Registry.Checks {
 		if Registry.Checks[i].ID == "PERF-3" {
@@ -57,24 +66,70 @@ func TestPERF3_SkippedS21ProbeCannotEarnFullCredit(t *testing.T) {
 	if perf3 == nil {
 		t.Fatal("PERF-3 is missing from the conformance registry")
 	}
-	if perf3.Status != StatusPartial || perf3.Probe == nil || len(perf3.Probe.Groups) != 1 {
-		t.Fatalf("PERF-3 must remain partial while candidate-bound S21 evidence is external: %+v", perf3)
+	if perf3.Status != StatusAuto || perf3.Probe == nil || len(perf3.Probe.Groups) != 1 {
+		t.Fatalf("PERF-3 must be AUTO with exactly the deterministic gate-guard probe group: %+v", perf3)
 	}
-	if !strings.Contains(perf3.Reason, "skipping without OMNILSP_BIN") {
-		t.Fatalf("PERF-3 reason does not identify the missing-candidate skip: %q", perf3.Reason)
+	guardGroup := perf3.Probe.Groups[0]
+	if guardGroup.Pkg != "internal/conformance" || len(guardGroup.Tests) != 1 || guardGroup.Tests[0] != "TestPERF3_S21GateFailsClosedWithoutCandidate" {
+		t.Fatalf("PERF-3 probe group must be the in-package gate guard, not the artifact-dependent corpus run: %+v", guardGroup)
+	}
+	// The corpus classification itself moved to DEF-S21CORPUS; assert the split
+	// holds so nobody silently puts the frozen-candidate run back on a scored
+	// entry and reintroduces a machine-dependent core score.
+	var corpusDeferred *Check
+	for i := range Registry.Checks {
+		if Registry.Checks[i].ID == "DEF-S21CORPUS" {
+			corpusDeferred = &Registry.Checks[i]
+			break
+		}
+	}
+	if corpusDeferred == nil {
+		t.Fatal("DEF-S21CORPUS is missing; the S21 corpus run would be off the ledger entirely")
+	}
+	if corpusDeferred.Status != StatusDeferred || corpusDeferred.Domain != "post-x9" || corpusDeferred.Probe != nil {
+		t.Fatalf("DEF-S21CORPUS must be a probe-less post-x9 DEFERRED: %+v", corpusDeferred)
 	}
 
-	group := perf3.Probe.Groups[0]
-	symbols := map[string][]string{group.Pkg: append([]string(nil), group.Tests...)}
-	// A nil execution error models go test's exit 0 when the S21 test skips.
-	// The partial status must prevent that exit from earning a pass.
-	execution := map[string]error{
-		group.Pkg + "\x00" + strings.Join(group.Tests, "\x00"): nil,
+	if testing.Short() {
+		t.Skip("guard shells out to the go toolchain; skipped in -short")
 	}
-	result := checkResult(perf3, symbols, execution, "full")
-	if result.Result != creditPartial {
-		t.Fatalf("PERF-3 result after a green (possibly skipped) probe = %v, want partial credit %v", result.Result, creditPartial)
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "./test/corpus", "-run", "^TestS21_ZeroErrorClassification$", "-count=1", "-timeout", "3m")
+	cmd.Dir = moduleRoot()
+	// Strip every candidate-bound variable the outer process may carry, then
+	// opt the inner run in: with the gate required and no candidate, the S21
+	// test must fail (t.Fatalf), not skip.
+	base := os.Environ()
+	strip := map[string]bool{
+		"OMNILSP_BIN": true, "OMNILSP_S21_REPORT": true, "OMNILSP_RUN_ID": true,
+		"OMNILSP_CANDIDATE_SHA256": true, "OMNILSP_S21_GATE": true,
+	}
+	env := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		if i := strings.IndexByte(kv, '='); i > 0 && strip[kv[:i]] {
+			continue
+		}
+		env = append(env, kv)
+	}
+	cmd.Env = append(env, "OMNILSP_S21_GATE=required")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("S21 gate did not fail closed without a candidate; output tail:\n%s", tailOf(string(out), 400))
+	}
+	if !strings.Contains(string(out), "opted in but no frozen candidate") {
+		t.Fatalf("S21 gate failure is not the missing-candidate t.Fatalf (tree may not compile); output tail:\n%s", tailOf(string(out), 400))
+	}
+}
+
+func tailOf(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 // TestRenderText_ContainsDomainsAndScores checks the human scorecard on a

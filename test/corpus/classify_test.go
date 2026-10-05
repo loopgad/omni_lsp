@@ -13,8 +13,11 @@ package corpus
 //	Snapshot Mixing            = 0
 //
 // The acceptance harness supplies the frozen OmniLSP candidate through
-// OMNILSP_BIN. A missing candidate is an environmental skip; direct backend
-// adapters are intentionally not used by this release evidence.
+// OMNILSP_BIN. A missing candidate is an environmental skip for form-only
+// invocations; a run that explicitly opts in through OMNILSP_S21_GATE=required
+// (the OMNILSP_SOAK_GATE=required contract of docs/soak-nightly.md) treats a
+// missing candidate as a hard failure instead of a silent not_verified. Direct
+// backend adapters are intentionally not used by this release evidence.
 
 import (
 	"context"
@@ -148,6 +151,9 @@ func TestS21_ZeroErrorClassification(t *testing.T) {
 		for _, language := range requiredLanguages {
 			evidence.skippedLanguages[language] = candidateErr.Error()
 		}
+		if s21GateRequired() {
+			t.Fatalf("OMNILSP_S21_GATE=required opted in but no frozen candidate is available: %v", candidateErr)
+		}
 		t.Skip(candidateErr.Error())
 	}
 	if testing.Short() {
@@ -155,6 +161,9 @@ func TestS21_ZeroErrorClassification(t *testing.T) {
 			for _, lang := range requiredLanguages {
 				evidence.skippedLanguages[lang] = "testing.Short() skips language toolchains"
 			}
+		}
+		if s21GateRequired() {
+			t.Fatalf("OMNILSP_S21_GATE=required opted in but -short skips the language toolchains; rerun without -short")
 		}
 		t.Skip("requires language toolchains")
 	}

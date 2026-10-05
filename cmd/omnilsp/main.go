@@ -89,7 +89,7 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		usage()
-		os.Exit(1)
+		os.Exit(2) // goal.md W1: invalid CLI invocation exits 2
 	}
 }
 
@@ -121,6 +121,16 @@ func cmdServe(args []string) {
 	workspace := fs.String("workspace", "", "workspace root (defaults to cwd)")
 	recordPath := fs.String("record", "", "record the session to this .jsonl file (§P9)")
 	_ = fs.Parse(args)
+
+	// goal.md W1: an explicitly named config file that does not exist is an
+	// invalid CLI invocation (exit 2), not a silent default start. Omitting
+	// --config entirely keeps the documented "missing file → defaults win"
+	// path inside config.Load.
+	if *configPath != "" {
+		if _, statErr := os.Stat(*configPath); os.IsNotExist(statErr) {
+			fatalCode(2, "config: file not found: %s", *configPath)
+		}
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -155,7 +165,14 @@ func cmdServe(args []string) {
 			fatal("http-addr: %v", verr)
 		}
 		sharedCore.srv.Store(srv)
-		hs := httpserver.New(sharedCore, httpserver.Options{Addr: *httpAddr})
+		opts := httpserver.Options{Addr: *httpAddr}
+		// §X6/N8: configured read-API bearer tokens switch the HTTP surface
+		// from the local-trust allow-all posture to bearer authentication.
+		// An empty token set keeps the pre-existing baseline behavior.
+		if tokens := cfg.ReadAPITokenSet(); len(tokens) > 0 {
+			opts.Auth.Tokens = tokens
+		}
+		hs := httpserver.New(sharedCore, opts)
 		ln, lerr := net.Listen("tcp", *httpAddr)
 		if lerr != nil {
 			fatal("http listen %s: %v", *httpAddr, lerr)
@@ -441,6 +458,15 @@ func fatal(f string, args ...any) {
 	os.Exit(1)
 }
 
+// fatalCode is the exit-code-aware variant of fatal for call sites whose
+// exit category differs from the shared default (goal.md W1). The shared
+// fatal() above keeps its hardcoded os.Exit(1) contract; only explicit
+// callers pick a different code.
+func fatalCode(code int, f string, args ...any) {
+	fmt.Fprint(os.Stderr, "omnilsp: "+security.RedactString(fmt.Sprintf(f, args...))+"\n")
+	os.Exit(code)
+}
+
 // sessionMeta assembles the §P9 header record: config digest plus the
 // backend/toolchain inventory discovered at serve time.
 func sessionMeta(cfg config.Config, srv *server.Server) replay.Meta {
@@ -476,8 +502,10 @@ func firstLine(s string) string {
 
 // §N11: every CLI log line passes the credential redactor before hitting
 // stderr — workspace names, config paths and backend output can carry tokens.
+// warn renders f with args first (same shape as info), then redacts; the
+// rendered string must never be fed back through f as a format argument.
 func warn(f string, args ...any) {
-	fmt.Fprintf(os.Stderr, "omnilsp: WARN: "+f+"\n", security.RedactString(fmt.Sprintf(f, args...)))
+	fmt.Fprint(os.Stderr, "omnilsp: WARN: "+security.RedactString(fmt.Sprintf(f, args...))+"\n")
 }
 
 func info(f string, args ...any) {

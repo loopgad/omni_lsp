@@ -359,14 +359,14 @@ func TestGoSnapshotSemanticFactsCacheReplansSameCapabilities(t *testing.T) {
 	defer view.Close()
 	backend := &mutableOverlayPlanBackend{toolPath: toolPath, planTag: "first"}
 	cache := newGoSnapshotSemanticFactsCache()
-	if _, err := cache.GetOrExport(ctx, s, view, backend, backend); err != nil {
+	if _, err := cache.GetOrExport(ctx, s, view, backend, backend, "go"); err != nil {
 		t.Fatalf("first export: %v", err)
 	}
 	if err := os.WriteFile(toolPath, []byte("tool-v2"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	backend.planTag = "second"
-	if _, err := cache.GetOrExport(ctx, s, view, backend, backend); err != nil {
+	if _, err := cache.GetOrExport(ctx, s, view, backend, backend, "go"); err != nil {
 		t.Fatalf("export after planner/tool input changed: %v", err)
 	}
 	if got := backend.exportCalls.Load(); got != 2 {
@@ -518,6 +518,14 @@ func newGoOverlayQueryTestServer(
 	content []byte,
 	backend languages.Backend,
 ) *Server {
+	return newOverlayQueryTestServer(root, rootURI, fileURI, "go", content, backend)
+}
+
+func newOverlayQueryTestServer(
+	root, rootURI, fileURI, language string,
+	content []byte,
+	backend languages.Backend,
+) *Server {
 	s := New(DefaultConfig())
 	s.workspaceID = identity.WorkspaceID(rootURI)
 	s.idx = &indexService{
@@ -525,11 +533,11 @@ func newGoOverlayQueryTestServer(
 		dir: filepath.Join(root, ".index"),
 	}
 	s.overlayFacts = newGoSnapshotSemanticFactsCache()
-	s.RegisterBackend("go", backend)
-	s.vfs.Open(fileURI, "go", 1, content, vfs.SourceEditor)
+	s.RegisterBackend(language, backend)
+	s.vfs.Open(fileURI, language, 1, content, vfs.SourceEditor)
 	revision := s.vfs.Revision()
 	captured := snapshot.New(string(s.workspaceID), revision, map[string]snapshot.DocumentSnapshot{
-		fileURI: {URI: fileURI, LanguageID: "go", Version: 1, Content: content},
+		fileURI: {URI: fileURI, LanguageID: language, Version: 1, Content: content},
 	})
 	s.snapMgr.Publish(captured)
 	return s
@@ -581,4 +589,364 @@ func overlaySymbolIDFromFactsCache(cache *goSnapshotSemanticFactsCache, name str
 		}
 	}
 	return false
+}
+
+// overlayFactsCacheLanguages counts the cached fact sets per language so tests
+// can assert that language participates in the cache key.
+func overlayFactsCacheLanguages(cache *goSnapshotSemanticFactsCache) map[string]int {
+	byLanguage := make(map[string]int)
+	if cache == nil {
+		return byLanguage
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	for _, element := range cache.entries {
+		entry := element.Value.(*goOverlayFactsEntry)
+		byLanguage[entry.facts.language]++
+	}
+	return byLanguage
+}
+
+// overlayLanguageFakeBackend is a hermetic semantic index capability for one
+// non-Go language. It plans a single workspace scope for its language and
+// exports a definition and a reference occurrence for token in the captured
+// snapshot source, mirroring the compiler-resolved contract without invoking
+// any external toolchain.
+type overlayLanguageFakeBackend struct {
+	mockBackend
+	language string
+	token    string
+	toolPath string
+	calls    atomic.Int32
+}
+
+func (b *overlayLanguageFakeBackend) BuildIndexRequest(_ context.Context, view model.WorkspaceView, rootURI string) (model.Request, error) {
+	toolBytes, err := os.ReadFile(b.toolPath)
+	if err != nil {
+		return model.Request{}, err
+	}
+	toolHash := strings.TrimPrefix(string(semanticOverlayContentHash(toolBytes)), "sha256:")
+	tool := model.ToolIdentity{Name: b.language + "-tool", Path: b.toolPath, Version: "test", SHA256: toolHash}
+	scope := model.Scope{
+		ID: b.language + ":overlay", Language: b.language, RootURI: rootURI,
+		Build: model.BuildInputs{Options: map[string]string{"language": b.language}},
+	}
+	scope.BuildContext = model.ComputeBuildContextID(scope, b.language+"-extractor", "1", b.language+"-toolchain", []model.ToolIdentity{tool})
+	provenance := model.Provenance{
+		SchemaVersion: model.SchemaVersion, Identity: view.Identity(), Scope: scope,
+		Extractor: b.language + "-extractor", ExtractorVer: "1",
+		Backend:   identity.BackendID{Language: b.language, Name: "test-" + b.language},
+		Toolchain: b.language + "-toolchain", Tools: []model.ToolIdentity{tool},
+	}
+	return model.Request{
+		WorkspaceRootURI: rootURI, View: view, Scopes: []model.Scope{scope},
+		Provenance: map[string]model.Provenance{scope.ID: provenance},
+	}, nil
+}
+
+func (b *overlayLanguageFakeBackend) ExportIndex(ctx context.Context, request model.Request, sink model.Sink) (model.Report, error) {
+	b.calls.Add(1)
+	var sources []model.File
+	if err := request.View.Walk(ctx, request.WorkspaceRootURI, func(file model.File) error {
+		if file.LanguageID == b.language {
+			sources = append(sources, file)
+		}
+		return nil
+	}); err != nil {
+		return model.Report{}, err
+	}
+	scope := request.Scopes[0]
+	var source model.File
+	var content []byte
+	for _, candidate := range sources {
+		candidateContent, err := readGoSnapshotViewFile(ctx, request.View.(*goSnapshotSemanticView), candidate)
+		if err != nil {
+			return model.Report{}, err
+		}
+		if strings.Contains(string(candidateContent), b.token) {
+			source, content = candidate, candidateContent
+			break
+		}
+	}
+	if source.URI == "" {
+		return model.Report{}, fmt.Errorf("test plan found no %s source containing %q", b.language, b.token)
+	}
+	occurrences, err := overlayFakeTokenOccurrences(b.language, b.token, content, source, scope)
+	if err != nil {
+		return model.Report{}, err
+	}
+	if err := sink.WriteSymbols(ctx, []model.Symbol{{ID: identity.SymbolID(b.language + "-symbol"), ScopeID: scope.ID, Name: b.token, Kind: "function"}}); err != nil {
+		return model.Report{}, err
+	}
+	if err := sink.WriteOccurrences(ctx, occurrences); err != nil {
+		return model.Report{}, err
+	}
+	coverage := make([]model.Coverage, 0, len(model.RequiredFactKinds))
+	for _, fact := range model.RequiredFactKinds {
+		coverage = append(coverage, model.Coverage{ScopeID: scope.ID, Fact: fact, State: model.Complete})
+	}
+	tool := request.Provenance[scope.ID].Tools[0]
+	return model.Report{
+		Identity: request.View.Identity(), Coverage: coverage,
+		UsedTools: map[string][]model.ToolIdentity{scope.ID: {tool}},
+	}, nil
+}
+
+func overlayFakeTokenOccurrences(language, token string, content []byte, source model.File, scope model.Scope) ([]model.Occurrence, error) {
+	first := strings.Index(string(content), token)
+	last := strings.LastIndex(string(content), token)
+	if first < 0 || last <= first {
+		return nil, fmt.Errorf("test %s source omitted a definition and reference of %q", language, token)
+	}
+	index := position.NewIndex(content, position.UTF16)
+	occurrence := func(offset int, role string) (model.Occurrence, error) {
+		start, err := index.OffsetToPosition(content, uint32(offset))
+		if err != nil {
+			return model.Occurrence{}, err
+		}
+		end, err := index.OffsetToPosition(content, uint32(offset+len(token)))
+		if err != nil {
+			return model.Occurrence{}, err
+		}
+		return model.Occurrence{
+			SymbolID: identity.SymbolID(language + "-symbol"), ScopeID: scope.ID, URI: source.URI,
+			Range: model.Position{StartLine: start.Line, StartChar: start.Col, EndLine: end.Line, EndChar: end.Col},
+			Role:  role, SourceHash: source.SHA256, BuildContext: scope.BuildContext,
+		}, nil
+	}
+	definition, err := occurrence(first, "definition")
+	if err != nil {
+		return nil, err
+	}
+	reference, err := occurrence(last, "reference")
+	if err != nil {
+		return nil, err
+	}
+	return []model.Occurrence{definition, reference}, nil
+}
+
+// runOverlayLanguageLocationsTest proves the dirty snapshot overlay answers
+// definition/reference queries for one non-Go language from the exact editor
+// buffer, with compiler-grade evidence and per-language cache facts.
+func runOverlayLanguageLocationsTest(t *testing.T, language, fileName string, diskSource, openSource []byte, token string) {
+	t.Helper()
+	toolPath := filepath.Join(t.TempDir(), "fake-"+language+"-tool")
+	if err := os.WriteFile(toolPath, []byte("tool-v1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	filePath := filepath.Join(root, fileName)
+	if err := os.WriteFile(filePath, diskSource, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootURI := uri.FromPath(root).Canonical()
+	fileURI := uri.FromPath(filePath).Canonical()
+	backend := &overlayLanguageFakeBackend{
+		mockBackend: mockBackend{langID: language},
+		language:    language, token: token, toolPath: toolPath,
+	}
+	s := newOverlayQueryTestServer(root, rootURI, fileURI, language, openSource, backend)
+	captured := s.snapMgr.Current()
+	ctx := withSnapshot(context.Background(), captured)
+
+	queryOffset := strings.LastIndex(string(openSource), token)
+	line, character := testPositionAtOffset(t, openSource, queryOffset, position.UTF16)
+	definition, used := s.goSnapshotSemanticLocations(ctx, fileURI, line, character, int(position.UTF16), captured.ID().Revision, persistentDefinition, false)
+	if !used {
+		t.Fatalf("%s overlay definition was not used for the dirty snapshot", language)
+	}
+	if definition.Status != identity.ResultExact || definition.Completeness != identity.Complete || len(definition.Value) != 1 {
+		t.Fatalf("%s overlay definition result = %#v", language, definition)
+	}
+	defOffset := strings.Index(string(openSource), token)
+	wantLine, wantStart := testPositionAtOffset(t, openSource, defOffset, position.UTF16)
+	_, wantEnd := testPositionAtOffset(t, openSource, defOffset+len(token), position.UTF16)
+	if got := definition.Value[0]; got.URI != fileURI || got.Range.StartLine != wantLine || got.Range.StartCharacter != wantStart ||
+		got.Range.EndLine != wantLine || got.Range.EndCharacter != wantEnd {
+		t.Fatalf("%s overlay definition location = %#v, want %d:%d-%d:%d", language, got, wantLine, wantStart, wantLine, wantEnd)
+	}
+	if len(definition.Evidence) != 1 || definition.Evidence[0].Kind != identity.EvidenceCompiler ||
+		definition.Evidence[0].Assurance != identity.AssuranceCompilerResolved || definition.Evidence[0].IndexGen != 0 ||
+		definition.Evidence[0].SourceHash != semanticOverlayContentHash(openSource) ||
+		definition.Evidence[0].Backend.Language != language ||
+		definition.Evidence[0].DetailCode != language+"-snapshot-overlay-definition" {
+		t.Fatalf("%s overlay definition evidence = %#v", language, definition.Evidence)
+	}
+
+	references, used := s.goSnapshotSemanticLocations(ctx, fileURI, line, character, int(position.UTF16), captured.ID().Revision, persistentReferences, true)
+	if !used || references.Status != identity.ResultExact || references.Completeness != identity.Complete || len(references.Value) != 2 {
+		t.Fatalf("%s overlay references result = %#v used=%v", language, references, used)
+	}
+	wantOffsets := []int{defOffset, queryOffset}
+	for i, offset := range wantOffsets {
+		wantLine, wantStart := testPositionAtOffset(t, openSource, offset, position.UTF16)
+		_, wantEnd := testPositionAtOffset(t, openSource, offset+len(token), position.UTF16)
+		got := references.Value[i]
+		if got.URI != fileURI || got.Range.StartLine != wantLine || got.Range.StartCharacter != wantStart ||
+			got.Range.EndLine != wantLine || got.Range.EndCharacter != wantEnd {
+			t.Fatalf("%s overlay reference location %d = %#v, want %d:%d-%d:%d", language, i, got, wantLine, wantStart, wantLine, wantEnd)
+		}
+	}
+	if got := overlayFactsCacheLanguages(s.overlayFacts); len(got) != 1 || got[language] != 1 {
+		t.Fatalf("%s overlay facts cache languages = %v, want exactly one %s fact set", language, got, language)
+	}
+}
+
+func TestRustSnapshotOverlayLocationsUseDirtySnapshot(t *testing.T) {
+	runOverlayLanguageLocationsTest(t, "rust", "main.rs",
+		[]byte("fn keep_old() {}\n"),
+		[]byte("fn renamed_target() {}\n\nfn caller() { renamed_target(); }\n"),
+		"renamed_target")
+}
+
+func TestCppSnapshotOverlayLocationsUseDirtySnapshot(t *testing.T) {
+	runOverlayLanguageLocationsTest(t, "cpp", "main.cpp",
+		[]byte("int keep_old() { return 0; }\n"),
+		[]byte("int renamed_target() { return 1; }\n\nint caller() { return renamed_target(); }\n"),
+		"renamed_target")
+}
+
+func TestTypescriptSnapshotOverlayLocationsUseDirtySnapshot(t *testing.T) {
+	runOverlayLanguageLocationsTest(t, "typescript", "main.ts",
+		[]byte("function keepOld() {}\n"),
+		[]byte("function renamedTarget() {}\n\nfunction caller() { renamedTarget(); }\n"),
+		"renamedTarget")
+}
+
+func TestSnapshotOverlayFactsCacheSeparatesLanguages(t *testing.T) {
+	root := t.TempDir()
+	rootURI := uri.FromPath(root).Canonical()
+	rustPath := filepath.Join(root, "main.rs")
+	tsPath := filepath.Join(root, "main.ts")
+	rustDisk := []byte("fn keep_old() {}\n")
+	tsDisk := []byte("function keepOld() {}\n")
+	rustOpen := []byte("fn renamed_target() {}\n\nfn caller() { renamed_target(); }\n")
+	tsOpen := []byte("function renamedTarget() {}\n\nfunction caller() { renamedTarget(); }\n")
+	if err := os.WriteFile(rustPath, rustDisk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tsPath, tsDisk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rustURI := uri.FromPath(rustPath).Canonical()
+	tsURI := uri.FromPath(tsPath).Canonical()
+	fake := func(language, token string, source []byte) *overlayLanguageFakeBackend {
+		toolPath := filepath.Join(t.TempDir(), "fake-"+language+"-tool")
+		if err := os.WriteFile(toolPath, []byte("tool-v1"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return &overlayLanguageFakeBackend{
+			mockBackend: mockBackend{langID: language},
+			language:    language, token: token, toolPath: toolPath,
+		}
+	}
+	rustBackend := fake("rust", "renamed_target", rustOpen)
+	tsBackend := fake("typescript", "renamedTarget", tsOpen)
+
+	s := New(DefaultConfig())
+	s.workspaceID = identity.WorkspaceID(rootURI)
+	s.idx = &indexService{
+		root: root, workspaceID: identity.WorkspaceID(rootURI),
+		dir: filepath.Join(root, ".index"),
+	}
+	s.overlayFacts = newGoSnapshotSemanticFactsCache()
+	s.RegisterBackend("rust", rustBackend)
+	s.RegisterBackend("typescript", tsBackend)
+	s.vfs.Open(rustURI, "rust", 1, rustOpen, vfs.SourceEditor)
+	s.vfs.Open(tsURI, "typescript", 1, tsOpen, vfs.SourceEditor)
+	revision := s.vfs.Revision()
+	captured := snapshot.New(string(s.workspaceID), revision, map[string]snapshot.DocumentSnapshot{
+		rustURI: {URI: rustURI, LanguageID: "rust", Version: 1, Content: rustOpen},
+		tsURI:   {URI: tsURI, LanguageID: "typescript", Version: 1, Content: tsOpen},
+	})
+	s.snapMgr.Publish(captured)
+	ctx := withSnapshot(context.Background(), captured)
+
+	query := func(fileURI string, source []byte, token string) {
+		t.Helper()
+		line, character := testPositionAtOffset(t, source, strings.LastIndex(string(source), token), position.UTF16)
+		result, used := s.goSnapshotSemanticLocations(ctx, fileURI, line, character, int(position.UTF16), captured.ID().Revision, persistentDefinition, false)
+		if !used || result.Status != identity.ResultExact || len(result.Value) != 1 || result.Value[0].URI != fileURI {
+			t.Fatalf("%s overlay definition result = %#v used=%v", fileURI, result, used)
+		}
+	}
+	query(rustURI, rustOpen, "renamed_target")
+	query(tsURI, tsOpen, "renamedTarget")
+	if rustBackend.calls.Load() != 1 || tsBackend.calls.Load() != 1 {
+		t.Fatalf("per-language exports = rust %d typescript %d, want one each", rustBackend.calls.Load(), tsBackend.calls.Load())
+	}
+	got := overlayFactsCacheLanguages(s.overlayFacts)
+	if len(got) != 2 || got["rust"] != 1 || got["typescript"] != 1 {
+		t.Fatalf("overlay facts cache languages = %v, want one fact set per language", got)
+	}
+}
+
+func TestSnapshotOverlayDirtyScreenStaysBoundedPerLanguage(t *testing.T) {
+	const rustFiles = overlayDirtyScreenMaxPerLanguage + 1
+	token := "renamed_target"
+	dirtyDisk := []byte("fn keep_old() {}\n")
+	dirtyOpen := []byte("fn " + token + "() {}\n\nfn caller() { " + token + "(); }\n")
+	cleanSource := []byte("fn clean() {}\n")
+
+	newServer := func(dirtyFirst bool) (*Server, string, string, *snapshot.Snapshot) {
+		t.Helper()
+		toolPath := filepath.Join(t.TempDir(), "fake-rust-tool")
+		if err := os.WriteFile(toolPath, []byte("tool-v1"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		root := t.TempDir()
+		rootURI := uri.FromPath(root).Canonical()
+		open := make(map[string]snapshot.DocumentSnapshot, rustFiles)
+		s := New(DefaultConfig())
+		s.workspaceID = identity.WorkspaceID(rootURI)
+		s.idx = &indexService{
+			root: root, workspaceID: identity.WorkspaceID(rootURI),
+			dir: filepath.Join(root, ".index"),
+		}
+		s.overlayFacts = newGoSnapshotSemanticFactsCache()
+		s.RegisterBackend("rust", &overlayLanguageFakeBackend{
+			mockBackend: mockBackend{langID: "rust"},
+			language:    "rust", token: token, toolPath: toolPath,
+		})
+		dirtyURI := ""
+		for i := 0; i < rustFiles; i++ {
+			name := fmt.Sprintf("main%03d.rs", i)
+			path := filepath.Join(root, name)
+			disk, editor := cleanSource, cleanSource
+			if i == 0 && dirtyFirst {
+				disk, editor = dirtyDisk, dirtyOpen
+			}
+			if err := os.WriteFile(path, disk, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fileURI := uri.FromPath(path).Canonical()
+			if i == 0 {
+				dirtyURI = fileURI
+			}
+			s.vfs.Open(fileURI, "rust", 1, editor, vfs.SourceEditor)
+			open[fileURI] = snapshot.DocumentSnapshot{URI: fileURI, LanguageID: "rust", Version: 1, Content: editor}
+		}
+		captured := snapshot.New(string(s.workspaceID), s.vfs.Revision(), open)
+		s.snapMgr.Publish(captured)
+		return s, rootURI, dirtyURI, captured
+	}
+
+	// More per-language open documents than the screen budget: the pre-screen
+	// stays bounded and the request falls back to the live backend instead of
+	// scanning without bound, even though every document is clean.
+	s, _, dirtyURI, captured := newServer(false)
+	ctx := withSnapshot(context.Background(), captured)
+	if _, used := s.goSnapshotSemanticLocations(ctx, dirtyURI, 0, 0, int(position.UTF16), captured.ID().Revision, persistentDefinition, false); used {
+		t.Fatal("overlay used although the dirty screen exceeded its per-language budget without finding a change")
+	}
+
+	// One dirty document inside the budget is still attributed, and the
+	// remaining over-budget documents neither disable the overlay nor unbound
+	// the screen.
+	s, _, dirtyURI, captured = newServer(true)
+	ctx = withSnapshot(context.Background(), captured)
+	line, character := testPositionAtOffset(t, dirtyOpen, strings.LastIndex(string(dirtyOpen), token), position.UTF16)
+	if _, used := s.goSnapshotSemanticLocations(ctx, dirtyURI, line, character, int(position.UTF16), captured.ID().Revision, persistentDefinition, false); !used {
+		t.Fatal("dirty overlay was not used although the dirty document sits inside the screen budget")
+	}
 }

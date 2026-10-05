@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := Default()
@@ -99,4 +103,93 @@ func TestLoadEmptyPath(t *testing.T) {
 		t.Fatalf("empty path should not error: %v", err)
 	}
 	_ = cfg
+}
+
+// TestDefaultConfigHasNoReadAPITokens pins the local-trust baseline: without
+// configuration the token set is empty and no auth wrapper is installed.
+func TestDefaultConfigHasNoReadAPITokens(t *testing.T) {
+	cfg := Default()
+	if len(cfg.ReadAPITokens) != 0 {
+		t.Errorf("expected no default read API tokens, got %v", cfg.ReadAPITokens)
+	}
+	if cfg.ReadAPITokenSet() != nil {
+		t.Errorf("expected nil token set for defaults, got %v", cfg.ReadAPITokenSet())
+	}
+}
+
+func TestLoadReadAPITokensFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "omnilsp.json")
+	if err := os.WriteFile(path, []byte(`{"readApiTokens":["tok-a","tok-b"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with readApiTokens: %v", err)
+	}
+	if want := []string{"tok-a", "tok-b"}; len(cfg.ReadAPITokens) != len(want) ||
+		cfg.ReadAPITokens[0] != want[0] || cfg.ReadAPITokens[1] != want[1] {
+		t.Fatalf("expected %v from file, got %v", want, cfg.ReadAPITokens)
+	}
+	set := cfg.ReadAPITokenSet()
+	if !set["tok-a"] || !set["tok-b"] || len(set) != 2 {
+		t.Fatalf("unexpected token set %v", set)
+	}
+}
+
+func TestLoadReadAPITokensFromEnv(t *testing.T) {
+	t.Setenv("OMNILSP_READ_API_TOKENS", "tok-a, tok-b ,,tok-c")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load config with read API token env: %v", err)
+	}
+	want := []string{"tok-a", "tok-b", "tok-c"}
+	if len(cfg.ReadAPITokens) != len(want) {
+		t.Fatalf("expected %v from env, got %v", want, cfg.ReadAPITokens)
+	}
+	for i, tok := range want {
+		if cfg.ReadAPITokens[i] != tok {
+			t.Fatalf("expected %v from env, got %v", want, cfg.ReadAPITokens)
+		}
+	}
+}
+
+// TestLoadReadAPITokensFileWinsOverEnv pins the Default < Env < File layering:
+// a file key replaces the env-seeded token list entirely.
+func TestLoadReadAPITokensFileWinsOverEnv(t *testing.T) {
+	t.Setenv("OMNILSP_READ_API_TOKENS", "env-tok")
+	path := filepath.Join(t.TempDir(), "omnilsp.json")
+	if err := os.WriteFile(path, []byte(`{"readApiTokens":["file-tok"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.ReadAPITokens) != 1 || cfg.ReadAPITokens[0] != "file-tok" {
+		t.Fatalf("file layer must win over env: got %v", cfg.ReadAPITokens)
+	}
+	if cfg.ReadAPITokenSet()["env-tok"] {
+		t.Fatalf("env token survived the file layer: %v", cfg.ReadAPITokenSet())
+	}
+}
+
+// TestLoadReadAPITokensEnvWithoutFile keeps env-only configuration working
+// when the config file is absent (the serve default path).
+func TestLoadReadAPITokensEnvWithoutFile(t *testing.T) {
+	t.Setenv("OMNILSP_READ_API_TOKENS", "env-tok")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.ReadAPITokens) != 1 || cfg.ReadAPITokens[0] != "env-tok" {
+		t.Fatalf("expected env token, got %v", cfg.ReadAPITokens)
+	}
+}
+
+func TestReadAPITokenSetDropsEmptyAndDuplicates(t *testing.T) {
+	cfg := Config{ReadAPITokens: []string{"a", "", "a"}}
+	set := cfg.ReadAPITokenSet()
+	if len(set) != 1 || !set["a"] {
+		t.Fatalf("expected single-entry set {a}, got %v", set)
+	}
 }

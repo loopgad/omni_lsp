@@ -52,6 +52,12 @@ type Config struct {
 	IndexDiskBudgetBytes int64           `json:"indexDiskBudgetBytes"`
 	Backends             []BackendConfig `json:"backends,omitempty"`
 	RequestTimeoutMs     int             `json:"requestTimeoutMs"`
+	// ReadAPITokens lists the bearer tokens accepted by the read-only HTTP
+	// API (§X6/N8). The file layer is the `readApiTokens` JSON array; the
+	// OMNILSP_READ_API_TOKENS environment variable (comma-separated) seeds
+	// the same field at the env layer, so a file key wins per
+	// Default < Env < File. Empty = local-trust allow-all (no auth wrapper).
+	ReadAPITokens []string `json:"readApiTokens,omitempty"`
 	// FeatureFlags (§R7): every flag must be registered in KnownFlags with an
 	// owner and expiry; unknown keys fail Validate so typos never silently
 	// disable behavior.
@@ -129,7 +135,31 @@ func applyEnv(cfg Config) Config {
 			cfg.MaxQueueSize = n
 		}
 	}
+	if v := os.Getenv("OMNILSP_READ_API_TOKENS"); v != "" {
+		for _, tok := range strings.Split(v, ",") {
+			if tok = strings.TrimSpace(tok); tok != "" {
+				cfg.ReadAPITokens = append(cfg.ReadAPITokens, tok)
+			}
+		}
+	}
 	return cfg
+}
+
+// ReadAPITokenSet returns the read-API bearer tokens in the set shape
+// transport/httpserver's AuthOptions.Tokens expects: deduplicated, empty
+// entries dropped. A nil/empty result keeps the local-trust allow-all
+// posture (auth wrapper not installed).
+func (c Config) ReadAPITokenSet() map[string]bool {
+	if len(c.ReadAPITokens) == 0 {
+		return nil
+	}
+	tokens := make(map[string]bool, len(c.ReadAPITokens))
+	for _, tok := range c.ReadAPITokens {
+		if tok != "" {
+			tokens[tok] = true
+		}
+	}
+	return tokens
 }
 
 func (c Config) Validate() error {

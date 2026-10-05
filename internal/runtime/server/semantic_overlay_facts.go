@@ -31,6 +31,7 @@ var errGoOverlayFactsBudget = errors.New("Go semantic overlay facts exceed the r
 
 type goOverlayFactsKey struct {
 	workspace        identity.WorkspaceID
+	language         string
 	diskDigest       identity.ContentHash
 	overlayDigest    identity.ContentHash
 	planDigest       identity.ContentHash
@@ -69,6 +70,7 @@ func newGoSnapshotSemanticFactsCache() *goSnapshotSemanticFactsCache {
 }
 
 type goSnapshotSemanticFacts struct {
+	language         string
 	identity         model.Identity
 	snapshotInstance uint64
 	revision         uint64
@@ -94,19 +96,21 @@ type goOverlayWorkspaceSymbol struct {
 }
 
 // GetOrExport returns exact snapshot facts from this cache or performs one
-// bounded full Go-scope export. Concurrent requests for the same snapshot
-// share a single export. The view must still be open when loading a miss.
+// bounded full-scope export for the requested language. Concurrent requests
+// for the same snapshot share a single export. The view must still be open
+// when loading a miss.
 func (c *goSnapshotSemanticFactsCache) GetOrExport(
 	ctx context.Context,
 	s *Server,
 	view *goSnapshotSemanticView,
 	builder languages.SemanticIndexRequestBuilder,
 	provider languages.SemanticIndexProvider,
+	language string,
 ) (*goSnapshotSemanticFacts, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if c == nil || s == nil || view == nil || builder == nil || provider == nil {
+	if c == nil || s == nil || view == nil || builder == nil || provider == nil || language == "" {
 		return nil, errGoSemanticOverlayUnavailable
 	}
 	if err := ctx.Err(); err != nil {
@@ -119,24 +123,24 @@ func (c *goSnapshotSemanticFactsCache) GetOrExport(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateGoSnapshotOverlayPlan(ctx, view, request); err != nil {
+	if err := validateGoSnapshotOverlayPlan(ctx, view, request, language); err != nil {
 		return nil, err
 	}
 	planDigest, ok := goOverlayPlanDigest(request)
 	if !ok {
 		return nil, errGoSemanticOverlayUnavailable
 	}
-	key, ok := goOverlayFactsCacheKey(view, builder, provider, planDigest)
+	key, ok := goOverlayFactsCacheKey(view, builder, provider, planDigest, language)
 	if !ok {
 		return nil, errGoSemanticOverlayUnavailable
 	}
 	load := func() (*goSnapshotSemanticFacts, error) {
 		sink := &boundedGoOverlayFactsSink{}
-		request, report, err := exportGoSnapshotOverlayWithRequest(ctx, s, view, request, provider, sink)
+		request, report, err := exportGoSnapshotOverlayWithRequest(ctx, s, view, request, provider, sink, language)
 		if err != nil {
 			return nil, err
 		}
-		facts, err := buildGoSnapshotSemanticFactsContext(ctx, view, request, report, sink)
+		facts, err := buildGoSnapshotSemanticFactsContext(ctx, view, request, report, sink, language)
 		if err != nil {
 			return nil, err
 		}
@@ -153,9 +157,10 @@ func (c *goSnapshotSemanticFactsCache) GetOrExport(
 	})
 }
 
-func goOverlayFactsCacheKey(view *goSnapshotSemanticView, builder, provider any, planDigest identity.ContentHash) (goOverlayFactsKey, bool) {
+func goOverlayFactsCacheKey(view *goSnapshotSemanticView, builder, provider any, planDigest identity.ContentHash, language string) (goOverlayFactsKey, bool) {
 	if view == nil || view.base == nil || view.snapshot == nil || view.base.snapshot == "" ||
 		view.identity.Workspace == "" || view.identity.Workspace != view.base.identity.Workspace ||
+		language == "" ||
 		view.identity.SnapshotRev == 0 || view.base.identity.SnapshotRev != view.identity.SnapshotRev ||
 		view.overlay.Revision != view.identity.SnapshotRev || view.overlay.SnapshotInstance == 0 ||
 		view.overlay.SnapshotInstance != view.snapshot.InstanceID() || view.overlay.Digest == "" ||
@@ -169,7 +174,7 @@ func goOverlayFactsCacheKey(view *goSnapshotSemanticView, builder, provider any,
 		return goOverlayFactsKey{}, false
 	}
 	return goOverlayFactsKey{
-		workspace: view.identity.Workspace, diskDigest: view.base.identity.DiskDigest,
+		workspace: view.identity.Workspace, language: language, diskDigest: view.base.identity.DiskDigest,
 		overlayDigest: view.overlay.Digest, planDigest: planDigest, snapshotInstance: view.snapshot.InstanceID(),
 		revision: view.identity.SnapshotRev, builder: builderID, provider: providerID,
 	}, true
@@ -389,8 +394,9 @@ func buildGoSnapshotSemanticFacts(
 	request model.Request,
 	report model.Report,
 	sink *boundedGoOverlayFactsSink,
+	language string,
 ) (*goSnapshotSemanticFacts, error) {
-	return buildGoSnapshotSemanticFactsContext(context.Background(), view, request, report, sink)
+	return buildGoSnapshotSemanticFactsContext(context.Background(), view, request, report, sink, language)
 }
 
 func buildGoSnapshotSemanticFactsContext(
@@ -399,27 +405,29 @@ func buildGoSnapshotSemanticFactsContext(
 	request model.Request,
 	report model.Report,
 	sink *boundedGoOverlayFactsSink,
+	language string,
 ) (*goSnapshotSemanticFacts, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if view == nil || sink == nil || request.View == nil || request.View.Identity() != view.Identity() || len(request.Scopes) == 0 {
-		return nil, fmt.Errorf("%w: Go export returned no stable request facts", errGoSemanticOverlayUnavailable)
+	if view == nil || sink == nil || language == "" || request.View == nil || request.View.Identity() != view.Identity() || len(request.Scopes) == 0 {
+		return nil, fmt.Errorf("%w: %s export returned no stable request facts", errGoSemanticOverlayUnavailable, language)
 	}
 	scopes := make(map[string]model.Scope, len(request.Scopes))
 	for _, scope := range request.Scopes {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if scope.Language != "go" || scope.ID == "" || scope.BuildContext == "" {
-			return nil, fmt.Errorf("%w: invalid Go scope identity", errGoSemanticOverlayUnavailable)
+		if scope.Language != language || scope.ID == "" || scope.BuildContext == "" {
+			return nil, fmt.Errorf("%w: invalid %s scope identity", errGoSemanticOverlayUnavailable, language)
 		}
 		if _, duplicate := scopes[scope.ID]; duplicate {
-			return nil, fmt.Errorf("%w: duplicate Go scope identity", errGoSemanticOverlayIncomplete)
+			return nil, fmt.Errorf("%w: duplicate %s scope identity", errGoSemanticOverlayIncomplete, language)
 		}
 		scopes[scope.ID] = scope
 	}
 	facts := &goSnapshotSemanticFacts{
+		language: language,
 		identity: view.Identity(), snapshotInstance: view.SnapshotInstanceID(), revision: view.overlay.Revision,
 		scopes: append([]model.Scope(nil), request.Scopes...), coverage: append([]model.Coverage(nil), report.Coverage...),
 		provenance: make(map[string]model.Provenance, len(request.Provenance)),
@@ -438,7 +446,7 @@ func buildGoSnapshotSemanticFactsContext(
 			return nil, fmt.Errorf("%w: symbol omitted stable ID or name", errGoSemanticOverlayIncomplete)
 		}
 		if _, ok := scopes[symbol.ScopeID]; !ok {
-			return nil, fmt.Errorf("%w: symbol references unknown Go scope", errGoSemanticOverlayIncomplete)
+			return nil, fmt.Errorf("%w: symbol references unknown %s scope", errGoSemanticOverlayIncomplete, language)
 		}
 		key := goOverlaySymbolKey{scopeID: symbol.ScopeID, id: symbol.ID}
 		if prior, duplicate := facts.symbolByID[key]; duplicate && (prior.Name != symbol.Name || prior.Kind != symbol.Kind || prior.Signature != symbol.Signature) {
@@ -488,13 +496,13 @@ func validateGoSnapshotFactSources(ctx context.Context, view *goSnapshotSemantic
 			return err
 		}
 		file, ok := view.file(fileURI)
-		if !ok || file.URI != fileURI || file.LanguageID != "go" || file.Size < 0 ||
+		if !ok || file.URI != fileURI || file.LanguageID != facts.language || file.Size < 0 ||
 			file.Size > semanticViewMaxFileBytes || file.SHA256 == "" {
-			return fmt.Errorf("%w: occurrence source is absent from the Go snapshot view", errGoSemanticOverlayIncomplete)
+			return fmt.Errorf("%w: occurrence source is absent from the %s snapshot view", errGoSemanticOverlayIncomplete, facts.language)
 		}
 		for _, index := range facts.byURI[fileURI] {
 			if facts.occurrences[index].SourceHash != file.SHA256 {
-				return fmt.Errorf("%w: occurrence source hash differs from the Go snapshot view", errGoSemanticOverlayIncomplete)
+				return fmt.Errorf("%w: occurrence source hash differs from the %s snapshot view", errGoSemanticOverlayIncomplete, facts.language)
 			}
 		}
 		content, err := readGoSnapshotViewFile(ctx, view, file)

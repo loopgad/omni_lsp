@@ -30,6 +30,14 @@ const (
 	DefaultBurst     = 100
 )
 
+// ReadAPIVersion is the §R4 version surface for the HTTP read API
+// (docs/versions.md: "HTTP read API | omnilsp.read.v1"). Per §R5 the route
+// table is additive-only; removals need a deprecation cycle (§R8).
+const ReadAPIVersion = "omnilsp.read.v1"
+
+// readAPIVersionHeader carries ReadAPIVersion on every /api/v1/* response.
+const readAPIVersionHeader = "X-OmniLSP-Read-API-Version"
+
 // Core is the consumer-side view of the semantic engine (goal.md U3).
 type Core interface {
 	Hover(ctx context.Context, uri string, line, column uint32) (identity.SemanticResult[*languages.HoverResult], error)
@@ -83,8 +91,14 @@ func New(core Core, opts Options) *Server {
 	s.mux.HandleFunc("GET /ready", s.handleReady)
 	s.mux.HandleFunc("GET /status", s.handleStatus)
 
-	// Rate limiting (N8) applies only to query endpoints.
-	api := func(h http.HandlerFunc) http.Handler { return s.limit(h) }
+	// Rate limiting (N8) applies only to query endpoints. The §R4 version
+	// header is stamped at this single wrapper so every rejection produced
+	// inside the mux — including 429 from the limiter — carries it. It does
+	// not cover 401: ServeHTTP hands the request to the auth wrapper before it
+	// ever reaches this mux, so an auth rejection leaves without the header.
+	api := func(h http.HandlerFunc) http.Handler {
+		return withReadAPIVersion(s.limit(h))
+	}
 	if opts.Auth.Tokens != nil || opts.Auth.PerSourcePerMinute > 0 {
 		s.auth = withAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.mux.ServeHTTP(w, r)
@@ -97,6 +111,15 @@ func New(core Core, opts Options) *Server {
 }
 
 func nowUnix() int64 { return time.Now().Unix() }
+
+// withReadAPIVersion stamps the §R4 read-API version header on every
+// response passing through the /api/v1/* wrapper chain.
+func withReadAPIVersion(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(readAPIVersionHeader, ReadAPIVersion)
+		h.ServeHTTP(w, r)
+	})
+}
 
 // ServeHTTP delegates to the routed mux; auth wraps everything when enabled.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +160,15 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.core.Status())
+	st := s.core.Status()
+	// Inject the §R4 surface into a copy: Core implementations may hand back
+	// their own map, and mutating it would corrupt core-internal state.
+	out := make(map[string]any, len(st)+1)
+	for k, v := range st {
+		out[k] = v
+	}
+	out["readAPIVersion"] = ReadAPIVersion
+	writeJSON(w, http.StatusOK, out)
 }
 
 // positionRequest is the shared POST body: {uri,line,column[,includeDeclaration]}.

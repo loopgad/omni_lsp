@@ -271,10 +271,12 @@ var Registry = struct{ Checks []Check }{
 			Text: "Interactive SLO: real-process single-request distributions collected against the frozen candidate; strict thresholds not met on every Tier S row", Status: StatusPartial,
 			Reason: "Real-process 1000-sample P50/P95/P99 distributions were collected for all seven Tier S fixtures against the frozen candidate (run gate-20261004T2347Z): 21/28 strict rows passed, but the Go backend hot path (hover/definition/completion P50 391-443ms) and the C/C++ completion/syntax rows exceeded strict thresholds; the structured report decision is failed, so full §S18 credit stays blocked"},
 		{ID: "PERF-3", Domain: "core", Category: "PERF", Clause: "§S21", Weight: 1,
-			Text:   "Qualified known-symbol positive results plus six-bucket zero-error classification (frozen-candidate corpus run reported decision=passed; OMNILSP_S21_GATE=required turns a missing candidate into a hard failure instead of a skip)",
+			// Split from the corpus run on purpose. The gate wiring is verifiable
+			// anywhere; the corpus result needs a frozen candidate binary, so it
+			// lives in DEF-S21CORPUS instead of riding on this entry's name.
+			Text:   "S21 candidate gate fails closed instead of skipping when no frozen candidate is available",
 			Status: StatusAuto,
 			Probe: &Probe{Groups: []ProbeGroup{
-				{Pkg: "test/corpus", Tests: []string{"TestS21_ZeroErrorClassification"}},
 				{Pkg: "internal/conformance", Tests: []string{"TestPERF3_S21GateFailsClosedWithoutCandidate"}},
 			}}},
 		{ID: "PERF-4", Domain: "core", Category: "PERF", Clause: "§S22", Weight: 1,
@@ -428,6 +430,9 @@ var Registry = struct{ Checks []Check }{
 				{Pkg: "cmd/omnilsp", Tests: []string{"TestMCPIndexStatusInitializesWorkspace"}},
 				{Pkg: "internal/index/persistent", Tests: []string{"TestL8_NullHistoryEntryDegradesWithoutPanic", "TestL4_IndependentStoresReserveDistinctMonotonicGenerations"}},
 			}}},
+		{ID: "DEF-S21CORPUS", Domain: "post-x9", Category: "PERF", Clause: "§S21 frozen-candidate corpus run", Weight: 1,
+			Text: "Frozen-candidate corpus run: qualified known-symbol positive results plus six-bucket zero-error classification", Status: StatusDeferred,
+			Milestone: "post-X9", Reason: "TestS21_ZeroErrorClassification is the real carrier but needs a frozen candidate binary via OMNILSP_BIN, so its result is machine-dependent; the probe cannot live on a scored entry without making the core score depend on an external artifact. PERF-3 keeps only the deterministic half (the gate fails closed); this entry keeps the other half on the ledger"},
 		{ID: "DEF-W0CLI", Domain: "post-x9", Category: "UX", Clause: "W0 canonical commands", Weight: 1,
 			Text: "omnilsp status / languages / query definition / query references / explain CLI entrypoints", Status: StatusDeferred,
 			Milestone: "post-X9", Reason: "§W0 is SHOULD-grade and silent on these five; status and query need only a facade over already-registered server methods (omnilsp/status, DefinitionEnvelope, ReferencesEnvelope), languages is a static table plus LookPath, explain cannot be built honestly because its handler takes no line:column and a fresh server has an empty evidence ring"},

@@ -37,7 +37,7 @@
 | PERF-S20 | Accuracy KPI formulas canonical and NaN-safe | S20 accuracy KPI | `TestS20_KPIFormulas`, `TestS20_KPIZeroDenominatorSafe` | AUTO |
 | PERF-1 | Benchmark reports carry mandatory metadata banner | §S17 | `TestS17_MetadataPresent` | AUTO |
 | PERF-2 | Interactive SLO: real-process single-request distributions collected against the frozen candidate; strict thresholds not met on every Tier S row | §S18 | — | PARTIAL (Real-process 1000-sample P50/P95/P99 distributions were collected for all seven Tier S fixtures against the frozen candidate (run gate-20261004T2347Z): 21/28 strict rows passed, but the Go backend hot path (hover/definition/completion P50 391-443ms) and the C/C++ completion/syntax rows exceeded strict thresholds; the structured report decision is failed, so full §S18 credit stays blocked) |
-| PERF-3 | Qualified known-symbol positive results plus six-bucket zero-error classification (frozen-candidate corpus run reported decision=passed; OMNILSP_S21_GATE=required turns a missing candidate into a hard failure instead of a skip) | §S21 | `TestS21_ZeroErrorClassification`, `TestPERF3_S21GateFailsClosedWithoutCandidate` | AUTO |
+| PERF-3 | S21 candidate gate fails closed instead of skipping when no frozen candidate is available | §S21 | `TestPERF3_S21GateFailsClosedWithoutCandidate` | AUTO |
 | PERF-4 | Metamorphic invariance (whitespace / line endings / comment injection) | §S22 | `TestS22_MetamorphicWhitespaceInvariance`, `TestS22_MetamorphicLineEndingInvariance`, `TestS22_MetamorphicCommentInjectionInvariance` | AUTO |
 
 ### PLUGIN
@@ -314,6 +314,12 @@
 | DEF-TRACEEXP | structured span-tree export format and sampling-rate configuration | P1/P5 trace export + sampling | — | DEFERRED→post-X9 |
 | DEF-P2METRICS | ~20 missing counters (latency/cancelled/quarantine/cache/index) and production telemetry.Recorder activation | P2 full metrics set + Recorder wiring | — | DEFERRED→post-X9 |
 | DEF-APPEREQ | Decoded→Admitted→SnapshotCaptured→Queued→Running→Validating stage observability | Appendix E request state machine stages | — | DEFERRED→post-X9 |
+
+### PERF
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-S21CORPUS | Frozen-candidate corpus run: qualified known-symbol positive results plus six-bucket zero-error classification | §S21 frozen-candidate corpus run | — | DEFERRED→post-X9 |
 
 ### PLUGIN
 

@@ -21,6 +21,10 @@ type fakeCore struct {
 	hoverErr error
 	ready    bool
 
+	// status, when set, is returned verbatim so tests can observe whether
+	// handlers mutate core-internal state.
+	status map[string]any
+
 	lastURI    string
 	lastLine   uint32
 	lastColumn uint32
@@ -42,8 +46,13 @@ func (f *fakeCore) References(_ context.Context, uri string, line, col uint32, i
 	return f.refRes, nil
 }
 
-func (f *fakeCore) Status() map[string]any { return map[string]any{"state": "running", "queue": 3} }
-func (f *fakeCore) Ready() bool            { return f.ready }
+func (f *fakeCore) Status() map[string]any {
+	if f.status != nil {
+		return f.status
+	}
+	return map[string]any{"state": "running", "queue": 3}
+}
+func (f *fakeCore) Ready() bool { return f.ready }
 
 func newTestServer(fc *fakeCore, opts Options) *httptest.Server {
 	return httptest.NewServer(New(fc, opts))
@@ -172,6 +181,63 @@ func TestHealthReadyStatus(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("ready status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// TestReadAPIVersionSurface locks the §R4 version surface mechanically
+// (docs/versions.md: "HTTP read API | omnilsp.read.v1"): every /api/v1/*
+// response carries the version header — including rate-limit rejections —
+// and GET /status exposes the version as a body field via a copy of the
+// core's map, never by mutating core-internal state.
+func TestReadAPIVersionSurface(t *testing.T) {
+	fc := &fakeCore{
+		hoverRes: identity.NewExactResult(&languages.HoverResult{}, nil),
+		defRes:   identity.NewExactResult([]languages.Location{}, nil),
+		refRes:   identity.NewExactResult([]languages.Location{}, nil),
+		ready:    true,
+	}
+	srv := newTestServer(fc, Options{})
+	defer srv.Close()
+
+	body := `{"uri":"file:///a.go","line":0,"column":0}`
+	for _, route := range []string{"/api/v1/hover", "/api/v1/definition", "/api/v1/references"} {
+		resp := postJSON(t, srv.URL+route, body)
+		if got := resp.Header.Get(readAPIVersionHeader); got != ReadAPIVersion {
+			t.Errorf("%s %s = %q, want %q", route, readAPIVersionHeader, got, ReadAPIVersion)
+		}
+		resp.Body.Close()
+	}
+
+	// The stamp sits outside the limiter, so 429 rejections carry it too.
+	limited := newTestServer(fc, Options{RateLimit: 1, Burst: 1})
+	defer limited.Close()
+	resp := postJSON(t, limited.URL+"/api/v1/hover", body)
+	resp.Body.Close()
+	rejected := postJSON(t, limited.URL+"/api/v1/hover", body)
+	defer rejected.Body.Close()
+	if rejected.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second limited request = %d, want 429", rejected.StatusCode)
+	}
+	if got := rejected.Header.Get(readAPIVersionHeader); got != ReadAPIVersion {
+		t.Errorf("429 %s = %q, want %q", readAPIVersionHeader, got, ReadAPIVersion)
+	}
+
+	// /status exposes the version via a copy; the core map stays untouched.
+	coreStatus := map[string]any{"State": "running", "CacheHits": float64(7)}
+	fc.status = coreStatus
+	resp, err := http.Get(srv.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	m := decodeBody(t, resp)
+	if m["readAPIVersion"] != ReadAPIVersion {
+		t.Errorf("status readAPIVersion = %v, want %q", m["readAPIVersion"], ReadAPIVersion)
+	}
+	if m["State"] != "running" || m["CacheHits"] != float64(7) {
+		t.Errorf("status body lost core fields: %v", m)
+	}
+	if _, mutated := coreStatus["readAPIVersion"]; mutated {
+		t.Error("core.Status() map mutated with readAPIVersion")
 	}
 }
 
