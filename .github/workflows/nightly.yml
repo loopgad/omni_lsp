@@ -10,6 +10,14 @@ on:
 
 jobs:
   soak:
+    # Form-only regression signal (§S16, docs/soak-nightly.md): the 55m
+    # accelerated in-process soak proves no monotonic leak, but it is NOT
+    # release-candidate evidence. RC evidence requires the real stdio gate —
+    # 30s and 10m preflights, then one uninterrupted 1h on windows/amd64,
+    # entered via the explicit OMNILSP_SOAK_GATE=required opt-in that
+    # scripts/acceptance.ps1 sets. This job deliberately omits that opt-in
+    # (no run ID, no frozen candidate), so TestSoak_RealStdioMixedWorkload
+    # skips here instead of failing on unmet preconditions.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -17,7 +25,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - name: Sustained soak (55m accelerated nightly form)
+      - name: Sustained soak (55m accelerated nightly form; regression signal only, not RC evidence — see docs/soak-nightly.md)
         run: go test -tags soak -timeout 70m -count=1 ./test/soak/
         env:
           SOAK_DURATION: 55m

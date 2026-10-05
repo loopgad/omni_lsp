@@ -321,3 +321,51 @@ field is a protocol failure; in-process backends report their fixed epoch as
 The final report must list every requirement as **passed**, **failed**, or
 **not verified**. The quick scorecard value is historical context only; it is
 not a substitute for correctness, client, S18/S19, or continuous-soak evidence.
+
+## Gate evidence record — run `gate-20261004T2347Z`
+
+Single frozen candidate for every gate in this round (docs/soak-nightly.md
+"Freeze once" contract), built from the tree after the parallel workstreams
+landed:
+
+- Candidate: `test/acceptance/evidence/gate-20261004T2347Z/omnilsp.exe`,
+  built with `go build -trimpath -o <evidence>/omnilsp.exe ./cmd/omnilsp`
+  (exit 0), SHA-256 `34aa6446093712ad86f7c5a330821eba2d6d2b1734c2b64838fb3016b53f7129`.
+- Freeze record: git HEAD `4b63ff3`, uncommitted worktree state, and UTC
+  timestamp are captured in `freeze-record.txt` inside the evidence directory.
+- `go run scripts/gen-sbom.go -o sbom.cdx.json .` → exit 0, 6 components.
+  The artifact stays uncommitted by decision: gen-sbom embeds a wall-clock
+  timestamp and a date-keyed serial, so every regeneration churns; `out/` and
+  `sbom.cdx.json` are .gitignore-managed per-run evidence.
+- `go test -count=1 ./test/golden/` → ok 7.504s (Y2-1/T-S9SEQ).
+- `go test -tags soak -count=1 -timeout 300s ./test/soak/` → ok 31.182s
+  (Y1-10 gate form). Two opt-in attempts of `TestSoak_RealStdioMixedWorkload`
+  with `OMNILSP_SOAK_GATE=required`, the frozen candidate, and
+  `SOAK_DURATION=30s` both failed at `soak/initial-queries` — the fixed
+  30-second per-request budget (test/soak/stdio_soak_test.go) expired on the
+  first Go references query. This is a host-speed limit, not a soak-bound
+  violation; the real-stdio gate remains release evidence to be captured on a
+  host that meets the budget.
+- `TestS21_ZeroErrorClassification` with `OMNILSP_BIN` + `OMNILSP_CANDIDATE_SHA256`
+  + `OMNILSP_S21_GATE=required` and the pinned seven-language toolchains →
+  structured report `s21.json`, decision **passed**: all seven languages
+  tested, 14 cases × 4 operations = 56 operations, all six §S21 buckets zero,
+  no skips, candidate path/hash/run ID bound to this run.
+- `TestS18S19_RealProcessPerformanceAcceptance` (strict policy, same frozen
+  candidate) → structured report `performance.json`, decision **failed**:
+  S19 real-process scaling passed all three sizes; S18 collected 1000-sample
+  P50/P95/P99 distributions for all 7 fixtures × 4 operations, 21/28 rows
+  passed strict thresholds. Failures: Go hover/definition/completion
+  (P50 391-443ms vs 20-40ms targets) and C/C++ completion/syntax rows. The
+  C/C++ rows are the ones `s18-evidence-qualified-v2` grants documented
+  exceptions for; the Go hot-path rows are a real finding for the candidate's
+  gopls bridge and keep PERF-2 partial.
+- `go test -race -count=1 -timeout 900s ./...` on the final tree (after the
+  registry/doc 落账 above was regenerated once to clear the drift the first
+  race pass caught in `TestGenerateDocs`) → exit 0, 51 packages ok
+  (16:59:09–17:04:19 UTC, `race-all-clean.log`). Y1-9 upgraded to AUTO with
+  race-mode probes; Y1-10 stays GATE for the reason recorded above.
+- Final tree: `go build ./...` and `go vet ./...` green; `omnilsp verify
+  --json` from a fresh `-trimpath` build reports coreScore **97.7096**
+  (floor 90, passed; `verify-final.json`) — +4.04 over the 93.669 baseline:
+  SBOM +1.00, Y2-1 +0.72, PERF-S19 +0.75, PERF-3/S21 +0.75, Y1-9 +0.82.

@@ -143,6 +143,18 @@ type controlledBackendRestartResult struct {
 }
 
 func TestSoak_RealStdioMixedWorkload(t *testing.T) {
+	// §S16 contract (docs/soak-nightly.md): the real stdio soak is the
+	// release-candidate evidence gate and runs only when the acceptance
+	// runner explicitly opts in via OMNILSP_SOAK_GATE=required, which
+	// scripts/acceptance.ps1 sets. Every other invocation — the nightly
+	// form-only regression job, full-package sweeps, plain `go test` — skips
+	// instead of failing on preconditions a form-only environment cannot
+	// satisfy. The strict gates below (run ID, SOAK_DURATION, windows/amd64
+	// Job Object accounting, frozen candidate, pinned tools) keep their full
+	// force under opt-in.
+	if os.Getenv("OMNILSP_SOAK_GATE") != "required" {
+		t.Skip("real stdio soak gate not opted in: set OMNILSP_SOAK_GATE=required (scripts/acceptance.ps1 does this); nightly/CI invocations are form-only regression signals, not release-candidate evidence — see docs/soak-nightly.md")
+	}
 	runID := os.Getenv("OMNILSP_RUN_ID")
 	if runID == "" {
 		runID = fmt.Sprintf("missing-run-id-%d", os.Getpid())

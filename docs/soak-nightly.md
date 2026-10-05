@@ -29,6 +29,18 @@ set of ten one-minute medians is checked with a Theil-Sen slope, so isolated
 local dips are allowed while sustained growth still fails when estimated
 private-memory growth reaches 512 MiB or handle growth reaches 1,024.
 
+Two run shapes share this gate and must not be conflated. The nightly
+workflow (`.github/workflows/nightly.yml`) runs the 55m accelerated
+in-process soak on ubuntu-latest as a regression signal only; it is not
+release-candidate evidence, and because it sets no run ID, no frozen
+candidate, and no `OMNILSP_SOAK_GATE` opt-in, `TestSoak_RealStdioMixedWorkload`
+skips there instead of failing on preconditions it cannot satisfy. The
+release-candidate contract is unchanged: the real stdio gate runs only under
+the explicit `OMNILSP_SOAK_GATE=required` opt-in — set automatically by
+`scripts/acceptance.ps1` — and the strict preconditions below (run ID,
+`SOAK_DURATION`, windows/amd64 Job Object accounting, frozen candidate,
+pinned tools) keep their full force under opt-in.
+
 For the local Windows release candidate, run the same mixed workload through
 30-second and 10-minute preflights, then one uninterrupted one-hour worker.
 The preflights do not count toward the final hour. Freeze the candidate once;
@@ -42,7 +54,16 @@ $env:OMNILSP_BIN = (Resolve-Path "$evidence/omnilsp.exe").Path
 $env:SOAK_JSONL = "$evidence/soak.jsonl"
 $env:OMNILSP_ACCEPTANCE_REPORT = "$evidence/soak-report.json"
 $env:SOAK_DURATION = '1h'
+$env:OMNILSP_SOAK_GATE = 'required'
 go test -tags soak -run '^TestSoak_RealStdioMixedWorkload$' -count=1 -timeout 90m ./test/soak/
+# Clean up immediately after the run. All six variables are soak-gate
+# preconditions (test/soak/stdio_soak_test.go); leaving them set makes every
+# later plain `go test ./...` and `omnilsp verify --full` attempt the real
+# stdio gate against stale preconditions and fail instead of skipping. This
+# mirrors the cleanup scripts/acceptance.ps1 performs after its own runs.
+Remove-Item Env:OMNILSP_RUN_ID, Env:OMNILSP_BIN, Env:SOAK_JSONL, `
+    Env:OMNILSP_ACCEPTANCE_REPORT, Env:SOAK_DURATION, Env:OMNILSP_SOAK_GATE `
+    -ErrorAction SilentlyContinue
 ```
 
 The release path uses `Start1h` and `Status` in `scripts/acceptance.ps1`, which

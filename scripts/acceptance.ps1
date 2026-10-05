@@ -2681,8 +2681,11 @@ function Invoke-Soak([string] $Duration, [string] $RunIdForSoak) {
     $env:OMNILSP_ACCEPTANCE_REPORT = $soakReport
     $env:OMNILSP_BIN = $CandidateBinary
     $env:OMNILSP_RUN_ID = $RunIdForSoak
+    # Explicit opt-in for the strict real-stdio gate (§S16); without it the
+    # test skips as form-only. See docs/soak-nightly.md.
+    $env:OMNILSP_SOAK_GATE = 'required'
     $result = Invoke-Step "soak-$Duration" $testExe @('-test.run=^TestSoak_RealStdioMixedWorkload$', '-test.count=1', '-test.timeout=90m')
-    Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID, Env:OMNILSP_SOAK_GATE -ErrorAction SilentlyContinue
     $hashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash.ToLowerInvariant()
     if ($hashBefore -ne $hashAfter) { throw 'Candidate binary hash changed during soak.' }
     $testHashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $testExe).Hash.ToLowerInvariant()
@@ -2883,6 +2886,7 @@ switch ($Phase) {
         $env:OMNILSP_ACCEPTANCE = '1'
         $env:OMNILSP_RUN_ID = $RunId
         $env:OMNILSP_CANDIDATE_SHA256 = $binaryHash
+        $env:OMNILSP_S21_GATE = 'required'
         $env:OMNILSP_S21_REPORT = Join-Path $EvidenceDirectory 's21.json'
         Remove-Item -LiteralPath $env:OMNILSP_S21_REPORT -Force -ErrorAction SilentlyContinue
         $s21Started = (Get-Date).ToUniversalTime()
@@ -3066,7 +3070,7 @@ switch ($Phase) {
                 $checks[-1].detail = 'test process exited nonzero despite a passing report'
             }
         }
-        Remove-Item Env:OMNILSP_ACCEPTANCE, Env:OMNILSP_BIN, Env:OMNILSP_PERF_REPORT, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_RUN_ID, Env:OMNILSP_RUN_CLIENT_ACCEPTANCE, Env:OMNILSP_VSCODE_BIN, Env:OMNILSP_NVIM_BIN, Env:OMNILSP_ACCEPTANCE_NODE, Env:OMNILSP_ACCEPTANCE_NODE_SHA256, Env:OMNILSP_ACCEPTANCE_LOCKED_TOOLS, Env:OMNILSP_SEMANTIC_NODE_PATH, Env:OMNILSP_SEMANTIC_TYPESCRIPT_PATH, Env:OMNILSP_SEMANTIC_PYRIGHT_INTERNAL_PATH, Env:OMNILSP_SEMANTIC_PYRIGHT_VENDOR_PATH, Env:OMNILSP_SEMANTIC_PYTHON_PATH, Env:OMNILSP_CANDIDATE_SHA256, Env:OMNILSP_S21_REPORT, Env:OMNILSP_S18_POLICY -ErrorAction SilentlyContinue
+        Remove-Item Env:OMNILSP_ACCEPTANCE, Env:OMNILSP_BIN, Env:OMNILSP_PERF_REPORT, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_RUN_ID, Env:OMNILSP_RUN_CLIENT_ACCEPTANCE, Env:OMNILSP_VSCODE_BIN, Env:OMNILSP_NVIM_BIN, Env:OMNILSP_ACCEPTANCE_NODE, Env:OMNILSP_ACCEPTANCE_NODE_SHA256, Env:OMNILSP_ACCEPTANCE_LOCKED_TOOLS, Env:OMNILSP_SEMANTIC_NODE_PATH, Env:OMNILSP_SEMANTIC_TYPESCRIPT_PATH, Env:OMNILSP_SEMANTIC_PYRIGHT_INTERNAL_PATH, Env:OMNILSP_SEMANTIC_PYRIGHT_VENDOR_PATH, Env:OMNILSP_SEMANTIC_PYTHON_PATH, Env:OMNILSP_CANDIDATE_SHA256, Env:OMNILSP_S21_GATE, Env:OMNILSP_S21_REPORT, Env:OMNILSP_S18_POLICY -ErrorAction SilentlyContinue
         Remove-Item Env:OMNILSP_RUST_SCIP_HELPER_PATH, Env:OMNILSP_RUST_SCIP_HELPER_VERSION, Env:OMNILSP_RUST_SCIP_HELPER_SHA256 -ErrorAction SilentlyContinue
         $env:PATH = $script:AcceptanceOriginalPath
 

@@ -34,3 +34,10 @@ __pycache__/
 
 # Local test evidence with absolute paths; never commit.
 /test/corpus/test/
+
+# Generated per-run evidence artifacts, not source control inputs:
+#   - out/ holds local iteration/audit reports written by agent runs;
+#   - sbom.cdx.json is regenerated per gate run (gen-sbom.go embeds a
+#     wall-clock timestamp and a date-keyed serial, so every regeneration
+#     churns); release evidence lives under test/acceptance/evidence/<runId>/.
+/out/
