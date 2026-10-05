@@ -264,9 +264,8 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 | `jsonrpc/fuzz_test.go:74-113` | `FuzzPosition` 整个函数空转：11 个**常量**字符串 unmarshal 后 `_ = raw`，从不碰 `Codec`/`Message`，注释却宣称「验证解码不 panic」 |
 | `jsonrpc/s10_conformance_test.go:81-95` | `TestStructuredErrorResponse` 注册 handler 却从不 Dispatch，断言只覆盖构造函数 |
 | `jsonrpc/s10_conformance_test.go:39-49` | `TestMalformedJSONDoesNotPanic` 的 `"not json"` 从不被解析（直接路由到未知方法 ⇒ `MethodNotFound`），测的是「未知方法」 |
-| `position/fuzz_test.go:62` | 往返断言被 `_ = back` 丢弃；同文件 `FuzzMultiByteBoundary:156` 却真断言了，自相矛盾 |
-| `position/fuzz_test.go:33-36` | `if enc < UTF8 \|\| enc > UTF32` 恒不成立（`% 3` 必 ∈ [0,2]） |
-| `position/fuzz_test.go:112-117` | 空 if 体，`err` 从不检查 |
+| `position/fuzz_test.go:62` | 往返断言被 `_ = back` 丢弃。代码注释已给出理由（模糊位置往返不精确，INV-POS-001 允许），所以不是缺陷而是**断言偏弱**；同文件 `FuzzMultiByteBoundary:156` 真断言了 `back != off`，两者强度不一致 |
+| `position/fuzz_test.go:112-117` | 空 if 体，`err` 从不检查。`OffsetToPosition` 的错误路径因此无人验证 |
 | `position/position_test.go:68-76` | `TestCJKCharacters` 对 3 字节 CJK 逐字节 offset 调 `OffsetToPosition`，返回值零断言 |
 | `golang/uri_fuzz_test.go:25-31` | `FuzzURI` 零断言 ⇒ `pathToUri`（`backend.go:1462`）唯一调用点是空转 fuzz，覆盖率应 0% |
 | `golang/features.go:90-92` | `if endCol == 0 { endCol = 0 }` 字面空操作；且 `:85-93` 的 endCol/endLine 计算在 `features_test.go:41-62` 完全未断言 |
@@ -274,6 +273,8 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 | `server/lifecycle_test.go:385-388` | 只有 `Logf` 没有 `Errorf`，文案「rejection is silent」自相矛盾 |
 
 ### 5.2 恒假守卫与不可达分支（代码本身的问题，测试再多也覆盖不到）
+
+> 复核记录：以下各条已逐条 grep/读码验证。其中 `auth.go:48`（window 只有定义、无赋值无读取）与 `meta_test.go:85-92`（`isLeafHelper` 两个分支都 `return false`，且 `:74` 真实调用它）确认成立。
 
 | 位置 | 问题 |
 |---|---|
