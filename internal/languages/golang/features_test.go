@@ -49,6 +49,15 @@ func TestFeatures_GolangBridgeSyntaxTier(t *testing.T) {
 		if len(edits) != 1 || edits[0].NewText == string(messy) {
 			t.Fatalf("expected one canonicalizing edit, got %+v", edits)
 		}
+		// The edit replaces the whole document, so its end has to be the
+		// position just past the last byte. A source ending in a newline has
+		// an empty final line, which makes that position column 0 -- and the
+		// arithmetic used to underflow uint32 there, handing the client
+		// EndChar 4294967295. Nothing checked this before.
+		if edits[0].EndLine != 2 || edits[0].EndChar != 0 {
+			t.Errorf("edit end = %d:%d, want 2:0 for a document ending in a newline",
+				edits[0].EndLine, edits[0].EndChar)
+		}
 		clean := edits[0].NewText
 		again, err := b.Formatting(context.Background(), languages.FormattingRequest{
 			URI: "file:///w/m.go", Content: []byte(clean),
@@ -58,6 +67,38 @@ func TestFeatures_GolangBridgeSyntaxTier(t *testing.T) {
 		}
 		if len(again) != 0 {
 			t.Errorf("canonical input reformatted again: %+v", again)
+		}
+	})
+
+	// The whole-document end position across the shapes a source can end in.
+	// Each needs gofmt to actually change something, so the messy form keeps a
+	// trailing space that format.Source strips.
+	t.Run("full-span end position", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			src      string
+			wantLine uint32
+			wantChar uint32
+		}{
+			{"ends with a newline", "package main\nfunc m(){x:=1;_=x} \n", 2, 0},
+			{"no newline at all", "package main\nfunc m(){x:=1;_=x} ", 1, 19},
+			{"trailing blank line", "package main\nfunc m(){x:=1;_=x}\n\n", 3, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				edits, err := b.Formatting(context.Background(), languages.FormattingRequest{
+					URI: "file:///w/m.go", Content: []byte(tc.src),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(edits) != 1 {
+					t.Skipf("gofmt left this input alone (%d edits), nothing to check", len(edits))
+				}
+				if edits[0].EndLine != tc.wantLine || edits[0].EndChar != tc.wantChar {
+					t.Errorf("edit end = %d:%d, want %d:%d",
+						edits[0].EndLine, edits[0].EndChar, tc.wantLine, tc.wantChar)
+				}
+			})
 		}
 	})
 

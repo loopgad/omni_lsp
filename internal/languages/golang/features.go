@@ -83,14 +83,17 @@ func (b *Backend) Formatting(ctx context.Context, req languages.FormattingReques
 	if string(out) == src {
 		return nil, nil
 	}
+	// The edit spans the whole document, so its end is the position just past
+	// the final byte: the last line, plus however much of that line exists. A
+	// source ending in a newline has an empty last line, so that end is column
+	// 0. Subtracting one more to mean "exclusive" underflowed uint32 there,
+	// since there was nothing left to subtract from, and the guard meant to
+	// catch it tested the post-subtraction value and so never fired.
 	lastNL := strings.LastIndexByte(src, '\n')
 	endLine := uint32(strings.Count(src, "\n"))
 	endCol := uint32(len(src))
 	if lastNL >= 0 {
-		endCol = uint32(len(src)-lastNL-1) - 1 // exclusive end at last char+1
-		if endCol == 0 {
-			endCol = 0
-		}
+		endCol = uint32(len(src) - lastNL - 1)
 	}
 	return []languages.TextEdit{{
 		URI:       req.URI,
