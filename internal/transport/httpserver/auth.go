@@ -41,11 +41,15 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimPrefix(h, "Bearer ")
 }
 
+// perSourceLimiterMaxBuckets caps how many distinct sources are tracked at
+// once. The comment used to cite goal.md §P3, but that section is about metric
+// label cardinality and has nothing to do with this map.
+const perSourceLimiterMaxBuckets = 4096
+
 // perSourceLimiter is a fixed-window counter per source key. Ponytail
 // simple: exact enough for abuse damping, no dependency on x/time/rate.
 type perSourceLimiter struct {
 	mu      sync.Mutex
-	window  int64 // seconds
 	limit   int
 	buckets map[string]*srcBucket
 }
@@ -64,7 +68,12 @@ func (p *perSourceLimiter) Allow(key string, nowSlot int64) bool {
 	defer p.mu.Unlock()
 	b := p.buckets[key]
 	if b == nil || b.slot != nowSlot {
-		if len(p.buckets) > 4096 { // bounded cardinality (§P3)
+		// Cap the map so rotating source addresses cannot grow it without
+		// bound: every distinct key earns an entry that outlives its window,
+		// so an attacker cycling sources would otherwise accumulate them
+		// forever. Clearing wholesale is blunt -- it also resets live sources
+		// -- but it is bounded, which is what matters here.
+		if len(p.buckets) >= perSourceLimiterMaxBuckets {
 			p.buckets = map[string]*srcBucket{}
 		}
 		p.buckets[key] = &srcBucket{slot: nowSlot}
@@ -83,7 +92,11 @@ func withAuth(next http.Handler, opts AuthOptions, lim *perSourceLimiter, now fu
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		if opts.PerSourcePerMinute > 0 && lim != nil {
+		// PerSourcePerMinute is the only thing that turns limiting on. A zero
+		// limiter would reject every request, since Allow admits while
+		// count <= limit and limit would be zero; the guard is what makes
+		// "unset" mean "unlimited" instead of "closed".
+		if opts.PerSourcePerMinute > 0 {
 			if !lim.Allow(sourceKey(r, tok), now()/60) {
 				http.Error(w, `{"error":"rate_limited"}`, http.StatusTooManyRequests)
 				return
