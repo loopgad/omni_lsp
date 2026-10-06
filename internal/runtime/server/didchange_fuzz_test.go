@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/omnilsp/omni/internal/protocol/lsp"
+	"github.com/omnilsp/omni/internal/workspace/position"
 )
 
 func FuzzDidChange(f *testing.F) {
@@ -35,10 +36,10 @@ func FuzzDidChange(f *testing.F) {
 			Start: lsp.Position{Line: line, Character: col},
 			End:   lsp.Position{Line: endLine, Character: endCol},
 		}
-		out, err := applyRangeEdit([]byte(content), rng, text)
+		out, err := applyRangeEdit([]byte(content), rng, text, position.UTF16)
 		if err != nil {
 			// Rejection is fine — it must be deterministic though.
-			if _, err2 := applyRangeEdit([]byte(content), rng, text); (err == nil) != (err2 == nil) {
+			if _, err2 := applyRangeEdit([]byte(content), rng, text, position.UTF16); (err == nil) != (err2 == nil) {
 				t.Fatalf("nondeterministic acceptance: %v vs %v", err, err2)
 			}
 			return
@@ -46,7 +47,7 @@ func FuzzDidChange(f *testing.F) {
 		// Accepted edit invariants:
 		//  1. output is valid UTF-8-preserving splice: re-applying the same
 		//     edit to the original must give identical bytes.
-		out2, err2 := applyRangeEdit([]byte(content), rng, text)
+		out2, err2 := applyRangeEdit([]byte(content), rng, text, position.UTF16)
 		if err2 != nil || string(out) != string(out2) {
 			t.Fatalf("nondeterministic result: %q vs %q (%v)", out, out2, err2)
 		}

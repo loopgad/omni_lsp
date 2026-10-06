@@ -16,6 +16,7 @@ import (
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/protocol/lsp"
 	"github.com/omnilsp/omni/internal/semantic/query"
+	"github.com/omnilsp/omni/internal/workspace/position"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
 	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 	"github.com/omnilsp/omni/internal/workspace/vfs"
@@ -440,7 +441,8 @@ func (s *Server) handleDidChange(ctx context.Context, msg *jsonrpc.Message) (jso
 	if content == nil {
 		content = []byte{}
 	}
-	next, err := applyContentChanges(content, params.ContentChanges)
+	next, err := applyContentChanges(content, params.ContentChanges,
+		position.Encoding(s.negotiatedEncodingInt()))
 	if err != nil {
 		s.syncRejects.Add(1)
 		s.metrics.SyncRejects.Inc(1)
