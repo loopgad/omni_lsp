@@ -45,7 +45,7 @@ const (
 type Backend struct {
 	conn    *nested.Conn
 	workDir string
-	cfgFile string // tsconfig.json presence gates project-wide rename (§X3)
+	cfgFile string // tsconfig.json presence gates project-wide rename (§I10)
 
 	gateOnce   sync.Once
 	hasCfgFile bool
@@ -486,7 +486,7 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {
 	epoch := b.currentBackendEpoch()
 	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
-	// X3/R4.1 fail-closed gate: without a tsconfig the server works in
+	// Fail-closed gate (§I10): without a tsconfig the server works in
 	// inferred-project mode with no project-wide file set, so rename
 	// completeness is unprovable.
 	if !b.cfgPresent() {
@@ -721,7 +721,7 @@ func (b *Backend) DidCloseDocument(uri string, snapshotRevision uint64) error {
 	return b.conn.CloseDocument(uri, snapshotRevision)
 }
 
-// cfgPresent reports whether the workspace tsconfig exists (§X3), cached:
+// cfgPresent reports whether the workspace tsconfig exists (§I10), cached:
 // it appears at scaffold time, not mid-session.
 func (b *Backend) cfgPresent() bool {
 	b.gateOnce.Do(func() {

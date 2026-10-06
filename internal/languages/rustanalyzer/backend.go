@@ -44,7 +44,7 @@ const (
 type Backend struct {
 	conn    *nested.Conn
 	workDir string
-	cfgFile string // Cargo.toml presence gates project-wide rename (§X3)
+	cfgFile string // Cargo.toml presence gates project-wide rename (§I10)
 
 	gateOnce           sync.Once
 	hasCfgFile         bool
@@ -511,7 +511,7 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {
 	epoch := b.currentBackendEpoch()
 	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
-	// X3/R4.1 fail-closed gate: without a workspace-level build manifest
+	// Fail-closed gate (§I10): without a workspace-level build manifest
 	// rust-analyzer indexes an incomplete crate graph, so project-wide rename
 	// completeness is unprovable.
 	if !b.cfgPresent() {
@@ -626,7 +626,7 @@ func (b *Backend) DidSaveDocument(uri string, content []byte, snapshotRevision u
 	return b.conn.DidSaveDocumentAtRevision(langID, uri, content, snapshotRevision)
 }
 
-// cfgPresent reports whether the workspace build manifest exists (§X3),
+// cfgPresent reports whether the workspace build manifest exists (§I10),
 // cached: the manifest appears at scaffold time, not mid-session.
 func (b *Backend) cfgPresent() bool {
 	b.gateOnce.Do(func() {

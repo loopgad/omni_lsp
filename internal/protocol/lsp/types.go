@@ -1,6 +1,7 @@
 // Invariants:
 //  1. Types mirror the LSP 3.17 baseline; unknown fields tolerated per A7.
-//  2. Declarations only - no behavior lives in this package.
+//  2. types.go holds declarations only; manifest.go in this same package builds and
+//     verifies the protocol fingerprint, so the package is not declaration-only.
 package lsp
 
 // LSPBaseline pins the wire protocol revision this package mirrors

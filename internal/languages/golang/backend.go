@@ -1434,7 +1434,7 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (iden
 }
 
 // CompletionIsIncomplete declares the go bridge's completion lists heuristic
-// subsets (§I9): ranking is best-effort, so clients must re-query while typing.
+// subsets (§I14): ranking is best-effort, so clients must re-query while typing.
 func (b *Backend) CompletionIsIncomplete() bool { return true }
 
 func (b *Backend) Close() error {
@@ -1585,7 +1585,7 @@ func objKindName(o types.Object) string {
 	}
 }
 
-// Declaration implements languages.DeclarationProvider (§I14/T2). Under
+// Declaration implements languages.DeclarationProvider (§T2). Under
 // go/types a declaration site and a definition site coincide — obj.Pos() is
 // where the name is introduced — so this is Definition's semantics under the
 // declaration method name, served through the optional interface so backends

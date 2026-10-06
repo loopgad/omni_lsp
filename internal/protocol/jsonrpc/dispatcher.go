@@ -21,7 +21,8 @@ type HandlerFunc func(ctx context.Context, msg *Message) (json.RawMessage, error
 //   - Thread-safe: handlers can be registered concurrently with dispatching.
 //   - Unknown methods return MethodNotFound error for requests.
 //   - Unknown notifications are silently ignored.
-//   - No handler should panic; the dispatcher does not recover.
+//   - A panicking handler is recovered at this boundary (F16) and turned into an
+//     InternalError so one bad handler cannot take the process down.
 type Dispatcher struct {
 	mu       sync.RWMutex
 	handlers map[string]HandlerFunc

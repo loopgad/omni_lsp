@@ -65,7 +65,7 @@ func TestX6_PerSourceRateLimitBucket(t *testing.T) {
 		t.Errorf("4th request = %d, want 429", code)
 	}
 
-	// Different source keeps its own bucket (§F14-style isolation).
+	// Different source keeps its own bucket (§F6-style isolation: bounded work per key).
 	req := httptest.NewRequest("POST", "/api/v1/hover", strings.NewReader(`{"uri":"file:///w/a.go","line":0,"column":0}`))
 	req.Header.Set("Authorization", "Bearer other-token")
 	req.RemoteAddr = "10.0.0.2:1234"

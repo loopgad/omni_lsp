@@ -1,4 +1,5 @@
-// manifest.go 提供 protocol.manifest（goal.md §Y5-4 / §U4 可复现检查）的
+// manifest.go 提供 protocol.manifest（goal.md §U4 可复现检查，
+// 对应的是本仓库 registry 条目 Y5-4，它不是 goal.md 的章节号）的
 // 构建与校验：对手写类型文件 types.go 的全部顶层声明做规范化文本指纹，
 // 供 scripts/gen-protocol.go 与 internal/conformance 探针共同调用。
 // 不引入真实 codegen——指纹一致即视为协议面未被意外改动。

@@ -15,7 +15,7 @@ import (
 	"github.com/omnilsp/omni/internal/languages"
 )
 
-// bareTestBackend builds a Backend with no process attached: the R4 gates
+// bareTestBackend builds a Backend with no process attached: the fail-closed gates
 // under test all sit before the first clangd round-trip.
 func bareTestBackend(t *testing.T, withCompileDb bool) *Backend {
 	t.Helper()

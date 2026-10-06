@@ -90,8 +90,8 @@ func (s *Snapshot) ID() ID { return s.id }
 // revision number; it is not persistent or exposed on the product protocol.
 func (s *Snapshot) InstanceID() uint64 { return s.instance }
 
-// Revision returns the monotonic revision of this snapshot (J6: part of the
-// coalescing key — requests on different revisions must never join).
+// Revision returns the monotonic revision of this snapshot (part of the
+// coalescing key — requests on different revisions must never join, §J3 内容地址化的同一原则).
 func (s *Snapshot) Revision() uint64 { return s.id.Revision }
 
 // Document returns the document snapshot for the given URI.

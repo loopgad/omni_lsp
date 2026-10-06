@@ -600,7 +600,7 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {
 	epoch := b.currentBackendEpoch()
 	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
-	// X3/R4.1: without a compile database clangd works in single-file mode —
+	// X3: without a compile database clangd works in single-file mode —
 	// it cannot see all translation units, so project-wide rename completeness
 	// is unprovable. Fail closed with an actionable diagnostic.
 	if !b.compileDbPresent() {

@@ -1,4 +1,8 @@
-// Package supervisor implements the backend lifecycle state machine per goal.md section G2-G5.
+// Package supervisor implements part of the backend lifecycle state machine per goal.md
+// section G2-G5. Of G5's six steps for a hung worker, HandleHungWorker performs the
+// backend-native cancellation and the process-group termination; the bounded grace
+// wait, the request failure, the BackendEpoch bump and the restart policy live in
+// the nested backend's watchdog.
 //
 // F2 Locking policy:
 //   - Protected: state, epoch, crashes, lastErr, health, onStateChange, onEpochChange

@@ -29,7 +29,7 @@ func TestP3_PerSourceLimiterWindowResets(t *testing.T) {
 }
 
 // TestP3_PerSourceLimiterBoundsCardinality covers the bounded-cardinality
-// guard (goal.md §P3). Unbounded per-source buckets are a memory-growth
+// guard. Unbounded per-source buckets are a memory-growth
 // vector: every distinct source address earns a permanent entry, so an
 // attacker rotating source keys would otherwise grow the map without limit.
 // Nothing tested that the map is actually capped.

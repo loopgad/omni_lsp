@@ -1,6 +1,6 @@
 // Package graph 实现五层依赖图与选择性失效（goal.md §M0-M4）：
 // File→Module→Build Target→Workspace→External 五层节点，
-// imports/includes/generates/expands/implements/inherits 六种边，
+// imports/includes/generates/expands/implements/inherits 六种边（goal.md §M0 列八种，缺 uses/depends_on），
 // 沿反向依赖的 BFS 失效传播（§M1）、公共语义指纹跳过（§M2）、
 // MaxFanout 安全阀（§M3），以及显式生成依赖建模（§M4）。
 //
@@ -28,7 +28,7 @@ const (
 	LayerExternal                 // 外部依赖
 )
 
-// EdgeKind 是六种依赖边（goal.md §M0）。
+// EdgeKind 是六种依赖边。§M0 还列了 uses 与 depends_on，本包未实现。
 type EdgeKind uint8
 
 const (

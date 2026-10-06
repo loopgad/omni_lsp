@@ -464,7 +464,7 @@ type StatusReporter interface {
 	BackendStatusMessage() string
 }
 
-// IncompleteCompletionProvider is an optional backend capability (§I9): the
+// IncompleteCompletionProvider is an optional backend capability (§I14): the
 // bridge declares its completion lists as heuristic subsets, so clients keep
 // re-querying while typing instead of treating one response as canonical.
 type IncompleteCompletionProvider interface {
@@ -493,7 +493,7 @@ const (
 	TokComment
 )
 
-// DeclarationProvider is an optional backend capability (§I14/T2):
+// DeclarationProvider is an optional backend capability (§T2):
 // textDocument/declaration. Distinct from Definition where a language
 // distinguishes declaration sites from implementation sites; backends
 // without such a distinction simply do not implement it and the server

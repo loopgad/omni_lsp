@@ -135,7 +135,7 @@ type Server struct {
 	evRing     [64]evidenceRecord
 	evRingNext int
 
-	// metrics are the §L telemetry counters (low-cardinality labels only).
+	// metrics are the §P2 telemetry counters (§P3: low-cardinality labels only).
 	metrics serverMetrics
 
 	completionPhaseTrace *completionPhaseTraceRecorder
@@ -172,7 +172,7 @@ func parseClientEditCapability(raw json.RawMessage) bool {
 	return caps.Workspace.WorkspaceEdit.DocumentChanges
 }
 
-// serverMetrics aggregates the canonical counters (§K/§L): every rejection,
+// serverMetrics aggregates the canonical counters (§P2/§P3): every rejection,
 // backend failure, and snapshot epoch must be visible, never silent.
 type serverMetrics struct {
 	RequestsTotal  *telemetry.Counter // omnilsp.requests.total

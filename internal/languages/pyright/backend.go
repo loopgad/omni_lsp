@@ -41,7 +41,7 @@ const (
 type Backend struct {
 	conn    *nested.Conn
 	workDir string
-	cfgFile string // pyproject.toml presence gates project-wide rename (§X3)
+	cfgFile string // pyproject.toml presence gates project-wide rename (§I10, §H4.3)
 
 	gateOnce   sync.Once
 	hasCfgFile bool
@@ -461,7 +461,7 @@ func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte
 func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {
 	epoch := b.currentBackendEpoch()
 	defer func() { envelope = languages.WithBackendEpoch(envelope, epoch) }()
-	// X3/R4.1 fail-closed gate: without a workspace manifest pyright indexes
+	// Fail-closed gate (§I10): without a workspace manifest pyright indexes
 	// an incomplete import graph, so project-wide rename completeness is
 	// unprovable.
 	if !b.cfgPresent() {
@@ -566,7 +566,7 @@ func (b *Backend) DidCloseDocument(uri string, snapshotRevision uint64) error {
 	return b.conn.CloseDocument(uri, snapshotRevision)
 }
 
-// cfgPresent reports whether the workspace manifest exists (§X3), cached:
+// cfgPresent reports whether the workspace manifest exists (§I10, §H4.3), cached:
 // the manifest appears at scaffold time, not mid-session.
 func (b *Backend) cfgPresent() bool {
 	b.gateOnce.Do(func() {

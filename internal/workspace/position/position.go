@@ -382,7 +382,7 @@ func UTF16Len(b []byte) int {
 // OffsetOfLineChar converts an LSP-style UTF-16 line/character position into a
 // byte offset within content. The character must lie on a scalar boundary
 // within the line content (terminator excluded); out-of-range positions
-// return an error — never clamp (goal.md §D6, INV-POS-002).
+// return an error — never clamp (goal.md §D7, INV-POS-002).
 func OffsetOfLineChar(content []byte, line, character uint32) (uint32, error) {
 	return OffsetOfLineCharEncoding(content, line, character, UTF16)
 }
