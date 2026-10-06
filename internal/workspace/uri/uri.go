@@ -71,8 +71,12 @@ func mustFile(s string) URI {
 	u, err := Parse(s)
 	if err != nil {
 		// FromPath inputs are structurally valid by construction; the only
-		// failure mode would be a control-character path, which we surface
-		// as an opaque non-file URI rather than panicking.
+		// failure mode would be a control-character path, which we surface as an
+		// opaque URI carrying the raw spelling rather than panicking. The scheme
+		// stays "file", so IsFile reports true and Path fails when it reparses
+		// the same string -- a caller never receives a guessed path, but a
+		// control-character path still leaves behind a URI that is not
+		// canonical and will not compare equal to its own normalized form.
 		return URI{original: s, canonical: s, scheme: "file"}
 	}
 	return u

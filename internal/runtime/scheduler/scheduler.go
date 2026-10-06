@@ -13,7 +13,10 @@ package scheduler
 // Invariants:
 //  1. All requests routed through bounded queues per F6.
 //  2. Priority aging prevents starvation per F7.
-//  3. Shutdown is graceful: in-flight work completes, new work rejected (F15).
+//  3. Shutdown drains queued work but cancels in-flight Execute: s.cancel()
+//     runs before the queues close, so anything already executing sees a done
+//     context immediately. Queued requests still run -- pickRequest treats the
+//     cancellation as a drain signal and keeps scanning the queues.
 //
 // F2 Locking policy:
 //   - Protected: queues[9], config, closed, inFlight, stats
@@ -33,9 +36,11 @@ import (
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
 )
 
-// Priority defines request priority levels per goal.md §F3.
-// CostClass classifies requests by resource cost per goal.md §F8.
-// Large work MUST have stricter concurrency caps than Tiny work.
+// CostClass is a reserved axis for goal.md §F8's cost-based concurrency
+// caps. Nothing sets Request.CostClass and the worker pool applies one cap to
+// every request regardless of it, so §F8's stricter caps for large work are not
+// in effect; §F8 states them as SHOULD rather than MUST, so this is a gap
+// rather than a violation.
 type CostClass int
 
 const (
@@ -63,6 +68,7 @@ func (c CostClass) String() string {
 	}
 }
 
+// Priority defines request priority levels per goal.md §F3.
 type Priority int
 
 const (

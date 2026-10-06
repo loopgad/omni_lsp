@@ -1,9 +1,12 @@
 // Package query implements the incremental query engine (goal.md §J0-J8):
 // deterministic memoized queries with content-addressed dependency tracking,
-// a six-state lifecycle, singleflight joining, and cycle detection.
+// a memoized entry lifecycle, singleflight joining, and cycle detection. Only
+// Ready and FailedStable are ever stored on an entry; a retryable failure and an
+// eviction both drop the entry outright, and work in flight lives in the
+// inflight table rather than in a Computing state.
 //
 // Owned mutable state: entries map (mu-protected), inflight table,
-// depIndex (dep → dependent keys), stats counters (atomics).
+// depIndex (dep → dependent keys), stats counters (guarded by the same gate).
 //
 // Concurrency model: one gate guards the entry/inflight tables; compute
 // functions run OUTSIDE the lock; waiters park on per-query channels.
