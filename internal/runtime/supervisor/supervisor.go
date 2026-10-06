@@ -342,14 +342,24 @@ func (s *Supervisor) notify(from, to State, err error) {
 	if from == StateReady && to != StateReady {
 		fmt.Fprintf(os.Stderr, "omnilsp: supervisor: %s -> %s (%v)\n", from, to, err)
 	}
-	if s.onStateChange != nil {
-		s.onStateChange(from, to, err)
+	// Read the callback under the lock that RegisterCallbacks writes it with.
+	// Copying it out first keeps the callback itself outside the critical
+	// section, since a consumer that called back into the supervisor would
+	// otherwise deadlock.
+	s.mu.Lock()
+	onChange := s.onStateChange
+	s.mu.Unlock()
+	if onChange != nil {
+		onChange(from, to, err)
 	}
 }
 
 func (s *Supervisor) notifyEpoch(ep uint64) {
-	if s.onEpochChange != nil {
-		s.onEpochChange(ep)
+	s.mu.Lock()
+	onEpoch := s.onEpochChange
+	s.mu.Unlock()
+	if onEpoch != nil {
+		onEpoch(ep)
 	}
 }
 

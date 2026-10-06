@@ -161,7 +161,7 @@ func TestClassifyPriority(t *testing.T) {
 		{"textDocument/definition", int(scheduler.PriorityDefinition)},
 		{"textDocument/references", int(scheduler.PriorityReferences)},
 		{"textDocument/rename", int(scheduler.PriorityReferences)},
-		{"textDocument/diagnostics", int(scheduler.PriorityDiagnostics)},
+		{"textDocument/diagnostic", int(scheduler.PriorityDiagnostics)},
 		{"textDocument/codeAction", int(scheduler.PriorityDiagnostics)},
 		{"textDocument/semanticTokens/full", int(scheduler.PrioritySemanticTokens)},
 		{"$/progress", int(scheduler.PriorityMaintenance)},
@@ -780,7 +780,7 @@ func TestPriorityOrdering(t *testing.T) {
 		"textDocument/hover",
 		"textDocument/definition",
 		"textDocument/references",
-		"textDocument/diagnostics",
+		"textDocument/diagnostic",
 		"textDocument/semanticTokens/full",
 		"/progress",
 	}

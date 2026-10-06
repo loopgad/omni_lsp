@@ -953,7 +953,7 @@ func (s *Server) classifyPriority(msg *jsonrpc.Message) scheduler.Priority {
 		return scheduler.PriorityDefinition
 	case "textDocument/references", "textDocument/rename":
 		return scheduler.PriorityReferences
-	case "textDocument/diagnostics", "textDocument/codeAction":
+	case "textDocument/diagnostic", "textDocument/codeAction":
 		return scheduler.PriorityDiagnostics
 	case "textDocument/semanticTokens/full", "textDocument/semanticTokens/range",
 		"textDocument/inlayHint":
