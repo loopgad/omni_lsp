@@ -185,9 +185,13 @@ func wrapTransient(err error) error {
 }
 
 // isRetryableKind reports backend failure classes worth retrying on a later
-// request rather than memoizing: stale content, crashed/restarting, timed out,
-// or overloaded backends may succeed next call; a deterministic compute error
-// would not.
+// request rather than memoizing: stale content, an unavailable backend, a
+// timeout, or an overloaded one may succeed on the next call; a deterministic
+// compute error would not.
+//
+// The comment used to claim crashed/restarting backends were covered here.
+// They are not: ErrBackendCrashed is absent from the switch, and nothing in the
+// tree constructs it, so there was no behaviour behind that clause.
 func isRetryableKind(err error) bool {
 	var e *ierrors.Error
 	if !errors.As(err, &e) {
