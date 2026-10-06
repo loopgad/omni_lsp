@@ -26,7 +26,6 @@ package scheduler
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -468,7 +467,7 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 	// In-flight budget check (F5 admission control).
 	if int(s.inFlight.Load()) >= s.config.MaxInFlight {
 		s.totalRejected.Add(1)
-		err := fmt.Errorf("scheduler: in-flight budget exceeded")
+		err := fmt.Errorf("scheduler: %w: in-flight budget exceeded", errRejected)
 		s.deliverRollback(req, err)
 		req.releaseSharedWaiter()
 		req.finish(Result{Err: err})
@@ -489,7 +488,7 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 		return Admitted
 	}
 	s.totalRejected.Add(1)
-	err := fmt.Errorf("scheduler: queue full")
+	err := fmt.Errorf("scheduler: %w: queue full", errRejected)
 	s.deliverRollback(req, err)
 	req.releaseSharedWaiter()
 	req.finish(Result{Err: err})
@@ -687,7 +686,7 @@ func (s *Scheduler) boostStaleRequests() {
 // capacity 1 and the submitter may already be gone) and rolls back any
 // coalescing group so joined waiters share the same terminal outcome.
 func (s *Scheduler) rejectDropped(req *Request, msg string) {
-	err := errors.New(msg)
+	err := fmt.Errorf("scheduler: %w: %s", errRejected, msg)
 	s.totalRejected.Add(1)
 	s.deliverRollback(req, err)
 	req.releaseSharedWaiter()

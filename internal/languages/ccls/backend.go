@@ -1,7 +1,11 @@
 // Invariants:
 //  1. Rename/edit operations fail closed without a compile database (X3).
-//  2. Ambiguous header contexts surface advisory diagnostics, never guesses.
-//  3. Macro-suspect identifiers are reported on success paths via macroSuspectDiag.
+//  2. Ambiguous header contexts surface advisory diagnostics rather than guessing,
+//     on the paths that carry diagnostics at all -- hover today. Definition and
+//     References report macro suspects only; Rename fails closed on a missing
+//     compile database and the two symbol queries return bare slices.
+//  3. Macro-suspect identifiers are reported via macroSuspectDiag on the hover,
+//     definition and references success paths.
 //
 // Package ccls bridges C/C++ semantics to a nested clangd language server.
 //
@@ -593,8 +597,12 @@ func (b *Backend) DiagnosticsWithEncoding(ctx context.Context, uri string, conte
 	return nil, nil
 }
 
+// SemanticTokens reports no tokens. clangd pushes them through
+// textDocument/publishSemanticTokens, which this bridge does not consume yet, so
+// the answer is an explicit empty list rather than a guess. The other nested
+// bridges are in the same position and say so at the same spot.
 func (b *Backend) SemanticTokens(ctx context.Context, uri string, content []byte) ([]languages.SemanticToken, error) {
-	return nil, nil
+	return nil, nil // push-based semantic tokens not yet consumed; explicit empty (Q3)
 }
 
 func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (envelope identity.SemanticResult[languages.ValidatedEdit], retErr error) {

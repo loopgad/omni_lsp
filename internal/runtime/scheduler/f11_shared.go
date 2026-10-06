@@ -7,7 +7,9 @@ import (
 )
 
 // errRejected is delivered to waiters when their leader never executes
-// (admission rollback). Distinct so tests and callers can recognize it.
+// (admission rollback). The budget and queue rejections wrap it too, so a
+// caller can tell "the scheduler would not run this" apart from a failure the
+// request itself caused, with errors.Is.
 var errRejected = errors.New("scheduler: leader rejected before execution")
 
 // InFlightTracker provides single-flight joining for shared computations

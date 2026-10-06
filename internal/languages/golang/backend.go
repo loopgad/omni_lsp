@@ -23,7 +23,11 @@
 // Invariants:
 //  1. A3: Never fabricate semantic results — use go/parser fallback with EvidenceSyntax.
 //  2. D2: URI/path conversion is bidirectional for file:// URIs.
-//  3. B5: All results carry evidence with SourceHash and BackendEpoch.
+//  3. B5: Enveloped results carry evidence with SourceHash. BackendEpoch stays 0:
+//     this bridge is in-process and owns no supervisor, so there is no restart
+//     epoch to report and nothing here sets that field. Completion,
+//     DocumentSymbols, WorkspaceSymbols, Diagnostics and SemanticTokens return
+//     plain slices rather than an envelope, so they carry no evidence at all.
 package golang
 
 import (
