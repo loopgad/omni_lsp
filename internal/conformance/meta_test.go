@@ -99,23 +99,48 @@ var coreDirs = []string{
 	"internal/workspace",
 }
 
+// arch002Forbidden is INV-ARCH-002's forbidden set, exactly as ADR-0002 and
+// internal/security/doc.go state it. The previous version of this test used a
+// broader list that both contradicted the ADR -- it banned all of
+// internal/protocol, including the jsonrpc framing package the ADR explicitly
+// sanctions -- and missed runtime/server, which the ADR does forbid, leaving
+// semantic/identity free to depend on the server adapter with nothing to
+// catch it. CI's go list -deps check (ci.yml) covers a different set of
+// packages than this test does; neither alone is complete, so both must match
+// the ADR.
+var arch002Forbidden = []string{
+	"/internal/protocol/lsp",
+	"/internal/protocol/mcp",
+	"/internal/protocol/dap",
+	"/internal/transport",
+	"/internal/runtime/server",
+}
+
 // TestARCH002_NoProtocolImportsInCore enforces Y5-2 mechanically instead of
-// by claim.
+// by claim. It reads the parsed import list rather than scanning the file text:
+// a substring scan cannot tell an import from a comment that merely mentions
+// the path, and doc comments in these packages do discuss the boundary.
 func TestARCH002_NoProtocolImportsInCore(t *testing.T) {
 	root := moduleRoot()
-	banned := []string{"/internal/protocol/", "/internal/transport/", "/internal/languages/"}
 	for _, dir := range coreDirs {
 		err := filepath.WalkDir(filepath.Join(root, filepath.FromSlash(dir)), func(path string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 				return err
 			}
-			src, rerr := os.ReadFile(path)
-			if rerr != nil {
-				return rerr
+			fset := token.NewFileSet()
+			file, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+			if perr != nil {
+				return perr
 			}
-			for _, b := range banned {
-				if strings.Contains(string(src), b) {
-					t.Errorf("%s imports %s — INV-ARCH-002 violation", path, strings.Trim(b, "/"))
+			for _, spec := range file.Imports {
+				if spec.Path == nil {
+					continue
+				}
+				imported := strings.Trim(spec.Path.Value, `"`)
+				for _, forbidden := range arch002Forbidden {
+					if strings.Contains(imported, forbidden) {
+						t.Errorf("%s imports %s — INV-ARCH-002 violation", path, strings.TrimPrefix(forbidden, "/"))
+					}
 				}
 			}
 			return nil
