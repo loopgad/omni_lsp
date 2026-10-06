@@ -23,6 +23,16 @@
 //	  | grep -E 'internal/(protocol/(lsp|mcp|dap)|transport|runtime/server)' \
 //	  && exit 1 || exit 0
 //
+// That check covers workspace, languages, scheduler and supervisor.
+// TestARCH002_NoProtocolImportsInCore in internal/conformance covers a
+// different set -- semantic, identity, scheduler and workspace -- from the
+// parsed import list rather than the dependency graph. The two are
+// complementary: neither package set is covered by the other alone, so both
+// must agree with the forbidden set listed above, which is also why the test's
+// list names the forbidden packages individually instead of banning
+// internal/protocol wholesale and accidentally rejecting the sanctioned jsonrpc
+// framing package.
+//
 // This file intentionally contains no imports — a previous version imported
 // core packages here and claimed that proved the invariant, which it did not.
 package security

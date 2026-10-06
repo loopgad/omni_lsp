@@ -29,9 +29,22 @@ protobuf 与少量辅助依赖。
    Google 官方 protobuf-go 库，安全维护等级高；适配器不引入任何网络/执行面。
 5. **Platform impact**: 纯 Go 实现，无 protoc/代码生成步骤进入本项目构建流程。
 6. **cgo impact**: 无 cgo。
-7. **Core contamination risk**: 零——SCIP 类型只出现在 internal/index/interop
-   包内，核心 index/query 包仅见 Canonical IR（§L14：SCIP 不是内存模型），
-   包边界由 internal/conformance 的机械检查保证。
+7. **Core contamination risk**: 低，但不是零，而且当前没有机械检查强制这一点。
+   SCIP 类型出现在 internal/index/interop 之外还有三处：rustanalyzer 与
+   typescript 的 semantic_index.go 直接 import scip 绑定以读取其索引产物，
+   cmd/omnilsp/index.go 在 CLI 边界做格式转换。核心 index/query 包
+   （internal/semantic/query 与 internal/index 本体）确实只见 Canonical IR
+   （§L14：SCIP 不是内存模型），这一点成立。
+
+   本条目此前写的是"SCIP 类型只出现在 internal/index/interop 包内"以及
+   "包边界由 internal/conformance 的机械检查保证"，两句都不成立：前者漏掉了上面
+   三处，后者把 internal/conformance 的依赖白名单（allowedDeps，恰恰是允许
+   scip 存在的那个）当成了边界检查，而该包唯一的架构检查 TestARCH002 只管
+   INV-ARCH-002 的协议/传输方向，对 SCIP 边界一无所知。在补上对应检查之前，
+   "零污染"是约定而非事实。
+
+   要收紧这项风险，正确的方向是让 SCIP 读取收敛到 interop 包内（后端通过
+   Canonical IR 交换数据），而不是在注释里声明它已经收敛了。
 8. **Replacement cost**: 手写最小 .pb 编码可行（本项目所需字段子集约百余行），
    但 proto 枚举/rule 演进后会静默漂移且无法与上游 conformance 测试对齐，
    长期成本高于维护一个 MIT 只读依赖，不采纳。
