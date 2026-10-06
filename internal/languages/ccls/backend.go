@@ -373,7 +373,7 @@ func (b *Backend) Definition(ctx context.Context, req languages.DefinitionReques
 		Status:              identity.ResultExact,
 		Value:               toLocations(raw),
 		Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd-resolved"),
-		InternalDiagnostics: macroSuspectDiag(req.Content, req.Line, req.Column),
+		InternalDiagnostics: append(headerAmbiguityDiag(req.URI), macroSuspectDiag(req.Content, req.Line, req.Column)...),
 		Completeness:        identity.Complete,
 	}, nil
 }
@@ -416,7 +416,7 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 		Status:              identity.ResultPartial,
 		Value:               toReferenceLocations(raw),
 		Evidence:            evidenceForCcls(req.SnapshotRev, req.BuildContext, req.Content, "clangd-index-scope"),
-		InternalDiagnostics: macroSuspectDiag(req.Content, req.Line, req.Column),
+		InternalDiagnostics: append(headerAmbiguityDiag(req.URI), macroSuspectDiag(req.Content, req.Line, req.Column)...),
 		Completeness:        identity.IncompleteKnownSubset,
 	}, nil
 }

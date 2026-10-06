@@ -1,7 +1,15 @@
-// Package budget implements the §F13 memory budget manager and §F14
-// per-backend quotas: a global soft limit that warns (visible, non-fatal)
-// and a hard limit plus per-owner quotas that refuse allocation with
-// ErrOverloaded.
+// Package budget implements §F14 per-backend quotas: a global soft limit that
+// warns (visible, non-fatal) and a hard limit plus per-owner quotas that
+// refuse allocation with ErrOverloaded.
+//
+// It has no production caller yet: nothing in the server constructs a
+// Manager, so ErrOverloaded is currently unreachable outside tests. The
+// §F13 per-category memory ladder — the categories, and the thresholds that
+// move from warn to evict to throttle to refuse as pressure rises — is a
+// separate implementation in internal/runtime/scheduler (f13_budget.go).
+// The two do not share a model: this one counts bytes per owner with no
+// categories, that one counts per-category bytes against a threshold
+// ladder. Consolidating them is a separate decision, not a comment fix.
 //
 // Concurrency model: one mutex guards the counters; Reserve/Release are
 // O(1). Owners are language backend names or "server".

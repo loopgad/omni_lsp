@@ -6,12 +6,12 @@ import "context"
 type State int
 
 const (
-	Absent State = iota
-	Computing
+	Absent    State = iota
+	Computing       // never stored: in-flight work is tracked in the inflight table
 	Ready
 	FailedStable    // negative knowledge; cached until a dependency changes
-	FailedTransient // retried on next Query, never cached
-	Evicted
+	FailedTransient // never stored: a retryable failure drops the entry instead
+	Evicted         // never stored: eviction drops the entry too
 )
 
 func (s State) String() string {
@@ -27,7 +27,10 @@ func (s State) String() string {
 	case FailedTransient:
 		return "failed-transient"
 	default:
-		return "evicted"
+		// Not the Evicted constant: that value is never stored, and
+		// naming a stray or out-of-range State "evicted" would send the
+		// reader looking at eviction instead of at whatever produced it.
+		return "unknown"
 	}
 }
 

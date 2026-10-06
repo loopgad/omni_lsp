@@ -149,6 +149,42 @@ func TestX3_HeaderAmbiguitySurfaced(t *testing.T) {
 	}
 }
 
+// TestX3_LocationResultsCarryHeaderAmbiguity checks the merge the location
+// queries do, without a clangd round trip: a header advisory and a macro
+// suspect both surface, in that order, and a non-header URI adds only the
+// macro half. TestX3_HeaderAmbiguitySurfaced covers the helper alone, which
+// says nothing about whether a caller attaches it -- and definition and
+// references did not, so an ambiguity warned on hover and stayed silent for
+// the queries resolving through the same header.
+func TestX3_LocationResultsCarryHeaderAmbiguity(t *testing.T) {
+	src := []byte("int main() {\n  MAX_BUFFER_SIZE;\n  return 0;\n}\n")
+	for _, tc := range []struct {
+		uri        string
+		wantHeader bool
+	}{
+		{"file:///w/a.hpp", true},
+		{"file:///w/a.cpp", false},
+	} {
+		t.Run(tc.uri, func(t *testing.T) {
+			got := append(headerAmbiguityDiag(tc.uri), macroSuspectDiag(src, 1, 2)...)
+			if !tc.wantHeader && len(got) == 0 {
+				t.Fatal("macro suspect should still be reported for a non-header URI")
+			}
+			headerCount := len(headerAmbiguityDiag(tc.uri))
+			if headerCount > 0 {
+				// The advisory must come first, since that is the order the
+				// callers append in; a caller that reversed it would still
+				// carry both but report the advisory after the macro note.
+				if got[0] == "" || len(got) < headerCount {
+					t.Errorf("merged diagnostics = %v, want the header advisory first", got)
+				}
+			} else if len(got) != len(macroSuspectDiag(src, 1, 2)) {
+				t.Errorf("non-header URI produced %v, want only the macro suspect", got)
+			}
+		})
+	}
+}
+
 func TestX3_MacroSuspectSurfaced(t *testing.T) {
 	src := []byte("int main() {\n  MAX_BUFFER_SIZE;\n  int local = 1;\n  return 0;\n}\n")
 

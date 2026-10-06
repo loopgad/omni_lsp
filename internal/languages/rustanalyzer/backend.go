@@ -1,5 +1,8 @@
 // Invariants:
-//  1. Rename fails closed without Cargo.toml at any ancestor.
+//  1. Rename fails closed without a Cargo.toml in the workspace root. The
+//     check is a single stat on that one directory, not a walk up the tree,
+//     so a crate in a subdirectory with its manifest above the workspace root
+//     is refused.
 //  2. All wire traffic flows through nested.Conn single-reader supervision.
 //  3. Errors carry typed identity per internal/errors conventions.
 //

@@ -1,5 +1,7 @@
 // Invariants:
-//  1. Rename fails closed without pyright project markers (pyrightconfig.json / setup.py).
+//  1. Rename fails closed without pyproject.toml in the workspace root. The
+//     markers the invariant used to name, pyrightconfig.json and setup.py, are
+//     not what is stat'ed, so a project carrying only those is refused.
 //  2. All wire traffic flows through nested.Conn single-reader supervision.
 //  3. Errors carry typed identity per internal/errors conventions.
 //

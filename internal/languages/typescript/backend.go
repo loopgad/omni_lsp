@@ -1,5 +1,7 @@
 // Invariants:
-//  1. Rename fails closed without tsconfig.json/jsconfig.json.
+//  1. Rename fails closed without tsconfig.json in the workspace root. There is
+//     no jsconfig.json fallback, so a JavaScript project that only carries that
+//     file is refused.
 //  2. All wire traffic flows through nested.Conn single-reader supervision.
 //  3. Errors carry typed identity per internal/errors conventions.
 //

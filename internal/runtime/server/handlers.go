@@ -249,9 +249,11 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 		// §C9 negotiation: remember whether the client wants version-aware
 		// documentChanges in future WorkspaceEdits.
 		s.clientWantsDocumentChanges.Store(parseClientEditCapability(params.Capabilities))
-		// §C4 position encoding negotiation: pick the client's first supported
-		// encoding; canonical engine order is preference order. Default stays
-		// UTF-16 (LSP baseline) when the client declares nothing.
+		// §C4 position encoding negotiation: take the first entry of the
+		// client's own list that the engine supports. The client's ordering is
+		// what decides here — the engine has no preference order of its own,
+		// only the set of encodings it can handle. Default stays UTF-16 (LSP
+		// baseline) when the client declares nothing.
 		if enc := negotiatePositionEncoding(params.General.PositionEncodings); enc != "" {
 			s.mu.Lock()
 			s.positionEncoding = enc

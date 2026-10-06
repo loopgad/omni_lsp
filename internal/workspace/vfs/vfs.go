@@ -20,7 +20,8 @@
 //  1. Editor source (SourceEditor) always takes precedence over disk content.
 //  2. Revision counter monotonically increases on each mutation (F1).
 //  3. Get() returns a copy to prevent external mutation of internal state.
-//  4. Close() reverts to disk state if available; editor overlay is discarded.
+//  4. Close() drops the entry entirely; the editor overlay is discarded and
+//     disk content is never restored into it.
 package vfs
 
 import (
@@ -61,11 +62,13 @@ var ErrDuplicateOpen = errors.New("vfs: conflicting duplicate open")
 // Invariants:
 //  1. All reads and writes are atomic per file.
 //  2. Editor overlay (SourceEditor) always takes precedence over disk.
-//  3. Closing a file reverts to disk state if available.
+//  3. Closing a file drops the entry; disk content is not restored.
 type VFS struct {
 	mu    sync.RWMutex
 	files map[string]*FileState
-	// diskFiles stores the last known disk content for revert.
+	// diskFiles retains the last known disk content per file. It is written on
+	// Open(SourceDisk) and Save and never read, and Close does not remove it, so
+	// it grows with every file the process has ever opened.
 	diskFiles map[string][]byte
 	revision  atomic.Uint64
 }
