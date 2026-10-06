@@ -8,8 +8,9 @@ import (
 
 // Engine is the incremental query engine (§J0).
 //
-// Owned mutable state: entries, inflight, depIndex (mu-protected);
-// stats counters (atomic); expectedRev (set under mu by InvalidateSnapshot).
+// Owned mutable state: entries, inflight, depIndex and the stats counters
+// (mu-protected -- the counters are plain uint64 read under the same lock, not
+// atomics); expectedRev (set under mu by InvalidateSnapshot).
 //
 // Concurrency model: one Mutex guards tables; compute functions run outside
 // the lock; waiters park on per-inflight-call channels. Cycle detection uses

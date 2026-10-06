@@ -16,7 +16,10 @@
 //
 // Invariants:
 //  1. U1: Semantic core packages MUST NOT import concrete backend packages.
-//  2. Every method returns SemanticResult[T] with explicit Status and Evidence.
+//  2. Methods whose answer is a judgement return SemanticResult[T] with explicit
+//     Status and Evidence. The five list-returning methods -- Completion,
+//     DocumentSymbols, WorkspaceSymbols, Diagnostics and SemanticTokens -- return
+//     plain slices, so an operational failure there is the Go error alone.
 //  3. BackendID identifies the implementation; LanguageID identifies the language.
 package languages
 

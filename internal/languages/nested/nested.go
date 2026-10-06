@@ -31,8 +31,10 @@
 //
 // Allowed dependencies:
 //
-//	internal/{jsonrpc,supervisor,errors,buildctx,identity,uri} only. No LSP
-//	semantic types beyond position/textDocument envelopes it must forward.
+//	internal/{jsonrpc,supervisor,errors,buildctx,identity,trust,uri,workspace/position}
+//	only. No LSP semantic types beyond position/textDocument envelopes it must
+//	forward. trust and workspace/position were missing from this list while
+//	being imported.
 //
 // Failure behavior:
 //
@@ -1010,7 +1012,6 @@ func (c *Conn) BuildContextID() identity.BuildContextID {
 	return c.buildCtxID
 }
 
-// Close shuts the process down in LSP order and releases the pipes.
 // killProcess terminates the worker without marking the Conn permanently
 // closed: unlike Close (manual shutdown), a watchdog kill must let the read
 // loop observe EOF so the supervisor's crash/restart cycle engages.
@@ -1071,6 +1072,8 @@ func (c *Conn) closeCurrentProcess() {
 	_ = c.stopProcessNow(stdin, stdout, cmd)
 }
 
+// Close shuts the process down in LSP order and releases the pipes. It is safe
+// to call more than once.
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)

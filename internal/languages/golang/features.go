@@ -18,8 +18,9 @@ import (
 // provides the answer for free (A3: never fabricate semantics).
 
 // parseBest returns a (possibly partial) AST for the content. The parser
-// returns a tree alongside its error list for most malformed inputs; both
-// are used rather than refusing to answer.
+// returns a tree alongside its error list for most malformed inputs, and the
+// tree is used even when that list is non-empty, so a document with syntax
+// errors still gets hover and completion. The error list itself is discarded.
 func parseBest(fset *token.FileSet, path string, src []byte) *ast.File {
 	f, _ := parser.ParseFile(fset, path, src, parser.AllErrors|parser.SkipObjectResolution)
 	return f
