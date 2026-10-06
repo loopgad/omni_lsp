@@ -121,6 +121,22 @@ type Message struct {
 	methodPresent bool
 }
 
+// hasMethod reports whether this message carries a method field.
+//
+// methodPresent alone cannot answer that, because it is unexported: a Message
+// built as a struct literal -- the natural way to write one in Go, and what
+// several call sites here and in the backends do -- never passes through a
+// constructor or a decoder, so the flag stays false while Method holds a real
+// name. Trusting the flag alone made IsNotification false for such a message,
+// and a caller looping until notifications arrived then spun forever.
+//
+// The fallback only applies when the flag was never set. A decoded
+// {"method":""} keeps methodPresent true, so it still counts as carrying a
+// method and IsResponse stays false for it.
+func (m *Message) hasMethod() bool {
+	return m.methodPresent || m.Method != ""
+}
+
 // UnmarshalJSON records whether the wire form carried a method field. The
 // decoder cannot tell an absent field from an empty one once both land in
 // one string, and the three message kinds hinge on that difference.
@@ -143,12 +159,12 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 // IsRequest returns true if this message is a request (has ID and Method).
 func (m *Message) IsRequest() bool {
-	return m.ID != nil && m.methodPresent
+	return m.ID != nil && m.hasMethod()
 }
 
 // IsNotification returns true if this message is a notification (has Method, no ID).
 func (m *Message) IsNotification() bool {
-	return m.ID == nil && m.methodPresent
+	return m.ID == nil && m.hasMethod()
 }
 
 // IsResponse returns true if this is a response (has ID, no method field).
@@ -162,7 +178,7 @@ func (m *Message) IsNotification() bool {
 // outcome per request, and a name that resolves to nothing gets
 // MethodNotFound.
 func (m *Message) IsResponse() bool {
-	return m.ID != nil && !m.methodPresent
+	return m.ID != nil && !m.hasMethod()
 }
 
 // IsError returns true if this is an error response.

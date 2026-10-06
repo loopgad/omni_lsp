@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 )
@@ -23,8 +24,19 @@ func TestNotificationsSinceAndCursorCoversAtomicSnapshot(t *testing.T) {
 		}
 	}()
 
+	// Bound the wait. This loop spins until the producer's notifications show
+	// up, and when they never do -- which is exactly what happened when
+	// IsNotification stopped recognising a struct-literal Message -- the test
+	// burned the whole package timeout before saying anything. A regression
+	// here should read as one line, not as a ninety-minute CI run.
+	deadline := time.After(30 * time.Second)
 	var cursor uint64
 	for cursor < total {
+		select {
+		case <-deadline:
+			t.Fatalf("only %d of %d notifications became visible; the producer stopped being recognised", cursor, total)
+		default:
+		}
 		notifications, nextCursor, overflow := session.NotificationsSinceAndCursor(cursor)
 		if overflow {
 			t.Fatal("notification history overflowed below its configured capacity")
