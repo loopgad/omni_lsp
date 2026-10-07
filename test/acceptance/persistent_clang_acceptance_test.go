@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/omnilsp/omni/internal/workspace/uri"
@@ -42,6 +43,9 @@ func newPersistentClangFixture(t *testing.T, workspace, language string) (persis
 	}
 	compiler, err := persistentClangCompilerFromLock(root, toolName)
 	if err != nil {
+		if strings.Contains(err.Error(), "not absolute in the tool lock") {
+			t.Skipf("tools.lock.json pins no usable %s path on this platform; provision it to run: %v", toolName, err)
+		}
 		t.Fatalf("read pinned %s compiler: %v", toolName, err)
 	}
 

@@ -10,6 +10,9 @@ func TestRustSemanticIndexToolConfigPinsToolchainExecutables(t *testing.T) {
 	if _, err := exec.LookPath("rustup"); err != nil {
 		t.Skip("rustup is not installed")
 	}
+	if err := exec.Command("rustup", "which", "rust-analyzer").Run(); err != nil {
+		t.Skipf("rust-analyzer component is not provisioned via rustup: %v", err)
+	}
 	config, err := rustSemanticIndexToolConfig()
 	if err != nil {
 		t.Fatal(err)

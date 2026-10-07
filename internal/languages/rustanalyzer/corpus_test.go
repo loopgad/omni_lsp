@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,9 @@ const corpusDir = "../../../test/corpus/testdata/rust"
 func TestCorpus_RustFilesProduceGroundedSemantics(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires rust-analyzer toolchain")
+	}
+	if runtime.GOOS != "windows" {
+		t.Skip("corpus E2E drives the pinned rust-analyzer toolchain; tools.lock.json pins windows entries only, linux provisioning is pending")
 	}
 	entries, err := os.ReadDir(corpusDir)
 	if err != nil {

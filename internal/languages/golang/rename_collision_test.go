@@ -9,6 +9,7 @@ import (
 
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
+	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 // TestRenameCollisionDetection pins the §I11 collision half: renaming onto an
@@ -17,7 +18,7 @@ import (
 func TestRenameCollisionDetection(t *testing.T) {
 	dir := t.TempDir()
 	b := New(dir)
-	uri := "file:///" + filepath.ToSlash(filepath.Join(dir, "main.go"))
+	uri := workspaceuri.FromPath(filepath.Join(dir, "main.go")).String()
 
 	src := "package main\n\nfunc main() {\n\ttotal := 1\n\t_ = total\n}\n"
 	if werr := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module w\n\ngo 1.21\n"), 0o644); werr != nil {
