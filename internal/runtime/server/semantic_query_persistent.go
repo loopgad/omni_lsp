@@ -478,7 +478,12 @@ func semanticPlanningStillMatches(ctx context.Context, bindings []namedSemanticI
 		for _, binding := range bindings {
 			request, err := binding.binding.planner.BuildIndexRequest(ctx, view, view.rootURI)
 			if err != nil {
-				return false
+				// One language whose planner cannot restate its plan this round
+				// (a Go workspace without go.mod, for example) contributes no
+				// request. The scope-count and provenance equality checks below
+				// still reject the generation unless every saved scope is
+				// reproduced by the remaining requests.
+				continue
 			}
 			requests = append(requests, request)
 		}

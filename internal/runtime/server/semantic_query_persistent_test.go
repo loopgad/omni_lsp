@@ -483,3 +483,136 @@ func TestPersistedOccurrencePositionsConvertFromUTF16(t *testing.T) {
 		}
 	}
 }
+
+// gomodSemanticFixture is a hermetic semantic binding for the no-go.mod
+// degradation tests: it plans one deterministic workspace scope and exports
+// one complete definition fact from the immutable view. With failNoProject set
+// it models what the real Go planner reports in a workspace without go.mod or
+// go.work instead of planning.
+type gomodSemanticFixture struct {
+	language      string
+	scopeID       string
+	failNoProject bool
+}
+
+func (f *gomodSemanticFixture) BuildIndexRequest(_ context.Context, view model.WorkspaceView, rootURI string) (model.Request, error) {
+	if f.failNoProject {
+		return model.Request{}, fmt.Errorf("Go semantic index: no go.mod or go.work project was found in the immutable scope")
+	}
+	scope := model.Scope{ID: f.scopeID, Language: f.language, RootURI: rootURI}
+	provenance := model.Provenance{
+		SchemaVersion: model.SchemaVersion,
+		Identity:      view.Identity(),
+		Scope:         scope,
+		Extractor:     f.language + "-gomod-fixture",
+		ExtractorVer:  "1",
+		Backend:       identity.BackendID{Language: f.language, Name: f.language + "-gomod-fixture"},
+		Toolchain:     f.language + "-gomod-toolchain",
+	}
+	scope.BuildContext = model.ComputeBuildContextID(scope, provenance.Extractor, provenance.ExtractorVer, provenance.Toolchain, nil)
+	provenance.Scope = scope
+	return model.Request{View: view, Scopes: []model.Scope{scope}, Provenance: map[string]model.Provenance{scope.ID: provenance}}, nil
+}
+
+func (f *gomodSemanticFixture) ExportIndex(ctx context.Context, request model.Request, sink model.Sink) (model.Report, error) {
+	scope := request.Scopes[0]
+	var source model.File
+	if err := request.View.Walk(ctx, scope.RootURI, func(file model.File) error {
+		if file.LanguageID == f.language {
+			source = file
+		}
+		return nil
+	}); err != nil {
+		return model.Report{}, err
+	}
+	if source.URI == "" {
+		return model.Report{}, fmt.Errorf("gomod fixture found no %s source", f.language)
+	}
+	name := "PersistentTarget"
+	symbolID := identity.SymbolID(f.language + " gomod fixture " + name)
+	if err := sink.WriteSymbols(ctx, []model.Symbol{{ID: symbolID, ScopeID: scope.ID, Name: name, Kind: "Function"}}); err != nil {
+		return model.Report{}, err
+	}
+	if err := sink.WriteOccurrences(ctx, []model.Occurrence{{
+		SymbolID: symbolID, ScopeID: scope.ID, URI: source.URI,
+		Range: model.Position{StartLine: 1, StartChar: 5, EndLine: 1, EndChar: 5 + uint32(len(name))},
+		Role:  "definition", SourceHash: source.SHA256, BuildContext: scope.BuildContext,
+	}}); err != nil {
+		return model.Report{}, err
+	}
+	report := model.Report{Identity: request.View.Identity(), UsedTools: map[string][]model.ToolIdentity{scope.ID: {}}}
+	for _, fact := range model.RequiredFactKinds {
+		state, reason := model.Unknown, "gomod fixture does not emit this fact family"
+		if fact == model.FactSymbol || fact == model.FactDefinition {
+			state, reason = model.Complete, ""
+		}
+		report.Coverage = append(report.Coverage, model.Coverage{ScopeID: scope.ID, Fact: fact, State: state, Reason: reason})
+	}
+	return report, nil
+}
+
+// A Go binding registered in a workspace without go.mod must not poison the
+// whole committed generation: its failing planner contributes no request this
+// round and the remaining language still restates every saved scope, so SCIP
+// export succeeds.
+func TestSemanticSCIPExportToleratesGoPlannerFailureWithoutGoMod(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "main.py"), []byte("def persistent_target():\n    pass\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.IndexDir = t.TempDir()
+	srv := New(cfg)
+	srv.InitializeWorkspace(workspace)
+	python := &gomodSemanticFixture{language: "python", scopeID: "py:gomod-overlay"}
+	srv.RegisterSemanticIndexProvider("python", python, python)
+	if response := indexRequest(srv, context.Background(), "omnilsp/reindex"); response == nil || response.Error != nil {
+		t.Fatalf("python reindex: %+v", response)
+	}
+	goBinding := &gomodSemanticFixture{language: "go", scopeID: "go:gomod-stub", failNoProject: true}
+	srv.RegisterSemanticIndexProvider("go", goBinding, goBinding)
+	data, err := srv.ExportSemanticSCIP(context.Background(), "py:gomod-overlay")
+	if err != nil {
+		t.Fatalf("SCIP export with a failing Go planner = %v, want the python generation exported", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("SCIP export produced no data")
+	}
+}
+
+// A generation containing a Go scope must stay unexportable once the Go
+// planner can no longer restate that scope: the per-binding degradation only
+// covers languages contributing nothing this round, never a saved scope.
+func TestSemanticSCIPExportStillRejectsUnreproducibleGoScope(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	workspace := t.TempDir()
+	files := map[string]string{
+		"go.mod":  "module gomod.fixture\n\ngo 1.22\n",
+		"main.go": "package fixture\n\nfunc PersistentTarget() {}\n",
+		"main.py": "def persistent_helper():\n    pass\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(workspace, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := DefaultConfig()
+	cfg.IndexDir = t.TempDir()
+	srv := New(cfg)
+	srv.InitializeWorkspace(workspace)
+	goBinding := &gomodSemanticFixture{language: "go", scopeID: "go:gomod-stub"}
+	python := &gomodSemanticFixture{language: "python", scopeID: "py:gomod-overlay"}
+	srv.RegisterSemanticIndexProvider("go", goBinding, goBinding)
+	srv.RegisterSemanticIndexProvider("python", python, python)
+	if response := indexRequest(srv, context.Background(), "omnilsp/reindex"); response == nil || response.Error != nil {
+		t.Fatalf("two-language reindex: %+v", response)
+	}
+	if _, err := srv.ExportSemanticSCIP(context.Background(), "py:gomod-overlay"); err != nil {
+		t.Fatalf("export before the Go planner failed: %v", err)
+	}
+	goBinding.failNoProject = true
+	if _, err := srv.ExportSemanticSCIP(context.Background(), "py:gomod-overlay"); err == nil || !strings.Contains(err.Error(), "generation is stale") {
+		t.Fatalf("export after the Go scope became unreproducible = %v, want a stale-generation rejection", err)
+	}
+}
