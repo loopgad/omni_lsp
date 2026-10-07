@@ -286,6 +286,10 @@ func registerBackends(srv *server.Server, cfg config.Config) {
 	if enabled("go") {
 		gb := golang.New(workDir)
 		srv.RegisterBackend(gb.LanguageID(), gb)
+		// Explicit semantic index registration: the Go exporter can prove
+		// complete dirty-snapshot answers, so dirty Go workspace/symbol
+		// requests fail closed instead of serving stale disk symbols.
+		srv.RegisterSemanticIndexProvider(gb.LanguageID(), gb, gb)
 		info("go backend registered (workdir=%s)", workDir)
 	}
 	if enabled("cpp") || enabled("c") {

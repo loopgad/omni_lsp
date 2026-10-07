@@ -102,15 +102,21 @@ type Server struct {
 	virtualReg       *virtual.Registry            // §D12 source-map registry for virtual documents
 	languages        map[string]languages.Backend // keyed by LanguageID
 	semanticIndexes  map[string]semanticIndexBinding
-	overlayFacts     *goSnapshotSemanticFactsCache
-	queries          *query.Engine    // §J memo engine for semantic read paths
-	diag             *diagCoordinator // §C11/§I17 push/pull diagnostics
-	positionEncoding string           // §C4 negotiated: utf-8|utf-16|utf-32
-	config           Config
-	workspaceID      identity.WorkspaceID
-	idx              *indexService
-	idxReason        string
-	trust            *trust.Policy
+	// explicitSemanticIndexes records the languages whose semantic index
+	// capability was registered through RegisterSemanticIndexProvider. The
+	// dirty workspace/symbol guard trusts only this set: a backend that
+	// merely implements the provider/planner interfaces must keep answering
+	// from the live backend when its documents are dirty.
+	explicitSemanticIndexes map[string]struct{}
+	overlayFacts            *goSnapshotSemanticFactsCache
+	queries                 *query.Engine    // §J memo engine for semantic read paths
+	diag                    *diagCoordinator // §C11/§I17 push/pull diagnostics
+	positionEncoding        string           // §C4 negotiated: utf-8|utf-16|utf-32
+	config                  Config
+	workspaceID             identity.WorkspaceID
+	idx                     *indexService
+	idxReason               string
+	trust                   *trust.Policy
 
 	// syncRejects counts rejected didChange notifications (invalid range or
 	// version) for observability (D6: rejection must be visible, not silent).
@@ -224,19 +230,20 @@ func DefaultConfig() Config {
 // New creates a new LSP server.
 func New(cfg Config) *Server {
 	s := &Server{
-		state:                StateUninitialized,
-		config:               cfg,
-		dispatcher:           jsonrpc.NewDispatcher(),
-		snapMgr:              snapshot.NewManager(),
-		vfs:                  vfs.New(),
-		virtualReg:           virtual.New(),
-		languages:            make(map[string]languages.Backend),
-		semanticIndexes:      make(map[string]semanticIndexBinding),
-		overlayFacts:         newGoSnapshotSemanticFactsCache(),
-		inflight:             make(map[string]*scheduler.Request),
-		metrics:              newServerMetrics(),
-		queries:              query.NewEngine(0),
-		completionPhaseTrace: newCompletionPhaseTraceFromEnv(),
+		state:                   StateUninitialized,
+		config:                  cfg,
+		dispatcher:              jsonrpc.NewDispatcher(),
+		snapMgr:                 snapshot.NewManager(),
+		vfs:                     vfs.New(),
+		virtualReg:              virtual.New(),
+		languages:               make(map[string]languages.Backend),
+		semanticIndexes:         make(map[string]semanticIndexBinding),
+		explicitSemanticIndexes: make(map[string]struct{}),
+		overlayFacts:            newGoSnapshotSemanticFactsCache(),
+		inflight:                make(map[string]*scheduler.Request),
+		metrics:                 newServerMetrics(),
+		queries:                 query.NewEngine(0),
+		completionPhaseTrace:    newCompletionPhaseTraceFromEnv(),
 	}
 	s.diag = newDiagCoordinator(s)
 	s.positionEncoding = "utf-16" // LSP baseline default until negotiated
@@ -280,14 +287,34 @@ func (s *Server) RegisterBackend(langID string, backend languages.Backend) {
 
 // RegisterSemanticIndexProvider binds an optional external semantic exporter
 // and request planner to a language key. It is used by language stacks where
-// the exporter is separate from the frozen Backend implementation.
+// the exporter is separate from the frozen Backend implementation, and by
+// backends whose own provider/planner capability must be trusted explicitly
+// for the dirty workspace/symbol guard.
 func (s *Server) RegisterSemanticIndexProvider(langID string, provider languages.SemanticIndexProvider, planner languages.SemanticIndexRequestBuilder) {
 	if langID == "" || provider == nil || planner == nil {
 		return
 	}
 	s.mu.Lock()
 	s.semanticIndexes[langID] = semanticIndexBinding{provider: provider, planner: planner}
+	s.explicitSemanticIndexes[langID] = struct{}{}
 	s.mu.Unlock()
+}
+
+// hasExplicitSemanticIndex reports whether the language's semantic index
+// capability was registered explicitly through RegisterSemanticIndexProvider.
+// The dirty workspace/symbol guard consults this set rather than the backend
+// interfaces: only an explicit registration may fail a dirty request closed,
+// so a backend whose planner cannot prove the snapshot (for example a ccls
+// bridge without compile_commands.json) keeps falling back to the live
+// backend instead.
+func (s *Server) hasExplicitSemanticIndex(language string) bool {
+	if language == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.explicitSemanticIndexes[language]
+	return ok
 }
 
 // Run runs the server with the given transport. Blocks until shutdown.

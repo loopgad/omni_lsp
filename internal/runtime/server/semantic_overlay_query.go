@@ -129,19 +129,6 @@ func (s *Server) goSnapshotSemanticLocations(
 	}, true
 }
 
-// goSnapshotSemanticWorkspaceSymbols returns complete Go symbols from the
-// exact dirty editor snapshot. used is true for every established dirty Go
-// overlay, including an explicit unknown result when the export cannot prove
-// a complete answer; callers must not substitute disk-only Go symbols then.
-func (s *Server) goSnapshotSemanticWorkspaceSymbols(
-	ctx context.Context,
-	query string,
-	revision uint64,
-	encoding int,
-) (identity.SemanticResult[[]languages.WorkspaceSymbol], bool) {
-	return s.snapshotSemanticWorkspaceSymbols(ctx, query, revision, encoding, "go")
-}
-
 // snapshotSemanticWorkspaceSymbols returns complete workspace symbols of one
 // language from the exact dirty editor snapshot. The language selects the
 // semantic index binding; used is true for every established dirty overlay of

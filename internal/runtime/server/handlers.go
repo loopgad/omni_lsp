@@ -1163,10 +1163,16 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message
 		}
 		var syms []languages.WorkspaceSymbol
 		var err error
-		if be.LanguageID() == "go" {
-			if overlay, used := s.goSnapshotSemanticWorkspaceSymbols(ctx, params.Query, revision, s.negotiatedEncodingInt()); used {
+		// Only a language whose semantic index capability was explicitly
+		// registered can prove a dirty snapshot answer; every other language
+		// keeps asking the live backend even when its documents are dirty.
+		// Implementing the provider/planner interfaces alone (for example a
+		// ccls bridge whose planner needs compile_commands.json) does not
+		// turn an unprovable dirty snapshot into a failed request.
+		if s.hasExplicitSemanticIndex(be.LanguageID()) {
+			if overlay, used := s.snapshotSemanticWorkspaceSymbols(ctx, params.Query, revision, s.negotiatedEncodingInt(), be.LanguageID()); used {
 				if overlay.Status != identity.ResultExact || overlay.Completeness != identity.Complete {
-					return nil, errors.New(errors.ErrContentModified, "server.workspace_symbols", "current Go workspace symbols could not be verified against the editor snapshot")
+					return nil, errors.New(errors.ErrContentModified, "server.workspace_symbols", fmt.Sprintf("current %s workspace symbols could not be verified against the editor snapshot", be.LanguageID()))
 				}
 				syms = overlay.Value
 				s.recordEvidence(ctx, "workspace/symbol", "", overlay.Status, overlay.Completeness, overlay.Evidence, overlay.InternalDiagnostics)
