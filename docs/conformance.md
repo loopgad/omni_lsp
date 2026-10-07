@@ -305,7 +305,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| DEF-V4FREEZE | languages.Backend 12-method shape guarded by a scored probe | ADR-0009 D2 core interface freeze | — | DEFERRED→post-X9 |
+| DEF-V4FREEZE | languages.Backend core shape frozen at 12 methods (Close, Completion, Definition, Diagnostics, DocumentSymbols, FileExtensions, Hover, LanguageID, References, Rename, SemanticTokens, WorkspaceSymbols); new capabilities enter as separate optional interfaces pinned by the same test | ADR-0009 D2 core interface freeze | `TestV4_CoreInterfaceShapeFreeze` | AUTO |
 
 ### OBSERVABILITY
 
