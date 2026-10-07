@@ -424,7 +424,9 @@ func TestCloseWaitsForChildProcessExit(t *testing.T) {
 			t.Fatal("Close did not finish within the bounded shutdown interval")
 		}
 	}
-	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+	// ProcessState is set only once the child has been reaped; a signal-killed
+	// child reports Exited()==false on unix, so the state pointer is the check.
+	if cmd.ProcessState == nil {
 		t.Fatalf("Close returned before the child process was reaped: state=%v", cmd.ProcessState)
 	}
 	sequence, err := os.ReadFile(marker)
@@ -473,7 +475,9 @@ func TestCloseForcedTerminationAfterShutdownTimeoutReportsLifecycleFailure(t *te
 	if elapsed := time.Since(started); elapsed > shutdownGracePeriod+forcedExitWait+closeLeaseWait+3*time.Second {
 		t.Fatalf("Close took %s, beyond the bounded shutdown interval", elapsed)
 	}
-	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+	// ProcessState is set only once the child has been reaped; a signal-killed
+	// child reports Exited()==false on unix, so the state pointer is the check.
+	if cmd.ProcessState == nil {
 		t.Fatalf("Close returned before the child process was reaped: state=%v", cmd.ProcessState)
 	}
 	markerData, err := os.ReadFile(marker)

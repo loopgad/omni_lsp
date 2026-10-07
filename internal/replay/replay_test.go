@@ -210,7 +210,16 @@ func TestP9_RecordReplayRoundTrip(t *testing.T) {
 		}
 		player.Feed(&msg)
 	}
-	go player.EndFeed()
+	go func() {
+		// End the feed only after every scripted response reached the player:
+		// an early EOF makes the server cancel in-flight requests, which would
+		// diverge the replay for scheduling reasons instead of content ones.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && len(player.Out()) < wantResponses {
+			time.Sleep(2 * time.Millisecond)
+		}
+		player.EndFeed()
+	}()
 
 	replayCtx, replayCancel := context.WithCancel(context.Background())
 	runErr := fresh.Run(replayCtx, player.Transport())
