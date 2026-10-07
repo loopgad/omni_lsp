@@ -8,7 +8,7 @@ until re-verified.
 
 | Backend | Bridge class | Min | Recommended | Max tested | Notes |
 |---|---|---|---|---|---|
-| Go | native in-process (golang.org/x/tools) | go1.21 | go1.26 | go1.26 | syntax-tier fallback below go1.21 |
+| Go | native in-process (golang.org/x/tools) | go1.26.1 | go1.26 | go1.26 | toolchain-missing fallback: completion degrades to the go/parser syntax tier (EvidenceL1), type-tier queries report Unknown (§A3) |
 | C/C++ | clangd nested LSP | 14 | 17 | 19 | compile_commands.json required for project-wide rename (§X3) |
 | Rust | rust-analyzer nested LSP | 2024-01 | latest stable | latest stable | Cargo.toml gates project rename |
 | Python | pyright-langserver nested LSP | 1.1.330 | latest | latest | venv discovery via workdir |

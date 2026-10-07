@@ -85,9 +85,15 @@ The client negotiates UTF-16 position encoding during initialize (C4). A
 refused collision rename must be visible in Helix and leave both the buffer
 and the fixture file unchanged.
 
-**Current result (Windows/amd64, 2026-10-01):** the locked Helix `25.07.1`
-binary and runtime are present under `test/acceptance/tools/bin`; profile
-validation passes. A real Helix TTY session opened the Go fixture with the
+**Current result (Windows/amd64, 2026-10-01, historical):** the locked Helix
+`25.07.1` binary and runtime were present under `test/acceptance/tools/bin`
+at the time of the check; they have since been cleaned up (verified absent on
+2026-10-07 — only the `helix-smoke` helper module remains there), while the
+acceptance tool lock still records the `25.07.1` identity and SHA-256. Per
+the missing→`not_verified` policy in `docs/acceptance.md` ("Fixed host
+tools"), a native re-run requires reinstalling Helix and passing the recorded
+SHA-256 check. Profile validation passed at the time. A real Helix TTY
+session opened the Go fixture with the
 diagnostic candidate (`SHA256 7966854AEFB6218CC350D2AF21B3E0FF377357FAE365F1E9650F0238D3E40F8B`):
 `Space-k` rendered the `SoakTarget` signature, `gd` moved to its definition at
 line 3, and `:q` returned exit code 0. This is manual evidence of Helix

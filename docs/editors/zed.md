@@ -104,12 +104,18 @@ client-visible hover, definition, completion, diagnostics, references,
 refused rename, unchanged source, and clean shutdown. A server trace alone
 cannot pass this check.
 
-**Current result:** this host has Zed Preview `1.19.0`
-(`f69e805e36a2ffcd63fd39285e07738f452a1687`) at
-`D:\Programs\Zed Preview\bin\Zed.exe`; it is not the proposed stable pin.
-No native UI action/result automation has been verified. The helper keeps all
-nine cases `not_verified`. Its `settings_contract` result is separate from the
-unverified language ID mapping and native result consumption.
+**Current result (historical, 2026-10-07):** this host previously had Zed
+Preview `1.19.0` (`f69e805e36a2ffcd63fd39285e07738f452a1687`) at
+`D:\Programs\Zed Preview\bin\Zed.exe`; that local artifact has since been
+cleaned up (verified absent on 2026-10-07) and it was not the proposed stable
+pin. Zed's installer identity is not yet recorded in the acceptance tool lock,
+so per the missing→`not_verified` policy in `docs/acceptance.md` ("Fixed host
+tools") the rows stay `not_verified`: a native re-run requires reinstalling
+the pinned client, recording its identity and SHA-256 in the tool lock, and
+passing the identity check. No native UI action/result automation has been
+verified. The helper keeps all nine cases `not_verified`. Its
+`settings_contract` result is separate from the unverified language ID
+mapping and native result consumption.
 
 A collision rename must be visibly refused and leave both the editor buffer
 and fixture file unchanged; the app and OmniLSP process tree must also exit

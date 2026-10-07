@@ -35,9 +35,14 @@ integrations after the real buffer is opened and changed; an LSP trace alone
 does not establish a pass. The refused rename must leave both the buffer and
 file unchanged, and the Eglot server process must shut down cleanly.
 
-**Host check (Windows/amd64, 2026-10-02):** the locked GNU Emacs `30.2`
-portable binary is present and its SHA-256 matches `tools.lock.json`. The
-native runner has exercised Eglot's actual client APIs. The nine-case batch
+**Host check (Windows/amd64, 2026-10-02, historical):** the locked GNU Emacs
+`30.2` portable binary was present at the time of the run and its SHA-256
+matched `tools.lock.json`; the local binary has since been cleaned up
+(verified absent on 2026-10-07 — the `emacs-30.2` directory remains but
+`bin/emacs.exe` is gone), so per the missing→`not_verified` policy in
+`docs/acceptance.md` ("Fixed host tools") a frozen-candidate re-run requires
+reinstalling Emacs and passing the recorded SHA-256 check first.
+The native runner has exercised Eglot's actual client APIs. The nine-case batch
 passed against development candidate `ff404be3952361964284ee5ec192dfb736708b51d9150764c930e1b1b0c22838`,
 including Go's client-visible Flymake diagnostic and clean server/client exit.
 Independent review confirmed native operation and result consumption. The

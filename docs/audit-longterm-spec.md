@@ -24,13 +24,13 @@ verify 跑的是 CI 出货的同一二进制，所以本地分数与 CI 同源�
 |---|---|---|
 | **core** | **97.7%** | = `baseline.json` 的 `97.70959595959597`，逐位吻合 |
 | post-x8 | 0.0% | |
-| post-x9 | 3.4% | A1c 的诚实代价，见 §2.1 |
+| post-x9 | 6.9% | DEF-V4FREEZE 记账收口后自 3.4% 升至 6.9%（第四轮）；A1c 的诚实代价见 §2.1 |
 | x5 | 85.7% | INDEX 83.3% / INTEROP 50.0% |
 | x7 | 100.0% | |
 | x8 | 66.7% | CLIENTS 50% / DIST 50% |
 | x9 | 75.0% | RELEASE 75% |
 
-registry 123 条。`gofmt -l internal cmd test` 只剩 3 个
+registry 124 条（2026-10-07 实测 `grep -c "Status: Status" internal/conformance/registry.go`）。`gofmt -l internal cmd test` 只剩 3 个
 `test/acceptance/evidence/**` fixture —— 那是捕获的编辑器证据，不是我们的源码。
 
 ### 分数口径的一个已知弱点 `[已复核]`
@@ -167,6 +167,11 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 
 ### 3.2 `test/soak/` 在默认 `go test ./...` 下不参与编译 `[已复核，已降级]`
 
+**已收口（2026-10-07 实测）**：剩下的文档半边已落地——`Makefile:12-13` 与
+`scripts/test.sh:12-13` 的入口注释均已写明 test/soak 在 `soak` build tag
+之后、按自己的节奏由 nightly workflow 跑 `go test -tags soak`，「默认不跑、
+nightly 跑」在入口处可见。下段保留为发现时的记录。
+
 全部 10 个文件都有 `//go:build soak` ⇒ `go vet ./test/soak/` 报
 `build constraints exclude all Go files`。`resource_trend_test.go` 里的资源
 泄漏闸门在本地与 PR CI 下**零执行**。
@@ -187,14 +192,16 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 
 ### 3.3 C/C++ 的 semanticTokens 是假声明 `[推断]`
 
-`ccls.SemanticTokens`（`backend.go:596-598`）返回成功 `nil, nil`，而
-`handlers.go:292` 无条件声明 `semanticTokensProvider` ⇒ C/C++ 客户端拿到
-`{"data":[]}`，按 LSP 语义等于「该文档无语义 token」，编辑器会**关掉自己的
-语法高亮**。
+**半边收口（2026-10-07 实测）**：桩注释半边已修——`ccls.SemanticTokens`
+（`backend.go:604-606`）返回空结果时已带注释说明为何是桩（push-based 语义
+token 尚未消费，显式空列表而非猜测）。**能力声明与空结果语义不一致的半边
+仍在**：`handlers.go:295` 仍无条件声明 `semanticTokensProvider` ⇒ C/C++
+客户端拿到 `{"data":[]}`，按 LSP 语义等于「该文档无语义 token」，编辑器会
+**关掉自己的语法高亮**。
 
 同一 server 内 `handleSignatureHelp`（`features_handlers.go:40`）与
 `handleFormatting`（`:102`）走 `errNotSupported` 干净拒绝 ⇒ **两种不一致的
-「不支持」投影**。另三个桩都有注释说明为何是桩，只有 ccls 这个没有。
+「不支持」投影**。
 
 同型待查：`handlers.go:771-810` 的 `handleDeclaration` 对无
 `DeclarationProvider` 的后端返回什么（`DeclarationProvider` 只有 golang 真实现）。
@@ -207,12 +214,20 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 
 同文件 `position.go:122-124` 的 `UTF16ColumnAt` 名不副实 —— 它直接转发
 `ColumnAt`，返回的是「索引构建编码」的列而非 UTF-16；唯一调用点
-`golang/backend.go:1303`。
+`golang/backend.go:1307`。
 
-修法：要么让 `enc` 真正生效（校验索引构建编码），要么从签名里删掉（编译器
-会告诉你所有调用点是否真的一致）。前者更好，因为静默错配比编译错误危险。
+**收口状态（2026-10-07 实测，两半分开记）**：enc 校验半边**已完成**——
+`position.go:201-206` 的 `PositionToOffset` 现在真正校验，`enc` 与索引构建
+编码不一致时返回带两种编码名的错误，静默错配已堵死；`UTF16ColumnAt`
+命名/转发半边**仍待办**（`position.go:122-124` 行为同上）。
 
 ### 3.5 数字型 `workDoneToken` 被静默丢弃 `[推断]`
+
+**已收口（2026-10-07 实测）**：`progress.go:27-40` 的 `extractWorkDoneToken`
+改为返回 raw JSON，数字 token 原样回传（注释明确记录「Decoding to string
+first would drop a numeric token」）；`progress_test.go:64-73` 补齐 string 与
+integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为发现时的
+记录。
 
 `progress.go:31-33` 只做 `if s, ok := ....(string)`，而 LSP 3.17 的
 `ProgressToken = integer | string`。客户端传 `42` 时服务端**完全不发**
@@ -374,8 +389,10 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 3. §5.2 的不可达分支：逐个确认后删掉（`invalidateExternalSources` 的
    `count == 0`、`completenessName` 的 default、`isLeafHelper`），或改写成
    真正可达的形式。
-4. §3.4 的 `enc` 形参：让它真正校验索引构建编码，或从签名删掉。
-5. §3.5 的数字型 `workDoneToken`：支持 `json.Number`/数字形态。
+4. §3.4 的 `enc` 形参：**enc 校验半边已完成**（`position.go:201-206`）；
+   `UTF16ColumnAt` 命名/转发半边（`position.go:122-124`）仍待办。
+5. §3.5 的数字型 `workDoneToken`：**已完成**（`progress.go:27-40` raw JSON
+   透传数字形态 + `progress_test.go:64-73` 用例）。
 6. §5.5 的并发测试假信号：补 store root 孤儿 segment 检查、给
    `view.Segments[0]` 加长度保护、把幂等恢复改成断言相等而非单调。
 

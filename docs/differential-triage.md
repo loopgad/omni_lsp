@@ -28,7 +28,7 @@ detect mismatch
 {
   "schema": "omnilsp.triage.v1",
   "backend": "go",
-  "fixture_ref": "test/corpus/testdata/minimal/definition.go",
+  "fixture_ref": "test/corpus/testdata/go/basic.go",
   "symptom": "definition target differs",
   "expected": "decl.go:10",
   "actual": "no result",

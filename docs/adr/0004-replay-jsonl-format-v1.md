@@ -45,7 +45,7 @@ Replay recordings are **JSONL files** (`internal/replay/session.go`,
 
 - **Line 1 is a meta entry** — `{"seq":0,"dir":"meta","payload":{...}}`
   whose payload carries:
-  - `formatVersion` (schema version, currently 1);
+  - `formatVersion` (schema version, currently 2 — see the amendment above);
   - `configHash` (SHA-256-derived digest of the deterministic config, per
     §P9 "config hash");
   - `backends` (language ID → engine version, per §P9 "backend versions");

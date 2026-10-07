@@ -39,8 +39,8 @@ utf-16/utf-32 全部原生支持）；结果回填能力声明，并以 int 注�
 
 ### D4: 文件监听为零依赖轮询
 
-依赖白名单排除 fsnotify。轮询扫描器以 (mtime,size) 指纹做差分，深度上限 16，
-首次扫描建立基线不报事件。`workspace/didChangeWatchedFiles` 及 D15 三通知
+依赖白名单排除 fsnotify。轮询扫描器以 (mtime,size,content) 指纹做差分，深度
+上限 64，首次扫描建立基线不报事件。`workspace/didChangeWatchedFiles` 及 D15 三通知
 作为客户端驱动通道并行接受。
 
 ### D5: 缓期必须显式化

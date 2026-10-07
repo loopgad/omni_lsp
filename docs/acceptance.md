@@ -359,7 +359,7 @@ landed:
   (P50 391-443ms vs 20-40ms targets) and C/C++ completion/syntax rows. The
   C/C++ rows are the ones `s18-evidence-qualified-v2` grants documented
   exceptions for; the Go hot-path rows are a real finding for the candidate's
-  gopls bridge and keep PERF-2 partial.
+  native in-process Go backend (packages.Load/type-check hot path) and keep PERF-2 partial.
 - `go test -race -count=1 -timeout 900s ./...` on the final tree (after the
   registry/doc 落账 above was regenerated once to clear the drift the first
   race pass caught in `TestGenerateDocs`) → exit 0, 51 packages ok

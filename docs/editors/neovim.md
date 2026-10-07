@@ -1,7 +1,8 @@
 # Neovim + OmniLSP
 
-OmniLSP speaks standard LSP over stdio, so Neovim (≥0.8) needs no plugin —
-only `vim.lsp.start` (built-in) or a one-line nvim-lspconfig custom entry.
+OmniLSP speaks standard LSP over stdio, so Neovim (≥0.11; the verification
+snippet below uses `client:request`) needs no plugin — only `vim.lsp.start`
+(built-in) or a one-line nvim-lspconfig custom entry.
 
 ## Built-in client (no plugins)
 

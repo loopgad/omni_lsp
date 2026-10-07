@@ -38,8 +38,9 @@ refused and leave the buffer and file unchanged.
 `test/acceptance/clients/sublime/driver.py`. It invokes Sublime LSP commands,
 checks results through the package response/notification hooks, and waits for
 the server session exit callback. Sublime Text Build `4215` and the LSP
-`4070-2.13.0` package archive are staged under
-`test/acceptance/tools/bin`, and Build 4215 starts and reports its version.
+`4070-2.13.0` package archive were staged under `test/acceptance/tools/bin`
+at the time of that run (Build 4215 started and reported its version); the
+staged artifacts have since been cleaned up (verified absent on 2026-10-07).
 The portable profile does not yet contain the LSP package or its dependencies,
 so the driver has not run against the native client and all rows remain
 `not_verified`.
@@ -50,11 +51,15 @@ Package Control libraries for builds `>=4096`: `bracex`, `mdpopups`, `orjson`,
 hashes before installing them in the isolated portable profile; the Python
 module names alone are not a dependency lock.
 
-**Host check (Windows/amd64, 2026-10-01):** the official [download
+**Host check (Windows/amd64, 2026-10-01, historical):** the official [download
 page](https://www.sublimetext.com/download) provides stable Build `4215` and a
 Windows x64 portable option. The upstream package archive is
 `4070-2.13.0` from the [official LSP release
-page](https://github.com/sublimelsp/LSP/releases). Both archives have been
-downloaded and the editor extracted locally; their versions are recorded in
-`test/acceptance/tools/bin`, while the central acceptance lock and the five
-package dependency artifacts still need to be completed before a native run.
+page](https://github.com/sublimelsp/LSP/releases). Both archives were
+downloaded and the editor extracted locally at the time of that check; the
+local artifacts have since been cleaned up (verified absent on 2026-10-07),
+while the acceptance tool lock now records the Build `4215` executable, the
+LSP package archive, and the five package dependency wheels with SHA-256
+identities. Per the missing→`not_verified` policy in `docs/acceptance.md`
+("Fixed host tools"), a native run requires reinstalling the pinned artifacts
+and passing the recorded SHA-256 checks first.
