@@ -285,7 +285,7 @@ func packageInputFingerprint(ctx context.Context, root *packages.Package, target
 			continue
 		}
 		packagesSeen[pkg] = struct{}{}
-		if pkg.IllTyped || len(pkg.Errors) > 0 || (pkg.Module != nil && pkg.Module.Error != nil) {
+		if !packageErrorsCacheable(pkg) {
 			return "", false, nil
 		}
 		if pkg.Dir != "" {
@@ -426,6 +426,37 @@ func packageInputFingerprint(ctx context.Context, root *packages.Package, target
 		writeHashField(inputHash, string(digest))
 	}
 	return contentHashFromBytes(inputHash.Sum(nil)), true, nil
+}
+
+// packageErrorsCacheable reports whether a package's load errors leave a graph
+// that a matching re-load would reproduce, so the package may back a cache
+// entry keyed by the input-closure fingerprint. Layout-class faults
+// (packages.ListError — go list verdicts such as "C source files not allowed
+// when not using cgo or SWIG") are deterministic functions of the inputs the
+// fingerprint already hashes: the package directory listing
+// (hashPackageDirectory), the Go file contents, and the module/workspace
+// files. Type and parse failures are genuine semantic faults, module-graph
+// errors can resolve through module-cache state the closure never hashes, and
+// UnknownError is unclassifiable, so all of those fail closed, as does
+// IllTyped without any local error (an ill-typed dependency outside the
+// visited Imports closure). Known limitation: a ListError verdict that
+// depends on CGO_ENABLED can go stale if the toolchain setting flips
+// mid-session via `go env -w`; the backend derives its environment once (as
+// it already does for GOFLAGS/GOWORK), and such a stale entry serves the same
+// Go graph with under-claimed (partial) evidence, never fabricated semantics.
+func packageErrorsCacheable(pkg *packages.Package) bool {
+	if pkg.Module != nil && pkg.Module.Error != nil {
+		return false
+	}
+	if len(pkg.Errors) == 0 {
+		return !pkg.IllTyped
+	}
+	for _, err := range pkg.Errors {
+		if err.Kind != packages.ListError {
+			return false
+		}
+	}
+	return true
 }
 
 func addPackageInputFile(files map[string]packageInputFile, path string, optional bool) error {
