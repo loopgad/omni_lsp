@@ -5,6 +5,7 @@
 #   make fast     formatting, build, vet and verify only
 #   make race     the mode CI runs (race detector)
 #   make short    skip the packages that shell out to language toolchains
+#   make clean-dist  remove omnilsp-$(VERSION)-* build artifacts from $(DIST)
 #
 # Every recipe is a plain `go` invocation, so nothing needs installing.
 #
@@ -13,8 +14,10 @@
 
 GO ?= go
 TIMEOUT ?= 90m
+VERSION ?= dev
+DIST ?= dist
 
-.PHONY: test fast race short fmt vet build verify
+.PHONY: test fast race short fmt vet build verify clean-dist
 
 test: ## gofmt, build, vet, tests, verify
 	$(MAKE) fmt vet build
@@ -42,3 +45,11 @@ build:
 
 verify: ## the binary CI ships; also resolves every conformance probe symbol
 	$(GO) run ./cmd/omnilsp verify --min 90
+
+clean-dist: ## delete this version's artifacts from $(DIST); same narrow scope as build-multiplatform.sh
+	@if [ -d "$(DIST)" ]; then \
+		find "$(DIST)" -maxdepth 1 -type f -name "omnilsp-$(VERSION)-*" -delete; \
+		echo "cleaned omnilsp-$(VERSION)-* from $(DIST)"; \
+	else \
+		echo "$(DIST) does not exist; nothing to clean"; \
+	fi

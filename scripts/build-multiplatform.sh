@@ -20,6 +20,13 @@ mkdir -p "${OUTDIR}"
 # not be re-joined onto it (and an absolute one must survive unchanged).
 OUTDIR_ABS="$(cd "${OUTDIR}" && pwd)"
 
+# X8-1: repeated gate runs append another four binaries into the same OUTDIR.
+# Clear this version's previous artifacts first, scoped tightly to the exact
+# names this script writes below: omnilsp-${VERSION}-* covers the binaries and
+# their .sha256 sidecars. Other versions' leftovers (omnilsp-<older>-*) and
+# unrelated files already in OUTDIR are deliberately left untouched.
+find "${OUTDIR_ABS}" -maxdepth 1 -type f -name "omnilsp-${VERSION}-*" -delete
+
 for entry in "${PLATFORMS[@]}"; do
   set -- $entry
   GOOS="$1" GOARCH="$2" CGO_ENABLED=0
