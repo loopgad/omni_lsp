@@ -55,16 +55,29 @@ $env:SOAK_JSONL = "$evidence/soak.jsonl"
 $env:OMNILSP_ACCEPTANCE_REPORT = "$evidence/soak-report.json"
 $env:SOAK_DURATION = '1h'
 $env:OMNILSP_SOAK_GATE = 'required'
+$env:OMNILSP_SOAK_REQUEST_BUDGET = '90s'
 go test -tags soak -run '^TestSoak_RealStdioMixedWorkload$' -count=1 -timeout 90m ./test/soak/
-# Clean up immediately after the run. All six variables are soak-gate
-# preconditions (test/soak/stdio_soak_test.go); leaving them set makes every
-# later plain `go test ./...` and `omnilsp verify --full` attempt the real
-# stdio gate against stale preconditions and fail instead of skipping. This
-# mirrors the cleanup scripts/acceptance.ps1 performs after its own runs.
+# Clean up immediately after the run. All seven variables are soak-gate
+# preconditions or harness settings (test/soak/stdio_soak_test.go); leaving
+# them set makes every later plain `go test ./...` and `omnilsp verify --full`
+# attempt the real stdio gate against stale preconditions and fail instead of
+# skipping. This mirrors the cleanup scripts/acceptance.ps1 performs after its
+# own runs.
 Remove-Item Env:OMNILSP_RUN_ID, Env:OMNILSP_BIN, Env:SOAK_JSONL, `
-    Env:OMNILSP_ACCEPTANCE_REPORT, Env:SOAK_DURATION, Env:OMNILSP_SOAK_GATE `
-    -ErrorAction SilentlyContinue
+    Env:OMNILSP_ACCEPTANCE_REPORT, Env:SOAK_DURATION, Env:OMNILSP_SOAK_GATE, `
+    Env:OMNILSP_SOAK_REQUEST_BUDGET -ErrorAction SilentlyContinue
 ```
+
+The per-request stdio budget is harness plumbing, not a §S16 value. Every
+`requestStdio` call waits at most 30s by default (`stdioRequestBudget` in
+`test/soak/stdio_soak_test.go`, pinned by `TestSoak_RequestBudgetDefaultIs30s`).
+`OMNILSP_SOAK_REQUEST_BUDGET` accepts a positive Go duration (for example
+`90s`) to widen that wait for a diagnostic run; `scripts/acceptance.ps1` sets
+`90s` for its own soak stages and cleans the variable afterwards. A malformed
+or non-positive value falls back to the 30s default with a stderr warning —
+it never silently mimics a widened run. The budget only bounds how long one
+request may take before the harness gives up; recorded latencies are the real
+measured durations either way.
 
 The release path uses `Start1h` and `Status` in `scripts/acceptance.ps1`, which
 run the worker in a hidden window and bind it to the passed Fast fingerprint.

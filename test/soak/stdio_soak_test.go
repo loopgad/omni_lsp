@@ -38,6 +38,11 @@ const (
 	resourceTrendWindows       = 10
 	resourcePrivateGrowthLimit = uint64(512 << 20)
 	resourceHandleGrowthLimit  = uint64(1024)
+
+	// stdioRequestBudgetEnv widens the per-request stdio budget for local
+	// diagnostic runs (see stdioRequestBudget). It is not a soak-gate
+	// precondition: strict gate semantics do not depend on it.
+	stdioRequestBudgetEnv = "OMNILSP_SOAK_REQUEST_BUDGET"
 )
 
 type stdioQuery struct {
@@ -2545,9 +2550,52 @@ func sampleSetWithUnit(id, unit string, values []float64) report.SampleSet {
 }
 
 func requestStdio(session *lspdriver.Session, method string, params any) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stdioRequestBudget())
 	defer cancel()
 	return session.RequestContext(ctx, method, params)
+}
+
+// stdioRequestBudget is the wall-clock budget every requestStdio caller gets.
+// The default stays at the historical hard-coded 30s; §S16 fixes no
+// per-request timeout, so this is harness plumbing, not a soak-gate value.
+// OMNILSP_SOAK_REQUEST_BUDGET exists so a diagnostic run can widen it — the
+// Y1-10 GATE (internal/conformance/registry.go) records this host's 30s
+// preflights dying on the fixed budget — without touching the strict gates.
+// A malformed or non-positive value must not silently mimic a widened run: it
+// falls back to the default, announced on stderr.
+func stdioRequestBudget() time.Duration {
+	const defaultBudget = 30 * time.Second
+	text := strings.TrimSpace(os.Getenv(stdioRequestBudgetEnv))
+	if text == "" {
+		return defaultBudget
+	}
+	budget, err := time.ParseDuration(text)
+	if err != nil || budget <= 0 {
+		fmt.Fprintf(os.Stderr, "soak: ignoring invalid %s=%q (want a positive duration like 90s); using default %s\n", stdioRequestBudgetEnv, text, defaultBudget)
+		return defaultBudget
+	}
+	return budget
+}
+
+// TestSoak_RequestBudgetDefaultIs30s pins the requestStdio budget semantics:
+// default 30s when the env is unset, and the env override honored when valid.
+// The soak-gate test TestSoak_SustainedMixedLoadBounded never calls
+// requestStdio, so without this pin the 30s default would be unobserved.
+func TestSoak_RequestBudgetDefaultIs30s(t *testing.T) {
+	t.Setenv(stdioRequestBudgetEnv, "")
+	if got := stdioRequestBudget(); got != 30*time.Second {
+		t.Fatalf("stdioRequestBudget() with %s unset = %s, want 30s", stdioRequestBudgetEnv, got)
+	}
+	t.Setenv(stdioRequestBudgetEnv, "90s")
+	if got := stdioRequestBudget(); got != 90*time.Second {
+		t.Fatalf("stdioRequestBudget() with %s=90s = %s, want 90s", stdioRequestBudgetEnv, got)
+	}
+	for _, invalid := range []string{"nope", "0s", "-5s"} {
+		t.Setenv(stdioRequestBudgetEnv, invalid)
+		if got := stdioRequestBudget(); got != 30*time.Second {
+			t.Fatalf("stdioRequestBudget() with %s=%q = %s, want the 30s default", stdioRequestBudgetEnv, invalid, got)
+		}
+	}
 }
 
 func waitForStdioRuntimeBounds(baselineGoroutines int, baselineHeap uint64) (int, uint64) {

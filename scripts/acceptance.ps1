@@ -2684,8 +2684,14 @@ function Invoke-Soak([string] $Duration, [string] $RunIdForSoak) {
     # Explicit opt-in for the strict real-stdio gate (§S16); without it the
     # test skips as form-only. See docs/soak-nightly.md.
     $env:OMNILSP_SOAK_GATE = 'required'
+    # Y1-10: the per-request stdio budget defaults to 30s inside the test
+    # (requestStdio). That is harness plumbing, not a §S16 value, and cold
+    # initial queries on this host can exceed it during preflights. Widen it
+    # for the harness run only; the test default stays 30s and this var never
+    # outlives the stage.
+    $env:OMNILSP_SOAK_REQUEST_BUDGET = '90s'
     $result = Invoke-Step "soak-$Duration" $testExe @('-test.run=^TestSoak_RealStdioMixedWorkload$', '-test.count=1', '-test.timeout=90m')
-    Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID, Env:OMNILSP_SOAK_GATE -ErrorAction SilentlyContinue
+    Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID, Env:OMNILSP_SOAK_GATE, Env:OMNILSP_SOAK_REQUEST_BUDGET -ErrorAction SilentlyContinue
     $hashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash.ToLowerInvariant()
     if ($hashBefore -ne $hashAfter) { throw 'Candidate binary hash changed during soak.' }
     $testHashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $testExe).Hash.ToLowerInvariant()
