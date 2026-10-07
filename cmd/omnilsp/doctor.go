@@ -4,8 +4,9 @@ package main
 //
 // v1 probe set (spec says "as applicable"): version, os/arch, config parse,
 // workspace readability, Go toolchain, clangd bridge, compile database,
-// cache directory writability, TCP bind check. Disk-space probing needs a
-// platform-specific syscall; it is SKIPped until then.
+// cache directory writability, TCP bind check, disk space. The disk probe
+// shells out to a per-platform syscall (doctor_disk_windows.go /
+// doctor_disk_unix.go) and SKIPs only when that call itself fails.
 
 import (
 	"encoding/json"
@@ -198,8 +199,20 @@ func cmdDoctor(args []string) error {
 		collect(probe{"port", statusSkip, "stdio transport — no port needed"})
 	}
 
-	// Disk space needs a per-platform syscall; upgrade when X9 hardening lands.
-	collect(probe{"disk space", statusSkip, "platform probe pending"})
+	// Disk space (X9): real free/total bytes via a per-platform syscall
+	// (doctor_disk_windows.go / doctor_disk_unix.go). Probed on the cache
+	// volume when resolvable — the index cache is what grows unbounded —
+	// falling back to the workspace volume. A failed probe is SKIP (the
+	// environment limits us), not FAIL: the disk could be fine.
+	diskPath := ws
+	if cd, cerr := os.UserCacheDir(); cerr == nil {
+		diskPath = filepath.Join(cd, "omnilsp")
+	}
+	if free, total, derr := diskSpace(diskPath); derr != nil {
+		collect(probe{"disk space", statusSkip, fmt.Sprintf("%s: %v", diskPath, derr)})
+	} else {
+		collect(probe{"disk space", statusPass, fmt.Sprintf("%d bytes free of %d (%s)", free, total, diskPath)})
+	}
 
 	if *jsonOut {
 		summary, sumErr := conformance.FastCoreSummary(".")
