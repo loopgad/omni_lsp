@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -20,6 +21,14 @@ const (
 	lsifFreshnessNote = "静态索引快照：数据可能已过时，不反映工作区当前状态（LSIF 导入）"
 )
 
+// lsifToolInfo 覆盖 LSIF metaData 顶点的标准 toolInfo 字段。
+// args 沿用 omnilsp 键值扩展约定（omnilsp.repository= 等），与 SCIP 对齐。
+type lsifToolInfo struct {
+	Name    string   `json:"name,omitempty"`
+	Version string   `json:"version,omitempty"`
+	Args    []string `json:"args,omitempty"`
+}
+
 type lsifPosition struct {
 	Line      int32 `json:"line"`
 	Character int32 `json:"character"`
@@ -32,13 +41,14 @@ type lsifVertex struct {
 	Start *lsifPosition `json:"start,omitempty"`
 	End   *lsifPosition `json:"end,omitempty"`
 
-	Version          string `json:"version,omitempty"`
-	PositionEncoding string `json:"positionEncoding,omitempty"`
-	ProjectRoot      string `json:"projectRoot,omitempty"`
-	CommitID         string `json:"commitId,omitempty"` // 扩展字段，见文件头注释
-	URI              string `json:"uri,omitempty"`
-	LanguageID       string `json:"languageId,omitempty"`
-	Symbol           string `json:"symbol,omitempty"` // resultSet 扩展字段
+	Version          string        `json:"version,omitempty"`
+	PositionEncoding string        `json:"positionEncoding,omitempty"`
+	ProjectRoot      string        `json:"projectRoot,omitempty"`
+	CommitID         string        `json:"commitId,omitempty"` // 扩展字段，见文件头注释
+	ToolInfo         *lsifToolInfo `json:"toolInfo,omitempty"`
+	URI              string        `json:"uri,omitempty"`
+	LanguageID       string        `json:"languageId,omitempty"`
+	Symbol           string        `json:"symbol,omitempty"` // resultSet 扩展字段
 }
 
 // lsifEdge 覆盖 contains/next/textDocument/references/item 五种边。
@@ -179,21 +189,30 @@ type lsifNodeRaw struct {
 	Symbol string        `json:"symbol"`
 	Root   string        `json:"projectRoot"`
 	Commit string        `json:"commitId"`
+	Tool   *lsifToolInfo `json:"toolInfo"`
 }
 
-// ImportLSIF 解析 LSIF JSONL 并映射为 Canonical IR。
-// 导入产物标记 Provenance="lsif" 与新鲜度限制（§L14）；
-// LSIF 不携带 kind/signature，导入后恒为 Unspecified/空（见 LossyNotes）。
-func ImportLSIF(data []byte) (Index, error) {
-	vertices := map[int]lsifNodeRaw{}
-	type itemEdge struct {
-		outV, inV int
-		prop      string
-	}
-	var items []itemEdge
-	nextRangeToRS := map[int]int{} // range id -> resultSet id
-	docRangeIDs := map[int][]int{} // document id -> range ids
+// lsifItemEdge 是一条 item 边的精简记录（range→role 归属）。
+type lsifItemEdge struct {
+	outV, inV int
+	prop      string
+}
 
+// lsifParsed 是 parseLSIFStream 的产物：顶点与三类边索引。
+type lsifParsed struct {
+	vertices      map[int]lsifNodeRaw
+	items         []lsifItemEdge
+	nextRangeToRS map[int]int // range id -> resultSet id
+	docRangeIDs   map[int][]int
+}
+
+// parseLSIFStream 解析 LSIF JSONL 为宽容结构。空行跳过；解析错误带行号。
+func parseLSIFStream(data []byte) (lsifParsed, error) {
+	parsed := lsifParsed{
+		vertices:      map[int]lsifNodeRaw{},
+		nextRangeToRS: map[int]int{},
+		docRangeIDs:   map[int][]int{},
+	}
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	lineNo := 0
@@ -205,59 +224,108 @@ func ImportLSIF(data []byte) (Index, error) {
 		}
 		var n lsifNodeRaw
 		if err := json.Unmarshal(line, &n); err != nil {
-			return Index{}, fmt.Errorf("lsif 第 %d 行解析失败: %w", lineNo, err)
+			return lsifParsed{}, fmt.Errorf("lsif 第 %d 行解析失败: %w", lineNo, err)
 		}
 		switch n.Label {
 		case "contains":
-			docRangeIDs[n.OutV] = append(docRangeIDs[n.OutV], n.InVs...)
+			parsed.docRangeIDs[n.OutV] = append(parsed.docRangeIDs[n.OutV], n.InVs...)
 		case "next":
-			nextRangeToRS[n.OutV] = n.InV
+			parsed.nextRangeToRS[n.OutV] = n.InV
 		case "item":
-			items = append(items, itemEdge{outV: n.OutV, inV: n.InV, prop: n.Prop})
+			parsed.items = append(parsed.items, lsifItemEdge{outV: n.OutV, inV: n.InV, prop: n.Prop})
 		default:
-			vertices[n.ID] = n
+			parsed.vertices[n.ID] = n
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return Index{}, err
+		return lsifParsed{}, err
 	}
+	return parsed, nil
+}
 
+// lsifVertexIDsAscending 返回顶点 id 升序切片，保证消费顺序可复现。
+func (p lsifParsed) lsifVertexIDsAscending() []int {
+	ids := make([]int, 0, len(p.vertices))
+	for id := range p.vertices {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// lsifRangeRoles 依 item 边推导 range 的定义/引用角色；无 item 边的 range 记为引用。
+func (p lsifParsed) lsifRangeRoles() map[int]Role {
 	rangeRole := map[int]Role{}
-	for _, it := range items {
+	for _, it := range p.items {
 		if it.prop == "definitions" {
 			rangeRole[it.inV] = RoleDefinition
 		} else {
 			rangeRole[it.inV] = RoleReference
 		}
 	}
+	return rangeRole
+}
+
+// lsifMetaData 返回 id 最小的 metaData 顶点（无则零值+false）。
+func (p lsifParsed) lsifMetaData() (lsifNodeRaw, bool) {
+	for _, id := range p.lsifVertexIDsAscending() {
+		if v := p.vertices[id]; v.Label == "metaData" {
+			return v, true
+		}
+	}
+	return lsifNodeRaw{}, false
+}
+
+// ImportLSIF 解析 LSIF JSONL 并映射为 Canonical IR。
+// 导入产物标记 Provenance="lsif" 与新鲜度限制（§L14）；
+// LSIF 不携带 kind/signature，导入后恒为 Unspecified/空（见 LossyNotes）。
+// 仓库身份优先取 metaData.toolInfo.args 的 omnilsp.repository= 扩展，
+// 否则回落到 metaData.projectRoot；commit 取 commitId 扩展字段，
+// 缺失时回落 omnilsp.commit= 扩展参数（与 SCIP 导入形态对齐）。
+func ImportLSIF(data []byte) (Index, error) {
+	parsed, err := parseLSIFStream(data)
+	if err != nil {
+		return Index{}, err
+	}
 
 	idx := Index{Metadata: Metadata{
 		Provenance:     lsifProvenance,
 		FreshnessLimit: lsifFreshnessNote,
 	}}
-	seenSyms := map[string]bool{}
-	for _, v := range vertices {
-		if v.Label != "metaData" {
-			continue
+	if meta, ok := parsed.lsifMetaData(); ok {
+		idx.Metadata.RepoIdentity = meta.Root
+		idx.Metadata.CommitID = meta.Commit
+		if meta.Tool != nil {
+			idx.Metadata.ToolVersion = meta.Tool.Version
+			for _, a := range meta.Tool.Args {
+				if v, ok := strings.CutPrefix(a, scipRepositoryArgPrefix); ok {
+					idx.Metadata.RepoIdentity = v
+				}
+				if v, ok := strings.CutPrefix(a, commitArgPrefix); ok && idx.Metadata.CommitID == "" {
+					idx.Metadata.CommitID = v
+				}
+			}
 		}
-		idx.Metadata.RepoIdentity = v.Root
-		idx.Metadata.CommitID = v.Commit
-		break
 	}
-	for _, v := range vertices {
+	ids := parsed.lsifVertexIDsAscending()
+	rangeRole := parsed.lsifRangeRoles()
+
+	seenSyms := map[string]bool{}
+	for _, id := range ids {
+		v := parsed.vertices[id]
 		if v.Label != "document" {
 			continue
 		}
 		path := strings.TrimPrefix(v.URI, "file:///")
 		d := Document{Path: path, LanguageID: v.Lang}
-		for _, rid := range docRangeIDs[v.ID] {
-			rv := vertices[rid]
+		for _, rid := range parsed.docRangeIDs[v.ID] {
+			rv := parsed.vertices[rid]
 			if rv.Label != "range" || rv.Start == nil || rv.End == nil {
 				continue
 			}
 			name := ""
-			if rsID, ok := nextRangeToRS[rid]; ok {
-				name = vertices[rsID].Symbol
+			if rsID, ok := parsed.nextRangeToRS[rid]; ok {
+				name = parsed.vertices[rsID].Symbol
 			}
 			d.Occurrences = append(d.Occurrences, Occurrence{
 				DocPath:    path,

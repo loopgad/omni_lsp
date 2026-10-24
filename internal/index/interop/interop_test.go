@@ -194,3 +194,46 @@ func TestImportProvenanceMarked(t *testing.T) {
 		t.Error("LSIF 导入产物 FreshnessLimit 为空（§L14 违规）")
 	}
 }
+
+// TestL15_LSIFImportDocumentOrderDeterministic 钉住导入产出顺序：Documents 按
+// vertex id 升序，且同一字节流反复导入结果一致——vertices 的 map 迭代顺序
+// 不定不得外泄为产物顺序。
+func TestL15_LSIFImportDocumentOrderDeterministic(t *testing.T) {
+	// 文档顶点在流中故意乱序出现（id 9 在 id 2、5 之前），输出仍须按 id 升序。
+	lines := []string{
+		`{"id":1,"label":"metaData","version":"0.5.0","positionEncoding":"utf-16","projectRoot":"file:///repo","commitId":"abc1234def"}`,
+		`{"id":9,"label":"document","uri":"file:///c.go","languageId":"go"}`,
+		`{"id":5,"label":"document","uri":"file:///a.go","languageId":"go"}`,
+		`{"id":2,"label":"document","uri":"file:///b.go","languageId":"go"}`,
+	}
+	data := []byte(strings.Join(lines, "\n") + "\n")
+	want := []string{"b.go", "a.go", "c.go"} // 对应 id 2、5、9
+	var baseline []string
+	for round := 0; round < 32; round++ {
+		out, err := ImportLSIF(data)
+		if err != nil {
+			t.Fatalf("ImportLSIF: %v", err)
+		}
+		if len(out.Documents) != len(want) {
+			t.Fatalf("documents 数: got %d want %d", len(out.Documents), len(want))
+		}
+		var got []string
+		for _, d := range out.Documents {
+			got = append(got, d.Path)
+		}
+		if baseline == nil {
+			baseline = got
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("文档顺序: got %v want %v", got, want)
+				}
+			}
+			continue
+		}
+		for i := range baseline {
+			if got[i] != baseline[i] {
+				t.Fatalf("第 %d 轮导入顺序漂移: got %v，首轮 %v", round+1, got, baseline)
+			}
+		}
+	}
+}

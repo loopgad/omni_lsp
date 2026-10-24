@@ -21,7 +21,7 @@ const maxSemanticSCIPFileBytes = 64 << 20
 
 func cmdIndex(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: omnilsp index <import|export> --format scip --scope SCOPE_ID [flags]")
+		return errors.New("usage: omnilsp index <import|export> --format scip|lsif --scope SCOPE_ID [flags]")
 	}
 	operation := args[0]
 	if operation != "import" && operation != "export" {
@@ -31,12 +31,12 @@ func cmdIndex(args []string) error {
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "", "path to omnilsp.json")
 	workspace := flags.String("workspace", "", "workspace root")
-	format := flags.String("format", "scip", "index format (scip)")
+	format := flags.String("format", "scip", "index format (scip or lsif)")
 	scopeID := flags.String("scope", "", "exact semantic scope ID from indexStats.semanticCoverage")
 	language := flags.String("language", "", "semantic provider language, required for import")
-	input := flags.String("input", "", "SCIP input file, required for import")
-	output := flags.String("output", "", "SCIP output file, required for export; existing files are never overwritten")
-	allowLossy := flags.Bool("allow-lossy", false, "export only: explicitly omit unsupported SCIP relation kinds and record counted losses in the artifact")
+	input := flags.String("input", "", "index input file, required for import")
+	output := flags.String("output", "", "index output file, required for export; existing files are never overwritten")
+	allowLossy := flags.Bool("allow-lossy", false, "export only: explicitly omit unsupported relation kinds and record counted losses in the artifact")
 	if err := flags.Parse(args[1:]); errors.Is(err, flag.ErrHelp) {
 		return nil
 	} else if err != nil {
@@ -48,8 +48,8 @@ func cmdIndex(args []string) error {
 	if operation != "export" && *allowLossy {
 		return errors.New("index: --allow-lossy is only valid for export")
 	}
-	if *format != "scip" {
-		return fmt.Errorf("index: unsupported format %q (only scip is available)", *format)
+	if *format != "scip" && *format != "lsif" {
+		return fmt.Errorf("index: unsupported format %q (only scip and lsif are available)", *format)
 	}
 	if *scopeID == "" {
 		return errors.New("index: --scope is required")
@@ -118,13 +118,33 @@ func cmdIndex(args []string) error {
 
 	ctx := context.Background()
 	if operation == "import" {
-		data, err := readBoundedSCIP(artifactPath)
-		if err != nil {
-			return err
+		var data []byte
+		switch *format {
+		case "lsif":
+			lsifData, err := readBoundedLSIF(artifactPath)
+			if err != nil {
+				return err
+			}
+			// server 原生 LSIF 导入 API 尚未落地：先在 interop 层把 LSIF 流
+			// 转码为等价 SCIP 流（UTF-16 语义不变），再走已验证的 SCIP 导入。
+			data, err = interop.ConvertLSIFToSCIP(lsifData)
+			if err != nil {
+				return err
+			}
+		default:
+			var err error
+			data, err = readBoundedSCIP(artifactPath)
+			if err != nil {
+				return err
+			}
 		}
 		result, err := srv.ImportSemanticSCIP(ctx, *language, *scopeID, data)
 		if err != nil {
 			return err
+		}
+		if *format == "lsif" {
+			fmt.Printf("LSIF imported via SCIP transcode: generation=%d scope=%s coverage=%d (LSIF facts are not declared complete)\n", result.Generation, result.ScopeID, len(result.Coverage))
+			return nil
 		}
 		fmt.Printf("SCIP imported: generation=%d scope=%s coverage=%d (SCIP facts are not declared complete)\n", result.Generation, result.ScopeID, len(result.Coverage))
 		return nil
@@ -140,16 +160,29 @@ func cmdIndex(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *format == "lsif" {
+		// server 原生 LSIF 导出 API 尚未落地：复用已验证的 SCIP 导出路径，
+		// 在 interop 层转码为 LSIF；有损计数一并转录进 metaData.toolInfo.args。
+		data, err = interop.ConvertSCIPToLSIF(data)
+		if err != nil {
+			return err
+		}
+	}
 	if err := writeNewFile(artifactPath, data); err != nil {
-		return fmt.Errorf("write SCIP export: %w", err)
+		return fmt.Errorf("write %s export: %w", *format, err)
 	}
 	if *allowLossy {
 		return json.NewEncoder(os.Stdout).Encode(struct {
 			Operation string                           `json:"operation"`
+			Format    string                           `json:"format"`
 			Scope     string                           `json:"scope"`
 			Bytes     int                              `json:"bytes"`
 			Losses    []interop.SemanticSCIPExportLoss `json:"losses"`
-		}{Operation: "export", Scope: *scopeID, Bytes: len(data), Losses: losses})
+		}{Operation: "export", Format: *format, Scope: *scopeID, Bytes: len(data), Losses: losses})
+	}
+	if *format == "lsif" {
+		fmt.Printf("LSIF exported via SCIP transcode: scope=%s bytes=%d\n", *scopeID, len(data))
+		return nil
 	}
 	fmt.Printf("SCIP exported: scope=%s bytes=%d\n", *scopeID, len(data))
 	return nil
@@ -194,31 +227,39 @@ func validateArtifactPathOutsideWorkspace(workspace, path string) (string, error
 }
 
 func readBoundedSCIP(path string) ([]byte, error) {
+	return readBoundedArtifact(path, "SCIP")
+}
+
+func readBoundedLSIF(path string) ([]byte, error) {
+	return readBoundedArtifact(path, "LSIF")
+}
+
+func readBoundedArtifact(path, label string) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open SCIP input: %w", err)
+		return nil, fmt.Errorf("open %s input: %w", label, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat SCIP input: %w", err)
+		return nil, fmt.Errorf("stat %s input: %w", label, err)
 	}
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxSemanticSCIPFileBytes {
-		return nil, fmt.Errorf("SCIP input must be a regular file between 1 and %d bytes", maxSemanticSCIPFileBytes)
+		return nil, fmt.Errorf("%s input must be a regular file between 1 and %d bytes", label, maxSemanticSCIPFileBytes)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxSemanticSCIPFileBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read SCIP input: %w", err)
+		return nil, fmt.Errorf("read %s input: %w", label, err)
 	}
 	if len(data) == 0 || len(data) > maxSemanticSCIPFileBytes {
-		return nil, fmt.Errorf("SCIP input exceeds the %d byte limit", maxSemanticSCIPFileBytes)
+		return nil, fmt.Errorf("%s input exceeds the %d byte limit", label, maxSemanticSCIPFileBytes)
 	}
 	return data, nil
 }
 
 func writeNewFile(path string, data []byte) error {
 	if len(data) == 0 || len(data) > maxSemanticSCIPFileBytes {
-		return fmt.Errorf("SCIP output must be between 1 and %d bytes", maxSemanticSCIPFileBytes)
+		return fmt.Errorf("index output must be between 1 and %d bytes", maxSemanticSCIPFileBytes)
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {

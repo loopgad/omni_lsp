@@ -8,8 +8,12 @@ import (
 )
 
 func TestCmdIndexRejectsUnboundOrUnsupportedImports(t *testing.T) {
-	if err := cmdIndex([]string{"import", "--format", "lsif", "--scope", "scope"}); err == nil || !strings.Contains(err.Error(), "unsupported format") {
+	if err := cmdIndex([]string{"import", "--format", "pdf", "--scope", "scope"}); err == nil || !strings.Contains(err.Error(), "unsupported format") {
 		t.Fatalf("unsupported index format error = %v", err)
+	}
+	// lsif 现为受支持格式：应通过 format 门禁，随后因缺少 import 必需旗标而报错。
+	if err := cmdIndex([]string{"import", "--format", "lsif", "--scope", "scope"}); err == nil || !strings.Contains(err.Error(), "requires --language") {
+		t.Fatalf("lsif import flag validation error = %v", err)
 	}
 	if err := cmdIndex([]string{"import", "--format", "scip", "--input", "input.scip", "--language", "go"}); err == nil || !strings.Contains(err.Error(), "--scope is required") {
 		t.Fatalf("missing scope error = %v", err)
@@ -35,6 +39,18 @@ func TestSCIPFileHelpersBoundReadsAndRefuseOverwrite(t *testing.T) {
 	}
 	if _, err := readBoundedSCIP(empty); err == nil {
 		t.Fatal("empty SCIP input was accepted")
+	}
+
+	lsifInput := filepath.Join(dir, "input.lsif")
+	if err := os.WriteFile(lsifInput, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lsifGot, err := readBoundedLSIF(lsifInput)
+	if err != nil || string(lsifGot) != "{}\n" {
+		t.Fatalf("readBoundedLSIF = %q, %v", lsifGot, err)
+	}
+	if _, err := readBoundedLSIF(empty); err == nil {
+		t.Fatal("empty LSIF input was accepted")
 	}
 
 	output := filepath.Join(dir, "output.scip")

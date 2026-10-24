@@ -16,5 +16,8 @@ func LossyNotes() []string {
 		"有损：SCIP 无 commit 字段，CommitID 通过 ToolInfo.Arguments 的 omnilsp.commit= 键值扩展传递，非 omnilsp 读取方会忽略它。",
 		"有损：SCIP projectRoot 仅表达工作区根；仓库身份通过 ToolInfo.Arguments 的 omnilsp.repository= 键值扩展传递，非 omnilsp 读取方会忽略它。",
 		"有损：LSIF resultSet 上的 symbol 字段为自定义扩展（替代 moniker 顶点链），仅 omnilsp 读取方可恢复符号名。",
+		"有损：Semantic→LSIF 导出仅携带符号 ID 字符串与出现点，模型 Symbol 的显示名/kind/signature 不进 LSIF，重新导入后为空或 Unspecified。",
+		"有损：omnilsp 的 LSIF 子集不编码任何模型关系边（implementation/type_relation/call 等），严格导出拒绝含边生成；显式有损导出才会省略，并在 metaData.toolInfo.args 记录 omnilsp.lossy-edge.<kind>=<count>，重新导入的产物不含这些边。",
+		"有损：LSIF metaData.toolInfo.args 携带 omnilsp.repository= 仓库身份扩展，非 omnilsp 读取方会忽略它们。",
 	}
 }
