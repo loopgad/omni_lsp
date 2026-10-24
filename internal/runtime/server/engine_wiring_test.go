@@ -645,6 +645,12 @@ func TestI12_ValidateEditSet(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+		// ValidateEditSet buckets edits by canonical URI, so the two edits
+		// above never reach rangesOverlap; call its URI-inequality guard
+		// directly so the defensive branch is actually exercised.
+		if rangesOverlap(mk("a.go", 2, 0, 5, 10), mk("b.go", 2, 0, 5, 10)) {
+			t.Error("rangesOverlap must return false for identical ranges in different files")
+		}
 	})
 }
 

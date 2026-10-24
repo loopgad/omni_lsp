@@ -95,7 +95,7 @@ func (s *Server) handleShutdown(ctx context.Context, msg *jsonrpc.Message) (json
 func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) indexState() (*indexService, *trust.Policy, string)
 func (s *Server) initIndex(rootURI string)
-func (s *Server) invalidateExternalSources(count int)
+func (s *Server) invalidateExternalSources()
 func (s *Server) negotiatedEncodingInt() int
 func (s *Server) publishSnapshot()
 func (s *Server) resolveBackend(uri string) (languages.Backend, error)

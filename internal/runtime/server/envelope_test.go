@@ -226,3 +226,22 @@ func TestB5_UnknownDefinitionAndDeclarationProjectNull(t *testing.T) {
 		}
 	}
 }
+
+// TestCompletenessNameMapping locks the three-value completenessName wire
+// mapping used by omnilsp/resultMeta (§B6 audit channel): identity.Completeness
+// has exactly three values and each must render its own token. A renamed token
+// or a new enum value has to update this table deliberately.
+func TestCompletenessNameMapping(t *testing.T) {
+	for _, tc := range []struct {
+		c    identity.Completeness
+		want string
+	}{
+		{identity.Complete, "complete"},
+		{identity.IncompleteKnownSubset, "incomplete-known-subset"},
+		{identity.CompletenessUnknown, "completeness-unknown"},
+	} {
+		if got := completenessName(tc.c); got != tc.want {
+			t.Errorf("completenessName(%d) = %q, want %q", uint8(tc.c), got, tc.want)
+		}
+	}
+}

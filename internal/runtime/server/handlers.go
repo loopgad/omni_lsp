@@ -1804,10 +1804,7 @@ func externalChangeURIValid(raw string) bool {
 	return err == nil && parsed.IsFile()
 }
 
-func (s *Server) invalidateExternalSources(count int) {
-	if count == 0 {
-		return
-	}
+func (s *Server) invalidateExternalSources() {
 	s.vfs.AdvanceRevision()
 	s.publishSnapshot()
 	s.metrics.ExternalSyncs.Inc(1)
@@ -1871,6 +1868,11 @@ func (s *Server) handleOmnilspQueryTrace(ctx context.Context, msg *jsonrpc.Messa
 }
 
 // completenessName renders identity.Completeness for the resultMeta wire.
+// Completeness has exactly three values, all mapped above; an out-of-enum
+// value is corruption on an audit channel (§B6), so it fails loudly instead
+// of masquerading as a legitimate "completeness-unknown". A panic here stays
+// a per-request error: the scheduler recovers it (executeSafely) and
+// drainResult is the F16 backstop.
 func completenessName(c identity.Completeness) string {
 	switch c {
 	case identity.Complete:
@@ -1880,6 +1882,6 @@ func completenessName(c identity.Completeness) string {
 	case identity.CompletenessUnknown:
 		return "completeness-unknown"
 	default:
-		return "completeness-unknown"
+		panic(fmt.Sprintf("unreachable completeness value: %d", uint8(c)))
 	}
 }

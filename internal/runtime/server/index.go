@@ -361,6 +361,17 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 	return json.Marshal(map[string]any{"generation": generation, "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
 }
 
+// firstInventoryChange names the first differing file between two inventories.
+// Both inputs come from inventory(): sorted by path (sort.Slice above) and
+// duplicate-free (WalkDir visits each path once), and fileRecord carries only
+// the three compared fields, so differing json.Marshal digests — the only
+// condition under which callers invoke this — always surface as an added,
+// removed or changed record that the merge loop returns before both cursors
+// exhaust. Reaching the tail therefore means an invariant broke (unsorted
+// input, a widened fileRecord); Go does no exhaustiveness analysis here, and a
+// silent fallback would disguise that corruption as a legitimate message, so
+// it fails loudly like the round-five completenessName arm. A panic stays a
+// per-request error: the scheduler recovers it (executeSafely).
 func firstInventoryChange(before, after []fileRecord) string {
 	for i, j := 0, 0; i < len(before) || j < len(after); {
 		if i == len(before) || (j < len(after) && after[j].Path < before[i].Path) {
@@ -375,7 +386,7 @@ func firstInventoryChange(before, after []fileRecord) string {
 		i++
 		j++
 	}
-	return "inventory digest changed without a differing file record"
+	panic("unreachable: inventory digests differ but no file record differs")
 }
 
 func reindexResponseError(err error) *jsonrpc.ResponseError {

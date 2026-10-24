@@ -365,12 +365,6 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 		if backendWorkspaceGeneration(be) != workspaceGeneration {
 			return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "child workspace changed while diagnostics were computed")
 		}
-		if string(backendBuildContext(be)) != buildContext || backendEpoch(be) != epoch {
-			return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "backend context changed before diagnostics could be cached")
-		}
-		if backendWorkspaceGeneration(be) != workspaceGeneration {
-			return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "child workspace changed before diagnostics could be cached")
-		}
 
 		d.mu.Lock()
 		if ctx.Err() != nil {

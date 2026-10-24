@@ -382,9 +382,10 @@ func TestC2_RejectsWorkBeforeInitialize(t *testing.T) {
 	if s.vfs.Get("file:///x.go") != nil {
 		t.Error("didOpen must not mutate VFS before initialize")
 	}
+	// Notifications carry no wire ID, so their rejection must stay silent (C2).
 	resps := ft.responses()
 	if len(resps) != 0 {
-		t.Logf("notification rejection is silent: %d responses", len(resps))
+		t.Errorf("notification rejection must be silent: %d responses emitted", len(resps))
 	}
 
 	// Requests receive an explicit InvalidRequest response.

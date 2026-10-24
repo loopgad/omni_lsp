@@ -76,7 +76,7 @@ func (s *Server) applyExternalSourceChanges(ctx context.Context, changes []langu
 	// before a reader can capture the new workspace revision. Publishing first
 	// lets a concurrent watcher/read interleave query the old child state under
 	// the new revision, even when both query-side flushes succeed.
-	s.invalidateExternalSources(len(changes))
+	s.invalidateExternalSources()
 	if s.diag != nil && s.State() == StateRunning {
 		for _, uri := range s.vfs.OpenFiles() {
 			s.diag.request(uri)
