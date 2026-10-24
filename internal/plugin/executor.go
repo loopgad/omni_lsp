@@ -16,11 +16,15 @@ import (
 // callTimeout 是单次 Call 读取响应行的上限。
 const callTimeout = 5 * time.Second
 
-// Process 是一个进程外插件子进程的句柄（Tier 1 执行骨架）。
+// Process 是一个进程外插件子进程的句柄（协议完整版）。
 //
-// 并发模型：Call 内部单飞锁串行化「写请求 + 读一行响应」；OnExit 在 Launch
-// 参数中传入（spawn 前接线），由唯一的 Wait goroutine 在进程退出时调用
-// 恰好一次——事后赋值与 Wait goroutine 的读取构成数据竞争。
+// 并发模型：Call 可任意并发——每个请求分配自增 id，readLoop 按响应 id 路由到
+// pending 表中对应的等待者（多路复用）；所有对 stdin 的写入（Call 请求与
+// Notify 通知）由 writeMu 串行化，帧与帧之间不会交错。插件→宿主的帧若带
+// method 而无 id（插件侧通知），当前由 readLoop 丢弃——宿主侧订阅 API 待
+// 有真实消费者再开放。OnExit 在 Launch 参数中传入（spawn 前接线），由唯一
+// 的 Wait goroutine 在进程退出时调用恰好一次——事后赋值与 Wait goroutine
+// 的读取构成数据竞争。
 type Process struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -58,8 +62,9 @@ type helloFrame struct {
 //  2. 能力门——manifest 声明的每项能力必须在 grant 中放行，
 //     任一被拒即返回 ErrCapabilityDenied，不产生子进程。
 //
-// TODO(协议完整版)：当前为行分隔 JSON-RPC 骨架。升级路径：id 关联多路复用、
-// 并发请求、notification 广播、Content-Length 头分帧、优雅 shutdown（plugin/shutdown
+// 协议完整版已落地：id 关联多路复用（Call 任意并发，按响应 id 配对）、
+// Content-Length 头分帧（附加头容忍、帧边界精确消费、单帧大小上限）、
+// 宿主→插件通知广播（Notify）。剩余升级路径：优雅 shutdown（plugin/shutdown
 // + plugin/exit）、以及按方法到能力的映射把能力门下沉到 Call 级别。
 func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*Process, error) {
 	if err := m.Validate(); err != nil {
@@ -135,27 +140,47 @@ func writeFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
+// maxPluginFrameSize 是单帧负载上限：敌意/损坏的 Content-Length 声明不允许
+// 让宿主按声明值无界分配内存（N14 防御纵深，覆盖 manifest 信任链之外的运行期）。
+const maxPluginFrameSize = 4 << 20 // 4 MiB
+
 func readFrame(r *bufio.Reader) ([]byte, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "" {
-		return nil, nil
-	}
-	if !strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
-		return []byte(strings.TrimRight(line, "\r\n")), nil
-	}
-	var size int
-	if _, err := fmt.Sscanf(trimmed, "Content-Length: %d", &size); err != nil {
-		return nil, fmt.Errorf("plugin: malformed Content-Length header: %w", err)
-	}
-	if size < 0 {
-		return nil, fmt.Errorf("plugin: invalid Content-Length %d", size)
-	}
-	if _, err := r.Discard(2); err != nil {
-		return nil, err
+	size := -1
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		trimmed := strings.TrimRight(line, "\r\n")
+		if trimmed == "" {
+			if size >= 0 {
+				break // 头块结束，接下来读取精确长度的负载
+			}
+			continue // 帧间杂散空行（骨架路径兼容）
+		}
+		if size >= 0 {
+			return nil, fmt.Errorf("plugin: 帧头块中出现意外行 %q", trimmed)
+		}
+		name, value, isHeader := strings.Cut(trimmed, ":")
+		// 头名只可能由字母/连字符组成；JSON 负载行的首个冒号前必然带
+		// 引号或花括号，据此区分「头块」与骨架的行分隔负载。
+		if !isHeader || !isHeaderName(name) {
+			return []byte(trimmed), nil
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "content-length") {
+			var n int
+			if _, err := fmt.Sscanf(strings.TrimSpace(value), "%d", &n); err != nil {
+				return nil, fmt.Errorf("plugin: malformed Content-Length header: %w", err)
+			}
+			if n < 0 {
+				return nil, fmt.Errorf("plugin: invalid Content-Length %d", n)
+			}
+			if n > maxPluginFrameSize {
+				return nil, fmt.Errorf("plugin: Content-Length %d 超出单帧上限 %d", n, maxPluginFrameSize)
+			}
+			size = n
+		}
+		// 其余头（如 Content-Type）按规范忽略。
 	}
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -164,14 +189,29 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 	return buf, nil
 }
 
+// isHeaderName 报告 s 是否形如 HTTP 头名（仅 ASCII 字母与连字符）。
+func isHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // rpcError 是 JSON-RPC 响应中的 error 对象。
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-// Call 发送一次 JSON-RPC 请求并等待单行响应，超时 callTimeout。
-// TODO(协议完整版)：见 Launch 尾注的升级路径。
+// readLoop 是唯一的响应读取者：按 Content-Length 帧边界逐帧读取，把响应按
+// id 路由进 pending 表（多路复用的宿主半边）。致命错误（EOF/管道损坏）才会
+// 中止循环并唤醒全部等待者；单帧负载损坏只丢弃该帧——多路复用通道上其余
+// 并发请求必须照常获得响应，不能被一帧垃圾连坐。
 func (p *Process) readLoop() {
 	for {
 		line, err := readFrame(p.stdout)
@@ -191,10 +231,8 @@ func (p *Process) readLoop() {
 			Error  *rpcError       `json:"error"`
 		}
 		if err := json.Unmarshal(line, &frame); err != nil {
-			p.mu.Lock()
-			p.notifyPendingLocked(fmt.Errorf("plugin: 解析响应: %w", err))
-			p.mu.Unlock()
-			return
+			// 单帧负载损坏：丢弃该帧，连接与其余并发请求不受牵连。
+			continue
 		}
 
 		p.mu.Lock()
@@ -221,6 +259,8 @@ func (p *Process) notifyPendingLocked(err error) {
 	}
 }
 
+// Call 发送一次 JSON-RPC 请求并按 id 等待对应响应，可任意并发（多路复用），
+// 超时 callTimeout。剩余升级路径（shutdown、按方法下沉能力门）见 Launch 尾注。
 func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 	p.mu.Lock()
 	p.nextID++
@@ -261,4 +301,28 @@ func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("plugin: 响应超时（>%v）", callTimeout)
 	}
+}
+
+// Notify 是宿主→插件的广播通道：发送一条无 id 的 JSON-RPC 通知帧
+// （method + params），不占用请求 id、不进入 pending 表、不等待回应。
+// 与 Call 共享 writeMu，帧之间不会交错；写入失败（进程已死、管道关闭）
+// 原样返回，由调用方决定是否接入 RecordCrash（§O4）。
+func (p *Process) Notify(method string, params any) error {
+	if method == "" {
+		return fmt.Errorf("plugin: 通知 method 为空")
+	}
+	notif, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return fmt.Errorf("plugin: 序列化通知: %w", err)
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if err := writeFrame(p.stdin, notif); err != nil {
+		return fmt.Errorf("plugin: 写通知: %w", err)
+	}
+	return nil
 }

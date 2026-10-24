@@ -185,7 +185,8 @@ func TestO4_QuarantineAfterCrashLoop(t *testing.T) {
 
 // TestExecutor_LaunchHandshake —— 能力门在进程启动前生效：声明的能力未被授予时
 // 返回 ErrCapabilityDenied 且不产生子进程；manifest 完整性同样前置校验。
-// 真实子进程握手需要编译产物，此处跳过（骨架由单元门覆盖）。
+// e2e 以测试二进制自身作为插件入口（TestMain helper 模式，零额外编译产物）
+// 实跑完整环路：前置门 → spawn → 握手 → 请求-响应 → 宿主→插件通知广播。
 func TestExecutor_LaunchHandshake(t *testing.T) {
 	ctx := context.Background()
 	m := newValidManifest([]byte("x"))
@@ -213,5 +214,55 @@ func TestExecutor_LaunchHandshake(t *testing.T) {
 		}
 	})
 
-	t.Skip("executor e2e needs compiled entrypoint; skeleton covered by unit gates")
+	t.Run("e2e_真实子进程_握手_调用_广播", func(t *testing.T) {
+		t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+		t.Setenv("GO_PLUGIN_MODE", "collect-notify")
+
+		em := newValidManifest([]byte("x"))
+		em.Capabilities = []Capability{CapDiagnosticsEmit}
+		p := spawnHelper(t, "collect-notify", em, NewGrant(em.Capabilities...))
+
+		// 请求-响应：握手后插件应答，params 原样往返。
+		res, err := p.Call("diagnostics/emit", map[string]any{"uri": "file:///e2e.go", "line": 9})
+		if err != nil {
+			t.Fatalf("e2e Call: %v", err)
+		}
+		var pong struct {
+			Pong struct {
+				URI  string `json:"uri"`
+				Line int    `json:"line"`
+			} `json:"pong"`
+		}
+		if err := json.Unmarshal(res, &pong); err != nil {
+			t.Fatalf("e2e result unparsable: %v (%s)", err, res)
+		}
+		if pong.Pong.URI != "file:///e2e.go" || pong.Pong.Line != 9 {
+			t.Fatalf("e2e params mangled: %+v", pong.Pong)
+		}
+
+		// 广播：宿主→插件通知被插件逐帧接收，audit 回传核对。
+		if err := p.Notify("plugin/documentDidOpen", map[string]any{"uri": "file:///e2e.go"}); err != nil {
+			t.Fatalf("e2e Notify: %v", err)
+		}
+		audit, err := p.Call("broadcast/audit", nil)
+		if err != nil {
+			t.Fatalf("e2e audit: %v", err)
+		}
+		var got struct {
+			Notifications []struct {
+				Method string `json:"method"`
+				Params struct {
+					URI string `json:"uri"`
+				} `json:"params"`
+			} `json:"notifications"`
+		}
+		if err := json.Unmarshal(audit, &got); err != nil {
+			t.Fatalf("e2e audit unparsable: %v (%s)", err, audit)
+		}
+		if len(got.Notifications) != 1 ||
+			got.Notifications[0].Method != "plugin/documentDidOpen" ||
+			got.Notifications[0].Params.URI != "file:///e2e.go" {
+			t.Fatalf("e2e broadcast mismatch: %s", audit)
+		}
+	})
 }

@@ -27,6 +27,16 @@ func TestMain(m *testing.M) {
 //     params 作为 result 回复（用于验证握手 grants 过滤）；
 //   - rpc-error : 第一个请求回复 error 帧；
 //   - reverse-roundtrip: 收到两次请求后按相反顺序回复（验证并发请求按 ID 匹配）；
+//   - batch-frames: 收到两次请求后，把两帧响应拼接进一次写入再回复
+//     （验证宿主能在单个数据块内切分连续帧），且每帧负载内嵌裸换行；
+//   - extra-headers: 响应帧携带 Content-Type 附加头 + 小写 content-length，
+//     负载内嵌裸换行（验证头块解析与负载内换行容错）；
+//   - oversized-frame: 回复一个声明 99999999 字节的帧头后立即退出
+//     （验证宿主单帧上限拒绝，而非按声明分配后 EOF）；
+//   - garbage-then-reply: 先写一行不可解析垃圾再回复合法帧
+//     （验证单帧损坏不中止连接、不殃及并发请求）；
+//   - collect-notify: 记录 hello 之后所有无 id 的通知帧，收到
+//     broadcast/audit 请求时把它们原样回传（验证 Notify 广播）；
 //   - die       : 立即退出（覆盖宿主的 EOF/进程死亡路径）；
 //   - roundtrip : 默认。回显 {"pong": <原样 params>}，id 与请求一致。
 func helperMain() {
@@ -46,6 +56,7 @@ func helperMain() {
 		ID   int64
 		Args json.RawMessage
 	}
+	var collected []json.RawMessage
 	for {
 		line, err := readHelperFrame(reader)
 		if err != nil {
@@ -66,15 +77,31 @@ func helperMain() {
 		}
 
 		var req struct {
-			ID   int64           `json:"id"`
-			Args json.RawMessage `json:"params"`
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Args   json.RawMessage `json:"params"`
 		}
 		_ = json.Unmarshal(line, &req)
+		if req.ID == nil {
+			// 无 id 的帧是插件→宿主方向的帧在宿主→插件方向上的镜像：
+			// 宿主发出的通知。只有 collect-notify 模式关心它们。
+			if mode == "collect-notify" {
+				note := struct {
+					Method string          `json:"method"`
+					Params json.RawMessage `json:"params"`
+				}{Method: req.Method, Params: req.Args}
+				if b, mErr := json.Marshal(note); mErr == nil {
+					collected = append(collected, b)
+				}
+			}
+			continue
+		}
+		id := *req.ID
 		if mode == "reverse-roundtrip" {
 			reverseBatch = append(reverseBatch, struct {
 				ID   int64
 				Args json.RawMessage
-			}{ID: req.ID, Args: req.Args})
+			}{ID: id, Args: req.Args})
 			if len(reverseBatch) < 2 {
 				continue
 			}
@@ -91,16 +118,56 @@ func helperMain() {
 			}
 			continue
 		}
+		if mode == "batch-frames" {
+			reverseBatch = append(reverseBatch, struct {
+				ID   int64
+				Args json.RawMessage
+			}{ID: id, Args: req.Args})
+			if len(reverseBatch) < 2 {
+				continue
+			}
+			// 两帧拼接进一次写入；负载成员之间嵌裸换行——若宿主按行
+			// 切帧（骨架旧行为）而非按 Content-Length 切帧，必解析失败。
+			var both strings.Builder
+			for _, queued := range reverseBatch {
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\n\"id\":%d,\"result\":{\"pong\":%s}}", queued.ID, queued.Args)
+				fmt.Fprintf(&both, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+			}
+			if _, err := w.WriteString(both.String()); err != nil {
+				return
+			}
+			reverseBatch = reverseBatch[:0]
+			if err := w.Flush(); err != nil {
+				return
+			}
+			continue
+		}
 
 		switch mode {
 		case "echo-hello":
-			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", req.ID, helloParams)
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", id, helloParams)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "rpc-error":
-			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":42,\"message\":\"nope\"}}", req.ID)
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":42,\"message\":\"nope\"}}", id)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "content-length":
-			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", req.ID, req.Args)
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+		case "extra-headers":
+			// 附加头 + 小写头名 + 负载内嵌裸换行：三者都必须被宿主容忍。
+			msg := fmt.Sprintf("{\"jsonrpc\": \"2.0\",\n\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+			fmt.Fprintf(w, "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\ncontent-length: %d\r\n\r\n%s", len(msg), msg)
+		case "oversized-frame":
+			// 声明远超单帧上限的长度后立即退出：宿主必须立刻以「超出
+			// 上限」报错，而不是按声明值分配内存后等到 EOF。
+			fmt.Fprint(w, "Content-Length: 99999999\r\n\r\n")
+			if err := w.Flush(); err != nil {
+				return
+			}
+			return
+		case "garbage-then-reply":
+			fmt.Fprint(w, "not-json-garbage\n")
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "slow-roundtrip":
 			if req.Args != nil {
@@ -109,10 +176,19 @@ func helperMain() {
 					time.Sleep(300 * time.Millisecond)
 				}
 			}
-			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", req.ID, req.Args)
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+		case "collect-notify":
+			if req.Method == "broadcast/audit" {
+				payload, _ := json.Marshal(collected)
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"notifications\":%s}}", id, payload)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+			} else {
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+			}
 		default:
-			fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}\n", req.ID, req.Args)
+			fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}\n", id, req.Args)
 		}
 		if err := w.Flush(); err != nil {
 			return
