@@ -160,9 +160,16 @@ func (b *persistentLocationsBackend) References(context.Context, languages.Refer
 }
 
 func newPersistentLocationsServer(tb testing.TB, fixture *persistentLocationsFixture) (*Server, string, string, uint32, uint32) {
+	return newPersistentLocationsServerWithDirs(tb, fixture, tb.TempDir(), filepath.Join(tb.TempDir(), "semantic-index"), true)
+}
+
+// newPersistentLocationsServerWithDirs builds the persistent-locations fixture
+// on an explicit workspace root and index directory. With reindex=false it
+// models a fresh server process that only reopens an existing store: it never
+// commits a generation itself.
+func newPersistentLocationsServerWithDirs(tb testing.TB, fixture *persistentLocationsFixture, root, indexDir string, reindex bool) (*Server, string, string, uint32, uint32) {
 	tb.Helper()
 	tb.Setenv("OMNILSP_TRUST", "trusted")
-	root := tb.TempDir()
 	mainPath := filepath.Join(root, "main.go")
 	targetPath := filepath.Join(root, "target.go")
 	mainContent := []byte("package sample\nfunc Use() { PersistentTarget() }\n")
@@ -177,7 +184,7 @@ func newPersistentLocationsServer(tb testing.TB, fixture *persistentLocationsFix
 	mainLineStart := strings.Index(string(mainContent), "\n") + 1
 	column := uint32(strings.Index(string(mainContent[mainLineStart:]), "PersistentTarget") + 2)
 	cfg := DefaultConfig()
-	cfg.IndexDir = filepath.Join(tb.TempDir(), "semantic-index")
+	cfg.IndexDir = indexDir
 	s := New(cfg)
 	backend := &persistentLocationsBackend{mockBackend: mockBackend{langID: "go", exts: []string{".go"}}}
 	s.RegisterBackend("go", backend)
@@ -190,8 +197,10 @@ func newPersistentLocationsServer(tb testing.TB, fixture *persistentLocationsFix
 	if response == nil || response.Error != nil {
 		tb.Fatalf("initialize: %+v", response)
 	}
-	if response := indexRequest(s, context.Background(), "omnilsp/reindex"); response == nil || response.Error != nil {
-		tb.Fatalf("semantic reindex: %+v", response)
+	if reindex {
+		if response := indexRequest(s, context.Background(), "omnilsp/reindex"); response == nil || response.Error != nil {
+			tb.Fatalf("semantic reindex: %+v", response)
+		}
 	}
 	return s, mainURI, targetURI, 1, column
 }
@@ -614,5 +623,165 @@ func TestSemanticSCIPExportStillRejectsUnreproducibleGoScope(t *testing.T) {
 	goBinding.failNoProject = true
 	if _, err := srv.ExportSemanticSCIP(context.Background(), "py:gomod-overlay"); err == nil || !strings.Contains(err.Error(), "generation is stale") {
 		t.Fatalf("export after the Go scope became unreproducible = %v, want a stale-generation rejection", err)
+	}
+}
+
+// persistentRestartSymbolResult decodes workspace/symbol entries including the
+// location URI the persistent generation reported.
+type persistentRestartSymbolResult struct {
+	Name     string `json:"name"`
+	Location struct {
+		URI   string `json:"uri"`
+		Range struct {
+			Start struct {
+				Line uint32 `json:"line"`
+			} `json:"start"`
+		} `json:"range"`
+	} `json:"location"`
+}
+
+func dispatchWorkspaceSymbolQuery(t *testing.T, s *Server, id int64, query string) []persistentRestartSymbolResult {
+	t.Helper()
+	params, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := s.dispatcher.Dispatch(context.Background(), jsonrpc.NewRequest(jsonrpc.RequestID{Num: id}, "workspace/symbol", params))
+	if response == nil || response.Error != nil {
+		t.Fatalf("workspace/symbol: %+v", response)
+	}
+	var result []persistentRestartSymbolResult
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatalf("decode workspace/symbol result %s: %v", response.Result, err)
+	}
+	return result
+}
+
+// TestTypedSemanticGenerationServesFreshQueriesAfterServerRestart closes the
+// X5-7 loop across processes: a typed semantic generation committed by one
+// server process is reopened from disk by a fresh server process — no
+// reindex, no re-export — and serves workspace-symbol, definition and
+// reference queries with the committed generation's evidence. Once the disk
+// tree diverges from the generation's digest, the restarted process must
+// refuse the stale generation and fall back to the live backend.
+func TestTypedSemanticGenerationServesFreshQueriesAfterServerRestart(t *testing.T) {
+	fixture := &persistentLocationsFixture{referenceCoverage: model.Complete}
+	root := t.TempDir()
+	indexDir := filepath.Join(t.TempDir(), "semantic-index")
+	s, mainURI, targetURI, line, column := newPersistentLocationsServerWithDirs(t, fixture, root, indexDir, true)
+	firstGeneration := indexStats(t, s).Generation
+
+	// A second server process over the same workspace and index directory,
+	// which never builds a generation itself.
+	restarted, restartMainURI, restartTargetURI, restartLine, restartColumn := newPersistentLocationsServerWithDirs(t, fixture, root, indexDir, false)
+	backend := restarted.languages["go"].(*persistentLocationsBackend)
+	if restartMainURI != mainURI || restartTargetURI != targetURI || restartLine != line || restartColumn != column {
+		t.Fatalf("restart fixture identities diverged: %s/%s/%d/%d", restartMainURI, restartTargetURI, restartLine, restartColumn)
+	}
+	if stats := indexStats(t, restarted); stats.Generation != firstGeneration {
+		t.Fatalf("restarted process sees generation %d, want the committed %d", stats.Generation, firstGeneration)
+	}
+
+	definitions := callPersistentLocationRequest(t, restarted, "textDocument/definition", mainURI, line, column, false, 81)
+	if len(definitions) != 1 || definitions[0].URI != targetURI || definitions[0].Range.Start.Line != 1 {
+		t.Fatalf("restarted definition = %+v, want the committed cross-file target %s:1", definitions, targetURI)
+	}
+	references := callPersistentLocationRequest(t, restarted, "textDocument/references", mainURI, line, column, true, 82)
+	if len(references) != 2 || references[0].URI != mainURI || references[1].URI != targetURI {
+		t.Fatalf("restarted references = %+v, want reference and committed definition in stable order", references)
+	}
+	envelope, err := restarted.DefinitionEnvelope(context.Background(), mainURI, line, column)
+	if err != nil || envelope.Status != identity.ResultExact || len(envelope.Value) != 1 || envelope.Value[0].URI != targetURI {
+		t.Fatalf("restarted typed definition = %+v, err=%v, want the committed target", envelope, err)
+	}
+	if len(envelope.Evidence) != 1 || envelope.Evidence[0].Kind != identity.EvidenceIndex ||
+		envelope.Evidence[0].Assurance != identity.AssuranceIndexedExact ||
+		envelope.Evidence[0].IndexGen != identity.IndexGeneration(firstGeneration) {
+		t.Fatalf("restarted definition evidence = %+v, want indexed-exact evidence for generation %d", envelope.Evidence, firstGeneration)
+	}
+	symbols := dispatchWorkspaceSymbolQuery(t, restarted, 83, "Persistent")
+	if len(symbols) != 1 || symbols[0].Name != "PersistentTarget" || symbols[0].Location.URI != targetURI {
+		t.Fatalf("restarted workspace symbols = %+v, want the committed PersistentTarget at %s", symbols, targetURI)
+	}
+	if backend.definitionCalls.Load() != 0 || backend.referenceCalls.Load() != 0 {
+		t.Fatalf("restarted process fell back to the live backend: definition=%d references=%d", backend.definitionCalls.Load(), backend.referenceCalls.Load())
+	}
+	if fixture.exportCalls.Load() != 1 {
+		t.Fatalf("restarted process re-exported the committed generation %d times; want only the original build", fixture.exportCalls.Load())
+	}
+
+	// The reopened store must refuse the committed generation once the disk
+	// tree diverges from its digest: adding a file changes the digest while
+	// every recorded source hash still matches, so the digest gates are the
+	// only defense between the stale generation and this query.
+	if err := os.WriteFile(filepath.Join(root, "restart_probe.go"), []byte("package sample\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fallback := callPersistentLocationRequest(t, restarted, "textDocument/definition", mainURI, line, column, false, 84)
+	if backend.definitionCalls.Load() != 1 || len(fallback) != 1 || fallback[0].URI != "file:///live/definition.go" {
+		t.Fatalf("restarted process served a generation whose disk digest no longer matches: calls=%d result=%+v", backend.definitionCalls.Load(), fallback)
+	}
+	if stale, used := restarted.persistentWorkspaceSymbols(context.Background(), "Persistent", restarted.currentRevision()); used {
+		t.Fatalf("stale generation served workspace symbols after the disk tree changed: %+v", stale)
+	}
+}
+
+// TestPersistentQueriesServeOnlyTheCurrentGenerationAfterRecommit pins
+// generation isolation on the query path: after a recommit publishes
+// generation 2, definitions and references must come from generation 2's
+// records (with its evidence), and a cursor position that only generation 1
+// indexed must never be served from the superseded generation.
+func TestPersistentQueriesServeOnlyTheCurrentGenerationAfterRecommit(t *testing.T) {
+	fixture := &persistentLocationsFixture{referenceCoverage: model.Complete}
+	s, mainURI, targetURI, line, column := newPersistentLocationsServer(t, fixture)
+	backend := s.languages["go"].(*persistentLocationsBackend)
+	ctx := context.Background()
+
+	first, err := s.DefinitionEnvelope(ctx, mainURI, line, column)
+	if err != nil || len(first.Value) != 1 || first.Value[0].URI != targetURI || first.Value[0].Range.StartLine != 1 {
+		t.Fatalf("generation-1 definition = %+v, err=%v, want the committed target on line 1", first, err)
+	}
+	if len(first.Evidence) != 1 || first.Evidence[0].IndexGen != 1 {
+		t.Fatalf("generation-1 evidence = %+v, want IndexGen 1", first.Evidence)
+	}
+
+	// Move the committed definition to a new line on disk and republish.
+	parsed, err := uri.Parse(targetURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath, err := parsed.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, []byte("package sample\n\nfunc PersistentTarget() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if response := indexRequest(s, ctx, "omnilsp/reindex"); response == nil || response.Error != nil {
+		t.Fatalf("generation-2 reindex: %+v", response)
+	}
+	if stats := indexStats(t, s); stats.Generation != 2 {
+		t.Fatalf("generation after recommit = %d, want 2", stats.Generation)
+	}
+
+	second, err := s.DefinitionEnvelope(ctx, mainURI, line, column)
+	if err != nil {
+		t.Fatalf("generation-2 definition: %v", err)
+	}
+	if backend.definitionCalls.Load() != 0 {
+		t.Fatalf("current-generation definition fell back to the live backend: %+v", second.Value)
+	}
+	if len(second.Value) != 1 || second.Value[0].URI != targetURI || second.Value[0].Range.StartLine != 2 {
+		t.Fatalf("definition after recommit = %+v, want the generation-2 location on line 2", second.Value)
+	}
+	if len(second.Evidence) != 1 || second.Evidence[0].IndexGen != 2 {
+		t.Fatalf("definition evidence after recommit = %+v, want IndexGen 2", second.Evidence)
+	}
+
+	// A position that only generation 1 indexed (the old definition line in
+	// target.go) must not be answered from the superseded generation.
+	stale := callPersistentLocationRequest(t, s, "textDocument/definition", targetURI, 1, 5, false, 91)
+	if backend.definitionCalls.Load() != 1 || len(stale) != 1 || stale[0].URI != "file:///live/definition.go" {
+		t.Fatalf("superseded generation-1 position was served: calls=%d result=%+v", backend.definitionCalls.Load(), stale)
 	}
 }
