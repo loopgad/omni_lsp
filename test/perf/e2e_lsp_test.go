@@ -794,9 +794,17 @@ type e2eWireLocation struct {
 // process. It is opt-in because it requires the acceptance tool mode and emits
 // a raw report; when enabled, missing tools and unsupported behavior are
 // recorded as blocked/failed instead of being counted as a pass.
+// OMNILSP_ACCEPTANCE=required is the hard opt-in for the PERF-2 gate: unlike
+// the legacy value 1 it must fail closed when no frozen candidate is pinned
+// via OMNILSP_BIN, so a required run can never silently fall back to a
+// self-built candidate or record a skip as a pass.
 func TestS18S19_RealProcessPerformanceAcceptance(t *testing.T) {
-	if os.Getenv(acceptanceModeEnv) != "1" {
+	acceptanceMode := os.Getenv(acceptanceModeEnv)
+	if acceptanceMode != "1" && acceptanceMode != "required" {
 		t.Skip("not run: set OMNILSP_ACCEPTANCE=1 to enable real-process stdio/LSP acceptance")
+	}
+	if acceptanceMode == "required" && strings.TrimSpace(os.Getenv(acceptanceBinEnv)) == "" {
+		t.Fatalf("opted in (required) but no frozen candidate: set OMNILSP_BIN to the frozen candidate binary")
 	}
 
 	now := time.Now().UTC()

@@ -71,23 +71,12 @@ func TestU2_InvariantHeadersPresent(t *testing.T) {
 		return nil
 	})
 	for pkg := range pkgs {
-		if !documented[pkg] && !isLeafHelper(pkg) {
+		if !documented[pkg] {
 			t.Errorf("internal/%s: no package file documents Invariants (§U2)", pkg)
 		}
 	}
 	if len(documented) < 15 {
 		t.Fatalf("suspiciously few documented packages (%d); walker broken?", len(documented))
-	}
-}
-
-// isLeafHelper exempts pure-leaf utility dirs whose contracts are fully
-// carried by their exported signatures.
-func isLeafHelper(pkg string) bool {
-	switch pkg {
-	case "internal/conformance":
-		return false // this package must document itself
-	default:
-		return false
 	}
 }
 
@@ -97,6 +86,7 @@ var coreDirs = []string{
 	"internal/identity",
 	"internal/runtime/scheduler",
 	"internal/workspace",
+	"internal/index",
 }
 
 // arch002Forbidden is INV-ARCH-002's forbidden set, exactly as ADR-0002 and

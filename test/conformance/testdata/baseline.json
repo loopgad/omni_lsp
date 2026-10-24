@@ -1,10 +1,10 @@
 {
-  "coreScore": 97.70959595959597,
+  "coreScore": 98.45959595959597,
   "categories": {
     "ACC": 1,
     "CONFIG": 1,
     "MEMO": 1,
-    "PERF": 0.9166666666666666,
+    "PERF": 1,
     "PLUGIN": 1,
     "STAB": 1,
     "TESTING": 1,

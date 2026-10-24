@@ -49,6 +49,31 @@ func TestFastReport_ScoreBoundsAndShape(t *testing.T) {
 	}
 }
 
+// TestPERF2_S18RegistryShapePinsAutoGateGuardProbe pins the upgraded PERF-2
+// contract: the interactive SLO earned AUTO with frozen-candidate evidence
+// (decision=passed, run gate-20261024T1136Z, 28/28 strict §S18 rows), and its
+// probe must be exactly the deterministic in-package gate guard — never the
+// artifact-dependent acceptance run itself (the PERF-3 split lesson).
+func TestPERF2_S18RegistryShapePinsAutoGateGuardProbe(t *testing.T) {
+	var perf2 *Check
+	for i := range Registry.Checks {
+		if Registry.Checks[i].ID == "PERF-2" {
+			perf2 = &Registry.Checks[i]
+			break
+		}
+	}
+	if perf2 == nil {
+		t.Fatal("PERF-2 is missing from the conformance registry")
+	}
+	if perf2.Status != StatusAuto || perf2.Probe == nil || len(perf2.Probe.Groups) != 1 {
+		t.Fatalf("PERF-2 must be AUTO with exactly the deterministic gate-guard probe group: %+v", perf2)
+	}
+	guardGroup := perf2.Probe.Groups[0]
+	if guardGroup.Pkg != "internal/conformance" || len(guardGroup.Tests) != 1 || guardGroup.Tests[0] != "TestPERF2_S18GateFailsClosedWithoutCandidate" {
+		t.Fatalf("PERF-2 probe group must be the in-package gate guard, not the artifact-dependent acceptance run: %+v", guardGroup)
+	}
+}
+
 // TestPERF3_S21GateFailsClosedWithoutCandidate pins the upgraded PERF-3
 // contract: the S21 classification earned AUTO with frozen-candidate evidence
 // (decision=passed, run gate-20261004T2347Z), and the corpus test's
