@@ -90,6 +90,53 @@ func TestINV_POS_001_DefinitionRoundTripThroughUTF16(t *testing.T) {
 	}
 }
 
+// TestDeclarationResolvesUseToDeclarationSite gives DeclarationProvider's only
+// real implementation a direct test: under go/types a declaration site and a
+// definition site coincide (backend.go Declaration delegates to Definition),
+// so asking at the use of 名字 must land on the parameter introduction —
+// not merely on any 名 spelling, and specifically not back on the use site.
+func TestDeclarationResolvesUseToDeclarationSite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires go toolchain")
+	}
+	b := newTestBackend(t)
+	defer b.Close()
+	uri := writeGoFile(t, b, "main.go", cjkSource)
+
+	lines := strings.Split(cjkSource, "\n")
+	var useLine, useCol, paramLine uint32
+	for i, l := range lines {
+		if idx := strings.Index(l, "+ 名字"); idx >= 0 {
+			useLine = uint32(i)
+			useCol = uint32(len([]rune(l[:strings.Index(l, "名字")])))
+		}
+		if strings.Contains(l, "名字 string") {
+			paramLine = uint32(i)
+		}
+	}
+	locs, err := b.Declaration(context.Background(), languages.DefinitionRequest{
+		URI: uri, Content: []byte(cjkSource),
+		Line: useLine, Column: useCol,
+	})
+	if err != nil {
+		t.Fatalf("Declaration: %v", err)
+	}
+	if len(locs.Value) == 0 {
+		t.Fatal("no declaration found")
+	}
+	decl := locs.Value[0]
+	if decl.Range.StartLine != paramLine {
+		t.Fatalf("declaration line = %d, want the parameter line %d (returning the use line %d means Declaration stopped resolving to the introduction site)",
+			decl.Range.StartLine, paramLine, useLine)
+	}
+	src := lines[decl.Range.StartLine]
+	runes := []rune(src)
+	if int(decl.Range.StartCharacter) >= len(runes) || runes[decl.Range.StartCharacter] != '名' {
+		t.Errorf("declaration position %d:%d does not land on 名 (landed on %q)",
+			decl.Range.StartLine, decl.Range.StartCharacter, safeRuneAt(src, int(decl.Range.StartCharacter)))
+	}
+}
+
 func TestINV_POS_001_ReferencesExcludeMidRuneOffsets(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires go toolchain")

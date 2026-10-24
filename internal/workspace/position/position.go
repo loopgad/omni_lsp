@@ -117,13 +117,10 @@ func NewIndex(content []byte, enc Encoding) *Index {
 
 func (idx *Index) LineCount() int { return len(idx.lines) }
 
-// UTF16ColumnAt returns the UTF-16 column of a byte offset within its line.
-// Returns 0 for out-of-range offsets.
-func (idx *Index) UTF16ColumnAt(offset uint32) uint32 {
-	return idx.ColumnAt(offset)
-}
-
 // ColumnAt returns the column in the encoding used to build the index.
+// Callers serving LSP positions must not read the method name as a unit
+// promise: build the index with the negotiated encoding and the columns come
+// out in that unit. Returns 0 for out-of-range offsets.
 func (idx *Index) ColumnAt(offset uint32) uint32 {
 	if int(offset) < len(idx.offsetCol) {
 		return idx.offsetCol[offset]

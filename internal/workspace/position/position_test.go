@@ -68,11 +68,20 @@ func TestPositionToOffset(t *testing.T) {
 func TestCJKCharacters(t *testing.T) {
 	content := []byte("\u4f60\u597d\u4e16\u754c")
 	idx := NewIndex(content, UTF8)
-	pos, err := idx.OffsetToPosition(content, 3)
-	if err != nil {
-		t.Fatalf("OffsetToPosition(3): %v", err)
+	// Four 3-byte CJK runes on one line: in UTF-8 the column is the byte
+	// count, so rune k starts at column 3k and the two interior bytes of
+	// each rune keep that rune's start column ("rune 内部字节列不变").
+	for off := uint32(0); off < idx.totalBytes; off++ {
+		pos, err := idx.OffsetToPosition(content, off)
+		if err != nil {
+			t.Fatalf("OffsetToPosition(%d): %v", off, err)
+		}
+		wantLine, wantCol := uint32(0), off-off%3
+		if pos.Line != wantLine || pos.Col != wantCol {
+			t.Errorf("offset %d: pos = (%d, %d), want (%d, %d)",
+				off, pos.Line, pos.Col, wantLine, wantCol)
+		}
 	}
-	_ = pos
 }
 
 func TestEmojiEncoding(t *testing.T) {
@@ -247,6 +256,40 @@ func TestUTF16Len(t *testing.T) {
 	// CJK.
 	if got := UTF16Len([]byte("中文")); got != 2 {
 		t.Errorf("UTF16Len(\"中文\") = %d, want 2", got)
+	}
+}
+
+// TestColumnAtUnitsFollowIndexEncoding pins ColumnAt's unit contract: the
+// column is expressed in the encoding the Index was built with. The golang
+// backend consumes this for semantic-token delta columns (it formerly went
+// through the misnamed UTF16ColumnAt, which forwarded here unchanged — the
+// column was never UTF-16 unless the index was built UTF-16).
+func TestColumnAtUnitsFollowIndexEncoding(t *testing.T) {
+	// 'a' + astral emoji (4 UTF-8 bytes / 2 UTF-16 units / 1 code point) + 'b'
+	content := []byte("a\xf0\x9f\x98\x80b")
+	cases := []struct {
+		enc      Encoding
+		wantColB uint32 // column of 'b' (byte offset 5) in this encoding
+	}{
+		{UTF8, 5},
+		{UTF16, 3},
+		{UTF32, 2},
+	}
+	for _, tc := range cases {
+		idx := NewIndex(content, tc.enc)
+		if got := idx.ColumnAt(5); got != tc.wantColB {
+			t.Errorf("%s: ColumnAt(5) = %d, want %d ('b' after 'a'+emoji in %s units)",
+				tc.enc, got, tc.wantColB, tc.enc)
+		}
+		// Interior bytes of the emoji share the emoji's start column.
+		if got := idx.ColumnAt(4); got != 1 {
+			t.Errorf("%s: ColumnAt(4) = %d, want 1 (emoji interior byte keeps the rune start column)",
+				tc.enc, got)
+		}
+		// Out-of-range offsets fail closed to the documented 0, never panic.
+		if got := idx.ColumnAt(uint32(len(content))); got != 0 {
+			t.Errorf("%s: ColumnAt(len) = %d, want 0", tc.enc, got)
+		}
 	}
 }
 

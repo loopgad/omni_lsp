@@ -165,6 +165,22 @@ func TestWorkspaceSnapshotOverlaysGoPackageDependencies(t *testing.T) {
 	}
 }
 
+// TestWorkspaceSnapshotGenerationIsPinnedZero locks the current contract of
+// Backend.WorkspaceSnapshotGeneration: constant 0. Go package loading consumes
+// immutable WorkspaceSnapshot values bound per request (BeginWorkspaceSnapshot
+// above), so the backend owns no separately mutable workspace document state
+// whose generation could ever bump. The server side treats this constant as
+// "freshness comes from snapshot identity itself"; a nonzero return here would
+// mean someone introduced mutable state and that assumption silently broke —
+// hence the pin.
+func TestWorkspaceSnapshotGenerationIsPinnedZero(t *testing.T) {
+	b := New(t.TempDir())
+	defer b.Close()
+	if got := b.WorkspaceSnapshotGeneration(); got != 0 {
+		t.Fatalf("WorkspaceSnapshotGeneration() = %d, want 0 (snapshots are immutable; there is no mutable workspace generation to report)", got)
+	}
+}
+
 func TestSemanticInputFingerprintWithoutLoadedPackageIsEmpty(t *testing.T) {
 	b := newTestBackend(t)
 	defer b.Close()

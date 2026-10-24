@@ -1304,7 +1304,10 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 		sp := fset.Position(p)
 		ep := fset.Position(end)
 		line := uint32(sp.Line - 1)
-		col := idx.UTF16ColumnAt(uint32(sp.Offset))
+		// Column unit = the encoding the index was built with (the
+		// negotiated one), keeping the delta column on the same basis as
+		// tokenLength below.
+		col := idx.ColumnAt(uint32(sp.Offset))
 		length := tokenLength(content[sp.Offset:ep.Offset], enc)
 		if length == 0 {
 			return true

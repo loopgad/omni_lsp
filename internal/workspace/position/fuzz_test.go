@@ -37,12 +37,10 @@ func FuzzPositionConversion(f *testing.F) {
 		content := []byte(seed)
 		idx := NewIndex(content, enc)
 
-		// INV-POS-001: roundtrip is guaranteed only when the position uniquely
-		// identifies the offset. When multiple offsets share the same (line, col)
-		// (e.g., consecutive null bytes), PositionToOffset returns the first match.
+		// INV-POS-001: roundtrip is guaranteed for strict logical boundaries.
 		// We verify: (1) OffsetToPosition never errors for valid offsets,
-		// (2) the resulting position is well-formed, (3) roundtrip is consistent
-		// when the position is unique.
+		// (2) the resulting position is well-formed, (3) the roundtrip result
+		// matches the pinned expectation for every offset class below.
 		for off := uint32(0); off <= idx.totalBytes; {
 			pos, err := idx.OffsetToPosition(content, off)
 			if err != nil {
@@ -56,10 +54,29 @@ func FuzzPositionConversion(f *testing.F) {
 			if err != nil {
 				t.Fatalf("roundtrip from (%d,%d): %v", pos.Line, pos.Col, err)
 			}
-			// Roundtrip is exact only when the position maps back to the same offset.
-			// For ambiguous positions (multiple offsets share same col), back may differ.
-			// This is expected and allowed by INV-POS-001.
-			_ = back
+			// Roundtrip expectations are pinned per case (no assertion-free
+			// path), matching what INV-POS-001 actually guarantees:
+			//  - the LF of a CRLF pair shares (line, col 0) with the line
+			//    start and is not a strict boundary; it resolves exactly to
+			//    the line start (tolerance pinned below as back == ls).
+			//  - every other boundary roundtrips exactly, including EOF:
+			//    an empty last line cannot strip its terminator (the clamp
+			//    never crosses the line start), and a non-empty last line
+			//    carries no byte at the EOF column, so the resolver returns
+			//    the content end unchanged.
+			ls, err := idx.LineStart(pos.Line)
+			if err != nil {
+				t.Fatalf("LineStart(%d) for roundtrip check: %v", pos.Line, err)
+			}
+			if off > 0 && off < idx.totalBytes && content[off] == '\n' && content[off-1] == '\r' {
+				if back != ls {
+					t.Fatalf("CRLF-LF offset %d enc=%s: got %d, want line start %d",
+						off, enc, back, ls)
+				}
+			} else if back != off {
+				t.Fatalf("roundtrip failed at offset %d enc=%s: got %d (want %d)",
+					off, enc, back, off)
+			}
 			// Advance to next rune boundary.
 			if off < idx.totalBytes {
 				_, s := utf8.DecodeRune(content[off:])
@@ -108,11 +125,21 @@ func FuzzPositionEdgeCases(f *testing.F) {
 		content := []byte(text)
 		for _, enc := range []Encoding{UTF8, UTF16, UTF32} {
 			idx := NewIndex(content, enc)
-			// Try all byte offsets including EOF.
+			// Every in-range offset (including EOF) is legal: OffsetToPosition
+			// must convert it without error — non-rune-boundary offsets snap
+			// inside OffsetToPosition instead of failing.
 			for off := uint32(0); off <= idx.totalBytes; off++ {
-				_, err := idx.OffsetToPosition(content, off)
-				if err != nil {
-					// Expected for some encodings at non-rune-boundary offsets.
+				if _, err := idx.OffsetToPosition(content, off); err != nil {
+					t.Fatalf("enc=%s: OffsetToPosition(%d) on %d bytes: unexpected error: %v",
+						enc, off, idx.totalBytes, err)
+				}
+			}
+			// Out-of-range offsets must fail closed with an error (never clamp
+			// silently).
+			for _, off := range []uint32{idx.totalBytes + 1, idx.totalBytes + 100, 1 << 24} {
+				if _, err := idx.OffsetToPosition(content, off); err == nil {
+					t.Fatalf("enc=%s: OffsetToPosition(%d) on %d bytes returned nil error, want out-of-range error",
+						enc, off, idx.totalBytes)
 				}
 			}
 			// Try out-of-range line numbers.
