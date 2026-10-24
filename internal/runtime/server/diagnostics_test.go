@@ -979,7 +979,7 @@ func TestI10_PrepareRenameGate(t *testing.T) {
 // is advertised in capabilities AND served through the optional
 // DeclarationProvider capability (ADR-0009 D2 — core interface stays frozen).
 func TestT2_DeclarationServedAndDeclared(t *testing.T) {
-	caps := buildCapabilities("utf-16")
+	caps := buildCapabilities("utf-16", true)
 	if !caps.DeclarationProvider {
 		t.Fatal("declarationProvider not declared")
 	}
@@ -1053,7 +1053,7 @@ func TestC12_ResultMetaAndQueryTrace(t *testing.T) {
 // makes clients send requests that fail; a served-but-undeclared one is dead.
 func TestC3_CapabilitiesDeclaredEqualsServed(t *testing.T) {
 	s := New(DefaultConfig())
-	caps := buildCapabilities("utf-16")
+	caps := buildCapabilities("utf-16", true)
 	if caps.HoverProvider {
 		if !s.dispatcher.HasHandler("textDocument/hover") {
 			t.Error("hoverProvider declared but no handler")

@@ -26,27 +26,6 @@
         "positionEncoding": "utf-16",
         "referencesProvider": true,
         "renameProvider": true,
-        "semanticTokensProvider": {
-          "full": true,
-          "legend": {
-            "tokenModifiers": [
-              "declaration",
-              "definition",
-              "readonly"
-            ],
-            "tokenTypes": [
-              "namespace",
-              "type",
-              "parameter",
-              "variable",
-              "function",
-              "keyword",
-              "string",
-              "number",
-              "comment"
-            ]
-          }
-        },
         "signatureHelpProvider": {},
         "textDocumentSync": {
           "change": "<n>",

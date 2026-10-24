@@ -93,6 +93,7 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 func (s *Server) handleSemanticTokens(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleShutdown(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
+func (s *Server) hasSemanticTokensEmitter() bool
 func (s *Server) indexState() (*indexService, *trust.Policy, string)
 func (s *Server) initIndex(rootURI string)
 func (s *Server) invalidateExternalSources()
@@ -104,7 +105,7 @@ func (s *Server) workspaceRoot() string
 func (s *Server) workspaceSymbolsFromBackend(ctx context.Context, be languages.Backend, query string) ([]languages.WorkspaceSymbol, error)
 func assuranceString(a identity.Assurance) string
 func backendBuildContext(be languages.Backend) identity.BuildContextID
-func buildCapabilities(positionEncoding string) ServerCapabilities
+func buildCapabilities(positionEncoding string, semanticTokens bool) ServerCapabilities
 func canonicalDocumentURI(raw string) string
 func completenessName(c identity.Completeness) string
 func completionRangeToLSP(r languages.Range) lsp.Range
@@ -192,10 +193,11 @@ type Range struct{Start Position json:"start", End Position json:"end"}
 type ReferencesParams struct{TextDocument lsp.TextDocumentIdentifier json:"textDocument", Position lsp.Position json:"position", Context struct{IncludeDeclaration bool} json:"context"}
 type RenameParams struct{TextDocument lsp.TextDocumentIdentifier json:"textDocument", Position lsp.Position json:"position", NewName string json:"newName"}
 type SaveOptions struct{IncludeText bool json:"includeText"}
+type SemanticTokensEmitter = languages.EncodedSemanticTokensProvider
 type SemanticTokensLegend struct{TokenTypes []string json:"tokenTypes", TokenModifiers []string json:"tokenModifiers"}
 type SemanticTokensOptions struct{Legend SemanticTokensLegend json:"legend", Full bool json:"full", Range bool json:"range,omitempty", Incremental bool json:"incremental,omitempty"}
 type SemanticTokensParams struct{TextDocument lsp.TextDocumentIdentifier json:"textDocument"}
-type ServerCapabilities struct{PositionEncoding string json:"positionEncoding,omitempty", TextDocumentSync *TextDocumentSyncOptions json:"textDocumentSync", HoverProvider bool json:"hoverProvider", CompletionProvider *CompletionOptions json:"completionProvider", DefinitionProvider bool json:"definitionProvider", DeclarationProvider bool json:"declarationProvider,omitempty", ReferencesProvider bool json:"referencesProvider", DocumentSymbolProvider bool json:"documentSymbolProvider", RenameProvider bool json:"renameProvider", SemanticTokensProvider *SemanticTokensOptions json:"semanticTokensProvider", WorkspaceSymbolProvider bool json:"workspaceSymbolProvider", SignatureHelpProvider *SignatureHelpOptions json:"signatureHelpProvider,omitempty", CodeActionProvider bool json:"codeActionProvider,omitempty", DiagnosticProvider *DiagnosticProviderOptions json:"diagnosticProvider,omitempty", DocumentFormattingProvider bool json:"documentFormattingProvider,omitempty", InlayHintProvider bool json:"inlayHintProvider,omitempty"}
+type ServerCapabilities struct{PositionEncoding string json:"positionEncoding,omitempty", TextDocumentSync *TextDocumentSyncOptions json:"textDocumentSync", HoverProvider bool json:"hoverProvider", CompletionProvider *CompletionOptions json:"completionProvider", DefinitionProvider bool json:"definitionProvider", DeclarationProvider bool json:"declarationProvider,omitempty", ReferencesProvider bool json:"referencesProvider", DocumentSymbolProvider bool json:"documentSymbolProvider", RenameProvider bool json:"renameProvider", SemanticTokensProvider *SemanticTokensOptions json:"semanticTokensProvider,omitempty", WorkspaceSymbolProvider bool json:"workspaceSymbolProvider", SignatureHelpProvider *SignatureHelpOptions json:"signatureHelpProvider,omitempty", CodeActionProvider bool json:"codeActionProvider,omitempty", DiagnosticProvider *DiagnosticProviderOptions json:"diagnosticProvider,omitempty", DocumentFormattingProvider bool json:"documentFormattingProvider,omitempty", InlayHintProvider bool json:"inlayHintProvider,omitempty"}
 type SignatureHelpOptions struct{}
 type SymbolKind int
 type TextDocumentContentChangeEvent struct{Range *Range json:"range,omitempty", Text string json:"text"}

@@ -45,16 +45,19 @@ type InitializeResult struct {
 }
 
 type ServerCapabilities struct {
-	PositionEncoding           string                     `json:"positionEncoding,omitempty"`
-	TextDocumentSync           *TextDocumentSyncOptions   `json:"textDocumentSync"`
-	HoverProvider              bool                       `json:"hoverProvider"`
-	CompletionProvider         *CompletionOptions         `json:"completionProvider"`
-	DefinitionProvider         bool                       `json:"definitionProvider"`
-	DeclarationProvider        bool                       `json:"declarationProvider,omitempty"`
-	ReferencesProvider         bool                       `json:"referencesProvider"`
-	DocumentSymbolProvider     bool                       `json:"documentSymbolProvider"`
-	RenameProvider             bool                       `json:"renameProvider"`
-	SemanticTokensProvider     *SemanticTokensOptions     `json:"semanticTokensProvider"`
+	PositionEncoding       string                   `json:"positionEncoding,omitempty"`
+	TextDocumentSync       *TextDocumentSyncOptions `json:"textDocumentSync"`
+	HoverProvider          bool                     `json:"hoverProvider"`
+	CompletionProvider     *CompletionOptions       `json:"completionProvider"`
+	DefinitionProvider     bool                     `json:"definitionProvider"`
+	DeclarationProvider    bool                     `json:"declarationProvider,omitempty"`
+	ReferencesProvider     bool                     `json:"referencesProvider"`
+	DocumentSymbolProvider bool                     `json:"documentSymbolProvider"`
+	RenameProvider         bool                     `json:"renameProvider"`
+	// omitempty: an undeclared semanticTokensProvider must be absent from the
+	// wire, not null — omission is the LSP-honest "not supported" shape and
+	// lets clients keep their own highlighter (方案B conditional declaration).
+	SemanticTokensProvider     *SemanticTokensOptions     `json:"semanticTokensProvider,omitempty"`
 	WorkspaceSymbolProvider    bool                       `json:"workspaceSymbolProvider"`
 	SignatureHelpProvider      *SignatureHelpOptions      `json:"signatureHelpProvider,omitempty"`
 	CodeActionProvider         bool                       `json:"codeActionProvider,omitempty"`
@@ -191,6 +194,33 @@ type buildContextProvider interface {
 	BuildContextID() identity.BuildContextID
 }
 
+// SemanticTokensEmitter is the capability bit behind the semanticTokensProvider
+// declaration (§I21). It is deliberately the same method set as
+// languages.EncodedSemanticTokensProvider — the encoding-aware token path that
+// only the golang backend's real pipeline implements today. Every push-based
+// bridge (ccls, typescript, pyright, rust-analyzer) keeps the required
+// Backend.SemanticTokens method as an explicit empty stub, and LSP semantics
+// give a declared provider priority over the client's own highlighter, so
+// declaring the capability for a stub would turn every C/C++/TS/Py/Rust
+// buffer gray. buildCapabilities therefore advertises the feature only when at
+// least one registered backend satisfies this interface; because the bit and
+// the served path share one method set, they cannot drift apart.
+type SemanticTokensEmitter = languages.EncodedSemanticTokensProvider
+
+// hasSemanticTokensEmitter reports whether any registered backend really
+// emits semantic tokens (§I21): the declaration gate for
+// semanticTokensProvider at initialize time.
+func (s *Server) hasSemanticTokensEmitter() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, be := range s.languages {
+		if _, ok := be.(SemanticTokensEmitter); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func backendBuildContext(be languages.Backend) identity.BuildContextID {
 	if p, ok := be.(buildContextProvider); ok {
 		return p.BuildContextID()
@@ -265,7 +295,7 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 	s.mu.RLock()
 	negotiated = s.positionEncoding
 	s.mu.RUnlock()
-	result := InitializeResult{Capabilities: buildCapabilities(negotiated)}
+	result := InitializeResult{Capabilities: buildCapabilities(negotiated, s.hasSemanticTokensEmitter())}
 	data, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("marshal initialize result: %w", err)
@@ -276,23 +306,36 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 // buildCapabilities assembles the advertised capability set (§C3). Every
 // entry here must have a registered handler behind it and vice versa — a
 // served-but-undeclared feature is unreachable, a declared-but-unserved one
-// is a lie. TestI21_LegendMatchesEmittedTypes pins the tokens side.
-func buildCapabilities(positionEncoding string) ServerCapabilities {
-	return ServerCapabilities{
+// is a lie. One deliberate exception: semanticTokensProvider is declared only
+// when a registered backend really emits tokens (hasSemanticTokensEmitter);
+// the handler stays registered either way, so a client that calls it anyway
+// gets the backend's own answer instead of a method-not-found lie.
+// TestI21_LegendMatchesEmittedTypes pins the tokens shape; the conditional
+// declaration is pinned by semantic_tokens_capability_test.go.
+func buildCapabilities(positionEncoding string, semanticTokens bool) ServerCapabilities {
+	caps := ServerCapabilities{
 		PositionEncoding: positionEncoding,
 		TextDocumentSync: &TextDocumentSyncOptions{
 			OpenClose: true,
 			Change:    2,
 			Save:      &SaveOptions{IncludeText: true},
 		},
-		HoverProvider:          true,
-		CompletionProvider:     &CompletionOptions{TriggerCharacters: []string{".", ":", ">", "\""}},
-		DefinitionProvider:     true,
-		DeclarationProvider:    true,
-		ReferencesProvider:     true,
-		DocumentSymbolProvider: true,
-		RenameProvider:         true, // prepareRename served (I10); plain bool keeps the typed struct honest
-		SemanticTokensProvider: &SemanticTokensOptions{
+		HoverProvider:              true,
+		CompletionProvider:         &CompletionOptions{TriggerCharacters: []string{".", ":", ">", "\""}},
+		DefinitionProvider:         true,
+		DeclarationProvider:        true,
+		ReferencesProvider:         true,
+		DocumentSymbolProvider:     true,
+		RenameProvider:             true, // prepareRename served (I10); plain bool keeps the typed struct honest
+		WorkspaceSymbolProvider:    true,
+		SignatureHelpProvider:      &SignatureHelpOptions{},
+		CodeActionProvider:         true,
+		DiagnosticProvider:         &DiagnosticProviderOptions{InterFileDependencies: true}, // pull + push (C11)
+		DocumentFormattingProvider: true,
+		InlayHintProvider:          true,
+	}
+	if semanticTokens {
+		caps.SemanticTokensProvider = &SemanticTokensOptions{
 			Legend: SemanticTokensLegend{
 				// §I21: legend indexes are the contract with backend emitters —
 				// both sides read the same slice (languages.SemanticTokenTypes).
@@ -303,14 +346,9 @@ func buildCapabilities(positionEncoding string) ServerCapabilities {
 			// No delta handler is implemented; claiming incremental would
 			// make clients request semanticTokens/delta and get
 			// method-not-found (§C3 honesty).
-		},
-		WorkspaceSymbolProvider:    true,
-		SignatureHelpProvider:      &SignatureHelpOptions{},
-		CodeActionProvider:         true,
-		DiagnosticProvider:         &DiagnosticProviderOptions{InterFileDependencies: true}, // pull + push (C11)
-		DocumentFormattingProvider: true,
-		InlayHintProvider:          true,
+		}
 	}
+	return caps
 }
 
 // handleInitialized transitions Initializing -> Running (C2).
