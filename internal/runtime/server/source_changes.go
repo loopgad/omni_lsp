@@ -160,17 +160,3 @@ func (s *Server) flushExternalSourceChanges(ctx context.Context, backend languag
 	state.pending = append([]languages.SourceChange(nil), state.pending[len(changes):]...)
 	return nil
 }
-
-func (s *Server) externalSourceSyncError(backend languages.Backend) error {
-	state := s.sourceState(backend, false)
-	if state == nil {
-		return nil
-	}
-	epoch := backendEpoch(backend)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if state.overflow || state.epoch == 0 || state.epoch == epoch {
-		return state.err
-	}
-	return nil
-}

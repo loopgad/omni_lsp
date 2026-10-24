@@ -724,9 +724,16 @@ func TestCompact_ReducesSegmentsAndPreservesReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-compact read: %v", err)
 	}
+	// Unpack mergeAppend's length-prefixed framing directly: the merged
+	// generation must carry the original payloads in commit order.
 	var got []string
-	for _, p := range SplitMerged(payload) {
-		got = append(got, string(p))
+	for len(payload) >= 8 {
+		n := binary.BigEndian.Uint64(payload[:8])
+		if uint64(len(payload)-8) < n {
+			t.Fatalf("merged segment framing is truncated: %d payload bytes claimed, %d present", n, len(payload)-8)
+		}
+		got = append(got, string(payload[8:8+n]))
+		payload = payload[8+n:]
 	}
 	wantPayloads := []string{"alpha", "beta", "gamma"}
 	if len(got) != len(wantPayloads) {

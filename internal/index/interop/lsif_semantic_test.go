@@ -53,8 +53,8 @@ func openSemanticReader(t *testing.T, store *persistent.FileStore) *semantic.Rea
 }
 
 // TestLSIFSemanticExportPreservesProvenanceAndRepeats 钉住 Semantic→LSIF 导出桥：
-// provenance（projectRoot/commitId/repository/tool 版本）进入 metaData 且可经
-// Canonical 导入恢复；同一生成两次导出逐位一致；取消的 ctx 返回取消错误。
+// provenance（projectRoot/commitId/repository/tool 版本）进入 metaData；
+// 同一生成两次导出逐位一致；取消的 ctx 返回取消错误。
 func TestLSIFSemanticExportPreservesProvenanceAndRepeats(t *testing.T) {
 	ctx := context.Background()
 	req, _, store := lsifRoundTripFixture(t)
@@ -92,47 +92,6 @@ func TestLSIFSemanticExportPreservesProvenanceAndRepeats(t *testing.T) {
 	} {
 		if !strings.Contains(string(first), marker) {
 			t.Errorf("LSIF export lost provenance marker %s:\n%s", marker, first)
-		}
-	}
-
-	canonical, err := ImportLSIF(first)
-	if err != nil {
-		t.Fatalf("ImportLSIF: %v", err)
-	}
-	wantIdentity := req.View.Identity()
-	if canonical.Metadata.RepoIdentity != wantIdentity.Repository {
-		t.Errorf("repository identity lost: got %q want %q", canonical.Metadata.RepoIdentity, wantIdentity.Repository)
-	}
-	if canonical.Metadata.CommitID != wantIdentity.Revision {
-		t.Errorf("revision identity lost: got %q want %q", canonical.Metadata.CommitID, wantIdentity.Revision)
-	}
-	if canonical.Metadata.ToolVersion != "1" {
-		t.Errorf("tool version lost: got %q", canonical.Metadata.ToolVersion)
-	}
-	if canonical.Metadata.Provenance != lsifProvenance || canonical.Metadata.FreshnessLimit == "" {
-		t.Errorf("import provenance/freshness not marked: %+v", canonical.Metadata)
-	}
-	if len(canonical.Documents) != 2 {
-		t.Fatalf("documents: got %d want 2", len(canonical.Documents))
-	}
-	symbol := string(identity.SymbolID("go repo main#Foo."))
-	type occKey struct {
-		path, symbol string
-		startLine    int32
-		defined      bool
-	}
-	got := map[occKey]bool{}
-	for _, doc := range canonical.Documents {
-		for _, occ := range doc.Occurrences {
-			got[occKey{doc.Path, occ.SymbolName, occ.Range.StartLine, occ.Role == RoleDefinition}] = true
-		}
-	}
-	for _, want := range []occKey{
-		{"repo/main.go", symbol, 1, true},
-		{"repo/refs.go", symbol, 1, false},
-	} {
-		if !got[want] {
-			t.Errorf("occurrence missing after canonical import: %+v (got %v)", want, got)
 		}
 	}
 
@@ -403,49 +362,5 @@ func TestConvertLSIFToSCIPFeedsModelImport(t *testing.T) {
 	}
 	if !bytes.Equal(lsifData, lsifAgain) {
 		t.Fatalf("LSIF→SCIP→model→SCIP→LSIF is not bitwise deterministic:\nfirst:\n%s\nagain:\n%s", lsifData, lsifAgain)
-	}
-}
-
-// TestLSIFImportReadsToolInfoExtensions 钉住 Canonical ImportLSIF 补全：
-// metaData.toolInfo 的版本与 omnilsp.repository=/omnilsp.commit= 扩展被读取；
-// projectRoot/commitId 仍是缺省来源。
-func TestLSIFImportReadsToolInfoExtensions(t *testing.T) {
-	lines := []string{
-		`{"id":1,"label":"metaData","version":"0.5.0","positionEncoding":"utf-16","projectRoot":"file:///repo","commitId":"abc1234def","toolInfo":{"name":"omnilsp","version":"v9.8","args":["omnilsp.repository=github.com/omnilsp/omni"]}}`,
-		`{"id":2,"label":"document","uri":"file:///a.go","languageId":"go"}`,
-		`{"id":3,"label":"range","start":{"line":0,"character":0},"end":{"line":0,"character":3}}`,
-		`{"id":4,"label":"resultSet","symbol":"go demo A."}`,
-		`{"id":5,"label":"referenceResult"}`,
-		`{"id":6,"label":"contains","outV":2,"inVs":[3]}`,
-		`{"id":7,"label":"textDocument/references","outV":4,"inV":5}`,
-		`{"id":8,"label":"next","outV":3,"inV":4}`,
-		`{"id":9,"label":"item","outV":5,"inV":3,"property":"definitions"}`,
-	}
-	out, err := ImportLSIF([]byte(strings.Join(lines, "\n") + "\n"))
-	if err != nil {
-		t.Fatalf("ImportLSIF: %v", err)
-	}
-	if out.Metadata.RepoIdentity != "github.com/omnilsp/omni" {
-		t.Errorf("repository extension ignored: got %q", out.Metadata.RepoIdentity)
-	}
-	if out.Metadata.CommitID != "abc1234def" {
-		t.Errorf("commitId field ignored: got %q", out.Metadata.CommitID)
-	}
-	if out.Metadata.ToolVersion != "v9.8" {
-		t.Errorf("toolInfo.version ignored: got %q", out.Metadata.ToolVersion)
-	}
-
-	// 无 toolInfo 时回落 projectRoot/commitId（既有行为），commitId 缺失时
-	// 回落 omnilsp.commit= 参数。
-	fallback := []string{
-		`{"id":1,"label":"metaData","version":"0.5.0","positionEncoding":"utf-16","projectRoot":"legacy/repo","toolInfo":{"name":"omnilsp","args":["omnilsp.commit=feed0001"]}}`,
-		`{"id":2,"label":"document","uri":"file:///a.go","languageId":"go"}`,
-	}
-	out, err = ImportLSIF([]byte(strings.Join(fallback, "\n") + "\n"))
-	if err != nil {
-		t.Fatalf("ImportLSIF fallback: %v", err)
-	}
-	if out.Metadata.RepoIdentity != "legacy/repo" || out.Metadata.CommitID != "feed0001" {
-		t.Errorf("fallback identity = %+v", out.Metadata)
 	}
 }

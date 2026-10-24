@@ -43,6 +43,12 @@ func s21CandidateBinary() (string, error) {
 		return "", fmt.Errorf("candidate binary is a directory: %s", abs)
 	}
 	claimed := strings.TrimSpace(os.Getenv("OMNILSP_CANDIDATE_SHA256"))
+	if claimed == "" && s21GateRequired() {
+		// Required-gate semantics (docs/soak-nightly.md, §S18/S21): a
+		// release-evidence invocation is a hard failure, never a skip, so an
+		// unpinned frozen candidate cannot silently bypass hash verification.
+		return "", fmt.Errorf("OMNILSP_S21_GATE=required opted in but OMNILSP_CANDIDATE_SHA256 is empty: the frozen candidate must be pinned to its sha256")
+	}
 	if claimed != "" {
 		actual, hashErr := s21FileSHA256(abs)
 		if hashErr != nil {
@@ -76,6 +82,60 @@ func TestS21CandidateBinaryRequired(t *testing.T) {
 	if _, err := s21CandidateBinary(); err == nil {
 		t.Fatal("S21 accepted an empty candidate path")
 	}
+}
+
+// TestS21RequiredGateRequiresCandidateSHA256 pins the fail-closed hash pinning:
+// under OMNILSP_S21_GATE=required a candidate binary without a declared sha256
+// is a hard error (required semantics: hard failure, never a skip), a wrong
+// declared hash is still refused, and without the gate the candidate stays
+// verifiable with the hash optional as before.
+func TestS21RequiredGateRequiresCandidateSHA256(t *testing.T) {
+	candidate := filepath.Join(t.TempDir(), "omnilsp-candidate.exe")
+	if err := os.WriteFile(candidate, []byte("frozen candidate bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := s21FileSHA256(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("required without declared sha fails closed", func(t *testing.T) {
+		t.Setenv("OMNILSP_BIN", candidate)
+		t.Setenv("OMNILSP_CANDIDATE_SHA256", "")
+		t.Setenv("OMNILSP_S21_GATE", "required")
+		_, err := s21CandidateBinary()
+		if err == nil || !strings.Contains(err.Error(), "OMNILSP_S21_GATE=required opted in but OMNILSP_CANDIDATE_SHA256 is empty") {
+			t.Fatalf("required gate accepted an unpinned candidate: err=%v", err)
+		}
+	})
+	t.Run("required with wrong declared sha still refuses", func(t *testing.T) {
+		t.Setenv("OMNILSP_BIN", candidate)
+		t.Setenv("OMNILSP_CANDIDATE_SHA256", strings.Repeat("0", 64))
+		t.Setenv("OMNILSP_S21_GATE", "required")
+		if _, err := s21CandidateBinary(); err == nil || !strings.Contains(err.Error(), "does not match OMNILSP_CANDIDATE_SHA256") {
+			t.Fatalf("required gate accepted a mismatching candidate hash: err=%v", err)
+		}
+	})
+	t.Run("required with actual sha verifies", func(t *testing.T) {
+		t.Setenv("OMNILSP_BIN", candidate)
+		t.Setenv("OMNILSP_CANDIDATE_SHA256", actual)
+		t.Setenv("OMNILSP_S21_GATE", "required")
+		if got, err := s21CandidateBinary(); err != nil || got != want {
+			t.Fatalf("pinned candidate rejected: got %q err=%v", got, err)
+		}
+	})
+	t.Run("gate-less default keeps the hash optional", func(t *testing.T) {
+		t.Setenv("OMNILSP_BIN", candidate)
+		t.Setenv("OMNILSP_CANDIDATE_SHA256", "")
+		t.Setenv("OMNILSP_S21_GATE", "")
+		if got, err := s21CandidateBinary(); err != nil || got != want {
+			t.Fatalf("gate-less behavior changed: got %q err=%v", got, err)
+		}
+	})
 }
 
 func TestS21WireParsersValidateCandidatePayloads(t *testing.T) {

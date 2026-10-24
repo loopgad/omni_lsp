@@ -240,21 +240,6 @@ func mergeAppend(dst []byte, payloads ...[]byte) []byte {
 	return dst
 }
 
-// SplitMerged unpacks a compacted segment produced by mergeAppend.
-func SplitMerged(merged []byte) [][]byte {
-	var out [][]byte
-	for len(merged) >= 8 {
-		n := binary.BigEndian.Uint64(merged[:8])
-		merged = merged[8:]
-		if uint64(len(merged)) < n {
-			return out // defensive: truncated tail (L7)
-		}
-		out = append(out, merged[:n])
-		merged = merged[n:]
-	}
-	return out
-}
-
 // Compact merges a pinned snapshot into one fresh segment. It holds the
 // cross-process writer lock only while opening the snapshot, reserving the new
 // generation, publishing it, and pruning history.

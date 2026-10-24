@@ -6,20 +6,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 )
 
-// LSIF 0.5.x JSON Lines 导出/导入（goal.md §L15：兼容性支持，不驱动内部架构）。
+// LSIF 0.5.x JSON Lines 解析与共享 wire 结构（goal.md §L15：兼容性支持，
+// 不驱动内部架构）。导出侧走 lsif_semantic.go（emitLSIF），导入模型侧走
+// lsif_model.go（ImportLSIFToModel）；早期的 Canonical 直转适配器
+// ExportLSIF/ImportLSIF 已按死码清理移除。
 //
 // ponytail: resultSet 上的 "symbol"、metaData 上的 "projectRoot"/"commitId"
 // 是自定义扩展字段，用于在最小标签集合内完成无损往返；标准读取方忽略未知字段。
 // 需要严格标准形状时改走 moniker 顶点链。
 
-const (
-	lsifVersion       = "0.5.0"
-	lsifProvenance    = "lsif"
-	lsifFreshnessNote = "静态索引快照：数据可能已过时，不反映工作区当前状态（LSIF 导入）"
-)
+// lsifVersion 是 metaData 顶点声明的 LSIF 版本。
+const lsifVersion = "0.5.0"
 
 // lsifToolInfo 覆盖 LSIF metaData 顶点的标准 toolInfo 字段。
 // args 沿用 omnilsp 键值扩展约定（omnilsp.repository= 等），与 SCIP 对齐。
@@ -65,114 +64,6 @@ type lsifLine interface{ lineID() int }
 
 func (v lsifVertex) lineID() int { return v.ID }
 func (e lsifEdge) lineID() int   { return e.ID }
-
-// ExportLSIF 产出合法的 LSIF 0.5.x JSON Lines 字节流。
-// 结构正确性优先于完备性：仅使用 metaData/document/range/resultSet/
-// referenceResult 顶点与 contains/next/textDocument/references/item 边。
-func ExportLSIF(idx Index) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	nextID := 1
-	emit := func(l lsifLine) error {
-		if err := enc.Encode(l); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	meta := lsifVertex{
-		ID: nextID, Label: "metaData",
-		Version:          lsifVersion,
-		PositionEncoding: "utf-16",
-		ProjectRoot:      idx.Metadata.RepoIdentity,
-		CommitID:         idx.Metadata.CommitID,
-	}
-	nextID++
-	if err := emit(meta); err != nil {
-		return nil, fmt.Errorf("lsif 导出 metaData: %w", err)
-	}
-
-	for _, doc := range idx.Documents {
-		docID := nextID
-		nextID++
-		if err := emit(lsifVertex{
-			ID: docID, Label: "document",
-			URI:        "file:///" + strings.TrimPrefix(doc.Path, "/"),
-			LanguageID: doc.LanguageID,
-		}); err != nil {
-			return nil, fmt.Errorf("lsif 导出 document %s: %w", doc.Path, err)
-		}
-
-		type symOcc struct {
-			rangeIDs []int
-			defined  []bool
-		}
-		bySym := map[string]*symOcc{}
-		var order []string
-		allRangeIDs := make([]int, 0, len(doc.Occurrences))
-		for _, occ := range doc.Occurrences {
-			rid := nextID
-			nextID++
-			sl, sc := occ.Range.StartLine, occ.Range.StartChar
-			el, ec := occ.Range.EndLine, occ.Range.EndChar
-			if err := emit(lsifVertex{
-				ID: rid, Label: "range",
-				Start: &lsifPosition{Line: sl, Character: sc},
-				End:   &lsifPosition{Line: el, Character: ec},
-			}); err != nil {
-				return nil, err
-			}
-			s, ok := bySym[occ.SymbolName]
-			if !ok {
-				s = &symOcc{}
-				bySym[occ.SymbolName] = s
-				order = append(order, occ.SymbolName)
-			}
-			s.rangeIDs = append(s.rangeIDs, rid)
-			s.defined = append(s.defined, occ.Role == RoleDefinition)
-			allRangeIDs = append(allRangeIDs, rid)
-		}
-		if len(allRangeIDs) > 0 {
-			if err := emit(lsifEdge{ID: nextID, Label: "contains", OutV: docID, InVs: allRangeIDs}); err != nil {
-				return nil, err
-			}
-			nextID++
-		}
-		for _, name := range order {
-			s := bySym[name]
-			rsID := nextID
-			nextID++
-			refID := nextID
-			nextID++
-			tdrID := nextID
-			nextID++
-			if err := emit(lsifVertex{ID: rsID, Label: "resultSet", Symbol: name}); err != nil {
-				return nil, err
-			}
-			if err := emit(lsifVertex{ID: refID, Label: "referenceResult"}); err != nil {
-				return nil, err
-			}
-			if err := emit(lsifEdge{ID: tdrID, Label: "textDocument/references", OutV: rsID, InV: refID}); err != nil {
-				return nil, err
-			}
-			for i, rid := range s.rangeIDs {
-				if err := emit(lsifEdge{ID: nextID, Label: "next", OutV: rid, InV: rsID}); err != nil {
-					return nil, err
-				}
-				nextID++
-				p := "referenceResults"
-				if s.defined[i] {
-					p = "definitions"
-				}
-				if err := emit(lsifEdge{ID: nextID, Label: "item", OutV: refID, InV: rid, Property: p}); err != nil {
-					return nil, err
-				}
-				nextID++
-			}
-		}
-	}
-	return buf.Bytes(), nil
-}
 
 // lsifNodeRaw 是导入侧的宽容联合结构：顶点与边共用。
 type lsifNodeRaw struct {
@@ -274,76 +165,4 @@ func (p lsifParsed) lsifMetaData() (lsifNodeRaw, bool) {
 		}
 	}
 	return lsifNodeRaw{}, false
-}
-
-// ImportLSIF 解析 LSIF JSONL 并映射为 Canonical IR。
-// 导入产物标记 Provenance="lsif" 与新鲜度限制（§L14）；
-// LSIF 不携带 kind/signature，导入后恒为 Unspecified/空（见 LossyNotes）。
-// 仓库身份优先取 metaData.toolInfo.args 的 omnilsp.repository= 扩展，
-// 否则回落到 metaData.projectRoot；commit 取 commitId 扩展字段，
-// 缺失时回落 omnilsp.commit= 扩展参数（与 SCIP 导入形态对齐）。
-func ImportLSIF(data []byte) (Index, error) {
-	parsed, err := parseLSIFStream(data)
-	if err != nil {
-		return Index{}, err
-	}
-
-	idx := Index{Metadata: Metadata{
-		Provenance:     lsifProvenance,
-		FreshnessLimit: lsifFreshnessNote,
-	}}
-	if meta, ok := parsed.lsifMetaData(); ok {
-		idx.Metadata.RepoIdentity = meta.Root
-		idx.Metadata.CommitID = meta.Commit
-		if meta.Tool != nil {
-			idx.Metadata.ToolVersion = meta.Tool.Version
-			for _, a := range meta.Tool.Args {
-				if v, ok := strings.CutPrefix(a, scipRepositoryArgPrefix); ok {
-					idx.Metadata.RepoIdentity = v
-				}
-				if v, ok := strings.CutPrefix(a, commitArgPrefix); ok && idx.Metadata.CommitID == "" {
-					idx.Metadata.CommitID = v
-				}
-			}
-		}
-	}
-	ids := parsed.lsifVertexIDsAscending()
-	rangeRole := parsed.lsifRangeRoles()
-
-	seenSyms := map[string]bool{}
-	for _, id := range ids {
-		v := parsed.vertices[id]
-		if v.Label != "document" {
-			continue
-		}
-		path := strings.TrimPrefix(v.URI, "file:///")
-		d := Document{Path: path, LanguageID: v.Lang}
-		for _, rid := range parsed.docRangeIDs[v.ID] {
-			rv := parsed.vertices[rid]
-			if rv.Label != "range" || rv.Start == nil || rv.End == nil {
-				continue
-			}
-			name := ""
-			if rsID, ok := parsed.nextRangeToRS[rid]; ok {
-				name = parsed.vertices[rsID].Symbol
-			}
-			d.Occurrences = append(d.Occurrences, Occurrence{
-				DocPath:    path,
-				SymbolName: name,
-				Range: Range{
-					StartLine: rv.Start.Line,
-					StartChar: rv.Start.Character,
-					EndLine:   rv.End.Line,
-					EndChar:   rv.End.Character,
-				},
-				Role: rangeRole[rid],
-			})
-			if name != "" && !seenSyms[name] {
-				seenSyms[name] = true
-				idx.Symbols = append(idx.Symbols, Symbol{Name: name})
-			}
-		}
-		idx.Documents = append(idx.Documents, d)
-	}
-	return idx, nil
 }

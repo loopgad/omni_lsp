@@ -105,8 +105,8 @@ func TestExternalChangeOverflowRequiresVerifiedRecovery(t *testing.T) {
 	if err := s.flushExternalSourceChanges(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	if b.recoveries != 1 || b.epoch != 2 || b.notifications != 0 || s.externalSourceSyncError(b) != nil {
-		t.Fatalf("overflow recovery = attempts %d, epoch %d, notifications %d, fence %v", b.recoveries, b.epoch, b.notifications, s.externalSourceSyncError(b))
+	if b.recoveries != 1 || b.epoch != 2 || b.notifications != 0 {
+		t.Fatalf("overflow recovery = attempts %d, epoch %d, notifications %d", b.recoveries, b.epoch, b.notifications)
 	}
 	if err := s.flushExternalSourceChanges(context.Background(), b); err != nil || b.recoveries != 1 {
 		t.Fatalf("restarted recovered child again: attempts %d, err %v", b.recoveries, err)
@@ -120,7 +120,9 @@ func TestExternalChangeOverflowRecoveryFailureKeepsFence(t *testing.T) {
 	if err := s.flushExternalSourceChanges(context.Background(), b); !errors.Is(err, failed) {
 		t.Fatalf("recovery error = %v, want %v", err, failed)
 	}
-	if s.externalSourceSyncError(b) == nil || b.notifications != 0 {
+	// The failed child stays fenced: a re-read through the production flush
+	// path must surface the retained fence instead of notifying the old child.
+	if err := s.flushExternalSourceChanges(context.Background(), b); !errors.Is(err, failed) || b.notifications != 0 {
 		t.Fatal("failed recovery cleared freshness fence or used old child")
 	}
 }
@@ -141,8 +143,8 @@ func TestExternalChangeOverflowDuringRecoveryRetainsFence(t *testing.T) {
 	if err := s.flushExternalSourceChanges(context.Background(), b); err == nil {
 		t.Fatal("recovery accepted another batch lost during initialization")
 	}
-	if b.recoveries != 1 || b.notifications != 0 || s.externalSourceSyncError(b) == nil {
-		t.Fatalf("new overflow fence was lost: attempts %d, notifications %d, fence %v", b.recoveries, b.notifications, s.externalSourceSyncError(b))
+	if b.recoveries != 1 || b.notifications != 0 {
+		t.Fatalf("new overflow fence was lost: attempts %d, notifications %d", b.recoveries, b.notifications)
 	}
 }
 
@@ -205,11 +207,13 @@ func TestFailedExternalSynchronizationFencesReadsUntilNewChildEpoch(t *testing.T
 	if err := s.applyExternalSourceChanges(context.Background(), changes); err != nil {
 		t.Fatal(err)
 	}
-	if s.externalSourceSyncError(b) == nil {
+	// A later partial hint cannot erase the missing-event fence: the flush
+	// read keeps surfacing it until a new child epoch releases it.
+	if err := s.flushExternalSourceChanges(context.Background(), b); err == nil {
 		t.Fatal("a later partial hint cannot erase missing-event failure")
 	}
 	b.epoch++
-	if s.externalSourceSyncError(b) != nil {
+	if err := s.flushExternalSourceChanges(context.Background(), b); err != nil {
 		t.Fatal("a new child process must be allowed to recover from disk")
 	}
 }
@@ -224,9 +228,6 @@ func TestCanceledExternalSynchronizationRetainsPendingBatch(t *testing.T) {
 	}
 	if err := s.flushExternalSourceChanges(context.Background(), b); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation: %v", err)
-	}
-	if s.externalSourceSyncError(b) != nil {
-		t.Fatal("canceled unsent notification must not fence the child epoch")
 	}
 	b.err = nil
 	if err := s.flushExternalSourceChanges(context.Background(), b); err != nil {

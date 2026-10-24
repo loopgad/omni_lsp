@@ -80,23 +80,6 @@ func (v GenerationView) ReadSegment(id SegmentID) ([]byte, error) {
 	return payload, nil
 }
 
-// IndexStore is the §L5 storage boundary. Implementations own durability;
-// callers own content semantics.
-type IndexStore interface {
-	OpenSnapshot(ctx context.Context) (GenerationView, error)
-	BeginBuild(ctx context.Context) (BuildSession, error)
-	Quarantine(seg SegmentID) error
-	Quarantined() []SegmentID
-	Compact(ctx context.Context) error
-}
-
-// LeasedIndexStore is an optional capability for readers that need their
-// generation's segments to remain on disk for the lifetime of a replay.
-// Callers must close each returned lease after the last segment read.
-type LeasedIndexStore interface {
-	OpenSnapshotLease(ctx context.Context) (*GenerationLease, error)
-}
-
 // BuildSession stages segments for the next generation (TXN-002).
 type BuildSession interface {
 	// GenerationID is assigned durably when the session is reserved. It is
@@ -113,8 +96,9 @@ type Config struct {
 	KeepGenerations int   // fallback depth; <=0 → historyK
 }
 
-// FileStore is the file-backed IndexStore implementation (v1 ADR choice:
-// immutable per-generation segment files + atomic manifest rename).
+// FileStore is the §L5 storage boundary's file-backed implementation (v1 ADR
+// choice: immutable per-generation segment files + atomic manifest rename).
+// The store owns durability; callers own content semantics.
 type FileStore struct {
 	root string
 	cfg  Config
@@ -283,23 +267,6 @@ func (s *FileStore) beginBuildWithWriterLock(ctx context.Context, writerLock *wr
 	return &fileBuild{store: s, genID: genID, stageDir: stage}, nil
 }
 
-// Quarantine moves suspect segments out of the readable path with evidence
-// preserved (TXN-004). If the current generation loses any member it is
-// dropped wholesale and the newest surviving history entry takes over.
-func (s *FileStore) Quarantine(seg SegmentID) error {
-	writerLock, err := acquireWriterLock(context.Background(), s.root)
-	if err != nil {
-		return err
-	}
-	defer writerLock.release()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.recover(); err != nil {
-		return err
-	}
-	return s.quarantineSegsLocked([]SegmentID{seg})
-}
-
 func (s *FileStore) quarantineSegsLocked(segs []SegmentID) error {
 	for _, seg := range segs {
 		if !validSegmentID(seg) {
@@ -329,31 +296,6 @@ func (s *FileStore) quarantineSegsLocked(segs []SegmentID) error {
 				break
 			}
 		}
-	}
-	return nil
-}
-
-// QuarantineGeneration drops an entire generation by ID (TXN-004 whole-trust
-// rule) and falls back to the newest surviving history entry.
-func (s *FileStore) QuarantineGeneration(genID uint64, segs []SegmentID) error {
-	writerLock, err := acquireWriterLock(context.Background(), s.root)
-	if err != nil {
-		return err
-	}
-	defer writerLock.release()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.recover(); err != nil {
-		return err
-	}
-	if s.current == nil || s.current.ID != genID {
-		return nil
-	}
-	if err := s.quarantineSegsLocked(segs); err != nil {
-		return err
-	}
-	if s.current != nil && s.current.ID == genID {
-		s.dropCurrentLocked()
 	}
 	return nil
 }
