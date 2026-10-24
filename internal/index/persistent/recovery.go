@@ -189,11 +189,10 @@ func (s *FileStore) cleanupOrphanSegments() {
 		if referenced[id] || !validSegmentID(id) {
 			continue
 		}
+		// validSegmentID already guaranteed the prefix before the only '-'
+		// parses as a canonical uint64 (format.go), so the error is ignored.
 		separator := strings.IndexByte(string(id), '-')
-		genID, err := strconv.ParseUint(string(id[:separator]), 10, 64)
-		if err != nil {
-			continue
-		}
+		genID, _ := strconv.ParseUint(string(id[:separator]), 10, 64)
 		gen := retired[genID]
 		if gen == nil {
 			gen = &Generation{ID: genID}

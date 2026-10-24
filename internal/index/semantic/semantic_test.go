@@ -764,3 +764,26 @@ func completeCoverage(scopes []model.Scope) []model.Coverage {
 	}
 	return coverage
 }
+
+// TestMetadataSegmentCapRejectsOversizedTotals pins the invariant that
+// validateMetadataRecords rejects metadata whose accumulated records exceed
+// MaxSegmentBytes. The cap is enforced incrementally by the add closure; the
+// former post-hoc total check was unreachable (every accepted add keeps
+// total <= MaxSegmentBytes), so this test is the guard on that accounting.
+func TestMetadataSegmentCapRejectsOversizedTotals(t *testing.T) {
+	small := Metadata{Coverage: []model.Coverage{{ScopeID: "scope", Fact: model.FactSymbol, State: model.Complete, Reason: "ok"}}}
+	if err := validateMetadataRecords(small); err != nil {
+		t.Fatalf("small metadata rejected: %v", err)
+	}
+	// Each record stays under MaxRecordBytes (1 MiB); 70 of them push the
+	// running total past MaxSegmentBytes (64 MiB = 67108864 bytes; each
+	// accepted record adds ~999062, so the 68th add trips the guard).
+	reason := strings.Repeat("a", 999_000)
+	big := Metadata{}
+	for i := 0; i < 70; i++ {
+		big.Coverage = append(big.Coverage, model.Coverage{ScopeID: "scope", Reason: reason})
+	}
+	if err := validateMetadataRecords(big); !errors.Is(err, ErrBounds) {
+		t.Fatalf("oversized metadata total: got err %v, want ErrBounds", err)
+	}
+}

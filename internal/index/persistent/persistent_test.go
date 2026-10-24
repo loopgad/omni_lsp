@@ -191,6 +191,13 @@ func TestCommitCanceledBeforePublishKeepsCurrentGeneration(t *testing.T) {
 func TestCancellationRacingCommitHasOneTerminalOutcome(t *testing.T) {
 	s := newStore(t)
 	oldID := publishOne(t, s, "before-race")
+	// The generation visible before each round is what a canceled commit
+	// must leave readable; a successful commit replaces it.
+	baseline, baseErr := s.OpenSnapshot(context.Background())
+	if baseErr != nil || baseline.ID != 1 || len(baseline.Segments) != 1 || baseline.Segments[0].ID != oldID {
+		t.Fatalf("setup did not leave generation 1 readable: %+v, err=%v", baseline.Generation, baseErr)
+	}
+	visibleID, visibleSeg := baseline.ID, baseline.Segments[0].ID
 	for i := 0; i < 8; i++ {
 		build, err := s.BeginBuild(context.Background())
 		if err != nil {
@@ -214,6 +221,17 @@ func TestCancellationRacingCommitHasOneTerminalOutcome(t *testing.T) {
 		close(start)
 		err = <-commitResult
 		cancel()
+		// A canceled commit must leave no orphan segment in the store root
+		// either: Commit renames staged segments into the root before
+		// publication, and a rollback that misses them leaks files there.
+		// Check before opening the snapshot — OpenSnapshot's
+		// cleanupOrphanSegments pass would silently delete the orphan and
+		// mask the rollback failure.
+		if errors.Is(err, context.Canceled) {
+			if _, statErr := os.Stat(filepath.Join(s.root, segFileName(newID))); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("round %d canceled commit left orphan segment %s in the store root: %v", i, newID, statErr)
+			}
+		}
 		view, openErr := s.OpenSnapshot(context.Background())
 		if openErr != nil {
 			t.Fatalf("open after commit race: %v", openErr)
@@ -223,10 +241,17 @@ func TestCancellationRacingCommitHasOneTerminalOutcome(t *testing.T) {
 			if len(view.Segments) != 1 || view.Segments[0].ID != newID {
 				t.Fatalf("commit reported success but generation %d was not published", view.ID)
 			}
-			oldID = newID
+			visibleID, visibleSeg = view.ID, newID
 		case errors.Is(err, context.Canceled):
-			if view.ID == 1 && view.Segments[0].ID != oldID || view.ID != 1 && view.Segments[0].ID == newID {
-				t.Fatalf("commit reported cancellation but published generation %d", view.ID)
+			// Cancellation must leave the pre-round generation readable:
+			// same generation ID, same segments. Guard the length first so
+			// a store that opens empty fails the test instead of panicking
+			// on Segments[0].
+			if len(view.Segments) == 0 {
+				t.Fatalf("round %d: canceled commit left no readable segments: %+v", i, view.Generation)
+			}
+			if view.ID != visibleID || len(view.Segments) != 1 || view.Segments[0].ID != visibleSeg {
+				t.Fatalf("round %d: commit reported cancellation but the readable generation moved to %d (segment %s), want generation %d (segment %s)", i, view.ID, view.Segments[0].ID, visibleID, visibleSeg)
 			}
 		default:
 			t.Fatalf("unexpected commit result: %v", err)
@@ -236,7 +261,8 @@ func TestCancellationRacingCommitHasOneTerminalOutcome(t *testing.T) {
 		// against the budget and cleanupOrphanSegments never descends into
 		// staging-*, so the leak is permanent and eventually starves commits
 		// with ErrDiskBudgetExceeded. A stranded manifest.tmp would also shadow
-		// the next publish.
+		// the next publish. The store root itself is covered above, before
+		// OpenSnapshot's cleanup pass can delete a leaked segment and hide it.
 		if staging, globErr := filepath.Glob(filepath.Join(s.root, "staging-*")); globErr != nil || len(staging) != 0 {
 			t.Fatalf("round %d left staging directories behind: %v (%v)", i, staging, globErr)
 		}
@@ -590,7 +616,10 @@ func TestL6_TXN003_IdempotentRecovery(t *testing.T) {
 	publishOne(t, s, "stable-old")
 	publishOne(t, s, "broken-new")
 
-	view, _ := s.OpenSnapshot(ctx)
+	view, err := s.OpenSnapshot(ctx)
+	if err != nil || len(view.Segments) == 0 {
+		t.Fatalf("setup open failed: %v", err)
+	}
 	p := filepath.Join(s.root, segFileName(view.Segments[0].ID))
 	raw, _ := os.ReadFile(p)
 	raw[segHeaderSz] ^= 0x01 // corrupt payload start
@@ -601,11 +630,28 @@ func TestL6_TXN003_IdempotentRecovery(t *testing.T) {
 	v2, err2 := s.OpenSnapshot(ctx)
 	q2 := s.Quarantined()
 
-	if (err1 == nil) != (err2 == nil) {
-		t.Fatalf("non-idempotent errors: %v vs %v", err1, err2)
+	// Idempotent recovery means both opens recover the same usable
+	// generation. A fully corrupted store where every open fails the same
+	// way is broken, not idempotent — agreeing on an error is not enough.
+	if err1 != nil {
+		t.Fatalf("first recovery open failed: %v", err1)
 	}
-	if len(v1.Segments) > 0 && len(v2.Segments) > 0 && v1.ID != v2.ID {
+	if err2 != nil {
+		t.Fatalf("second recovery open failed: %v", err2)
+	}
+	if len(v1.Segments) == 0 {
+		t.Fatalf("first recovery returned an empty generation %d", v1.ID)
+	}
+	if v1.ID != v2.ID {
 		t.Errorf("recovered generations diverge: %d vs %d", v1.ID, v2.ID)
+	}
+	if len(v1.Segments) != len(v2.Segments) {
+		t.Fatalf("recovered segment counts diverge: %d vs %d", len(v1.Segments), len(v2.Segments))
+	}
+	for j := range v1.Segments {
+		if v1.Segments[j] != v2.Segments[j] {
+			t.Errorf("recovered segment[%d] diverges: %+v vs %+v", j, v1.Segments[j], v2.Segments[j])
+		}
 	}
 	if len(q2) < len(q1) {
 		t.Errorf("quarantine list shrank between runs")

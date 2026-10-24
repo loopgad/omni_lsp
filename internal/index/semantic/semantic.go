@@ -712,8 +712,12 @@ func uriWithinRoot(root, candidate string) bool {
 
 func validateMetadataRecords(meta Metadata) error {
 	total := int64(256) // envelope, identity, and JSON container overhead
+	// add caps the segment total incrementally: every caller passes a len()
+	// result (never negative), and the guard below rejects any record that
+	// would push total past MaxSegmentBytes, so the invariant
+	// total <= MaxSegmentBytes holds after every accepted record.
 	add := func(size int) error {
-		if size < 0 || total > MaxSegmentBytes-int64(size)-2 {
+		if total > MaxSegmentBytes-int64(size)-2 {
 			return fmt.Errorf("%w: metadata segment exceeds %d bytes", ErrBounds, MaxSegmentBytes)
 		}
 		total += int64(size) + 2 // commas and quoting/field separators
@@ -765,9 +769,6 @@ func validateMetadataRecords(meta Metadata) error {
 				return fmt.Errorf("used tool for %q: %w", scopeID, err)
 			}
 		}
-	}
-	if total > MaxSegmentBytes {
-		return fmt.Errorf("%w: metadata segment exceeds %d bytes", ErrBounds, MaxSegmentBytes)
 	}
 	return nil
 }
