@@ -22,10 +22,10 @@ verify 跑的是 CI 出货的同一二进制，所以本地分数与 CI 同源�
 
 | 域 | 分数 | 说明 |
 |---|---|---|
-| **core** | **97.7%** | = `baseline.json` 的 `97.70959595959597`，逐位吻合 |
+| **core** | **98.5%** | = `baseline.json` 的 `98.45959595959597`，逐位吻合（PERF-2 升 AUTO，run gate-20261024T1136Z，+0.75） |
 | post-x8 | 0.0% | |
 | post-x9 | 6.9% | DEF-V4FREEZE 记账收口后自 3.4% 升至 6.9%（第四轮）；A1c 的诚实代价见 §2.1 |
-| x5 | 85.7% | INDEX 83.3% / INTEROP 50.0% |
+| x5 | 78.6% | INDEX 83.3% / INTEROP 50.0% / GRAPH 50.0%（X5-4 于 i8-p1 降 PARTIAL 后实况；本表旧值 85.7% 是降级前口径，2026-10-25 记账员以 `go run ./cmd/scorecard` 实测订正） |
 | x7 | 100.0% | |
 | x8 | 66.7% | CLIENTS 50% / DIST 50% |
 | x9 | 75.0% | RELEASE 75% |
@@ -43,8 +43,20 @@ AST 符号存在性扫描**（`probe.go:19-66`），从不执行任何测试。
 
 算分本身是自洽的：按 `report.go:182-195` 的加权式
 `0.24*Y0+0.18*Y3+0.18*Y1+0.13*Y2+0.09*Y4+0.09*Y5+0.09*PERF` 代入 7 个有权类目，
-精确等于 `97.70959595959597`；Y1=10.5/11、Y2=8.5/9、PERF=5.5/6 的分母也与
+精确等于 `98.45959595959597`；Y1=10.5/11、Y2=8.5/9、PERF=6/6 的分母也与
 registry 的 AUTO/PARTIAL/GATE 分布一致。
+
+> **PERF-2 升 AUTO（2026-10-24，run gate-20261024T1136Z，decision=passed）**：
+> 第八轮 no_attempt 的缺口本轮收口——第八轮交付的 memo 修复（internal/
+> languages/ccls/memo.go + memo_test.go）经冻结候选实测生效：28/28 严格行
+> 全过（7 语言 × 4 操作；上轮 P50 63-74ms 的四条 c/cpp 行本轮 P50
+> 0.51-2.13ms，证据 `out/freeze-staging/gate-20261024T1136Z/performance.json`，
+> strict 策略 s18-strict-v1，全文件无 blocked/not_verified 状态）。registry
+> PERF-2 改 AUTO，探针恰为 in-package 闸门守卫
+> TestPERF2_S18GateFailsClosedWithoutCandidate（required 模式无候选即
+> fail-closed），形状由 engine_test.go 断言锁定；core 98.45959595959597 /
+> PERF=6/6（+0.75）。第八轮笔录的 stable-ABBA 让位权衡按原样维持（本轮
+> 验收走 strict 策略，stable 模式未复测），仍待决策包记录。
 
 ---
 
@@ -165,6 +177,13 @@ dispatcher 仍在应答，这正是 INV-ARCH-001 的契约）。
 **第一步不是写代码**，是先决定语义：拒绝并保持连接，还是实现批量。两者都
 可接受，但必须有一个测试钉住选定的那一个。
 
+**现状已钉住（待拍板，2026-10-24 第八轮）**：新增 `TestBatchFrameIsPerStreamFatal`
+（internal/transport/stdio_test.go:282）钉住「数组体 → Codec.ParseError → stdio
+readLoop 致命 → 连接终止」整条现状链，注释精确引用本节与 §7.5；codec 半边此前
+已由 commit 9897d0a 的 codec_framing_test.go 批量用例钉住（上文「全仓 0 处测试
+构造数组体」的前提已过时）。§7.5 拍板后须同步改写两处用例；TCPTransport.readLoop
+有同型致命分支，本轮范围明写 stdio，未加 TCP 用例。未改任何生产代码。
+
 ### 3.2 `test/soak/` 在默认 `go test ./...` 下不参与编译 `[已复核，已降级]`
 
 **已收口（2026-10-07 实测）**：剩下的文档半边已落地——`Makefile:12-13` 与
@@ -205,6 +224,18 @@ token 尚未消费，显式空列表而非猜测）。**能力声明与空结果
 
 同型待查：`handlers.go:771-810` 的 `handleDeclaration` 对无
 `DeclarationProvider` 的后端返回什么（`DeclarationProvider` 只有 golang 真实现）。
+**已销账（2026-10-24 实测）**：handleDeclaration 对无 `DeclarationProvider` 的
+后端返回 `MethodNotFound` 干净拒绝（handlers.go:786-788，注释亦声明此意图），
+无 §3.3 主段那类「能力声明与空结果语义不一致」的同型问题。
+
+**现状已钉住（待拍板，2026-10-24 第八轮）**：新增
+`TestQ3_SemanticTokensDeclaredButCclsServesEmpty`
+（internal/runtime/server/semantic_tokens_current_state_test.go:19）钉住行为链
+两端——buildCapabilities 无条件声明 semanticTokensProvider（含 Full=true，
+handlers.go:295-306）+ ccls.Backend.SemanticTokens 返回空列表（backend.go:600-606）。
+leftOpen 如实注明：ccls 空列表端变异验证未执行（internal/languages/ccls/** 属
+c/cpp 修复员文件边界），以断言直读返回值锁定；「改声明或改空列表→红」的协议以
+声明侧变异满足。拍板（不声明 / 按后端条件化）前本测试保护现状不漂移。
 
 ### 3.4 `position.PositionToOffset` 的 `enc` 形参从未被读取 `[推断，但可自查]`
 
@@ -216,10 +247,13 @@ token 尚未消费，显式空列表而非猜测）。**能力声明与空结果
 `ColumnAt`，返回的是「索引构建编码」的列而非 UTF-16；唯一调用点
 `golang/backend.go:1307`。
 
-**收口状态（2026-10-07 实测，两半分开记）**：enc 校验半边**已完成**——
+**收口状态（2026-10-24 实测，两半均已收口）**：enc 校验半边——
 `position.go:201-206` 的 `PositionToOffset` 现在真正校验，`enc` 与索引构建
 编码不一致时返回带两种编码名的错误，静默错配已堵死；`UTF16ColumnAt`
-命名/转发半边**仍待办**（`position.go:122-124` 行为同上）。
+命名/转发半边也已收口（2026-10-24）：该名不副实的转发函数已删除，唯一
+调用点 `golang/backend.go`（语义 token delta 列）改为直呼 `ColumnAt` 并
+注明列单位=索引构建编码；`position` 包补 `TestColumnAtUnitsFollowIndexEncoding`
+钉住该单位契约。
 
 ### 3.5 数字型 `workDoneToken` 被静默丢弃 `[推断]`
 
@@ -247,8 +281,8 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 | **X5-1** | 含 "corruption quarantine" | 三个探针无一断言 quarantine：一个走 Abort 路径、一个只断言返回 error、一个是压实。真正断言 `Quarantined()` 的 `TestL7`/`TestL9` 挂在别的条目下 | `[推断]` |
 | **Y1-7** | 「Disk budget refusal **preserves last good generation**」 | `TestBudget_RejectsWhenFull` 从**空 store** 起，根本没有 last good generation 可保留；另一个探针是 Abort 路径，与 disk budget 无关 | `[推断]` |
 | **Y1-6** | 「Index corruption isolated」（IDX-TXN-004/L8） | `TestL7` 的回退半边是 `t.Logf`（非断言），`TestL6_TXN003` 只比错误 nil 布尔与 quarantine 长度单调性 ⇒ 合起来都没验证「回退到最新存活历史」 | `[推断]` |
-| **X5-2** | 「SCIP/LSIF conversions preserve provenance and report conversion losses」 | 探针缺两个**孤儿测试**：`TestL11_IdentityPreserved`（唯一做双向 repo/commit identity 往返）、`TestL14_LossyNotesDocumented`（唯一做 §L14 有损登记） | `[推断]` |
-| **X5-7** | 「Typed semantic generations persist and serve fresh-only ... queries」 | persistent 探针组是纯租约/取消语义，两测试只用 `publishOne(t, s, "string")`，**不触碰任何 semantic payload** | `[推断]` |
+| **X5-2** | 「SCIP/LSIF conversions preserve provenance and report conversion losses」 | 探针缺两个**孤儿测试**：`TestL11_IdentityPreserved`（唯一做双向 repo/commit identity 往返）、`TestL14_LossyNotesDocumented`（唯一做 §L14 有损登记） | `[推断]` → **孤儿测试半边已闭合（2026-10-25 记账员复核）**：两测试均已入探针清单，且 LSIF 全链路本轮落地（semantic→LSIF 导出桥含 metaData provenance 与有损计数、ImportLSIF 读 toolInfo 扩展与身份校验、SCIP↔LSIF 双向转换、CLI --format lsif 经 SCIP 转码过格式门禁），6 个新 interop 测试本人实跑全绿并已入探针；仍维持 PARTIAL——候选二进制 CLI 执行与 server 原生 LSIF API 半边（ExportSemanticLSIF/ImportSemanticLSIF）未验证 |
+| **X5-7** | 「Typed semantic generations persist and serve fresh-only ... queries」 | persistent 探针组是纯租约/取消语义，两测试只用 `publishOne(t, s, "string")`，**不触碰任何 semantic payload** | `[推断]` → **过时（2026-10-25 记账员复核）**：探针组现已含 typed semantic 代际隔离跨 recommit（persistent 层）与「重启后 fresh-only 查询」「recommit 后只服务当前代」（server 层端到端）三测试，全部变异验证红→绿且本人实跑通过（`go test -count=1` persistent + server）；跨进程闭环 Go 半边已闭合，仍维持 PARTIAL——七语言 fact 覆盖、非 Go 端到端查询证据、replay 半边未闭合 |
 
 ### 4.1 两个 ADR 的机制描述与代码不符
 
@@ -257,12 +291,22 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
   `internal/languages/rustanalyzer/semantic_index.go:28` 是生产代码且直接
   import scip 绑定；而**不存在任何这样的机械检查**。同样的假命题也写在
   `internal/index/interop/scip.go:11`。
+  **更新（2026-10-24 实测）**：ADR 正文已自我撤回这两句
+  （`docs/adr/0006-scip-protobuf-dependency.md:39-43`）；但其补写的新正文又
+  轻微过时——现存生产 scip import 在 interop 之外仅
+  `internal/languages/rustanalyzer/semantic_index.go:28` 一处（ADR 所记
+  typescript 与 cmd/omnilsp 两处已无）。
 - **ADR-0002** 称「CI 跑 `go list -deps` 并对除 `internal/protocol/jsonrpc` 外的
   禁用匹配失败」。实际 `ci.yml:30` 只覆盖
   `./internal/workspace/... ./internal/languages/... ./internal/runtime/scheduler
   ./internal/runtime/supervisor`，**不含 `internal/index/`**；仓内唯一自动检查
   `TestARCH002_NoProtocolImportsInCore` 是源码字符串匹配，且**禁用整个
   `/internal/protocol/` 前缀**（与 ADR 的「jsonrpc 豁免」语义相反）。
+  **更新（2026-10-24 实测）**：对 TestARCH002 的指控已过时——现为
+  parser.ParseFile 读 import（meta_test.go:112 起），arch002Forbidden 只禁
+  protocol 的 lsp|mcp|dap、transport、runtime/server 五个子路径
+  （meta_test.go:100-106），jsonrpc 豁免与 ADR-0002 一致；「ci.yml 的 go
+  list 不含 internal/index」这半边仍成立（ci.yml:30）。
 
 ### 4.2 Y5-2「No protocol imports in Semantic Core」的覆盖面被低估 `[推断]`
 
@@ -270,6 +314,12 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 `internal/identity`、`internal/runtime/scheduler`、`internal/workspace`），
 **不含 `internal/index/`** —— 而 `internal/index/{model,semantic,persistent,graph}`
 才是 Semantic Core 的主体。
+
+**已收口（2026-10-24 第八轮）**：coreDirs 已加入 `internal/index`
+（meta_test.go:89）。前置预检 grep 证实 internal/index 树内无
+protocol/transport/runtime/server import；`go test ./internal/conformance/
+-count=1 -timeout 20m` 首跑 2.003s、终态复跑 2.175s 均完整绿 ⇒ 按判定规则
+保留改动，§7 拍板#4 的可自主半边已销，剩「是否有意分层」的语义确认。
 
 ### 4.3 ADR-0009 已在本轮补齐一半 `[已复核]`
 
@@ -286,16 +336,16 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 
 | 位置 | 问题 |
 |---|---|
-| `jsonrpc/fuzz_test.go:74-113` | `FuzzPosition` 整个函数空转：11 个**常量**字符串 unmarshal 后 `_ = raw`，从不碰 `Codec`/`Message`，注释却宣称「验证解码不 panic」 |
-| `jsonrpc/s10_conformance_test.go:81-95` | `TestStructuredErrorResponse` 注册 handler 却从不 Dispatch，断言只覆盖构造函数 |
-| `jsonrpc/s10_conformance_test.go:39-49` | `TestMalformedJSONDoesNotPanic` 的 `"not json"` 从不被解析（直接路由到未知方法 ⇒ `MethodNotFound`），测的是「未知方法」 |
-| `position/fuzz_test.go:62` | 往返断言被 `_ = back` 丢弃。代码注释已给出理由（模糊位置往返不精确，INV-POS-001 允许），所以不是缺陷而是**断言偏弱**；同文件 `FuzzMultiByteBoundary:156` 真断言了 `back != off`，两者强度不一致 |
-| `position/fuzz_test.go:112-117` | 空 if 体，`err` 从不检查。`OffsetToPosition` 的错误路径因此无人验证 |
-| `position/position_test.go:68-76` | `TestCJKCharacters` 对 3 字节 CJK 逐字节 offset 调 `OffsetToPosition`，返回值零断言 |
-| `golang/uri_fuzz_test.go:25-31` | `FuzzURI` 零断言 ⇒ `pathToUri`（`backend.go:1462`）唯一调用点是空转 fuzz，覆盖率应 0% |
-| `golang/features.go:90-92` | `if endCol == 0 { endCol = 0 }` 字面空操作；且 `:85-93` 的 endCol/endLine 计算在 `features_test.go:41-62` 完全未断言 |
-| `server/progress_test.go:26-29` | `orig := s.send; if orig == nil { t.Fatal }` —— Go 的 method value 是闭包，**永远非 nil**；同行 `notifications`/`orig` 声明后从未使用 |
-| `server/lifecycle_test.go:385-388` | 只有 `Logf` 没有 `Errorf`，文案「rejection is silent」自相矛盾 |
+| `jsonrpc/fuzz_test.go:74-113` | `FuzzPosition` 整个函数空转：11 个**常量**字符串 unmarshal 后 `_ = raw`，从不碰 `Codec`/`Message`，注释却宣称「验证解码不 panic」。**已收口（2026-10-24 实测，J1）**：11 个 payload 经 frame()+ReadMessage 真解码，按 json.Unmarshal-into-Message oracle 断言形态与 ParseError；变异 codec.go 解码分支 18 seed 全红、复原绿 |
+| `jsonrpc/s10_conformance_test.go:81-95` | `TestStructuredErrorResponse` 注册 handler 却从不 Dispatch，断言只覆盖构造函数。**已收口（2026-10-24 实测，J2）**：补真实 Dispatch 两子测试（typed error 逐字段保留 / plain error→InternalError），构造函数断言保留；变异 dispatcher.go:98 红、复原绿 |
+| `jsonrpc/s10_conformance_test.go:39-49` | `TestMalformedJSONDoesNotPanic` 的 `"not json"` 从不被解析（直接路由到未知方法 ⇒ `MethodNotFound`），测的是「未知方法」。**已收口（2026-10-24 实测，J3）**：拆为 codec_body_not_json（构帧送 ReadMessage，断言 CodecError/ParseError）与 unknown_method 两子测试 |
+| `position/fuzz_test.go:62` | 往返断言被 `_ = back` 丢弃。代码注释已给出理由（模糊位置往返不精确，INV-POS-001 允许），所以不是缺陷而是**断言偏弱**；同文件 `FuzzMultiByteBoundary:156` 真断言了 `back != off`，两者强度不一致。**已收口（2026-10-24 实测，G2）**：`_ = back` 改按类钉死的往返断言（CRLF 容差写死为行首精确值，其余边界含 EOF 精确往返）；变异 position.go:222 红、复原绿 |
+| `position/fuzz_test.go:112-117` | 空 if 体，`err` 从不检查。`OffsetToPosition` 的错误路径因此无人验证。**已收口（2026-10-24 实测，G1）**：0..totalBytes（含 EOF）断言 err==nil，越界偏移断言必返 error；变异 position.go:139 红（越界 panic）、复原绿 |
+| `position/position_test.go:68-76` | `TestCJKCharacters` 对 3 字节 CJK 逐字节 offset 调 `OffsetToPosition`，返回值零断言。**已收口（2026-10-24 实测，G3）**：遍历 12 个字节偏移断言 (0, off-off%3)；变异 position.go:108 列填充循环红、复原绿 |
+| `golang/uri_fuzz_test.go:25-31` | `FuzzURI` 零断言 ⇒ `pathToUri`（`backend.go:1462`）唯一调用点是空转 fuzz，覆盖率应 0%。**部分收口（2026-10-24 实测，G5）**：补分层断言（uriToPath==u.Path()、产物已是规范形、往返不动点）；leftOpen：引擎层两怪癖仅注释记录未修——FromPath 不转义路径中 ?/#，解码路径含裸 % 时往返有损 |
+| `golang/features.go:90-92` | `if endCol == 0 { endCol = 0 }` 字面空操作；且 `:85-93` 的 endCol/endLine 计算在 `features_test.go:41-62` 完全未断言。**已收口（2026-10-24 实测，commit abc8c14）**：空操作已修，features_test.go 现有真断言（:57 定值 + :76-100 表驱动） |
+| `server/progress_test.go:26-29` | `orig := s.send; if orig == nil { t.Fatal }` —— Go 的 method value 是闭包，**永远非 nil**；同行 `notifications`/`orig` 声明后从未使用。**已收口（2026-10-24 实测，commit 40bf458）**：整文件重写为 recordingTransport 真断言 $/progress 通知 |
+| `server/lifecycle_test.go:385-388` | 只有 `Logf` 没有 `Errorf`，文案「rejection is silent」自相矛盾。**已收口（2026-10-24 实测，S1）**：改为 t.Errorf 真契约（通知无 wire ID、拒绝必须静默，C2）；变异 server.go 静默守卫红、复原绿 |
 
 ### 5.2 恒假守卫与不可达分支（代码本身的问题，测试再多也覆盖不到）
 
@@ -303,17 +353,17 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 
 | 位置 | 问题 |
 |---|---|
-| `server/engine_wiring.go:239-241` | `rangesOverlap` 的 URI 不等分支**恒假**：`ValidateEditSet` 以 `canonicalDocumentURI` 分桶，只在同桶内成对调用。`engine_wiring_test.go:641` 的「cross-file overlap impossible」子测试因两文件分属不同桶**根本没调用到** |
-| `server/handlers.go:1798-1800` | `invalidateExternalSources` 的 `if count == 0` **不可达**（唯一调用点已在 `:48` 提前返回） |
-| `server/diagnostics.go:368-370` | 与 `:362-364` 逐字重复的守卫，单线程语义下恒不成立 ⇒ 错误文案不可达。**需 `-race -count=100` 复核** |
-| `server/index.go:378` | `firstInventoryChange` 兜底 return **不可达**（records 已排序 + json.Marshal ⇒ 摘要相同 ⟺ 记录全等 ⟺ 循环必先 return） |
-| `httpserver/auth.go:86` | `lim != nil` **恒真**（唯一调用点第三实参恒为 `newPerSourceLimiter(...)`） |
-| `httpserver/auth.go:48` | `perSourceLimiter.window int64` 是**完全死字段**（窗口硬编码 `now()/60`） |
-| `server/handlers.go:1872-1873` | `completenessName` 的 `default` 臂**不可达**（枚举恰 3 值且 3 个 case 全列出） |
-| `index/semantic/semantic.go:716` | `size < 0` 恒假（全部来自 `len()`） |
-| `index/semantic/semantic.go:769-771` | `total > MaxSegmentBytes` 不可达（前置条件已逐次封顶） |
-| `index/persistent/recovery.go:192-196` | `ParseUint` 失败 continue **不可达**（`validSegmentID` 已保证可解析） |
-| `conformance/meta_test.go:85-92` | `isLeafHelper` 恒返回 false 的死函数 |
+| `server/engine_wiring.go:239-241` | `rangesOverlap` 的 URI 不等分支**恒假**：`ValidateEditSet` 以 `canonicalDocumentURI` 分桶，只在同桶内成对调用。`engine_wiring_test.go:641` 的「cross-file overlap impossible」子测试因两文件分属不同桶**根本没调用到**。**已收口（2026-10-24 实测，S4）**：分支保留为防御，新增直调 `rangesOverlap`(不同 URI) 断言 false 使其真被覆盖（经 ValidateEditSet 仍不可达，注释说明）；变异 engine_wiring.go:243 仅该子测试红 |
+| `server/handlers.go:1798-1800` | `invalidateExternalSources` 的 `if count == 0` **不可达**（唯一调用点已在 `:48` 提前返回）。**已收口（2026-10-24 实测）**：签名已改无参（handlers.go:1807），count==0 分支随之消失；protocol.manifest 已重生成，TestY54_ProtocolManifestFresh 转绿 |
+| `server/diagnostics.go:368-370` | 与 `:362-364` 逐字重复的守卫，单线程语义下恒不成立 ⇒ 错误文案不可达。**需 `-race -count=100` 复核**。**已收口（2026-10-24 第八轮）**：按 `-race -count=100` 实测数据删除第二段逐字重复守卫（原 :368-373，仅错误文案尾缀不同），保留第一段（现 diagnostics.go:362-367） |
+| `server/index.go:378` | `firstInventoryChange` 兜底 return **不可达**（records 已排序 + json.Marshal ⇒ 摘要相同 ⟺ 记录全等 ⟺ 循环必先 return）。**已收口（2026-10-24 第八轮）**：兜底改 `panic("unreachable: inventory digests differ but no file record differs")` 并附 doc comment，沿用 completenessName（handlers.go:1870-1887）的处理模式与理由框架（panic 现位于 index.go:389） |
+| `transport/httpserver/auth.go:86` | `lim != nil` **恒真**（唯一调用点第三实参恒为 `newPerSourceLimiter(...)`）。**已收口（2026-10-24 实测，commit f1c0206）**：包已自 internal/httpserver 迁至 internal/transport/httpserver（表内路径同步），守卫改为 `opts.PerSourcePerMinute > 0` 真条件 |
+| `transport/httpserver/auth.go:48` | `perSourceLimiter.window int64` 是**完全死字段**（窗口硬编码 `now()/60`）。**已收口（2026-10-24 实测，commit f1c0206）**：window 字段已删，struct 现仅 mu/limit/buckets |
+| `server/handlers.go:1872-1873` | `completenessName` 的 `default` 臂**不可达**（枚举恰 3 值且 3 个 case 全列出）。**已收口（2026-10-24 实测，S3）**：default 改 panic（Go switch 无穷尽性分析下与「删 default+尾终止」等价的诚实形式；panic 经 executeSafely 为每请求错误非进程崩溃），TestCompletenessNameMapping 锁定三值；变异 case 红、复原绿 |
+| `index/semantic/semantic.go:716` | `size < 0` 恒假（全部来自 `len()`）。**已收口（2026-10-24 第八轮）**：恒假 `size<0` 子条件已删，保留 total 封顶守卫，闭包前补不变式注释（每次接受的 add 后 total ≤ MaxSegmentBytes，semantic.go:714-717） |
+| `index/semantic/semantic.go:769-771` | `total > MaxSegmentBytes` 不可达（前置条件已逐次封顶）。**已收口（2026-10-24 第八轮）**：不可达终检已删；因增量守卫成为该上限唯一防线且此前该函数零测试覆盖，补 TestMetadataSegmentCapRejectsOversizedTotals（semantic_test.go:773：小样例通过 + 70 条 ~999KB Coverage 记录触发 ErrBounds） |
+| `index/persistent/recovery.go:192-196` | `ParseUint` 失败 continue **不可达**（`validSegmentID` 已保证可解析）。**已收口（2026-10-24 第八轮）**：不可达 continue 已删，改 `genID, _ := strconv.ParseUint(...)`（recovery.go:195）并补注释说明为何可忽略错误 |
+| `conformance/meta_test.go:85-92` | `isLeafHelper` 恒返回 false 的死函数。**已收口（2026-10-24 实测，M1）**：死函数连注释整体删除，调用点化简为 `!documented[pkg]`（等价性论证 + conformance 全包绿） |
 
 ### 5.3 死代码与「声明了却无人消费」的契约
 
@@ -323,13 +373,13 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 | `index/persistent/store.go:85-91,96-98` | `IndexStore` 与 `LeasedIndexStore` 接口**全仓无任何生产代码当类型使用或做类型断言**（全部直接用 `*FileStore`） |
 | `index/graph/**` | **整包零生产 import**；`Propagate`/`RegisterGenerated`/`InvalidateGenerator` 的调用点全在 `graph_test.go` 内 |
 | `index/interop` Canonical IR | `ExportSCIP`/`ImportSCIP`/`FromOccurrences` 及整套类型只被 `interop_test.go` 使用，生产走 `scip_model.go` 另一套 |
-| `jsonrpc/codec.go:14` | `HeaderContentType` 常量**全仓零引用** |
+| `jsonrpc/codec.go:14` | `HeaderContentType` 常量**全仓零引用**。**已收口（2026-10-24 实测，J4）**：常量已删，全仓零引用，`go build ./...` 通过 |
 | `server/source_changes.go:164-176` | `externalSourceSyncError` **只有测试调用点** |
 | `golang/features.go:31,76,104` | SignatureHelp/Formatting/InlayHint **只有 golang 实现**，无测试记录这是有意的 |
-| `server/handlers.go:1504-1507` | `CacheStats()` 聚合分支：全仓无任何测试 backend 实现该接口 |
-| `server/features_handlers.go:139-192` | **`handleInlayHints` 成功路径整体零覆盖** —— 全仓无测试 backend 实现 `InlayHintProvider` |
-| `golang/backend.go:1593-1595` | `Declaration`（`DeclarationProvider` 唯一真实现）零测试 |
-| `golang/package_freshness.go:151` | `WorkspaceSnapshotGeneration(){return 0}` 是常量桩但**零测试钉住「永远 0」**；server 侧 snapshot-isolation 依赖 generation 单调性 |
+| `server/handlers.go:1504-1507` | `CacheStats()` 聚合分支：全仓无任何测试 backend 实现该接口。**已收口（2026-10-24 第八轮）**：新增 cacheStatsBackend mock（嵌入 mockBackend 实现 `CacheStats() (int64,int64)`）与 TestK_StatusAggregatesCacheStatsAcrossBackends（status_metrics_test.go:61）——两 provider (11,3)/(5,7) 加一无接口 mockBackend，断言 omnilsp/status 聚合 CacheHits=16/Misses=10，锁定求和逻辑与可选接口容错（聚合分支现 handlers.go:1514-1515）；测试-only 未改生产代码 |
+| `server/features_handlers.go:139-192` | **`handleInlayHints` 成功路径整体零覆盖** —— 全仓无测试 backend 实现 `InlayHintProvider`。**已收口（2026-10-24 实测，commit 655925c）**：新增 inlay_hints_test.go 三个测试覆盖成功路径 |
+| `golang/backend.go:1593-1595` | `Declaration`（`DeclarationProvider` 唯一真实现）零测试。**已收口（2026-10-24 实测，G6）**：新增 TestDeclarationResolvesUseToDeclarationSite（断言落参数声明行非使用行，列落『名』上不入 rune 中部）；变异委托行红、复原绿 |
+| `golang/package_freshness.go:151` | `WorkspaceSnapshotGeneration(){return 0}` 是常量桩但**零测试钉住「永远 0」**；server 侧 snapshot-isolation 依赖 generation 单调性。**已收口（2026-10-24 实测，G7）**：新增 TestWorkspaceSnapshotGenerationIsPinnedZero（含 snapshot 不可变设计意图注释）；变异 return 1 红、复原绿 |
 
 ### 5.4 perf / soak / corpus 的假信号
 
@@ -338,15 +388,32 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 - `perf_test.go:369-371` 的 `TestS17_MetadataPresent` 断言的是 `buildCorpus()`
   自己硬编码生成的 198 行 ⇒ **自证式断言**；且对 `fs=unavailable`（`:299-306`
   带注释承认未实现）这类占位符不设约束 ⇒ §S17「记录确切环境」被降级为
-  「打印占位符」。
+  「打印占位符」。**已收口（2026-10-24 第八轮）**：自证循环已消除——删掉
+  「断言横幅包含键名」（同数组渲染恒真），改为逐键断言值非空、横幅如实渲染
+  该值、OS/filesystem 项与当场独立重探真值一致；fs=unavailable 占位符改
+  probeFilesystem() 真探测（临时目录写读一轮，perf_test.go:298,348-352）；
+  提取 values()（:382）令渲染与测试共源防漂移。
 - `perf/e2e_lsp_test.go:797-800` 的 `TestS18S19_RealProcessPerformanceAcceptance`
   被 `OMNILSP_ACCEPTANCE=1` 静默 skip，**无 `=required` 硬失败模式** —— 与
   `test/soak/stdio_soak_test.go:155` 的 `OMNILSP_SOAK_GATE=required` 和
   `test/corpus/s21_report_test.go:27` 的 `s21GateRequired()` 模式不一致。
+  **已收口（2026-10-24，run gate-20261024T1136Z 轮）**：`OMNILSP_ACCEPTANCE=required`
+  硬失败模式落地——required 且无 `OMNILSP_BIN` 即 `t.Fatalf("opted in
+  (required) but no frozen candidate")`（e2e_lsp_test.go:807）；并新增
+  in-package 常态守卫 `TestPERF2_S18GateFailsClosedWithoutCandidate`
+  （internal/conformance/perf2_guard_test.go）：剥离全部候选绑定变量后
+  shell 进 required 模式，断言失败消息恰为缺候选 t.Fatalf（非 skip、非
+  自建候选）。该守卫同时是 PERF-2 升 AUTO 后的唯一注册探针，形状由
+  engine_test.go 的 TestPERF2_S18RegistryShapePinsAutoGateGuardProbe 锁定。
 - `test/corpus/s21_stdio_test.go:45-54` 的 `OMNILSP_CANDIDATE_SHA256` 是
   **可选**的（`if claimed != ""`）⇒ 未设时「frozen candidate」前提不被验证。
 - `test/corpus/classify_test.go` 裸跑（无 `OMNILSP_S21_REPORT`）时所有语言全
-  skip ⇒ `buckets.Total()==0` ⇒ **测试通过、零 signal**。
+  skip ⇒ `buckets.Total()==0` ⇒ **测试通过、零 signal**。**已收口（2026-10-24
+  第八轮）**：补零信号守卫——终态另统计 Σ evidence.testedCases[].OperationCount.Total，为 0 则 Fatalf（classify_test.go:293-299，镜像 report 路径
+  operations.Total==0⇒not_verified）。工作项字面「断言 buckets.Total()>0」与
+  :286 要求其为 0 自相矛盾，按意图实现为「已分类操作数>0」。leftOpen 笔录：
+  工作项所提 `internal/corpus` 目录不存在（实测 ls），实际门禁 test/corpus 与
+  internal/conformance 均已按工作项指定命令跑绿，按目录名笔误如实登记。
 
 ### 5.5 并发 / 事务测试的假信号（`internal/index/persistent`）
 
@@ -374,6 +441,14 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 `index/interop/lsif.go:187`+`:221-223`+`:239`/`:247` 对 `vertices` 做 map 迭代
 产出 `idx.Documents`，顺序不确定，而测试全用集合比较 ⇒ 非确定性从不被暴露。
 
+**已收口（2026-10-24 第八轮）**：ImportLSIF 对 `vertices` 的两处 map 迭代
+（metaData 选取 + document 产出）改为先收集全部 vertex id、sort.Slice 升序后
+按 id 消费（lsif.go:245）——同一字节流导入结果可复现；对 id 顺序与流顺序一致
+的正规导出，产出序即源序。新增 TestL15_LSIFImportDocumentOrderDeterministic
+（interop_test.go:201）：流内故意乱序（document id 9 先于 id 2、5），断言产出
+序恰为 [b.go a.go c.go]（id 升序）且 32 轮重复导入顺序零漂移——确定性聚排序
+规则一并钉死。
+
 ---
 
 ## §6 长程路线
@@ -382,26 +457,49 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 
 ### 阶段 A：不需要任何人拍板（可立即开始）
 
-1. §5.1 的恒真测试：逐个补断言或改注释（11 处）。
+1. §5.1 的恒真测试：逐个补断言或改注释（11 处）。**全部处理（2026-10-24
+   实测）**：features.go（abc8c14）与 progress_test.go（40bf458）既往收口；
+   本轮 J1/J2/J3/G1/G2/G3/S1 收口；仅 G5（FuzzURI）部分收口——断言已补，
+   引擎层两怪癖（FromPath 不转义 ?/#、裸 % 往返有损）仅注释记录未修，超出
+   本轮范围。
 2. §5.3 的死代码：删 `HeaderContentType`、`perSourceLimiter.window`、
    `isLeafHelper`；给 `golang.WorkspaceSnapshotGeneration` 加一条钉住 `0` 的
-   测试；给 `handleInlayHints` 成功路径加 mock。
+   测试；给 `handleInlayHints` 成功路径加 mock。**已完成（2026-10-24 实测）**：
+   HeaderContentType（J4）、perSourceLimiter.window（f1c0206）、isLeafHelper
+   （M1）均已删；钉 0 测试（G7）与 inlay_hints_test.go（655925c）已补。
 3. §5.2 的不可达分支：逐个确认后删掉（`invalidateExternalSources` 的
    `count == 0`、`completenessName` 的 default、`isLeafHelper`），或改写成
-   真正可达的形式。
-4. §3.4 的 `enc` 形参：**enc 校验半边已完成**（`position.go:201-206`）；
-   `UTF16ColumnAt` 命名/转发半边（`position.go:122-124`）仍待办。
+   真正可达的形式。**清单三项全部收口（2026-10-24 实测）**：count==0 随签名
+   改无参消失（manifest 已重生成，TestY54 转绿）；completenessName default
+   改 panic+表测试（S3）；isLeafHelper 已删（M1）。表内其余各条第八轮全部
+   收口（2026-10-24）：diagnostics.go 重复守卫按 `-race -count=100` 实测数据
+   删除、index.go 兜底改 panic（含 doc comment）、semantic.go 两处（恒假
+   子条件删 + 不可达终检删并补直接单测）、recovery.go ParseUint 不可达分支
+   删。§5.2 表内已无开放行。
+4. §3.4 的 `enc` 形参：**已完成**（enc 校验半边 `position.go:201-206`；
+   `UTF16ColumnAt` 命名/转发半边于 2026-10-24 收口：函数删除，调用点直呼
+   `ColumnAt` 并注明列单位=索引构建编码）。
 5. §3.5 的数字型 `workDoneToken`：**已完成**（`progress.go:27-40` raw JSON
    透传数字形态 + `progress_test.go:64-73` 用例）。
 6. §5.5 的并发测试假信号：补 store root 孤儿 segment 检查、给
    `view.Segments[0]` 加长度保护、把幂等恢复改成断言相等而非单调。
+   **三项均落地（2026-10-24 实测，P1/P2/P3）**：P1（孤儿检查，置于
+   OpenSnapshot 之前躲开 cleanupOrphanSegments 掩盖）与 P2（长度守卫+取消后
+   旧代严格断言）为部分收口——实现侧单点变异在本机调度下不可构造（探针
+   300/300 取消先于 promote），红证据取自写入路径孤儿变异与测试侧期望失配，
+   已如实记录；P3（幂等恢复改断言全等，setup 补 err+长度守卫）已收口。
 
 ### 阶段 B：需要先测量的前置工作
 
 1. §3.1 的批量请求：先加一个「数组体进 `ReadMessage`」的测试把当前行为钉住
-   （必然失败或返回 ParseError），再决定语义。
+   （必然失败或返回 ParseError），再决定语义。**钉住半边已完成（2026-10-24
+   第八轮）**：`TestBatchFrameIsPerStreamFatal`（stdio_test.go:282）钉住传输
+   半边现状链，codec 半边已由 commit 9897d0a 用例钉住；剩语义拍板（§7.5），
+   拍板后须改写两处用例。
 2. §5.2 中标「需 `-race` 复核」的三条：跑 `-race -count=100 -cover` 拿数据，
-   再决定删还是留。
+   再决定删还是留。**第八轮已清（2026-10-24）**：diagnostics.go 重复守卫按
+   `-race -count=100` 实测数据删除；其余不可达分支经推理确认后收口（见 §5.2
+   表，已无开放行）。
 3. §4 中所有标 `[推断]` 的：先用 grep/`go list -deps`/临时变异逐条证伪。
    **不要在未证伪前改 registry** —— 那会动分数。
 
@@ -437,8 +535,12 @@ registry 的 Text↔探针对齐、X5-4 的降级、`soak` 的默认门禁、
    时间，但「form-only」的那些不需要。
 4. **`TestARCH002` 的 `coreDirs` 是否该含 `internal/index`？** 需要查
    `goal.md` §U1/INV-ARCH-002 对 "Semantic Core" 的定义，判断当前是有意分层
-   还是遗漏。
-5. **JSON-RPC 批量的语义**：拒绝并保持连接，还是实现批量。
+   还是遗漏。**第八轮（2026-10-24）已销可自主半边**：coreDirs 已含
+   `internal/index`（meta_test.go:89），前置 grep 证实无违规 import，
+   conformance 包两跑绿（详见 §4.2）；剩定义层面的确认。
+5. **JSON-RPC 批量的语义**：拒绝并保持连接，还是实现批量。**第八轮
+   （2026-10-24）现状已钉住（待拍板）**：`TestBatchFrameIsPerStreamFatal`
+   （stdio_test.go:282）+ codec 侧 9897d0a 用例；拍板后须改写两处用例。
 6. **`probeRequiredEnv` 已删，但 `perf_test.go:429-431` 的 2s 墙钟阈值要不要
    改？** 它测的是「取消是否被及时响应」，2s 是任意值。
 
