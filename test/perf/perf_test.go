@@ -293,11 +293,9 @@ func collectBenchmarkMetadata() BenchmarkMetadata {
 	if cpu == "" {
 		cpu = "unknown-cpu(" + runtime.GOARCH + ")"
 	}
-	// ponytail: 文件系统类型未探测（Windows 卷信息需 syscall）；标 unavailable，
-	// 需要时用 GetVolumeInformationW 补上。
 	m := BenchmarkMetadata{
 		Hardware:     fmt.Sprintf("%s; %d logical cores", cpu, runtime.NumCPU()),
-		OSFilesystem: fmt.Sprintf("%s/%s; fs=unavailable", runtime.GOOS, runtime.GOARCH),
+		OSFilesystem: fmt.Sprintf("%s/%s; %s", runtime.GOOS, runtime.GOARCH, probeFilesystem()),
 		CorpusRevision: fmt.Sprintf("sha256:%x (%d lines, 内嵌合成语料)",
 			sha256.Sum256([]byte(corpus)), corpusNewlines),
 		BackendVersions: "perf-fake-go v1 (确定性无工具链测试后端)",
@@ -347,13 +345,51 @@ func probeToolchains() string {
 	return strings.Join(found, ", ")
 }
 
-// RenderBanner 输出 §S17 全部十项元数据的对齐横幅。
-func (m BenchmarkMetadata) RenderBanner() string {
-	vals := [10]string{
+// probeFilesystem 报告一个真实观测到的文件系统事实：当前进程能否在系统
+// 临时目录完成「创建→写入→读回」一轮探测。成功时返回带卷名的可写结论；
+// 失败时返回携带失败原因的显式 unavailable 标记。旧版硬编码 fs=unavailable
+// 占位符，任何测试都无法区分「探测过但不可用」与「根本没有探测」。
+func probeFilesystem() string {
+	f, err := os.CreateTemp("", "omnilsp-fs-probe-*")
+	if err != nil {
+		return "fs=unavailable (create: " + err.Error() + ")"
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if _, err := f.WriteString("omnilsp-fs-probe"); err != nil {
+		_ = f.Close()
+		return "fs=unavailable (write: " + err.Error() + ")"
+	}
+	if err := f.Close(); err != nil {
+		return "fs=unavailable (close: " + err.Error() + ")"
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		return "fs=unavailable (read back: " + err.Error() + ")"
+	}
+	if string(got) != "omnilsp-fs-probe" {
+		return "fs=unavailable (read back mismatch)"
+	}
+	volume := filepath.VolumeName(path)
+	if volume == "" {
+		volume = runtime.GOOS + "-no-volume"
+	}
+	return "fs=temp-writable (" + volume + ")"
+}
+
+// values 按 s17Keys 的键序返回十个元数据值。RenderBanner 与元数据测试共用
+// 这一份来源，避免测试与渲染各自维护顺序后悄然漂移。
+func (m BenchmarkMetadata) values() [10]string {
+	return [10]string{
 		m.Hardware, m.OSFilesystem, m.ProductBuild, m.BackendVersions,
 		m.Toolchains, m.CorpusRevision, m.ColdWarmState, m.CacheState,
 		m.WorkerCount, m.MemoryLimit,
 	}
+}
+
+// RenderBanner 输出 §S17 全部十项元数据的对齐横幅。
+func (m BenchmarkMetadata) RenderBanner() string {
+	vals := m.values()
 	var b strings.Builder
 	b.WriteString("==== OmniLSP 基准元数据（goal.md §S17） ====\n")
 	for i, k := range s17Keys {
@@ -364,16 +400,31 @@ func (m BenchmarkMetadata) RenderBanner() string {
 
 // --- 测试 -----------------------------------------------------------------------
 
-// TestS17_MetadataPresent 断言横幅包含 §S17 全部十个键。
+// TestS17_MetadataPresent 断言 §S17 十项元数据逐项有真实内容：每个键的值
+// 非空（或带原因的显式 unavailable 标记），横幅如实渲染该值，且
+// OS/filesystem 项与当场独立重新探测的文件系统真值一致。旧版只断言横幅
+// 包含键名——而横幅正是用同一 s17Keys 渲染的，Contains 恒真；硬编码的
+// fs=unavailable 占位符也无任何约束。
 func TestS17_MetadataPresent(t *testing.T) {
 	if got := strings.Count(corpus, "\n"); got != corpusNewlines {
 		t.Fatalf("语料行数漂移：got %d, want %d", got, corpusNewlines)
 	}
-	banner := collectBenchmarkMetadata().RenderBanner()
-	for _, k := range s17Keys {
-		if !strings.Contains(banner, k) {
-			t.Errorf("横幅缺少 §S17 键 %q", k)
+	m := collectBenchmarkMetadata()
+	banner := m.RenderBanner()
+	for i, value := range m.values() {
+		key := s17Keys[i]
+		if strings.TrimSpace(value) == "" {
+			t.Errorf("§S17 元数据 %q 的值为空：必须有非空值或带原因的显式 unavailable 标记", key)
+			continue
 		}
+		if !strings.Contains(banner, key) || !strings.Contains(banner, value) {
+			t.Errorf("横幅未如实渲染 §S17 键 %q（值 %q）", key, value)
+		}
+	}
+	// fs 真值判定：独立再探测一次，元数据必须与之一致；探测可写时，
+	// 硬编码占位符（旧版 fs=unavailable）必须被抓出。
+	if fs := probeFilesystem(); !strings.Contains(m.OSFilesystem, fs) {
+		t.Errorf("OS/filesystem 元数据 %q 与独立探测到的文件系统真值 %q 不一致", m.OSFilesystem, fs)
 	}
 	t.Logf("\n%s", banner)
 }

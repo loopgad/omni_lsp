@@ -285,6 +285,24 @@ func TestS21_ZeroErrorClassification(t *testing.T) {
 	if buckets.Total() != 0 {
 		t.Fatalf("§S21 violated: %d error-bucket hits across the qualified corpus", buckets.Total())
 	}
+	// Bare-run guard: without OMNILSP_S21_REPORT the deferred decision check
+	// above is short-circuited, so a run whose candidate exists but whose
+	// every case skipped (for example "candidate backend unavailable" on all
+	// languages) would pass on buckets.Total()==0 alone — zero signal
+	// counting as a pass. Mirror the report path's decision() rule
+	// (operations.Total == 0 => not_verified): a bare run must actually
+	// classify at least one response. A run with no candidate at all already
+	// exits through the explicit t.Skip near the top, so zero signal never
+	// counts as a pass.
+	if !evidenceEnabled {
+		classifiedResponses := 0
+		for _, testCase := range evidence.testedCases {
+			classifiedResponses += testCase.OperationCount.Total
+		}
+		if classifiedResponses == 0 {
+			t.Fatalf("bare S21 run (no %s) classified 0 responses: every case skipped; zero signal is not a pass", s21ReportPathEnv)
+		}
+	}
 }
 
 // runStdioQueriesAndClassify drives hover → definition → references → rename
