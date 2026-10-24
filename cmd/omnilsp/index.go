@@ -119,32 +119,32 @@ func cmdIndex(args []string) error {
 	ctx := context.Background()
 	if operation == "import" {
 		var data []byte
-		switch *format {
-		case "lsif":
-			lsifData, err := readBoundedLSIF(artifactPath)
-			if err != nil {
-				return err
-			}
-			// server 原生 LSIF 导入 API 尚未落地：先在 interop 层把 LSIF 流
-			// 转码为等价 SCIP 流（UTF-16 语义不变），再走已验证的 SCIP 导入。
-			data, err = interop.ConvertLSIFToSCIP(lsifData)
-			if err != nil {
-				return err
-			}
-		default:
-			var err error
+		var err error
+		if *format == "lsif" {
+			data, err = readBoundedLSIF(artifactPath)
+		} else {
 			data, err = readBoundedSCIP(artifactPath)
-			if err != nil {
-				return err
+		}
+		if err != nil {
+			return err
+		}
+		var generation uint64
+		var importedScope string
+		var coverage int
+		if *format == "lsif" {
+			// server 原生 LSIF 导入：与 SCIP 共用同一套空库/信任/新鲜度守卫，
+			// 不再经 SCIP 转码迂回。
+			result, importErr := srv.ImportSemanticLSIF(ctx, *language, *scopeID, data)
+			if importErr != nil {
+				return importErr
 			}
+			generation, importedScope, coverage = result.Generation, result.ScopeID, len(result.Coverage)
+			fmt.Printf("LSIF imported: generation=%d scope=%s coverage=%d (LSIF facts are not declared complete)\n", generation, importedScope, coverage)
+			return nil
 		}
 		result, err := srv.ImportSemanticSCIP(ctx, *language, *scopeID, data)
 		if err != nil {
 			return err
-		}
-		if *format == "lsif" {
-			fmt.Printf("LSIF imported via SCIP transcode: generation=%d scope=%s coverage=%d (LSIF facts are not declared complete)\n", result.Generation, result.ScopeID, len(result.Coverage))
-			return nil
 		}
 		fmt.Printf("SCIP imported: generation=%d scope=%s coverage=%d (SCIP facts are not declared complete)\n", result.Generation, result.ScopeID, len(result.Coverage))
 		return nil
@@ -152,21 +152,21 @@ func cmdIndex(args []string) error {
 
 	var data []byte
 	var losses []interop.SemanticSCIPExportLoss
-	if *allowLossy {
+	if *format == "lsif" {
+		// server 原生 LSIF 导出：直连语义生成 Reader，与 SCIP 共享新鲜度守卫；
+		// 有损计数由 interop 层写进 metaData.toolInfo.args。
+		if *allowLossy {
+			data, losses, err = srv.ExportSemanticLSIFWithLosses(ctx, *scopeID)
+		} else {
+			data, err = srv.ExportSemanticLSIF(ctx, *scopeID)
+		}
+	} else if *allowLossy {
 		data, losses, err = srv.ExportSemanticSCIPWithLosses(ctx, *scopeID)
 	} else {
 		data, err = srv.ExportSemanticSCIP(ctx, *scopeID)
 	}
 	if err != nil {
 		return err
-	}
-	if *format == "lsif" {
-		// server 原生 LSIF 导出 API 尚未落地：复用已验证的 SCIP 导出路径，
-		// 在 interop 层转码为 LSIF；有损计数一并转录进 metaData.toolInfo.args。
-		data, err = interop.ConvertSCIPToLSIF(data)
-		if err != nil {
-			return err
-		}
 	}
 	if err := writeNewFile(artifactPath, data); err != nil {
 		return fmt.Errorf("write %s export: %w", *format, err)
@@ -181,7 +181,7 @@ func cmdIndex(args []string) error {
 		}{Operation: "export", Format: *format, Scope: *scopeID, Bytes: len(data), Losses: losses})
 	}
 	if *format == "lsif" {
-		fmt.Printf("LSIF exported via SCIP transcode: scope=%s bytes=%d\n", *scopeID, len(data))
+		fmt.Printf("LSIF exported: scope=%s bytes=%d\n", *scopeID, len(data))
 		return nil
 	}
 	fmt.Printf("SCIP exported: scope=%s bytes=%d\n", *scopeID, len(data))
