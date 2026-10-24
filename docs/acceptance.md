@@ -369,3 +369,169 @@ landed:
   --json` from a fresh `-trimpath` build reports coreScore **97.7096**
   (floor 90, passed; `verify-final.json`) — +4.04 over the 93.669 baseline:
   SBOM +1.00, Y2-1 +0.72, PERF-S19 +0.75, PERF-3/S21 +0.75, Y1-9 +0.82.
+
+## Gate evidence record — run `gate-20261024T0558Z`
+
+PERF-2 full re-measurement against a freshly frozen candidate (canonical
+evidence directory remains ACL-locked, so this round stages under
+`out/freeze-staging/gate-20261024T0558Z/`; offset debt on file in
+`freeze-record.txt`):
+
+- Candidate: `omnilsp.exe` built with the locked toolchain
+  `C:/Users/32806/sdk/go1.26.1/bin/go.exe` (`go version go1.26.1
+  windows/amd64`, matches the go.mod lock), `go build -trimpath` exit 0,
+  SHA-256 `9bb6d9ba789748530697b68757e09852209caa08e02f994aebcd57a71c88b43c`,
+  git HEAD `355af1520bdd1c0e987c5af16071b48ac972b1be` plus the recorded
+  uncommitted worktree state (`freeze-record.txt`, UTC 2026-10-24T05:59:19Z).
+  The earlier same-day probe attempt `gate-20261024T0516Z` never reached
+  measurement: `not_verified` because the ambient toolchain was go1.27.1
+  (lock expects go1.26.1) — tool-blocked, not a threshold verdict.
+- `TestS18S19_RealProcessPerformanceAcceptance` (strict policy) →
+  `performance.json`, decision **failed**: S19 passed all rows
+  (references@200/800/3200, active-cancellation, progress, no-starvation,
+  process-tree-resources). S18 collected full 1000-sample P50/P95/P99
+  distributions for all 7 languages × 4 rows; 24/28 strict rows passed.
+  The Go hot-path fix landed: all four Go rows now pass strict thresholds
+  (hover P50 3.8ms, definition P50 12.5ms, completion P50 3.8ms,
+  syntax-update P50 0.5ms — previously 391-443ms in gate-20261004T2347Z).
+- Failed rows, all on fully measured 1000-sample latency (no zero-sample
+  skips in this report): `c/completion_first_usable` P50 74.1ms/P95 137.4ms
+  vs 40/120; `c/syntax_update_after_edit` P50 74.0ms/P95 129.3ms/P99 149.4ms
+  vs 15/50/100; `cpp/completion_first_usable` P50 68.1ms vs 40 (P95 75.6ms/
+  P99 82.5ms within limits); `cpp/syntax_update_after_edit` P50 63.3ms/
+  P95 71.3ms/P99 74.9ms vs 15/50/100. Both syntax rows also exceed the
+  `s18-evidence-qualified-v2` absolute ceiling (60/100/150) — C on P50/P95,
+  C++ on P50 — and `release_assessment` granted no exceptions
+  (`exception_check_ids` empty).
+- Blocked items recorded separately from threshold misses: the cpp
+  completion display-only classification stayed tool-blocked ("completion
+  item count differs before presentation classification"), and the companion
+  diagnostic probe report (`performance-probe.json`, same freeze directory)
+  is `not_verified` overall: 27 of its 28 S18 rows are zero-sample
+  ("excluded by diagnostic S18 filter"), while the filter-selected
+  `go/hot_hover` row did measure 1000 samples and passed. The
+  classification block and the probe's overall `not_verified` are blocked
+  evidence, not sub-threshold results.
+- 落账: `internal/conformance/registry.go` PERF-2 Reason rewritten to this
+  run's facts; `OMNISP_UPDATE_CONFORMANCE=1 go test -count=1
+  ./test/conformance/` → ok, re-run without the env var → ok;
+  `baseline.json` byte-identical (coreScore 97.70959595959597, PERF category
+  0.9166666666666666). PERF-2 维持 PARTIAL，Reason 更新为新事实。
+
+## Gate evidence record — run `gate-20261024T1136Z`
+
+PERF-2 upgrade run against a freshly frozen candidate after the c/cpp bridge
+hot-path fix (request-scoped memos), closing the four-row gap that kept
+`gate-20261024T0558Z` at 24/28 (evidence directory remains ACL-locked, so
+this round also stages under `out/freeze-staging/gate-20261024T1136Z/`;
+offset debt on file in `freeze-record.txt`):
+
+- Candidate: `omnilsp.exe` built with the locked toolchain
+  `C:/Users/32806/sdk/go1.26.1/bin/go.exe` (`go version go1.26.1
+  windows/amd64`, matches the go.mod lock), `go build -trimpath` exit 0,
+  SHA-256 `e96b87c4bf85b09ba668f946bfa777bbfb55bbeb337ef836a8895ab718b86e60`,
+  git HEAD `355af1520bdd1c0e987c5af16071b48ac972b1be` plus the recorded
+  uncommitted worktree state (`freeze-record.txt`, UTC 2026-10-24T11:37:43Z).
+- Fix under test: `internal/languages/ccls/memo.go` — bounded request-scoped
+  memos for the two clangd requests that paid a full frontend invocation per
+  request (completion, documentSymbol after a content change), keyed on
+  document content hash + supervisor epoch + bridge invalidation counter, so
+  answers stay semantically identical to upstream (`memo_test.go` pins the
+  invalidation rules).
+- `TestS18S19_RealProcessPerformanceAcceptance` (strict policy
+  `s18-strict-v1`) → `performance.json`, decision **passed**: S18 collected
+  full 1000-sample P50/P95/P99 distributions for all 7 languages × 4 rows and
+  **all 28 strict rows passed**; S19 passed all rows; `release_assessment`
+  completed with no exceptions (`exception_check_ids` empty). Evolution over
+  `gate-20261024T0558Z` (24/28): the four formerly failing c/cpp rows now
+  measure — `c/completion_first_usable` P50 2.13ms (vs 40 threshold, was
+  74.1ms), `c/syntax_update_after_edit` P50 0.51ms (vs 15, was 74.0ms),
+  `cpp/completion_first_usable` P50 1.62ms (vs 40, was 68.1ms),
+  `cpp/syntax_update_after_edit` P50 0.51ms (vs 15, was 63.3ms) — and the
+  round-8 tool-blocked cpp completion display-only classification no longer
+  blocks this run (row status `passed` in `performance.json`).
+- Gate guard in place: `TestPERF2_S18GateFailsClosedWithoutCandidate`
+  (`internal/conformance/perf2_guard_test.go`) shells the acceptance test
+  with `OMNILSP_ACCEPTANCE=required` and every candidate-binding variable
+  stripped; the required mode fails closed with the missing-candidate
+  `t.Fatalf` (`test/perf/e2e_lsp_test.go:807`) instead of skipping or
+  self-building, so PERF-2 credit can never again come from a silently
+  skipped S18 run (the DEF-S21CORPUS lesson).
+- 落账: `internal/conformance/registry.go` PERF-2 → `Status: StatusAuto`,
+  Reason deleted, Text rewritten to this run's facts, Probe added pointing at
+  the in-package gate guard; shape pinned by
+  `TestPERF2_S18RegistryShapePinsAutoGateGuardProbe` (red against the PARTIAL
+  registry, green after the flip); `OMNISP_UPDATE_CONFORMANCE=1 go test
+  -count=1 ./test/conformance/` → ok, re-run without the env var → ok;
+  `baseline.json` coreScore 97.70959595959597 → **98.45959595959597**
+  (+0.75), PERF category 0.9166666666666666 → **1**. PERF-2 升 AUTO。
+
+## Evidence record — iteration10 closeout（2026-10-24/25）
+
+### X8-2 客户端矩阵本地取证（42 格）
+
+完整记录 `out/omnilsp-iteration10-取证记录.md`（取证员实测，环境 Windows
+10.0.26300 x64 / go1.27.1）。报告经 `OMNILSP_ACCEPTANCE_REPORT` 重定向到仓库
+外临时目录，未触碰 ACL 锁定区 `test/acceptance/evidence/**`。记账员抽核了
+下述关键行引用（client_test.go / stdio_soak_test.go 均为本人读码确认）。
+
+- 工具锁静态核验（先于运行，逐文件 SHA-256 复算）：缺失 emacs-30.2 /
+  nvim-0.12.5 / helix-25.07.1 / npm / rust-analyzer-semantic-helper /
+  sublime 全套 8 项；SHA 不匹配 go（本机 1.27.1 vs 锁 1.26.1）、vscode
+  （自动更新致 Code.exe 内容漂移）、rustc/cargo/rust-analyzer 全套；匹配
+  gopls、node、python、clangd 三件套、typescript、typescript-language-server、
+  pyright 三件套。语义运行时绑定硬门（node/typescript/python/pyright，
+  client_test.go:556-576）本轮 passed。
+- 42 格矩阵运行：`go test -tags clients -run '^TestRealClientMatrix$'
+  -count=1 -timeout=30m ./test/acceptance/clients/`（env：`OMNILSP_BIN`=本地
+  构建候选、`OMNILSP_RUN_CLIENT_ACCEPTANCE=1`、`OMNILSP_RUN_ID=x82-local-evidence`）
+  → EXIT=1，decision=`not_verified`，`client/matrix-contract` 校验通过（42 格
+  三态合法）；无任何编辑器进程被拉起（三个原生客户端均因 tool 校验未过走
+  clientReady=false 跳过分支，client_test.go:345-353）。
+- 42 格逐格结果（pass=0 / fail=0 / skip(not_verified)=42）：VS Code 7 格
+  skip（Code.exe SHA 与锁不符）；Neovim 7 格 skip（锁定二进制缺失）；
+  Emacs/Eglot 7 格 skip（锁定 emacs-30.2 缺失，正式通道
+  `TestFormalEmacsClientMatrix` 单独确认 not_verified）；Helix / Zed /
+  Sublime LSP 21 格 skip（runner 无原生 driver，契约强制 not_verified）。
+- 其余 driver 测试全包 `-count=1`（skip 两矩阵入口）：48 个测试 41 PASS /
+  2 FAIL / 5 SKIP；两 FAIL 为 Sublime 锁定资产缺失 fail-closed（按设计），
+  非回归；helix 相关 PASS 项为 ConPTY 探针等基础设施机构件，不等于 helix
+  格通过。
+- 判定意义：X8-2 CLIENTS 维持 PARTIAL 50% 不动，本轮不构成任何格升级依据。
+  本机工具锁破损使 VS Code/Neovim/Emacs 三通道均不可现场复跑——上文
+  「Fixed host tools」段所述安装状态与当前主机不符（helix/emacs 已不在），
+  per-editor 现状以 docs/editors/*.md 的 missing→not_verified 政策记录为准。
+
+### X9-1 soak（1h 连续档，红）
+
+- 命令：`go test -tags soak -count=1 -timeout 100m ./test/soak/`；必填 env：
+  `OMNILSP_SOAK_GATE=required`（stdio_soak_test.go:160，未设则 skip）、
+  `SOAK_DURATION=1h`（parseStdioSoakDuration 仅接受精确 30s/10m/1h，
+  stdio_soak_test.go:2049-2060；显式设置硬门 :201-206）、`OMNILSP_RUN_ID`
+  （:195）、`OMNILSP_BIN=<冻结候选>`。`SOAK_DURATION=1h` 触发
+  resource-trend 必检（stdio_soak_test.go:1009 `trendRequired := duration ==
+  time.Hour`，需 10 个一分钟窗口）。注意 in-process soak（soak_test.go:29-38
+  `soakDuration()`）同读 `SOAK_DURATION`、缺省 30s，与 stdio 严格 gate 是
+  两套旋钮。
+- 结果：红——1h 连续档证据在本机仍缺席，X9-1 维持 PARTIAL 现状（registry
+  Reason「current evidence is pending」与本结果一致）。记账员未复跑本次
+  1h 档（时长所限），结果自本轮 soak 实测转录。
+
+### rust-analyzer semantic helper 重建（tools.lock.json 未手改）
+
+- 源一致性：本地 write-tree tree-id `09d330dd…` 与 googlesource 报告的
+  `src/tools/rust-analyzer@2d8144b7` tree id 一致 ⇒ 源内容与上游一致；但
+  googlesource +archive 容器含下载时刻 mtime，字节 sha 不可复现
+  （sourceShaOk=false）。
+- 补丁与锁：补丁 sha 与锁一致且干净应用；但补丁引用上游不存在的
+  `ReferenceData.is_import` ⇒ 仅补丁的树无法编译，锁 `modifiedTreeSha256`
+  与任何自然 staging 协议均不符，证实原构建树含未登记的 static_index.rs
+  修改。
+- 重建：按 USE 祖先检查语义重建该最小修改后，cargo 1.97.0（rustc/cargo
+  版本与锁一致）`build --release` 成功，`--version` 输出与锁内 observed
+  版本串逐字一致。
+- 产物：exe sha256 `3641e232…` ≠ 锁内 `f402ac78…`；已按协议生成未套用的
+  锁更新补丁 `out/patches/i10-rust-helper-lock.patch`（`git apply --check`
+  通过）。`tools.lock.json` 依纪律未手改，锁一致性待补丁批准后落账。
+
+
