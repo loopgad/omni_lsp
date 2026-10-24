@@ -262,6 +262,88 @@ func TestS13_BufferFullDropsAndCloses(t *testing.T) {
 	}
 }
 
+// TestBatchFrameIsPerStreamFatal pins the CURRENT end-to-end behaviour of a
+// JSON-RPC batch frame on the stdio transport — the chain §3.1 of
+// docs/audit-longterm-spec.md calls out:
+//
+//	array body frame → Codec.ReadMessage decodes into a single *Message
+//	  (codec.go ReadMessage, json.Unmarshal on a struct) → *CodecError{ParseError}
+//	  → StdioTransport.readLoop treats ANY ReadMessage error as fatal
+//	  → errCh + close(done) → the whole connection terminates.
+//
+// JSON-RPC 2.0 §5.1 wants an unparseable message answered with a per-message
+// ParseError while the stream lives on; here per-message recovery has
+// degraded into per-stream fatal, so one legal batch frame kills the session
+// and anything framed after it is never read.
+//
+// 语义未拍板（§7.5，docs/audit-longterm-spec.md §7 第 5 条「JSON-RPC 批量的
+// 语义」）：拒绝并保持连接 vs 实现批量；本测试钉的是现状，拍板后必须随选定
+// 语义改写。
+func TestBatchFrameIsPerStreamFatal(t *testing.T) {
+	frame := func(body string) string {
+		return fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(body), body)
+	}
+	// Three frames on one in-memory stream: a good message, a legal JSON-RPC
+	// batch (array body — legal per JSON-RPC 2.0, but unrepresentable for a
+	// decoder that targets a single *Message), then another good message.
+	var stream strings.Builder
+	stream.WriteString(frame(`{"jsonrpc":"2.0","id":1,"method":"before/batch"}`))
+	stream.WriteString(frame(`[{"jsonrpc":"2.0","id":2,"method":"batch/a"},{"jsonrpc":"2.0","id":3,"method":"batch/b"}]`))
+	stream.WriteString(frame(`{"jsonrpc":"2.0","id":7,"method":"after/batch"}`))
+
+	tr := NewStdioTransport(strings.NewReader(stream.String()), &bytes.Buffer{})
+	defer tr.Close()
+
+	// Drain until the terminal error. The buffered good frame and the error
+	// may arrive in either order (Read selects among ready cases), so the
+	// loop just keeps reading; two deliveries can never happen: the batch
+	// itself (it never becomes a Message) and the frame after it (readLoop
+	// is dead before reaching it).
+	var gotErr error
+	for gotErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		msg, err := tr.Read(ctx)
+		cancel()
+		if err != nil {
+			gotErr = err
+			break
+		}
+		if msg == nil {
+			t.Fatal("Read delivered a nil message: the batch frame must surface as a terminal error, never as a nil delivery")
+		}
+		if msg.Method == "after/batch" {
+			t.Fatal("message framed after the batch was delivered: the current chain is per-stream fatal and must not read past the batch")
+		}
+	}
+
+	// The terminal error is the codec's typed ParseError, surfaced through
+	// errCh — not a bare io.EOF: readLoop sends the ReadMessage error before
+	// closing done, and Read's done-branch drains errCh.
+	var codecErr *jsonrpc.CodecError
+	if !errors.As(gotErr, &codecErr) {
+		t.Fatalf("terminal error = %v (%T), want *jsonrpc.CodecError", gotErr, gotErr)
+	}
+	if codecErr.Code != jsonrpc.ParseError {
+		t.Errorf("code = %d, want ParseError (%d)", codecErr.Code, jsonrpc.ParseError)
+	}
+
+	// readLoop exited: the connection is down, exactly the per-stream
+	// fatal degradation §3.1 describes.
+	select {
+	case <-tr.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() did not close after the batch frame: transport survived a per-message fault")
+	}
+
+	// And it stays down: a later Read errors (EOF once errCh is drained)
+	// instead of reviving to deliver the stranded after/batch frame.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if msg, err := tr.Read(ctx); err == nil {
+		t.Fatalf("Read after termination delivered %+v; the stream must stay dead", msg)
+	}
+}
+
 // TestTransportInterface verifies both transports satisfy the Transport interface.
 var _ Transport = (*StdioTransport)(nil)
 var _ Transport = (*TCPTransport)(nil)

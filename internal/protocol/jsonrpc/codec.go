@@ -11,7 +11,6 @@ import (
 
 const (
 	HeaderContentLength = "Content-Length"
-	HeaderContentType   = "Content-Type"
 
 	// DefaultMaxMessageSize is the default inbound message cap per goal.md §C1
 	// (64 MiB). It is configurable per-Codec via the MaxMessageSize field.

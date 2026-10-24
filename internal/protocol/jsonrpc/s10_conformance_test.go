@@ -4,6 +4,8 @@ package jsonrpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -37,15 +39,39 @@ func TestResponseHasNoMethod(t *testing.T) {
 }
 
 func TestMalformedJSONDoesNotPanic(t *testing.T) {
-	d := NewDispatcher()
-	msg := NewRequest(RequestID{Str: "x", IsStr: true}, "unknown", json.RawMessage("not json"))
-	resp := d.Dispatch(nil, msg)
-	if resp == nil {
-		t.Fatal("expected error response")
-	}
-	if resp.Error == nil {
-		t.Fatal("expected error")
-	}
+	// Wire-level path: a frame whose body is not JSON must come back as a
+	// typed ParseError CodecError — never a panic, never a silent success.
+	t.Run("codec body not json", func(t *testing.T) {
+		msg, err := NewCodec().ReadMessage(strings.NewReader(frame("not json")))
+		if err == nil {
+			t.Fatalf("malformed body must be rejected, got message %+v", msg)
+		}
+		if msg != nil {
+			t.Fatalf("malformed body must not yield a message: %+v", msg)
+		}
+		var codecErr *CodecError
+		if !errors.As(err, &codecErr) {
+			t.Fatalf("error = %v (%T), want *CodecError", err, err)
+		}
+		if codecErr.Code != ParseError {
+			t.Errorf("code = %d, want ParseError (%d)", codecErr.Code, ParseError)
+		}
+	})
+
+	// Original case, kept as its own subtest: a request for an unknown
+	// method whose params happen to be malformed still yields an error
+	// response instead of a panic.
+	t.Run("unknown method malformed params", func(t *testing.T) {
+		d := NewDispatcher()
+		msg := NewRequest(RequestID{Str: "x", IsStr: true}, "unknown", json.RawMessage("not json"))
+		resp := d.Dispatch(nil, msg)
+		if resp == nil {
+			t.Fatal("expected error response")
+		}
+		if resp.Error == nil {
+			t.Fatal("expected error")
+		}
+	})
 }
 
 func TestUnknownMethodReturnsError(t *testing.T) {
@@ -79,19 +105,71 @@ func TestResponsePassthrough(t *testing.T) {
 }
 
 func TestStructuredErrorResponse(t *testing.T) {
-	d := NewDispatcher()
-	d.Register("test/panic", func(ctx context.Context, msg *Message) (json.RawMessage, error) {
-		return nil, nil
+	// S10 contract over the real dispatch path: a handler that fails must
+	// get a typed error response carrying code and message — not just a
+	// constructed one.
+	t.Run("dispatch typed error response", func(t *testing.T) {
+		d := NewDispatcher()
+		d.Register("test/fail", func(ctx context.Context, msg *Message) (json.RawMessage, error) {
+			return nil, &ResponseError{
+				Code:    InvalidParams,
+				Message: "bad input",
+				Data:    json.RawMessage(`{"hint":"check params"}`),
+			}
+		})
+		req := NewRequest(RequestID{Str: "e", IsStr: true}, "test/fail", json.RawMessage("{}"))
+		resp := d.Dispatch(context.Background(), req)
+		if resp == nil {
+			t.Fatal("dispatch must answer a failing handler with a response")
+		}
+		if resp.Error == nil {
+			t.Fatal("expected error in response")
+		}
+		if resp.Error.Code != InvalidParams {
+			t.Errorf("code = %d, want InvalidParams (%d)", resp.Error.Code, InvalidParams)
+		}
+		if resp.Error.Message != "bad input" {
+			t.Errorf("message = %q, want %q", resp.Error.Message, "bad input")
+		}
+		if string(resp.Error.Data) != `{"hint":"check params"}` {
+			t.Errorf("data = %s, want the handler's data preserved", resp.Error.Data)
+		}
+		if resp.ID == nil || !resp.ID.Equals(RequestID{Str: "e", IsStr: true}) {
+			t.Error("request ID must be preserved on the error response")
+		}
 	})
-	// Verify error response construction
-	id := RequestID{Str: "e", IsStr: true}
-	err := NewErrorResponse(id, InternalError, "boom", nil)
-	if err == nil || err.Error == nil {
-		t.Fatal("expected error response")
-	}
-	if err.Error.Code != InternalError {
-		t.Errorf("code = %d, want InternalError", err.Error.Code)
-	}
+
+	// A plain (non-*ResponseError) error maps to InternalError with the
+	// error text as the message.
+	t.Run("dispatch plain error maps to InternalError", func(t *testing.T) {
+		d := NewDispatcher()
+		d.Register("test/plain", func(ctx context.Context, msg *Message) (json.RawMessage, error) {
+			return nil, errors.New("boom")
+		})
+		req := NewRequest(RequestID{Num: 3}, "test/plain", nil)
+		resp := d.Dispatch(context.Background(), req)
+		if resp == nil || resp.Error == nil {
+			t.Fatal("expected error response")
+		}
+		if resp.Error.Code != InternalError {
+			t.Errorf("code = %d, want InternalError (%d)", resp.Error.Code, InternalError)
+		}
+		if resp.Error.Message != "boom" {
+			t.Errorf("message = %q, want %q", resp.Error.Message, "boom")
+		}
+	})
+
+	// Constructor-level check kept from the original test.
+	t.Run("constructor", func(t *testing.T) {
+		id := RequestID{Str: "e", IsStr: true}
+		err := NewErrorResponse(id, InternalError, "boom", nil)
+		if err == nil || err.Error == nil {
+			t.Fatal("expected error response")
+		}
+		if err.Error.Code != InternalError {
+			t.Errorf("code = %d, want InternalError", err.Error.Code)
+		}
+	})
 }
 
 func TestRequestIDNumberAndString(t *testing.T) {

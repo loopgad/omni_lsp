@@ -29,8 +29,11 @@ func TestCodecRejectsMalformedBodies(t *testing.T) {
 		// body fails. Asserting the typed error documents the shape; it does
 		// not make the behaviour right. transport treats any ReadMessage error
 		// as fatal, so one batch frame currently drops the connection instead of
-		// getting a per-message ParseError as JSON-RPC 2.0 §5.1 requires. See
-		// docs/audit-longterm-spec.md.
+		// getting a per-message ParseError as JSON-RPC 2.0 §5.1 requires.
+		// 语义未拍板（§7.5，见 docs/audit-longterm-spec.md §3.1 现状与 §7 第 5 条
+		// 拍板项）：拒绝并保持连接 vs 实现批量；本用例钉的是 codec 半边现状，
+		// 传输半边由 transport.TestBatchFrameIsPerStreamFatal 钉住，拍板后两者
+		// 必须随选定语义改写。
 		{"json-rpc batch array", frame(`[{"jsonrpc":"2.0","id":1,"method":"x"}]`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

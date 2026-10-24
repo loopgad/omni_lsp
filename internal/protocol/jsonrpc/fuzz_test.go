@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -87,11 +88,23 @@ func FuzzPosition(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, text string, enc string) {
-		// Test JSON-RPC decode of position params.
+		// Test JSON-RPC decode of position params. Every payload is driven
+		// through the real wire path: frame it as a Content-Length body and
+		// read it back through the codec. The oracle is a direct
+		// json.Unmarshal into a Message — the framed path must agree with
+		// it: a body the oracle rejects must come back as a typed
+		// ParseError CodecError, a body it accepts must decode into a
+		// Message whose kind predicates match its decoded shape. Never a
+		// panic on either side.
+		//
+		// The oracle cannot be json.Valid: the fuzzer controls text/enc and
+		// can inject quotes, so a body may be legal JSON yet carry a
+		// mistyped known field (e.g. "jsonrpc":123) — legal JSON, illegal
+		// Message, still a ParseError.
 		payloads := []string{
-			fmt.Sprintf(`{"line":0,"character":0}`),
+			`{"line":0,"character":0}`,
 			fmt.Sprintf(`{"line":%d,"character":%d}`, 1<<20, 1<<20),
-			fmt.Sprintf(`{"line":-1,"character":0}`),
+			`{"line":-1,"character":0}`,
 			`{"line":"oops","character":1}`,
 			`{"line":0}`,
 			`{"character":0}`,
@@ -101,14 +114,49 @@ func FuzzPosition(f *testing.F) {
 			`\x00\x01\x02`,
 			"\x00\x00\x00\x00\x00",
 		}
+		c := NewCodec()
 		for _, p := range payloads {
-			var raw json.RawMessage
-			if err := json.Unmarshal([]byte(p), &raw); err != nil {
-				// expected for non-JSON
+			var oracle Message
+			malformed := json.Unmarshal([]byte(p), &oracle) != nil
+
+			msg, err := c.ReadMessage(strings.NewReader(frame(p)))
+
+			if malformed {
+				if err == nil {
+					t.Fatalf("payload %q: malformed body must be rejected, got message %+v", p, msg)
+				}
+				if msg != nil {
+					t.Fatalf("payload %q: malformed body must not yield a message: %+v", p, msg)
+				}
+				var codecErr *CodecError
+				if !errors.As(err, &codecErr) {
+					t.Fatalf("payload %q: error = %v (%T), want *CodecError", p, err, err)
+				}
+				if codecErr.Code != ParseError {
+					t.Fatalf("payload %q: code = %d, want ParseError (%d)", p, codecErr.Code, ParseError)
+				}
 				continue
 			}
-			// Validate: if it unmarshals, the codec is safe.
-			_ = raw
+
+			if err != nil {
+				t.Fatalf("payload %q: well-formed body must decode, got error: %v", p, err)
+			}
+			if msg == nil {
+				t.Fatalf("payload %q: well-formed body decoded to nil message", p)
+			}
+			hasM := msg.methodPresent || msg.Method != ""
+			if got, want := msg.IsRequest(), msg.ID != nil && hasM; got != want {
+				t.Errorf("payload %q: IsRequest = %v, want %v", p, got, want)
+			}
+			if got, want := msg.IsNotification(), msg.ID == nil && hasM; got != want {
+				t.Errorf("payload %q: IsNotification = %v, want %v", p, got, want)
+			}
+			if got, want := msg.IsResponse(), msg.ID != nil && !hasM; got != want {
+				t.Errorf("payload %q: IsResponse = %v, want %v", p, got, want)
+			}
+			if got, want := msg.IsError(), msg.ID != nil && !hasM && msg.Error != nil; got != want {
+				t.Errorf("payload %q: IsError = %v, want %v", p, got, want)
+			}
 		}
 	})
 }
