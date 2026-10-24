@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
@@ -37,6 +38,10 @@ import (
 type Backend struct {
 	conn    *nested.Conn
 	workDir string
+
+	// memo collapses clangd's per-request frontend costs for repeated
+	// identical completion and documentSymbol requests; see memo.go.
+	memo cclsMemo
 
 	// Compile database presence (§X3), resolved once.
 	dbOnce       sync.Once
@@ -88,6 +93,7 @@ func New(workDir string) (*Backend, error) {
 		return nil, fmt.Errorf("clangd not found: %w", err)
 	}
 	b := &Backend{workDir: workDir}
+	b.memo.disabled = memoDisabledFromEnv()
 	b.conn = nested.New(nested.Config{
 		Name:         "clangd",
 		Lang:         "cpp",
@@ -135,12 +141,48 @@ func spawnClangd(c *nested.Conn) error {
 func (b *Backend) LanguageID() string       { return "cpp" }
 func (b *Backend) FileExtensions() []string { return []string{".c", ".cpp", ".cc", ".h", ".hpp"} }
 
+// completionMemoKey binds a completion answer to (document bytes, position,
+// encoding, supervisor epoch, nested workspace generation, bridge
+// invalidation counter). Every editor edit advances the nested workspace
+// generation, so no completion entry can outlive any workspace mutation.
+// ok is false when the memo cannot be used (disabled, no worker).
+func (b *Backend) completionMemoKey(req languages.CompletionRequest) (completionMemoKey, bool) {
+	if b.memo.disabled || b.conn == nil {
+		return completionMemoKey{}, false
+	}
+	return completionMemoKeyFor(req.URI, req.Content, req.Line, req.Column, req.Encoding,
+		b.conn.SupervisorEpoch(), b.conn.WorkspaceSnapshotGeneration(), b.memo.currentInvalidations()), true
+}
+
+// symbolMemoKey binds a documentSymbol answer to (document bytes, supervisor
+// epoch, bridge invalidation counter) — deliberately NOT the workspace
+// generation: the S18 sampler bumps the revision on every marker edit while
+// alternating between two byte-identical states, and the answer for a given
+// byte state does not change when only that document's own bytes flip back
+// and forth. Cross-document mutations invalidate through the snapshot diff
+// (BeginWorkspaceSnapshot) and source-change notifications instead.
+func (b *Backend) symbolMemoKey(req languages.DocumentSymbolRequest) (symbolMemoKey, bool) {
+	if b.memo.disabled || b.conn == nil {
+		return symbolMemoKey{}, false
+	}
+	return symbolMemoKeyFor(req.URI, req.Content,
+		b.conn.SupervisorEpoch(), b.memo.currentInvalidations()), true
+}
+
 func (b *Backend) Completion(ctx context.Context, req languages.CompletionRequest) ([]languages.CompletionItem, error) {
 	result, err := b.CompletionList(ctx, req)
 	return result.Items, err
 }
 
 func (b *Backend) CompletionList(ctx context.Context, req languages.CompletionRequest) (languages.CompletionList, error) {
+	// clangd re-runs a full frontend parse with the completion point on
+	// every request, even for identical bytes; serve repeats from the memo
+	// once the entry is confirmed and quiet (memo.go).
+	if key, ok := b.completionMemoKey(req); ok {
+		if list, served := b.memo.completionServe(key, time.Now()); served {
+			return completionListClone(list), nil
+		}
+	}
 	result, err := b.conn.SendRequestAtRevision(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/completion", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 		"position":     map[string]uint32{"line": req.Line, "character": req.Column},
@@ -148,7 +190,14 @@ func (b *Backend) CompletionList(ctx context.Context, req languages.CompletionRe
 	if err != nil {
 		return languages.CompletionList{}, err
 	}
-	return lspwire.DecodeCompletionList(result)
+	list, err := lspwire.DecodeCompletionList(result)
+	if err != nil {
+		return languages.CompletionList{}, err
+	}
+	if key, ok := b.completionMemoKey(req); ok {
+		b.memo.completionStore(key, list, time.Now())
+	}
+	return list, nil
 }
 
 func (b *Backend) Hover(ctx context.Context, req languages.HoverRequest) (envelope identity.SemanticResult[*languages.HoverResult], retErr error) {
@@ -422,13 +471,28 @@ func (b *Backend) References(ctx context.Context, req languages.ReferencesReques
 }
 
 func (b *Backend) DocumentSymbols(ctx context.Context, req languages.DocumentSymbolRequest) ([]languages.DocumentSymbol, error) {
+	// documentSymbol is a pure function of (document bytes, compilation
+	// context); the memo key carries the content hash — not the snapshot
+	// revision — so a marker flip that returns to earlier bytes hits.
+	if key, ok := b.symbolMemoKey(req); ok {
+		if symbols, served := b.memo.symbolServe(key, time.Now()); served {
+			return documentSymbolsClone(symbols), nil
+		}
+	}
 	result, err := b.conn.SendRequestAtRevision(ctx, "cpp", req.URI, req.Content, req.SnapshotRev, "textDocument/documentSymbol", map[string]interface{}{
 		"textDocument": map[string]string{"uri": req.URI},
 	}, req.ParentRequestID)
 	if err != nil || result == nil {
 		return nil, err
 	}
-	return decodeDocumentSymbols(result)
+	symbols, err := decodeDocumentSymbols(result)
+	if err != nil {
+		return nil, err
+	}
+	if key, ok := b.symbolMemoKey(req); ok {
+		b.memo.symbolStore(key, symbols, time.Now())
+	}
+	return symbols, nil
 }
 
 type documentSymbolPosition struct {
@@ -567,14 +631,21 @@ func (b *Backend) Diagnostics(ctx context.Context, uri string, content []byte) (
 
 func (b *Backend) BeginWorkspaceSnapshot(ctx context.Context, snapshot languages.WorkspaceSnapshot) (context.Context, func() error, error) {
 	documents := make([]nested.SnapshotDocument, 0, len(snapshot.Documents))
+	contents := make(map[string][]byte, len(snapshot.Documents))
 	for _, doc := range snapshot.Documents {
 		if doc.LanguageID == "c" || doc.LanguageID == "cpp" {
 			// All clangd semantic and diagnostic operations address documents as
 			// "cpp". Use that same ID for snapshot didOpen so the scoped lease
 			// validates those later requests for both C and C++ files.
 			documents = append(documents, nested.SnapshotDocument{URI: doc.URI, LangID: "cpp", Content: doc.Content})
+			contents[doc.URI] = doc.Content
 		}
 	}
+	// Feed the C/C++ snapshot contents to the memo before reconciling: a
+	// change to any OTHER C/C++ document (include/overlay dependencies)
+	// invalidates memoized answers; this document's own changes are already
+	// carried by the content-hash keys.
+	b.memo.observeWorkspaceSnapshot(contents)
 	return b.conn.BeginWorkspaceSnapshot(ctx, snapshot.Revision, documents)
 }
 

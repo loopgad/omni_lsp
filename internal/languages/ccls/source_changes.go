@@ -8,6 +8,11 @@ import (
 )
 
 func (b *Backend) NotifySourceChanges(ctx context.Context, changes []languages.SourceChange) error {
+	// External file events change clangd's compilation world (headers on
+	// disk feed preambles and the index) before any nested bookkeeping
+	// reflects them; drop memoized answers up front, conservatively even
+	// if the notification below ends up rejected or empty.
+	b.memo.invalidate()
 	normalized, err := languages.NormalizeSourceChanges(changes)
 	if err != nil || len(normalized) == 0 {
 		return err
@@ -20,5 +25,8 @@ func (b *Backend) NotifySourceChanges(ctx context.Context, changes []languages.S
 }
 
 func (b *Backend) RecoverSourceChanges(ctx context.Context) error {
+	// Recovery replaces the worker process: every memoized answer belonged
+	// to a predecessor clangd world.
+	b.memo.invalidate()
 	return b.conn.RecoverSourceChanges(ctx)
 }
