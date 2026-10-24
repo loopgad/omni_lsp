@@ -534,4 +534,56 @@ offset debt on file in `freeze-record.txt`):
   锁更新补丁 `out/patches/i10-rust-helper-lock.patch`（`git apply --check`
   通过）。`tools.lock.json` 依纪律未手改，锁一致性待补丁批准后落账。
 
+## Evidence record — 2026-10-25 记账轮（registry X5-2/X5-4/X5-7 + semanticTokens 行为变更）
+
+### semanticTokens 能力声明条件化（方案B，行为变更）
+
+- 行为变更：initialize 的 `semanticTokensProvider` 声明改为按已注册后端真实
+  能力条件化——仅当存在真 `SemanticTokensEmitter`（handlers.go:208，
+  = `languages.EncodedSemanticTokensProvider` 别名，唯一真发 token 的 golang
+  encoding-aware 路径；ccls/typescript/pyright/rust-analyzer 为显式空桩不满足）
+  时声明；handler 仍注册、显式请求仍被服务；`omitempty` 使「不声明」在 wire
+  上为省略而非 null。旧钉现状测试 semantic_tokens_current_state_test.go 改写为
+  semantic_tokens_capability_test.go 的
+  `TestQ3_SemanticTokensDeclaredOnlyForRealEmitters`（golang 必声明含
+  Full/legend、ccls-only 必不声明且桩仍服务、无后端不声明）。
+  internal/protocol/lsp/protocol.manifest 与 11 个 test/golden 快照经运行
+  所有者授权后用官方命令（gen-protocol.go / `OMNISP_UPDATE_GOLDEN=1`）再生成
+  承接，逐行核对：manifest 恰为三处签名变化 + ServerCapabilities 行
+  omitempty（全部源于独占文件 handlers.go）；11 个 golden 每个恰为同一
+  21 行 semanticTokensProvider 块的纯删除（0 增 21 删），无外来内容。
+- 同轮 registry 落账（详见 docs/audit-longterm-spec.md §1/§3.3/§4/§5.3/§7
+  收口标注）：X5-2 升 AUTO（server 原生 LSIF API 落地、探针修剪 5 个死码
+  测试并补 3 个新 server LSIF 测试，全组 `-count=1` 实跑绿）；X5-7 维持
+  PARTIAL（多语言 persistent 层 + replay 跨进程两项证据入探针，七语言
+  fact 覆盖仍未闭合）；X5-4 改 probe-less PARTIAL（internal/index/graph
+  死码整删）；X7-1 探针 TestExecutor_LaunchHandshake 的 SKIP 诚实性缺口
+  收口（`-count=1 -v` 实核 e2e 子测试真实 PASS）。baseline.json 未动
+  （core 逐位不变 98.45959595959597）；x5 由 78.57% 升 85.71%
+  （`go run ./cmd/omnilsp verify --json` 实算）。
+
+### 白名单扩展登记（2026-10-25 返工·清算独立复核后补登）
+
+- 本轮 sanctioned 区（ZONE_PREFIXES）之外实测共两组 dirty 路径（`git status
+  --porcelain -z` 全量 46 项逐一比对，无其他漏网），均属运行所有者授权的
+  披露变更，登记为白名单扩展而非未授权越界：
+  ① internal/index/graph/**（graph/generated/invalidate/graph_test 四文件
+  整删）——勘察员 safeToDelete 清单内、清理员汇合后执行。返工复核：
+  `rg '"internal/index/graph' --type go` 全仓零命中；唯一非测试引用即 registry
+  旧 X5-4 Probe 字面量（HEAD registry.go:321，本轮已随探针移除，仅剩
+  registry.go:320 Reason 对删除本身的记载）；`go build ./...` 绿。
+  不回滚——恢复文件只会复活零引用死码，并与 X5-4 已落账的
+  "Dead package removed" 处置（registry/audit/conformance.md 三处一致）矛盾。
+  ② internal/protocol/lsp/protocol.manifest——server 域经运行所有者授权后
+  用官方命令 `go run scripts/gen-protocol.go` 再生成承接。返工复核：
+  `git diff --numstat` = 4 增/2 删，恰 4 行变化（+hasSemanticTokensEmitter、
+  buildCapabilities 双参、+SemanticTokensEmitter 别名、ServerCapabilities
+  semanticTokensProvider omitempty），全部源于独占文件 handlers.go 的真实
+  签名；TestY54_ProtocolManifestFresh 与 TestConformanceNoRegression 均
+  `-count=1` 实跑 PASS。不回滚——回退 manifest 将立即使 TestY54 判红
+  （指纹与 handlers.go 现源不符）。授权会话本身不在仓库内、无法独立验证，
+  仅能确认变更形态与声明逐位吻合且官方一致性测试全绿——按「诚实高于
+  完成」如实登记该验证边界。本扩展仅限本轮；后续轮次白名单由运行脚本
+  另行划定。
+
 

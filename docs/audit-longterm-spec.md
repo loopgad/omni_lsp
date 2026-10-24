@@ -25,8 +25,8 @@ verify 跑的是 CI 出货的同一二进制，所以本地分数与 CI 同源�
 | **core** | **98.5%** | = `baseline.json` 的 `98.45959595959597`，逐位吻合（PERF-2 升 AUTO，run gate-20261024T1136Z，+0.75） |
 | post-x8 | 0.0% | |
 | post-x9 | 6.9% | DEF-V4FREEZE 记账收口后自 3.4% 升至 6.9%（第四轮）；A1c 的诚实代价见 §2.1 |
-| x5 | 78.6% | INDEX 83.3% / INTEROP 50.0% / GRAPH 50.0%（X5-4 于 i8-p1 降 PARTIAL 后实况；本表旧值 85.7% 是降级前口径，2026-10-25 记账员以 `go run ./cmd/scorecard` 实测订正） |
-| x7 | 100.0% | |
+| x5 | 85.7% | INDEX 83.3% / INTEROP 100.0% / GRAPH 50.0%（2026-10-25 记账员落账：X5-2 升 AUTO——server 原生 LSIF API 落地、探针组修剪死码测试后全组 `-count=1` 实跑绿；X5-4 改 probe-less PARTIAL——internal/index/graph 按零生产引用死码整包删除，PARTIAL 恒 0.5 故分数不变。实算 `go run ./cmd/omnilsp verify --json`：x5=0.8571428571428571，与 verify 输出逐位一致） |
+| x7 | 100.0% | X7-1 探针 TestExecutor_LaunchHandshake 此前实跑报 SKIP 的诚实性缺口已收口（2026-10-25：插件宿主协议完整版落地后 e2e 子测试「真实子进程_握手_调用_广播」实跑 PASS，记账员 `-count=1 -v` 实核非 SKIP） |
 | x8 | 66.7% | CLIENTS 50% / DIST 50% |
 | x9 | 75.0% | RELEASE 75% |
 
@@ -237,6 +237,28 @@ leftOpen 如实注明：ccls 空列表端变异验证未执行（internal/langua
 c/cpp 修复员文件边界），以断言直读返回值锁定；「改声明或改空列表→红」的协议以
 声明侧变异满足。拍板（不声明 / 按后端条件化）前本测试保护现状不漂移。
 
+**已拍板并落地——方案B：按后端条件化（2026-10-25，server 域工程师实施、
+记账员落账）**：initialize 的 semanticTokensProvider 声明改为按已注册后端
+真实能力条件化——能力位 `SemanticTokensEmitter`（handlers.go:208，=
+`languages.EncodedSemanticTokensProvider` 的别名，即唯一真发 token 的
+golang encoding-aware 路径；ccls/typescript/pyright/rust-analyzer 的
+`Backend.SemanticTokens` 是显式空桩故不满足），`hasSemanticTokensEmitter`
+遍历已注册后端，仅在有真 emitter 时声明（handler 仍注册、显式请求仍被
+服务）；`SemanticTokensProvider` 加 omitempty 使「不声明」在 wire 上为
+省略而非 null。原钉现状测试删除，改写为
+`TestQ3_SemanticTokensDeclaredOnlyForRealEmitters`
+（semantic_tokens_capability_test.go:41：golang 真后端经真实 initialize
+握手必声明含 Full/legend、ccls-only 必不声明且桩仍服务、无后端不声明；
+记账员随探针组 `-count=1` 实跑绿）。manifest 与 11 个 golden 快照经运行
+所有者授权后用官方命令（gen-protocol.go / `OMNISP_UPDATE_GOLDEN=1`）
+再生成承接：manifest 恰为三处签名变化 + ServerCapabilities 行 omitempty
+（全部源于 handlers.go）；golden 每个恰为同一 21 行 semanticTokensProvider
+块的纯删除（0 增 21 删）。「C/C++ 客户端拿到空 data 关掉自己的语法高亮」
+的触发面随声明面诚实化消失。**残留半边**：显式请求路径上两种「不支持」
+投影仍不一致（semanticTokens 空列表 vs signatureHelp errNotSupported）；
+混合注册（golang+ccls）时能力按 server 级声明（LSP 能力无 per-document
+形态），ccls 文档显式请求仍回空列表——方案B 决策包的既定粒度。
+
 ### 3.4 `position.PositionToOffset` 的 `enc` 形参从未被读取 `[推断，但可自查]`
 
 `position.go:200` 起，函数体只用 `idx.offsetCol`，传 `UTF8` 与传 `UTF32`
@@ -277,12 +299,12 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 
 | 条目 | Text 声称 | 探针实际验证 | 证据 |
 |---|---|---|---|
-| **X5-4** | 「Dependency graph with selective invalidation + fingerprints + generator edges」，记 **AUTO=1.0** | 只有 `internal/index/graph` 的**自测**；而 ADR-0008 D5 明写「graph 选择性失效经评估同样缓期」，且该包**零生产 import**（全仓唯一命中是 registry 里的 Probe 字符串字面量） | `[推断]` 建议用 `go list -deps ./... \| grep internal/index/graph` 复核 |
+| **X5-4** | 「Dependency graph with selective invalidation + fingerprints + generator edges」，记 **AUTO=1.0** | 只有 `internal/index/graph` 的**自测**；而 ADR-0008 D5 明写「graph 选择性失效经评估同样缓期」，且该包**零生产 import**（全仓唯一命中是 registry 里的 Probe 字符串字面量） | `[推断]` 建议用 `go list -deps ./... \| grep internal/index/graph` 复核 → **已收口（i8-p1 降 PARTIAL + 2026-10-25 清理员整包删除）**：graph 四文件（graph/generated/invalidate/graph_test）全删，registry 探针同步移除，X5-4 改 probe-less PARTIAL（PARTIAL 恒 0.5，GRAPH 类目与 x5 分数不受删除影响），Reason 注明死码删除与复活条件（接线 X10 + 新证据方可回 AUTO） |
 | **X5-1** | 含 "corruption quarantine" | 三个探针无一断言 quarantine：一个走 Abort 路径、一个只断言返回 error、一个是压实。真正断言 `Quarantined()` 的 `TestL7`/`TestL9` 挂在别的条目下 | `[推断]` |
 | **Y1-7** | 「Disk budget refusal **preserves last good generation**」 | `TestBudget_RejectsWhenFull` 从**空 store** 起，根本没有 last good generation 可保留；另一个探针是 Abort 路径，与 disk budget 无关 | `[推断]` |
 | **Y1-6** | 「Index corruption isolated」（IDX-TXN-004/L8） | `TestL7` 的回退半边是 `t.Logf`（非断言），`TestL6_TXN003` 只比错误 nil 布尔与 quarantine 长度单调性 ⇒ 合起来都没验证「回退到最新存活历史」 | `[推断]` |
-| **X5-2** | 「SCIP/LSIF conversions preserve provenance and report conversion losses」 | 探针缺两个**孤儿测试**：`TestL11_IdentityPreserved`（唯一做双向 repo/commit identity 往返）、`TestL14_LossyNotesDocumented`（唯一做 §L14 有损登记） | `[推断]` → **孤儿测试半边已闭合（2026-10-25 记账员复核）**：两测试均已入探针清单，且 LSIF 全链路本轮落地（semantic→LSIF 导出桥含 metaData provenance 与有损计数、ImportLSIF 读 toolInfo 扩展与身份校验、SCIP↔LSIF 双向转换、CLI --format lsif 经 SCIP 转码过格式门禁），6 个新 interop 测试本人实跑全绿并已入探针；仍维持 PARTIAL——候选二进制 CLI 执行与 server 原生 LSIF API 半边（ExportSemanticLSIF/ImportSemanticLSIF）未验证 |
-| **X5-7** | 「Typed semantic generations persist and serve fresh-only ... queries」 | persistent 探针组是纯租约/取消语义，两测试只用 `publishOne(t, s, "string")`，**不触碰任何 semantic payload** | `[推断]` → **过时（2026-10-25 记账员复核）**：探针组现已含 typed semantic 代际隔离跨 recommit（persistent 层）与「重启后 fresh-only 查询」「recommit 后只服务当前代」（server 层端到端）三测试，全部变异验证红→绿且本人实跑通过（`go test -count=1` persistent + server）；跨进程闭环 Go 半边已闭合，仍维持 PARTIAL——七语言 fact 覆盖、非 Go 端到端查询证据、replay 半边未闭合 |
+| **X5-2** | 「SCIP/LSIF conversions preserve provenance and report conversion losses」 | 探针缺两个**孤儿测试**：`TestL11_IdentityPreserved`（唯一做双向 repo/commit identity 往返）、`TestL14_LossyNotesDocumented`（唯一做 §L14 有损登记） | `[推断]` → **孤儿测试半边已闭合（2026-10-25 记账员复核）**：两测试均已入探针清单，且 LSIF 全链路本轮落地（semantic→LSIF 导出桥含 metaData provenance 与有损计数、ImportLSIF 读 toolInfo 扩展与身份校验、SCIP↔LSIF 双向转换、CLI --format lsif 经 SCIP 转码过格式门禁），6 个新 interop 测试本人实跑全绿并已入探针；仍维持 PARTIAL——候选二进制 CLI 执行与 server 原生 LSIF API 半边（ExportSemanticLSIF/ImportSemanticLSIF）未验证 → **已收口（2026-10-25 记账员，升 AUTO）**：server 原生 ExportSemanticLSIF/ExportSemanticLSIFWithLosses/ImportSemanticLSIF 落地（semantic_lsif.go，与 SCIP 共享新鲜度/信任/空库守卫核心），TestSemanticLSIFImportExportRoundTripIsNativeAndDeterministic（两段往返逐位一致 + 空输入/替换/缺 scope/开文档四守卫 + coverage 如实声明）与 TestSemanticLSIFExportLossTrackMirrorsSCIP（损失清单自描述）实跑绿；CLI --format lsif 直连原生 API，SCIP 转码迂回与措辞删除；探针同步修剪清理员删除的 5 个死码测试（TestL14_SCIPRoundTrip/TestL15_LSIFRoundTrip/TestImportProvenanceMarked/TestL11_IdentityPreserved/TestLSIFImportReadsToolInfoExtensions），身份/provenance 证据由存活测试接替（TestLSIFSemanticExportPreservesProvenanceAndRepeats、TestPersistentSemanticLSIFModelRoundTripBitwiseDeterministic 等）。候选二进制 CLI 端到端执行按仓库惯例（DEF-S21CORPUS 同型理由：机器依赖的冻结候选证据不入计分探针）留作发布侧证据，已记录在案 |
+| **X5-7** | 「Typed semantic generations persist and serve fresh-only ... queries」 | persistent 探针组是纯租约/取消语义，两测试只用 `publishOne(t, s, "string")`，**不触碰任何 semantic payload** | `[推断]` → **过时（2026-10-25 记账员复核）**：探针组现已含 typed semantic 代际隔离跨 recommit（persistent 层）与「重启后 fresh-only 查询」「recommit 后只服务当前代」（server 层端到端）三测试，全部变异验证红→绿且本人实跑通过（`go test -count=1` persistent + server）；跨进程闭环 Go 半边已闭合，仍维持 PARTIAL——七语言 fact 覆盖、非 Go 端到端查询证据、replay 半边未闭合 → **更新（2026-10-25 记账员，维持 PARTIAL）**：两项剩余半边闭合——①非 Go persistent 层证据：TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit（rust/cpp/python 三语言 SCIP 模型写成同代三分 scope 的 typed facts，跨进程重开逐字节复原、recommit 后 fresh reader 只服务新代、lease 钉住的旧代仍只服务旧代；证据工程师变异验证通过）；②replay 半边：TestPersistedSemanticGenerationReplayServesFreshOnlyAcrossProcesses（持久化 typed 代录制成会话文件，另一 store 重开以恢复代重建 identity 并通过 VerifySemanticReproduction+VerifyResponseBindings，hover 重放由重开 store fresh-only 读出，CompareSession 达 ReproductionComplete；recommit 后陈旧录音必返 ErrSemanticGenerationUnavailable）。两测试已入探针，记账员 `-count=1` 实跑绿；仍不升 AUTO——七语言 fact 覆盖仍未闭合（不在本轮边界，诚实登记） |
 
 ### 4.1 两个 ADR 的机制描述与代码不符
 
@@ -369,12 +391,12 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
 
 | 位置 | 问题 |
 |---|---|
-| `index/persistent/store.go:289,338` | `FileStore.Quarantine` / `QuarantineGeneration` 全仓零调用点零测试（TXN-004 声明在 `IndexStore` 接口却从未接线，实际走 `quarantineSegsLocked`） |
-| `index/persistent/store.go:85-91,96-98` | `IndexStore` 与 `LeasedIndexStore` 接口**全仓无任何生产代码当类型使用或做类型断言**（全部直接用 `*FileStore`） |
-| `index/graph/**` | **整包零生产 import**；`Propagate`/`RegisterGenerated`/`InvalidateGenerator` 的调用点全在 `graph_test.go` 内 |
-| `index/interop` Canonical IR | `ExportSCIP`/`ImportSCIP`/`FromOccurrences` 及整套类型只被 `interop_test.go` 使用，生产走 `scip_model.go` 另一套 |
+| `index/persistent/store.go:289,338` | `FileStore.Quarantine` / `QuarantineGeneration` 全仓零调用点零测试（TXN-004 声明在 `IndexStore` 接口却从未接线，实际走 `quarantineSegsLocked`）。**已收口（2026-10-25 清理员）**：两方法已删 |
+| `index/persistent/store.go:85-91,96-98` | `IndexStore` 与 `LeasedIndexStore` 接口**全仓无任何生产代码当类型使用或做类型断言**（全部直接用 `*FileStore`）。**已收口（2026-10-25 清理员）**：两接口已删；`Quarantined()` 与 `OpenSnapshotLease()` 方法保留在 FileStore 上（生产调用：server index.go:197-198、semantic_query.go:45、semantic_query_persistent.go:183、semantic_replay_identity.go:34、semantic_scip.go:93，记账员 grep 复核） |
+| `index/graph/**` | **整包零生产 import**；`Propagate`/`RegisterGenerated`/`InvalidateGenerator` 的调用点全在 `graph_test.go` 内。**已收口（2026-10-25 清理员）**：graph/generated/invalidate/graph_test 四文件整包删除，X5-4 同步改 probe-less PARTIAL |
+| `index/interop` Canonical IR | `ExportSCIP`/`ImportSCIP`/`FromOccurrences` 及整套类型只被 `interop_test.go` 使用，生产走 `scip_model.go` 另一套。**已收口（2026-10-25 清理员）**：FromOccurrences/RawOccurrence/Index/Document/Symbol/Occurrence/Metadata 与删后孤儿 Kind 簇已删（Range/Role 生产引用保留）；scip.go 死符号（ExportSCIP/ImportSCIP 等）与 lsif.go 死符号（ExportLSIF/ImportLSIF 及 provenance/freshness note）已删；连带删除只测死码的 interop 测试五个（X5-2 探针同步修剪，身份/provenance 证据由存活测试 TestLSIFSemanticExportPreservesProvenanceAndRepeats、TestPersistentSemanticLSIFModelRoundTripBitwiseDeterministic 接替）；scip.go 重写为共享 wire 常量文件，包 doc 注明生产路径走 ImportSCIPToModel/ExportSCIPSemanticScope |
 | `jsonrpc/codec.go:14` | `HeaderContentType` 常量**全仓零引用**。**已收口（2026-10-24 实测，J4）**：常量已删，全仓零引用，`go build ./...` 通过 |
-| `server/source_changes.go:164-176` | `externalSourceSyncError` **只有测试调用点** |
+| `server/source_changes.go:164-176` | `externalSourceSyncError` **只有测试调用点**。**已收口（2026-10-25 清理员）**：方法已删（记账员 grep 全仓零残留）；source_changes_test.go 8 处纯测试引用改写为经生产路径 flushExternalSourceChanges 断言同一栅栏语义 |
 | `golang/features.go:31,76,104` | SignatureHelp/Formatting/InlayHint **只有 golang 实现**，无测试记录这是有意的 |
 | `server/handlers.go:1504-1507` | `CacheStats()` 聚合分支：全仓无任何测试 backend 实现该接口。**已收口（2026-10-24 第八轮）**：新增 cacheStatsBackend mock（嵌入 mockBackend 实现 `CacheStats() (int64,int64)`）与 TestK_StatusAggregatesCacheStatsAcrossBackends（status_metrics_test.go:61）——两 provider (11,3)/(5,7) 加一无接口 mockBackend，断言 omnilsp/status 聚合 CacheHits=16/Misses=10，锁定求和逻辑与可选接口容错（聚合分支现 handlers.go:1514-1515）；测试-only 未改生产代码 |
 | `server/features_handlers.go:139-192` | **`handleInlayHints` 成功路径整体零覆盖** —— 全仓无测试 backend 实现 `InlayHintProvider`。**已收口（2026-10-24 实测，commit 655925c）**：新增 inlay_hints_test.go 三个测试覆盖成功路径 |
@@ -449,6 +471,12 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
 序恰为 [b.go a.go c.go]（id 升序）且 32 轮重复导入顺序零漂移——确定性聚排序
 规则一并钉死。
 
+**后续（2026-10-25 记账员）**：TestL15_LSIFImportDocumentOrderDeterministic
+随死码 ImportLSIF 的删除一并移除；确定性保证由存活链路承接并已入 X5-2 探针
+——TestPersistentSemanticLSIFModelRoundTripBitwiseDeterministic（persistent
+层逐位确定往返）与 TestSemanticLSIFImportExportRoundTripIsNativeAndDeterministic
+（server 原生 LSIF 两段往返逐位一致）。
+
 ---
 
 ## §6 长程路线
@@ -511,7 +539,8 @@ registry 的 Text↔探针对齐、X5-4 的降级、`soak` 的默认门禁、
 ### 阶段 D：结构性（不急但别忘）
 
 - `internal/index/graph` 要么接线要么降级 —— 一个零生产 import 的包不该在
-  AUTO 满分项上。
+  AUTO 满分项上。**已收口（2026-10-25）**：包按零生产引用死码删除，
+  X5-4 改 probe-less PARTIAL（0.5 不变）。
 - 两个 ADR 的机制描述需要与代码对齐（ADR-0006 的 scip 边界、ADR-0002 的
   CI 检查）。
 - fast 报告的语义：如果它只做符号存在性，就该在字段名或文档里说清楚它
@@ -527,6 +556,8 @@ registry 的 Text↔探针对齐、X5-4 的降级、`soak` 的默认门禁、
 1. **X5-4 是否从 AUTO 降级？** 它声称选择性失效 + 生成器边，探针只有自测，
    而 ADR-0008 说缓期、包零生产接线。降级会拉低 x5 分数，但让分数与事实
    一致。**建议降级，并同时决定 `internal/index/graph` 的去留。**
+   **已销（i8-p1 降 PARTIAL；2026-10-25 包删除、X5-4 改 probe-less
+   PARTIAL，去留问题以「删」结案）**。
 2. **fast 模式是否应执行探针？** 当前 97.71 分可以在所有被引用测试全红时保持
    不变。这是「分数能不能自己解释」的核心问题。**建议至少让
    `TestConformanceNoRegression` 能有一种模式真正跑探针**，哪怕慢。
