@@ -587,3 +587,72 @@ offset debt on file in `freeze-record.txt`):
   另行划定。
 
 
+
+## Evidence record — 2026-10-25 最小收口轮（registry X5-7 升 AUTO + X9-1 非标准诊断 soak 红）
+
+### X5-7 七语言覆盖闭合（升 AUTO）
+
+- X5-7 工程师在 `internal/index/persistent/semantic_multilang_test.go` 为
+  `TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit` 补齐
+  c/typescript/javascript 三语言（按既有 rust/cpp/python 表驱动构造法 +
+  `interop.ImportSCIPToModel` typed facts，`scip.Document.Language` 与
+  `scope.Language` 经 `scipLanguageMatches` 按 family 匹配——typescript/
+  javascript 同属 ts-js-family，严格同名是充分而非必要条件；每次 import
+  仅传单 scope（semantic_multilang_test.go:298），无跨语言混入风险——
+  internal/index/interop/scip_model.go:242-262），恢复代 scopes 断言 3→6；
+  go 语言由既有 `TestTypedSemanticGenerationIsolationAcrossRecommit`
+  （semantic_isolation_test.go:195）覆盖，七语言（go/c/cpp/rust/python/
+  typescript/javascript）全覆盖。变异验证由证据工程师在其文件边界内对
+  被测断言施加等价最小变异（恒假→红→复原绿）；生产代码侧变异因记账员
+  文件边界（registry/acceptance/audit-docs/baseline）未做，如实登记。
+- 记账员本轮实跑（全部 `-count=1`，完整输出判定）：named run
+  `go test -count=1 -run '^TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit$' -v ./internal/index/persistent/`
+  → `--- PASS ... (0.21s)`；探针四组全绿：persistent 全包 ok 1.297s、
+  server 探针 15 测试 ok 3.995s、interop ok 0.628s、replay ok 0.267s。
+- 记账：X5-7 升 AUTO、删 Reason（探针四组不变，测试名已含
+  `TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit`）；
+  `OMNISP_UPDATE_CONFORMANCE=1 go test -count=1 ./test/conformance/`
+  再生成 docs/conformance.md（X5-7 行 PARTIAL→AUTO），无 env 复跑
+  ok 0.294s；baseline.json 逐位不变（X5-7 属 x5 域，core 预期不变，实测
+  确认）。
+
+### X9-1 soak 非标准诊断档（红，维持 PARTIAL）
+
+- 性质：非标准 budget 诊断跑——`OMNILSP_SOAK_REQUEST_BUDGET=300s`
+  （标准为 90s，scripts/acceptance.ps1:2692），按本轮任务授权施行的
+  一次诊断性重跑；任务硬上限（一次完整重跑）已用，未追第二次。
+- 冻结候选：RUNID=gate-20261025T0716Z；`C:/Users/32806/sdk/go1.26.1/bin/go.exe
+  build -trimpath` 产出 omnilsp.exe，SHA-256=2f776cee8bae6b111552fa81936636c9b
+  5b0c54e764f678cdce9905ad8191556，git rev=c12de47047c9c02b5adc5f47a442b8581197ed40；
+  冻结时刻 porcelain/diff --stat 为空（freeze-record.txt，记账员已亲读）。
+- 命令（经 s18run 运行器后台单次执行）：`go test -tags soak -count=1 -run
+  '^TestSoak_RealStdioMixedWorkload$' -timeout 90m ./test/soak/`，env：
+  `OMNILSP_SOAK_GATE=required`、`SOAK_DURATION=1h`、`OMNILSP_RUN_ID=
+  gate-20261025T0716Z-soak`、`OMNILSP_BIN=<冻结候选>`、
+  `OMNILSP_SOAK_REQUEST_BUDGET=300s`。
+- 结果：红——真实执行 244.56s 后失败中止（请求时长 3600s，完成约 6.8%；
+  非编译/环境快速失败）。失败检查=soak/reindex：`stdio_soak_test.go:424:
+  omnilsp/reindex: context deadline exceeded`（soak-run.log 共 7 行记账员
+  已全文读核；soak-report.json decision=failed；10 项工具锁 +
+  soak/process-tree-limit 全 passed，tool/rust-analyzer 实测 1.97.0
+  (2d8144b7 2026-07-07)，go1.26.1 对齐）。soak.jsonl 0 字节属预期：失败
+  发生在 8 worker 启动（stdio_soak_test.go:504）之前，无 telemetry 行。
+- 根因（deadlineMechanism，记账员读码复核）：initial-queries 检查
+  （:412 assertStdioQuerySet）的期限由 `OMNILSP_SOAK_REQUEST_BUDGET` 治理
+  ——requestStdio→`context.WithTimeout(ctx, stdioRequestBudget())`
+  （:2552-2556），`stdioRequestBudget()`（:2566-2578）未设/非法回退默认
+  30s，无独立固定阶段 deadline；而 omnilsp/reindex 走另一条固定 10s 期限
+  （requestReindexWithRetry，:1996 `context.WithTimeout(ctx, 10*time.Second)`），
+  不受该 env 治理——ra 1.97.0 冷启动索引满载压力下 reindex 首次提交未在
+  10s 内完成（同一路径在 1.99.0 的 3601s 完整跑中曾通过）。
+- 诊断价值：300s budget 下 initial-queries（上轮阻塞点）已通过（执行序
+  证据：t.Fatal 命中 :424 reindex 分支仅当 :412 返回 nil 才可达，代码顺序
+  记账员亲读核实），证明 90s 对 rust-analyzer 1.97.0 冷启动确实过紧。
+- 判定：非标准 budget 的红 → X9-1 维持 PARTIAL（registry Milestone x9、
+  Reason 不动），本结果不构成任何升级依据。
+- 证据位置：out/freeze-staging/gate-20261025T0716Z/{freeze-record.txt,
+  omnilsp.exe, soak-run.log, soak-report.json, soak.jsonl}。
+- 工作树观察：internal/index/persistent/semantic_multilang_test.go 于
+  soak 进行中（15:19）被并行 X5-7 工程师修改（+40/-10）；冻结时刻
+  （15:16）porcelain 为空已录 freeze-record.txt；该文件为另一包 _test.go，
+  不参与 `./test/soak/` 编译，冻结候选与 soak 证据不受影响。
