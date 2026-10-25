@@ -1,8 +1,9 @@
 // External test package: it drives typed multi-language semantic generations
 // through the persistent store. The typed facts are produced by the interop
-// SCIP import adapter (rust/cpp/python documents), and both interop and
-// semantic import persistent, so only a _test package may exercise the full
-// write/read path of the §L5 storage boundary at once.
+// SCIP import adapter (rust/cpp/c/python/typescript/javascript documents — the
+// six non-Go languages; Go is pinned by the isolation test), and both interop
+// and semantic import persistent, so only a _test package may exercise the
+// full write/read path of the §L5 storage boundary at once.
 package persistent_test
 
 import (
@@ -27,7 +28,7 @@ import (
 
 const multiLangWorkspace = "file:///x5-multilang"
 
-// multiLangView is an immutable model.WorkspaceView over three per-language
+// multiLangView is an immutable model.WorkspaceView over six per-language
 // source files. Walk honours the requested scope root so every language scope
 // captures only its own files, exactly like the server's disk view.
 type multiLangView struct {
@@ -105,6 +106,27 @@ func multiLangLanguages() []multiLangLanguage {
 			suffix:      "Cache",
 			occurrences: 2, // definition + reference
 		},
+		{
+			scopeID: "x5-multilang-c", language: "c", root: multiLangWorkspace + "/c",
+			fileName: "packet.c", toolchain: "clang-21",
+			tool:        model.ToolIdentity{Name: "clangd", Path: "C:/tools/clangd.exe", Version: "21.1", SHA256: strings.Repeat("d", 64)},
+			suffix:      "Packet",
+			occurrences: 2, // definition + reference
+		},
+		{
+			scopeID: "x5-multilang-typescript", language: "typescript", root: multiLangWorkspace + "/typescript",
+			fileName: "app.ts", toolchain: "tsc-5.9",
+			tool:        model.ToolIdentity{Name: "typescript-language-server", Path: "C:/tools/typescript-language-server.exe", Version: "4.3.4", SHA256: strings.Repeat("e", 64)},
+			suffix:      "Store",
+			occurrences: 2, // definition + reference
+		},
+		{
+			scopeID: "x5-multilang-javascript", language: "javascript", root: multiLangWorkspace + "/javascript",
+			fileName: "app.js", toolchain: "node-24",
+			tool:        model.ToolIdentity{Name: "typescript-language-server", Path: "C:/tools/typescript-language-server.exe", Version: "4.3.4", SHA256: strings.Repeat("f", 64)},
+			suffix:      "Queue",
+			occurrences: 2, // definition + reference
+		},
 	}
 }
 
@@ -116,6 +138,12 @@ func multiLangSource(lang multiLangLanguage, marker string) string {
 		return "trait Render {}\n\nstruct " + typeName + ";\n\nimpl Render for " + typeName + " {}\n"
 	case "cpp":
 		return "class " + typeName + " {};\n\nint boot(" + typeName + " kernel) {\n    return 0;\n}\n"
+	case "c":
+		return "struct " + typeName + " { int size; };\n\nstatic int boot(void) {\n    struct " + typeName + " item;\n    return 0;\n}\n"
+	case "typescript":
+		return "class " + typeName + " {\n    value: number = 0;\n}\n\nfunction warm(): " + typeName + " {\n    return new " + typeName + "();\n}\n"
+	case "javascript":
+		return "class " + typeName + " {\n}\n\nfunction warm() {\n    const item = new " + typeName + "();\n    return item;\n}\n"
 	default: // python
 		return "class " + typeName + ":\n    pass\n\n\ndef warm():\n    item = " + typeName + "()\n    return item\n"
 	}
@@ -349,10 +377,12 @@ func readMultiLangFacts(t *testing.T, ctx context.Context, view persistent.Gener
 
 // TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit closes the
 // non-Go half of X5-7's multi-language gap: typed semantic generations built
-// from rust/cpp/python SCIP payloads persist through the store, round-trip
-// intact across a fresh-process reopen, and after a recommit fresh readers
-// serve only the new generation's facts while a lease pinned to the old
-// generation keeps reading exactly its own facts — never a mix.
+// from rust/cpp/c/python/typescript/javascript SCIP payloads persist through
+// the store, round-trip intact across a fresh-process reopen, and after a
+// recommit fresh readers serve only the new generation's facts while a lease
+// pinned to the old generation keeps reading exactly its own facts — never a
+// mix. Together with the Go-only isolation test this pins all seven X5-7
+// languages.
 func TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -376,8 +406,8 @@ func TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit(t *testing.
 		t.Fatalf("reopened store serves generation %d, want the committed %d", recovered.ID, gen1)
 	}
 	names, occurrences, definitions, edges, metadata := readMultiLangFacts(t, ctx, recovered)
-	if len(metadata.Scopes) != 3 {
-		t.Fatalf("recovered generation carries %d scopes, want one per language", len(metadata.Scopes))
+	if len(metadata.Scopes) != 6 {
+		t.Fatalf("recovered generation carries %d scopes, want one per non-Go language", len(metadata.Scopes))
 	}
 	languages := make(map[string]string, len(metadata.Scopes))
 	for _, scope := range metadata.Scopes {
