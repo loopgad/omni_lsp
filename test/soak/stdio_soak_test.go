@@ -398,7 +398,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		soakFailed(&evidence, "soak/index-init", err.Error())
 		t.Fatal(err)
 	}
-	if err := waitForRustSoakHover(session, rustURI, rustText, 90*time.Second); err != nil {
+	if err := waitForRustSoakHover(session, rustURI, rustText, stdioColdStartAllowance(90*time.Second)); err != nil {
 		soakFailed(&evidence, "soak/rust-semantic", err.Error())
 		t.Fatal(err)
 	}
@@ -827,7 +827,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 					soakFailed(&evidence, "soak/restart-rust-open", err.Error())
 					t.Fatal(err)
 				}
-				if err := waitForRustSoakHover(session, rustURI, rustText, 90*time.Second); err != nil {
+				if err := waitForRustSoakHover(session, rustURI, rustText, stdioColdStartAllowance(90*time.Second)); err != nil {
 					soakFailed(&evidence, "soak/restart-rust-semantic", err.Error())
 					t.Fatal(err)
 				}
@@ -1655,7 +1655,7 @@ func restartControlledRustBackend(session *lspdriver.Session, job *processTreeBu
 	if err != nil {
 		return 0, 0, fmt.Errorf("find supervised rust-analyzer process before restart: %w", err)
 	}
-	if err := waitForRustSoakHover(session, rustURI, rustText, 90*time.Second); err != nil {
+	if err := waitForRustSoakHover(session, rustURI, rustText, stdioColdStartAllowance(90*time.Second)); err != nil {
 		return 0, 0, fmt.Errorf("Rust backend semantic probe before restart: %w", err)
 	}
 	if err := terminateJobPID(oldPID); err != nil {
@@ -1993,7 +1993,14 @@ func validatePersistentIndexRecovery(generation, expectedGeneration uint64, enab
 }
 
 func requestReindexWithRetry(ctx context.Context, request func(context.Context) (json.RawMessage, error)) (json.RawMessage, error) {
-	retryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// The retry window is the same per-request allowance requestStdio uses.
+	// The fixed 10s this line previously carried was proven insufficient for
+	// the pinned rust-analyzer 1.97.0 cold start under full-corpus load
+	// (gate-20261025T0716Z: soak/reindex died on it), so it must not survive
+	// as a floor: max(budget, 10s) would keep a proven-bad bound and defeat
+	// deliberately small diagnostic budgets. stdioRequestBudget() widens the
+	// window with OMNILSP_SOAK_REQUEST_BUDGET (default 30s).
+	retryCtx, cancel := context.WithTimeout(ctx, stdioRequestBudget())
 	defer cancel()
 	var lastBusy error
 	for {
@@ -2114,6 +2121,12 @@ func cancelStdioReindex(session *lspdriver.Session, startAt time.Time, latencies
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("reindex request did not enter cancellation path: id=%d err=%v", id, err)
 	}
+	// terminalCtx bounds only the terminal cancellation acknowledgment: the
+	// reindex request is canceled 1ms after issue, so this window never spans
+	// the pinned rust-analyzer cold start. It is deliberately NOT derived
+	// from stdioRequestBudget (audited 2026-10-25: different origin from the
+	// cold-start allowances; the same holds for the identical 20s window in
+	// cancelStdioReferenceQuery).
 	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer terminalCancel()
 	terminal, err := session.WaitForResponse(terminalCtx, id)
@@ -2575,6 +2588,20 @@ func stdioRequestBudget() time.Duration {
 		return defaultBudget
 	}
 	return budget
+}
+
+// stdioColdStartAllowance sizes a soak phase that must outlast the pinned
+// rust-analyzer 1.97.0 cold start (e.g. the first semantic rust hover).
+// OMNILSP_SOAK_REQUEST_BUDGET may widen the phase but never tightens it below
+// the historical sizing: a small diagnostic budget must not shrink an
+// allowance whose fit at smaller values has never been observed. Phases whose
+// window does not span cold start (e.g. cancellation acknowledgments) stay
+// fixed constants instead.
+func stdioColdStartAllowance(historical time.Duration) time.Duration {
+	if budget := stdioRequestBudget(); budget > historical {
+		return budget
+	}
+	return historical
 }
 
 // TestSoak_RequestBudgetDefaultIs30s pins the requestStdio budget semantics:

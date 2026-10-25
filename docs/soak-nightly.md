@@ -55,7 +55,7 @@ $env:SOAK_JSONL = "$evidence/soak.jsonl"
 $env:OMNILSP_ACCEPTANCE_REPORT = "$evidence/soak-report.json"
 $env:SOAK_DURATION = '1h'
 $env:OMNILSP_SOAK_GATE = 'required'
-$env:OMNILSP_SOAK_REQUEST_BUDGET = '90s'
+$env:OMNILSP_SOAK_REQUEST_BUDGET = '300s'
 go test -tags soak -run '^TestSoak_RealStdioMixedWorkload$' -count=1 -timeout 90m ./test/soak/
 # Clean up immediately after the run. All seven variables are soak-gate
 # preconditions or harness settings (test/soak/stdio_soak_test.go); leaving
@@ -71,9 +71,12 @@ Remove-Item Env:OMNILSP_RUN_ID, Env:OMNILSP_BIN, Env:SOAK_JSONL, `
 The per-request stdio budget is harness plumbing, not a §S16 value. Every
 `requestStdio` call waits at most 30s by default (`stdioRequestBudget` in
 `test/soak/stdio_soak_test.go`, pinned by `TestSoak_RequestBudgetDefaultIs30s`).
-`OMNILSP_SOAK_REQUEST_BUDGET` accepts a positive Go duration (for example
-`90s`) to widen that wait for a diagnostic run; `scripts/acceptance.ps1` sets
-`90s` for its own soak stages and cleans the variable afterwards. A malformed
+`OMNILSP_SOAK_REQUEST_BUDGET` accepts a positive Go duration to widen that
+wait for a diagnostic run; `scripts/acceptance.ps1` sets `300s` for its own
+soak stages and cleans the variable afterwards. Since 2026-10-25 `300s` is
+the standard harness budget: `90s` was proven insufficient for the pinned
+rust-analyzer 1.97.0 cold start by the gate-20261025T0716Z diagnosis
+(initial-queries passed only at 300s there). A malformed
 or non-positive value falls back to the 30s default with a stderr warning —
 it never silently mimics a widened run. The budget only bounds how long one
 request may take before the harness gives up; recorded latencies are the real
