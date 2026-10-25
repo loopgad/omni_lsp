@@ -26,7 +26,7 @@
     "sublime-typing-extensions": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-typing_extensions-4.16.0-py3-none-any.whl", "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8" },
     "sublime-orjson": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-orjson-3.12.0-cp314-cp314-win_amd64.whl", "sha256": "0b1ac5bf6609b2716c7954011c5fef6254922df029f45d032ee4ebf5d363cbed" },
     "sublime-mdpopups": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\sublime-mdpopups-5.1.2-py3-none-any.whl", "sha256": "0ee53e9d24b1846f5b7f4b3a83e493e3aa28a825e26206617fa6e6b2abd6bd03" },
-    "rust-analyzer-semantic-helper": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\rust-analyzer-semantic-1.97.0.exe", "sha256": "f402ac788979848f306d56d2027d6dec9212ed23ce04ed23b802923f5390ea64" },
+    "rust-analyzer-semantic-helper": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\rust-analyzer-semantic-1.97.0.exe", "sha256": "3641e2323591c2f51c7e06ab713e0348f17590f30fa1dcd27b0ad0453a5ee933" },
     "go": { "path": "D:\\Program Files\\Go\\bin\\go.exe", "sha256": "a8f114f8a0a7e057fee64152b76ac50c7289981de2a76455b4baee1a034734fa" },
     "gopls": { "path": "C:\\Users\\32806\\go\\bin\\gopls.exe", "sha256": "63feae64809f9ef57cbff79e09bb8aedfc6e891e2fdb24d0aae08f41b512dba3" },
     "vscode": { "path": "C:\\Users\\32806\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe", "sha256": "96851792952c34ead53462ad36d973356af2e737b5ed4e433e23c4647e0d6318" },
