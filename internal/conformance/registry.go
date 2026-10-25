@@ -456,7 +456,7 @@ var Registry = struct{ Checks []Check }{
 		// ---------- Deferred domain x9 (hardening release duty) ----------
 		{ID: "X9-1", Domain: "x9", Category: "RELEASE", Clause: "T7/S6 release duty", Weight: 1,
 			Text: "Sustained soak + differential mismatch triage pipeline", Status: StatusPartial,
-			Milestone: "x9", Reason: "triage pipeline live; nightly workflow runs a 55m form, while selected Windows acceptance requires a continuous 1h run and current evidence is pending"},
+			Milestone: "x9", Reason: "triage pipeline live; nightly workflow runs a 55m form, while selected Windows acceptance requires a continuous 1h run: the first formalized standard-budget 1h soak (gate-20261025T1404Z-soak, OMNILSP_SOAK_REQUEST_BUDGET=300s — harness plumbing per acceptance.ps1, not a §S16 value) is RED — TestSoak_RealStdioMixedWorkload aborted at 586.42s by the harness continuity guard (active duration monitor starved: it shares the main goroutine with blocking request bodies and processed no 5s tick), decision=not_verified with all 10 tool pins and setup stages passed; 1h evidence remains absent and the candidate-side status-latency degradation needs an instrumented diagnostic run"},
 		{ID: "X9-2", Domain: "x9", Category: "RELEASE", Clause: "C17/U4 reproducibility", Weight: 1,
 			Text: "Protocol reproducibility check (manifest fingerprint via the documented `go run scripts/gen-protocol.go -check` operator entry; metamodel-driven codegen stays post-X9+)", Status: StatusAuto,
 			Probe: &Probe{Groups: []ProbeGroup{{Pkg: "cmd/omnilsp", Tests: []string{"TestProtocolGenCheckProbe"}}}}},

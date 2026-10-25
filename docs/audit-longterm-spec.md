@@ -57,6 +57,13 @@ registry 的 AUTO/PARTIAL/GATE 分布一致。
 > fail-closed），形状由 engine_test.go 断言锁定；core 98.45959595959597 /
 > PERF=6/6（+0.75）。第八轮笔录的 stable-ABBA 让位权衡按原样维持（本轮
 > 验收走 strict 策略，stable 模式未复测），仍待决策包记录。
+>
+> **销案（2026-10-25，基建勘误员）**：上段遗留的 stable-ABBA 让位权衡
+> （决策包第八轮「仍开放的权衡拍板项（唯一遗留）」，原拍板问题①）就此
+> 销案——定性为**长期权衡项、无消费方（stable 无在用场景、PERF 已满
+> 6/6）、不放宽**：历轮验收均走 strict 策略，stable 模式无在用场景，
+> PERF 已 6/6 满格，放宽 ABBA 关联或暴露 nested trace 钩子无任何分数或
+> 功能收益，不再列为待拍板项，无需决策包另录。
 
 ---
 
@@ -438,7 +445,7 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
   internal/conformance 均已按工作项指定命令跑绿，按目录名笔误如实登记。
 - **X9-1 soak 现状注记（2026-10-25 最小收口轮记账员；本文档原无 X9-1 专行，
   落于本 soak 节）**：X9-1 维持 PARTIAL——非标准 budget 诊断跑
-  （`OMNILSP_SOAK_REQUEST_BUDGET=300s`，标准 90s＝scripts/acceptance.ps1:2692）
+  （`OMNILSP_SOAK_REQUEST_BUDGET=300s`，当时标准 90s＝scripts/acceptance.ps1:2692；勘误注 2026-10-25：赋值行现移至 :2693、标准改 300s）
   于 244.56s 红在 soak/reindex（stdio_soak_test.go:424 context deadline
   exceeded）：reindex 走 requestReindexWithRetry 固定 10s 期限（:1996），
   不受 REQUEST_BUDGET 治理；诊断价值=initial-queries（:412）在 300s 下

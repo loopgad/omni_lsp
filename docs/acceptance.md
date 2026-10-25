@@ -533,6 +533,21 @@ offset debt on file in `freeze-record.txt`):
 - 产物：exe sha256 `3641e232…` ≠ 锁内 `f402ac78…`；已按协议生成未套用的
   锁更新补丁 `out/patches/i10-rust-helper-lock.patch`（`git apply --check`
   通过）。`tools.lock.json` 依纪律未手改，锁一致性待补丁批准后落账。
+- **锁更新套用登记（2026-10-25，基建勘误员）**：上述补丁经批准后已套用——
+  `tools.lock.json` 的 `rust-analyzer-semantic-helper` sha 由 `f402ac78…`
+  改为 `3641e232…`（git diff 恰 1 行；补丁文件本身混有 CRLF/LF 行尾，直接
+  套用会给 8 行上下文带入 CR，实际以 `git apply --ignore-whitespace` 套用并
+  规范化行尾，终态 diff 已核验仅该 1 行）；重建产物
+  `.zcode/tmp/rust-analyzer-semantic-1.97.0-built-3641e232.exe` 已复制为
+  `test/acceptance/tools/bin/rust-analyzer-semantic-1.97.0.exe`，复制件
+  sha256 实测 `3641e2323591c2f51c7e06ab713e0348f17590f30fa1dcd27b0ad0453a5ee933`
+  与锁逐字一致。**modifiedTreeSha256 溯源缺口注记**：该缺口未因套用消除——
+  锁 `modifiedTreeSha256=1dbe96a2…` 无法由任何自然 git staging 协议复现
+  （raw+is_import=e08f0f3d、raw+仅补丁=f121e444、normalized=b88a194a），
+  即**原锁构建树含补丁之外的未登记 static_index.rs 修改**；`3641e232` 重建
+  按同一 USE 祖先检查语义复现了该最小修改，其构建树同样偏离「上游源+补丁」
+  的可登记状态。当前对齐的仅是「锁内 exe sha ↔ 磁盘产物 sha」；树级溯源
+  仍缺一份可复现的 modified 树登记，留待 X8-2 工具重锁策略一并处理。
 
 ## Evidence record — 2026-10-25 记账轮（registry X5-2/X5-4/X5-7 + semanticTokens 行为变更）
 
@@ -619,7 +634,7 @@ offset debt on file in `freeze-record.txt`):
 ### X9-1 soak 非标准诊断档（红，维持 PARTIAL）
 
 - 性质：非标准 budget 诊断跑——`OMNILSP_SOAK_REQUEST_BUDGET=300s`
-  （标准为 90s，scripts/acceptance.ps1:2692），按本轮任务授权施行的
+  （当时标准为 90s，scripts/acceptance.ps1:2692；勘误注 2026-10-25：该行号为当时位置，现赋值行在 :2693、标准已改 300s），按本轮任务授权施行的
   一次诊断性重跑；任务硬上限（一次完整重跑）已用，未追第二次。
 - 冻结候选：RUNID=gate-20261025T0716Z；`C:/Users/32806/sdk/go1.26.1/bin/go.exe
   build -trimpath` 产出 omnilsp.exe，SHA-256=2f776cee8bae6b111552fa81936636c9b
@@ -632,8 +647,8 @@ offset debt on file in `freeze-record.txt`):
   `OMNILSP_SOAK_REQUEST_BUDGET=300s`。
 - 结果：红——真实执行 244.56s 后失败中止（请求时长 3600s，完成约 6.8%；
   非编译/环境快速失败）。失败检查=soak/reindex：`stdio_soak_test.go:424:
-  omnilsp/reindex: context deadline exceeded`（soak-run.log 共 7 行记账员
-  已全文读核；soak-report.json decision=failed；10 项工具锁 +
+  omnilsp/reindex: context deadline exceeded`（soak-run.log 共 6 行记账员
+  已全文读核；勘误注 2026-10-25 二次复核：原记「7 行」系误计，实测共 6 行，包级 FAIL 行在第 5 行、其后另有裸 `FAIL` 一行；soak-report.json decision=failed；10 项工具锁 +
   soak/process-tree-limit 全 passed，tool/rust-analyzer 实测 1.97.0
   (2d8144b7 2026-07-07)，go1.26.1 对齐）。soak.jsonl 0 字节属预期：失败
   发生在 8 worker 启动（stdio_soak_test.go:504）之前，无 telemetry 行。
@@ -645,6 +660,20 @@ offset debt on file in `freeze-record.txt`):
   （requestReindexWithRetry，:1996 `context.WithTimeout(ctx, 10*time.Second)`），
   不受该 env 治理——ra 1.97.0 冷启动索引满载压力下 reindex 首次提交未在
   10s 内完成（同一路径在 1.99.0 的 3601s 完整跑中曾通过）。
+  **【勘误 2026-10-25，基建勘误员】上一句括注「同一路径在 1.99.0 的 3601s
+  完整跑中曾通过」为失实转录，原文保留不改，更正如下**：out/x9-1-soak-replay/
+  whole-soak-report.json 实测 run_id=`x10-soak-replay-whole` 自
+  2026-10-24T17:42:54.82Z 至 17:42:55.53Z 仅 **0.71s** 即死于 fail-closed
+  工具闸门（stdio_soak_test.go:234：tool/go 本机 1.27.1 vs 锁 1.26.1、
+  tool/rust-analyzer 本机 1.99.0 vs 锁 1.97.0，decision=not_verified；
+  whole-soak.log 首行 `--- FAIL: TestSoak_RealStdioMixedWorkload (0.72s)`），
+  reindex 工作负载从未执行；`3601.497s` 是 `go test` 的**包级墙钟**
+  （whole-soak.log 包级 FAIL 行 `FAIL github.com/omnilsp/omni/test/soak 3601.497s`；二次复核注 2026-10-25：whole-soak.log 共 10 行，该行在第 8 行，其后另有 `FAIL` 与 `WHOLE REPLAY EXIT=1` 两行），
+  被同包 in-process golang-only soak（soak_test.go:27-37 `soakDuration()`
+  同读 `SOAK_DURATION=1h` 跑满 1h）消耗，并非 stdio soak 的运行时长。因此
+  **omnilsp/reindex 的固定 10s 期限在 1.99.0 下从未被观测**：不存在
+  「1.99.0 下 10s 期限内通过」的对照组，「10s 不足」仅由本机 1.97.0 冷启动
+  的单次实测（gate-20261025T0716Z）支撑。
 - 诊断价值：300s budget 下 initial-queries（上轮阻塞点）已通过（执行序
   证据：t.Fatal 命中 :424 reindex 分支仅当 :412 返回 nil 才可达，代码顺序
   记账员亲读核实），证明 90s 对 rust-analyzer 1.97.0 冷启动确实过紧。
@@ -656,3 +685,59 @@ offset debt on file in `freeze-record.txt`):
   soak 进行中（15:19）被并行 X5-7 工程师修改（+40/-10）；冻结时刻
   （15:16）porcelain 为空已录 freeze-record.txt；该文件为另一包 _test.go，
   不参与 `./test/soak/` 编译，冻结候选与 soak 证据不受影响。
+
+
+## Evidence record — 2026-10-25 记账轮（X9-1 正式化标准 budget 1h soak 红，维持 PARTIAL）
+
+### X9-1 soak 正式化标准 budget 档（1h，红，维持 PARTIAL）
+
+- 性质：本轮为**正式化后的标准 budget 证据**——`OMNILSP_SOAK_REQUEST_BUDGET=300s`
+  已由基建勘误员在 scripts/acceptance.ps1:2693 落地（注释 :2689-2692 载明
+  harness plumbing：钉版 1.97.0 工具链冷启动 allowances，90s 经
+  gate-20261025T0716Z 诊断实证不足，非 §S16 值；2026-10-25 起 300s 即标准
+  harness budget），docs/soak-nightly.md 同步。本轮 soak 即该标准值的 1h 档。
+- 冻结候选：RUNID=gate-20261025T1404Z；`C:/Users/32806/sdk/go1.26.1/bin/go.exe
+  build -trimpath` 产出 omnilsp.exe，SHA-256=
+  5a77f1b0a611a0ba280887eb31b369513590c71c9b27e3d1165c602ec67c9d20，
+  git rev=912252391ba2db746d507feab6a355ca41f28885 (main)；冻结时刻含 6 个
+  基建工作树文件（freeze-record.txt 记账员亲读；test/soak、docs、scripts
+  变更不影响候选运行时代码）。
+- 命令（经 s18run 运行器后台单次执行）：`go test -tags soak -count=1 -run
+  '^TestSoak_RealStdioMixedWorkload$' -timeout 90m ./test/soak/`，env：
+  `OMNILSP_SOAK_GATE=required`、`SOAK_DURATION=1h`、`OMNILSP_RUN_ID=
+  gate-20261025T1404Z-soak`、`OMNILSP_BIN=<冻结候选>`、
+  `OMNILSP_SOAK_REQUEST_BUDGET=300s`（显式传递，与 acceptance.ps1 正式化
+  标准值一致）。
+- 结果：红——TestSoak_RealStdioMixedWorkload 于 586.42s（≈9.8 分钟，未跑满
+  1h）被测试自身连续性守卫中止：`stdio_soak_test.go:868: active duration
+  monitor did not advance`（.zcode/tmp/soak-gate-20261025T1404Z.log 全文
+  6 行记账员已读；勘误注 2026-10-25 二次复核：原记「5 行」系误计，实测共 6 行，包级 FAIL 行在第 5 行、其后另有裸 `FAIL` 一行；包级墙钟 586.506s，exit 1）。soak-report.json
+  decision=not_verified，run_id=gate-20261025T1404Z-soak；记账员逐项亲读：
+  10 项工具钉定（tool/go、node、python、clangd、rust-analyzer、pyright、
+  typescript-language-server、typescript 及两 wrapper）+
+  soak/process-tree-limit、initialize-open、cancel、reindex、
+  semantic-workload 全部 passed，soak/continuity not_verified；soak.jsonl
+  0 字节（零分钟遥测，与 monitor 饥饿一致）。
+- 根因分层（soak 攻坚员诊断，记账员转录）：active 仅在 5s ticker 分支推进
+  （stdio_soak_test.go:599），失败条件 active==0（:863）⇒ 主 goroutine 自
+  ticker 创建起一次 tick 未处理，全程阻塞于某 select case 同步体内（机制
+  定位：editStdioDocument→readStdioStatus/waitForStdioSnapshot 链，各受
+  300s 预算；seed=0 确定性调度下两次连续 omnilsp/status 往返各吃满预算量
+  级）。定性：冻结候选在真实负载下的活性/延迟问题触发 harness 连续性守卫，
+  非环境配置错误；harness 脆弱性已登记（时长监控器与阻塞请求体共用主
+  goroutine，单次 >30s 慢请求在 active==0 时即饿死监控致 not_verified），
+  留待后续轮次评估监控器独立化。
+- 判定：正式化标准 budget（300s）+ 1h 档的红 → X9-1 维持 PARTIAL
+  （registry Milestone x9），本轮按红分支更新 Reason 载入新事实（budget
+  正式化、run id、红因、候选侧根因待插桩诊断），不构成任何升级依据；
+  探针挂载评估仅适用于绿分支（PERF-2 守卫模式），本轮不适用。
+- 证据位置：out/freeze-staging/gate-20261025T1404Z/{freeze-record.txt,
+  omnilsp.exe, soak-report.json, soak.jsonl}；
+  .zcode/tmp/soak-gate-20261025T1404Z.log。
+- 记账后续（记账员实跑）：`OMNISP_UPDATE_CONFORMANCE=1 go test -count=1
+  ./test/conformance/` 再生成；docs/conformance.md 零 diff（X9-1 带
+  Milestone x9，PARTIAL Reason 不进投影，docgen.go:82-86）；baseline.json
+  逐位不变（X9-1 属 x9 域，core 独立计分，report.go:104-111）。fast 实测
+  （`go run ./cmd/omnilsp verify --json`）：coreScore=98.45959595959597、
+  x5 域 0.9285714285714286、x9 域 0.75（X9-1 PARTIAL 0.5 + X9-2 AUTO 1.0
+  均值），变更前后逐位一致。
