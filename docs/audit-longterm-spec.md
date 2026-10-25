@@ -14,6 +14,42 @@
 
 ---
 
+## 终审状态（2026-10-25）
+
+本段由文档终审员于 2026-10-25 复核落账，是当前账面的权威快照；正文各处原值
+一律保留、以「终审注/终审销案/勘误注」追加，与快照冲突时以此段为准。
+
+- **registry 计数（124 条）**：AUTO 88 / PARTIAL 7 / DEFERRED 27 / GATE 2
+  （本轮实测 `grep -c "Status: Status" internal/conformance/registry.go` =
+  124，按 Status 字段逐一计数）。PARTIAL 七条：WS-D14、Y2-5、X5-4、
+  DEF-EDITORS、DEF-IDXWIRE、X8-2、X9-1；GATE 两条：Y1-10、X8-1。
+- **域分数（本轮实测 `go run ./cmd/omnilsp verify --json`）**：core
+  0.9845959595959597、x5 **0.9285714285714286**（= 6.5/7：INDEX 100%——
+  X5-1/X5-6/X5-7 全 AUTO，INTEROP/QUERY/CACHE 满，GRAPH 50%——X5-4
+  probe-less PARTIAL）、x7 1、x8 0.6666666666666666、x9 0.75、post-x9
+  0.06896551724137931、post-x8 0。§1 表内 x5 行「85.7%／INDEX 83.3%」是
+  ed5226f（2026-10-25 16:17，X5-7 PARTIAL→AUTO）之前的旧值，其余域与
+  verify 输出逐位一致。
+- **剩余台账分类**：
+  - **待拍板（5）**：§7.2 fast 模式探针执行；§7.3 soak 默认门禁（决策包
+    §1.3 建议的 form-only 测试移出 tag 未执行——resource_trend_test.go:1
+    实测仍 `//go:build soak`）；§7.4 Semantic Core 定义层面确认（ci.yml:30
+    补 internal/index 归门禁侧）；§7.5 批量帧语义（现状已钉住待拍板）；
+    §7.6 2s 墙钟阈值（现位于 test/perf/perf_test.go:487，阈值实测仍在）。
+  - **PARTIAL 收口台账（7）**：X5-4（graph 死码删除后 probe-less，恒 0.5，
+    待 X10 接线方有回 AUTO 通道）、WS-D14、Y2-5、DEF-EDITORS、DEF-IDXWIRE、
+    X8-2（客户端矩阵 not_verified 半边）、X9-1（1h 连续档证据仍缺席——
+    registry X9-1 Reason 记 gate-20261025T1404Z-soak 红于 586.42s 连续性
+    守卫，见 §5.4 注记）。
+  - **GATE（2）**：Y1-10（soak 长跑闸门）、X8-1（multiplatform 发布门禁）。
+  - **DEFERRED（27）**：结构性缓期、probe-less 不计分（含 DEF-S21CORPUS
+    的机器依赖候选证据）。
+  - **跨文档在案**：第八轮决策包 §2.2③「把 lock 跟随候选冻结写进
+    docs/acceptance.md 操作规程」grep 无命中（本轮实测），仍未执行，登记
+    缓期——见决策包 §2.2 终审销案注。
+
+---
+
 ## §1 现状基线
 
 `bash scripts/test.sh`（等价 `make test`）是唯一的完整门禁：gofmt → build →
@@ -25,7 +61,7 @@ verify 跑的是 CI 出货的同一二进制，所以本地分数与 CI 同源�
 | **core** | **98.5%** | = `baseline.json` 的 `98.45959595959597`，逐位吻合（PERF-2 升 AUTO，run gate-20261024T1136Z，+0.75） |
 | post-x8 | 0.0% | |
 | post-x9 | 6.9% | DEF-V4FREEZE 记账收口后自 3.4% 升至 6.9%（第四轮）；A1c 的诚实代价见 §2.1 |
-| x5 | 85.7% | INDEX 83.3% / INTEROP 100.0% / GRAPH 50.0%（2026-10-25 记账员落账：X5-2 升 AUTO——server 原生 LSIF API 落地、探针组修剪死码测试后全组 `-count=1` 实跑绿；X5-4 改 probe-less PARTIAL——internal/index/graph 按零生产引用死码整包删除，PARTIAL 恒 0.5 故分数不变。实算 `go run ./cmd/omnilsp verify --json`：x5=0.8571428571428571，与 verify 输出逐位一致） |
+| x5 | 85.7% | INDEX 83.3% / INTEROP 100.0% / GRAPH 50.0%（2026-10-25 记账员落账：X5-2 升 AUTO——server 原生 LSIF API 落地、探针组修剪死码测试后全组 `-count=1` 实跑绿；X5-4 改 probe-less PARTIAL——internal/index/graph 按零生产引用死码整包删除，PARTIAL 恒 0.5 故分数不变。实算 `go run ./cmd/omnilsp verify --json`：x5=0.8571428571428571，与 verify 输出逐位一致）。**终审注（2026-10-25）**：本行分数已过期——X5-7 随 ed5226f（2026-10-25 16:17，X5-7 PARTIAL→AUTO）升格后，行内 85.7%／INDEX 83.3%／实算 x5=0.8571428571428571 均为升格前旧值；终审复跑同命令实测 x5=0.9285714285714286（92.86%，6.5/7）、INDEX=100%（X5-1/X5-6/X5-7 全 AUTO），其余域分数与 verify 输出仍逐位一致。见文首「终审状态」 |
 | x7 | 100.0% | X7-1 探针 TestExecutor_LaunchHandshake 此前实跑报 SKIP 的诚实性缺口已收口（2026-10-25：插件宿主协议完整版落地后 e2e 子测试「真实子进程_握手_调用_广播」实跑 PASS，记账员 `-count=1 -v` 实核非 SKIP） |
 | x8 | 66.7% | CLIENTS 50% / DIST 50% |
 | x9 | 75.0% | RELEASE 75% |
@@ -243,6 +279,11 @@ handlers.go:295-306）+ ccls.Backend.SemanticTokens 返回空列表（backend.go
 leftOpen 如实注明：ccls 空列表端变异验证未执行（internal/languages/ccls/** 属
 c/cpp 修复员文件边界），以断言直读返回值锁定；「改声明或改空列表→红」的协议以
 声明侧变异满足。拍板（不声明 / 按后端条件化）前本测试保护现状不漂移。
+**终审注（2026-10-25）**：本段引用的
+internal/runtime/server/semantic_tokens_current_state_test.go 已在方案B 落地
+（commit 68c69c9）时删除，改写为 semantic_tokens_capability_test.go:41 的
+TestQ3_SemanticTokensDeclaredOnlyForRealEmitters（见下段；ls 实测原文件已不存在）
+——本段保留为历史记录，该路径引用现为死链。
 
 **已拍板并落地——方案B：按后端条件化（2026-10-25，server 域工程师实施、
 记账员落账）**：initialize 的 semanticTokensProvider 声明改为按已注册后端
@@ -307,9 +348,9 @@ integer 两形态用例（integer `4242` → `"token":4242`）。下段保留为
 | 条目 | Text 声称 | 探针实际验证 | 证据 |
 |---|---|---|---|
 | **X5-4** | 「Dependency graph with selective invalidation + fingerprints + generator edges」，记 **AUTO=1.0** | 只有 `internal/index/graph` 的**自测**；而 ADR-0008 D5 明写「graph 选择性失效经评估同样缓期」，且该包**零生产 import**（全仓唯一命中是 registry 里的 Probe 字符串字面量） | `[推断]` 建议用 `go list -deps ./... \| grep internal/index/graph` 复核 → **已收口（i8-p1 降 PARTIAL + 2026-10-25 清理员整包删除）**：graph 四文件（graph/generated/invalidate/graph_test）全删，registry 探针同步移除，X5-4 改 probe-less PARTIAL（PARTIAL 恒 0.5，GRAPH 类目与 x5 分数不受删除影响），Reason 注明死码删除与复活条件（接线 X10 + 新证据方可回 AUTO） |
-| **X5-1** | 含 "corruption quarantine" | 三个探针无一断言 quarantine：一个走 Abort 路径、一个只断言返回 error、一个是压实。真正断言 `Quarantined()` 的 `TestL7`/`TestL9` 挂在别的条目下 | `[推断]` |
-| **Y1-7** | 「Disk budget refusal **preserves last good generation**」 | `TestBudget_RejectsWhenFull` 从**空 store** 起，根本没有 last good generation 可保留；另一个探针是 Abort 路径，与 disk budget 无关 | `[推断]` |
-| **Y1-6** | 「Index corruption isolated」（IDX-TXN-004/L8） | `TestL7` 的回退半边是 `t.Logf`（非断言），`TestL6_TXN003` 只比错误 nil 布尔与 quarantine 长度单调性 ⇒ 合起来都没验证「回退到最新存活历史」 | `[推断]` |
+| **X5-1** | 含 "corruption quarantine" | 三个探针无一断言 quarantine：一个走 Abort 路径、一个只断言返回 error、一个是压实。真正断言 `Quarantined()` 的 `TestL7`/`TestL9` 挂在别的条目下 | `[推断]` → **终审销案（2026-10-25，i8-p3 随 commit b9075c6 套用）**：X5-1 探针现含 TestL7_ChecksumMismatchQuarantines 与 TestL9_FutureSchemaQuarantinesAndFallsBack（registry.go:290 实测），行内「真正断言 `Quarantined()` 的 `TestL7`/`TestL9` 挂在别的条目下」的前提已失效；条目现状 AUTO |
+| **Y1-7** | 「Disk budget refusal **preserves last good generation**」 | `TestBudget_RejectsWhenFull` 从**空 store** 起，根本没有 last good generation 可保留；另一个探针是 Abort 路径，与 disk budget 无关 | `[推断]` → **终审销案（2026-10-25，i8-p3 随 commit b9075c6 套用）**：registry.go:67 实测 Text 已改为「Disk budget refusal never partially applies (fail-closed); keeps-old-generation is proven on the crash-before-publish path, not the budget path」，行内声称的「preserves last good generation」措辞已不存在 |
+| **Y1-6** | 「Index corruption isolated」（IDX-TXN-004/L8） | `TestL7` 的回退半边是 `t.Logf`（非断言），`TestL6_TXN003` 只比错误 nil 布尔与 quarantine 长度单调性 ⇒ 合起来都没验证「回退到最新存活历史」 | `[推断]` → **终审销案（2026-10-25，i8-p3 随 commit b9075c6 套用）**：Y1-6 探针现引用 TestCompactRetiresOnlyTheCompactedFallback（registry.go:65 实测，与 TestL7/TestL6_TXN003 同组）；§5.5 末条「未被任何 registry 条目引用」的断言随之失效（见该处终审注） |
 | **X5-2** | 「SCIP/LSIF conversions preserve provenance and report conversion losses」 | 探针缺两个**孤儿测试**：`TestL11_IdentityPreserved`（唯一做双向 repo/commit identity 往返）、`TestL14_LossyNotesDocumented`（唯一做 §L14 有损登记） | `[推断]` → **孤儿测试半边已闭合（2026-10-25 记账员复核）**：两测试均已入探针清单，且 LSIF 全链路本轮落地（semantic→LSIF 导出桥含 metaData provenance 与有损计数、ImportLSIF 读 toolInfo 扩展与身份校验、SCIP↔LSIF 双向转换、CLI --format lsif 经 SCIP 转码过格式门禁），6 个新 interop 测试本人实跑全绿并已入探针；仍维持 PARTIAL——候选二进制 CLI 执行与 server 原生 LSIF API 半边（ExportSemanticLSIF/ImportSemanticLSIF）未验证 → **已收口（2026-10-25 记账员，升 AUTO）**：server 原生 ExportSemanticLSIF/ExportSemanticLSIFWithLosses/ImportSemanticLSIF 落地（semantic_lsif.go，与 SCIP 共享新鲜度/信任/空库守卫核心），TestSemanticLSIFImportExportRoundTripIsNativeAndDeterministic（两段往返逐位一致 + 空输入/替换/缺 scope/开文档四守卫 + coverage 如实声明）与 TestSemanticLSIFExportLossTrackMirrorsSCIP（损失清单自描述）实跑绿；CLI --format lsif 直连原生 API，SCIP 转码迂回与措辞删除；探针同步修剪清理员删除的 5 个死码测试（TestL14_SCIPRoundTrip/TestL15_LSIFRoundTrip/TestImportProvenanceMarked/TestL11_IdentityPreserved/TestLSIFImportReadsToolInfoExtensions），身份/provenance 证据由存活测试接替（TestLSIFSemanticExportPreservesProvenanceAndRepeats、TestPersistentSemanticLSIFModelRoundTripBitwiseDeterministic 等）。候选二进制 CLI 端到端执行按仓库惯例（DEF-S21CORPUS 同型理由：机器依赖的冻结候选证据不入计分探针）留作发布侧证据，已记录在案 |
 | **X5-7** | 「Typed semantic generations persist and serve fresh-only ... queries」 | persistent 探针组是纯租约/取消语义，两测试只用 `publishOne(t, s, "string")`，**不触碰任何 semantic payload** | `[推断]` → **过时（2026-10-25 记账员复核）**：探针组现已含 typed semantic 代际隔离跨 recommit（persistent 层）与「重启后 fresh-only 查询」「recommit 后只服务当前代」（server 层端到端）三测试，全部变异验证红→绿且本人实跑通过（`go test -count=1` persistent + server）；跨进程闭环 Go 半边已闭合，仍维持 PARTIAL——七语言 fact 覆盖、非 Go 端到端查询证据、replay 半边未闭合 → **更新（2026-10-25 记账员，维持 PARTIAL）**：两项剩余半边闭合——①非 Go persistent 层证据：TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit（rust/cpp/python 三语言 SCIP 模型写成同代三分 scope 的 typed facts，跨进程重开逐字节复原、recommit 后 fresh reader 只服务新代、lease 钉住的旧代仍只服务旧代；证据工程师变异验证通过）；②replay 半边：TestPersistedSemanticGenerationReplayServesFreshOnlyAcrossProcesses（持久化 typed 代录制成会话文件，另一 store 重开以恢复代重建 identity 并通过 VerifySemanticReproduction+VerifyResponseBindings，hover 重放由重开 store fresh-only 读出，CompareSession 达 ReproductionComplete；recommit 后陈旧录音必返 ErrSemanticGenerationUnavailable）。两测试已入探针，记账员 `-count=1` 实跑绿；仍不升 AUTO——七语言 fact 覆盖仍未闭合（不在本轮边界，诚实登记） → **已收口（2026-10-25 最小收口轮记账员，升 AUTO）**：七语言 fact 覆盖闭合——X5-7 工程师按既有表驱动构造法把 TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit 扩到 c/typescript/javascript（连同既有 rust/cpp/python 共六非 Go 语言，恢复代 scopes 断言 3→6；typed facts 经 interop.ImportSCIPToModel 构造，scip.Document.Language 与 scope.Language 经 scipLanguageMatches 按 family 匹配——typescript/javascript 同属 ts-js-family，严格同名是充分而非必要条件；每次 import 仅传单 scope 无跨语言混入风险——interop/scip_model.go:242-262），go 由 TestTypedSemanticGenerationIsolationAcrossRecommit（semantic_isolation_test.go:195）覆盖；变异验证由证据工程师在测试文件边界内对被测断言施加等价最小变异（恒假→红→复原绿），生产侧变异未做（越权，如实登记）。记账员本轮实跑探针四组全绿（`-count=1`：persistent 全包 ok 1.297s 含被扩测试 named run PASS 0.21s、server 探针 15 测试 ok 3.995s、interop ok 0.628s、replay ok 0.267s）；registry 升 AUTO 删 Reason，`OMNISP_UPDATE_CONFORMANCE=1` 再生成 docs/conformance.md、无 env 复跑绿，baseline.json core 逐位不变（X5-7 属 x5 域） |
 
@@ -412,7 +453,8 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
 
 ### 5.4 perf / soak / corpus 的假信号
 
-- `perf_test.go:429-431` 的 `d > 2*time.Second` 是任意绝对墙钟阈值（flaky 源）。
+- `perf_test.go:429-431` 的 `d > 2*time.Second` 是任意绝对墙钟阈值（flaky 源；
+  终审注 2026-10-25：行号现漂移至 test/perf/perf_test.go:487）。
   它测的是「取消是否被及时响应」而非复杂度，所以不打算跟 §2.4 一起改。
 - `perf_test.go:369-371` 的 `TestS17_MetadataPresent` 断言的是 `buildCorpus()`
   自己硬编码生成的 198 行 ⇒ **自证式断言**；且对 `fs=unavailable`（`:299-306`
@@ -451,6 +493,15 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
   不受 REQUEST_BUDGET 治理；诊断价值=initial-queries（:412）在 300s 下
   通过，证明 90s 对 rust-analyzer 1.97.0 冷启动过紧。1h 连续档证据在本机
   仍缺席；完整记录见 docs/acceptance.md「2026-10-25 最小收口轮」节。
+  **勘误注（2026-10-25 终审）**：上段「reindex 走 requestReindexWithRetry
+  固定 10s 期限（:1996），不受 REQUEST_BUDGET 治理」半边已过时——commit
+  9e3b14e（2026-10-25 23:13）已把重试期限改为 stdioRequestBudget() 派生
+  （test/soak/stdio_soak_test.go:1995-2008 实测 `context.WithTimeout(ctx,
+  stdioRequestBudget())`，代码注释明言固定 10s「must not survive」）；
+  8d5a80d 的勘误只更了 acceptance.ps1:2693/300s 半边（本轮实测赋值行在
+  :2693），reindex 半边至此在 spec 补记。X9-1 仍 PARTIAL：registry X9-1
+  Reason 记首个标准预算 1h soak（gate-20261025T1404Z-soak）红于 586.42s
+  连续性守卫，1h 连续档证据仍缺席。
 
 ### 5.5 并发 / 事务测试的假信号（`internal/index/persistent`）
 
@@ -472,6 +523,11 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
   正确处，但它**未被任何 registry 条目引用**）；**没有任何测试构造「多段
   generation 中一段坏」**，而 `quarantineSegsLocked` 的多段交集分支从未走过；
   `historyK=3` 的多级回退顺序无测试。
+  **终审注（2026-10-25）**：上句「它**未被任何 registry 条目引用**」已失效——
+  TestCompactRetiresOnlyTheCompactedFallback 现被 Y1-6 探针引用（registry.go:65，
+  i8-p3 随 commit b9075c6 套用），与 §4 表 Y1-6 行的文内矛盾就此消除；「多段
+  generation 中一段坏」「多段交集分支」「多级回退顺序」三半边本轮终审未核查、
+  不在此销案。
 
 ### 5.6 顺序不确定性（同 §2.1 那类问题的残留）
 
@@ -589,6 +645,9 @@ registry 的 Text↔探针对齐、X5-4 的降级、`soak` 的默认门禁、
    （stdio_test.go:282）+ codec 侧 9897d0a 用例；拍板后须改写两处用例。
 6. **`probeRequiredEnv` 已删，但 `perf_test.go:429-431` 的 2s 墙钟阈值要不要
    改？** 它测的是「取消是否被及时响应」，2s 是任意值。
+   **终审更正（2026-10-25）**：行号漂移——该 2s 墙钟阈值现位于
+   test/perf/perf_test.go:487（实测 `if d := time.Since(start); d >
+   2*time.Second` 在位）；事项仍开放，阈值实测仍在。
 
 ---
 
