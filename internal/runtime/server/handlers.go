@@ -1426,7 +1426,7 @@ func (s *Server) dispatchSemanticRequest(
 		msg.Method == "textDocument/completion" && msg.ID != nil {
 		languageID := be.LanguageID()
 		if phaseSpan == nil && (languageID == "c" || languageID == "cpp") {
-			phaseSpan = recorder.begin(languageID, uri, rawJSONRPCRequestID(msg.ID))
+			phaseSpan = recorder.begin(msg.Method, languageID, uri, rawJSONRPCRequestID(msg.ID))
 			finishPhaseSpanHere = phaseSpan != nil
 		}
 		if phaseSpan != nil {

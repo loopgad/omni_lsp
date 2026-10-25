@@ -500,7 +500,7 @@ func (s *Server) scheduleMessage(parentCtx context.Context, msg *jsonrpc.Message
 		return
 	}
 	priority := s.classifyPriority(msg)
-	phaseSpan := s.beginScheduledCompletionTrace(msg)
+	phaseSpan := s.beginScheduledPhaseTrace(msg)
 
 	// Track in-flight requests for $/cancelRequest mapping (C7).
 	var reqID string
@@ -588,15 +588,27 @@ func (s *Server) scheduleMessage(parentCtx context.Context, msg *jsonrpc.Message
 	}
 }
 
-func (s *Server) beginScheduledCompletionTrace(msg *jsonrpc.Message) *completionPhaseTraceSpan {
-	if s.completionPhaseTrace == nil || msg == nil || msg.ID == nil || msg.Method != "textDocument/completion" {
+func (s *Server) beginScheduledPhaseTrace(msg *jsonrpc.Message) *completionPhaseTraceSpan {
+	if s.completionPhaseTrace == nil || msg == nil || msg.ID == nil {
 		return nil
 	}
-	var params CompletionParams
-	if err := json.Unmarshal(msg.Params, &params); err != nil || params.TextDocument.URI == "" {
+	uri := ""
+	switch msg.Method {
+	case "textDocument/completion":
+		var params CompletionParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.TextDocument.URI == "" {
+			return nil
+		}
+		uri = params.TextDocument.URI
+	case "omnilsp/status":
+		// Status is the soak's scheduler-liveness probe; its phase samples
+		// split a slow status round trip into scheduler queue wait (scheduling),
+		// dispatcher time (candidate handler), and response write (transport)
+		// without adding a separate observation path.
+	default:
 		return nil
 	}
-	span := s.completionPhaseTrace.begin("", params.TextDocument.URI, rawJSONRPCRequestID(msg.ID))
+	span := s.completionPhaseTrace.begin(msg.Method, "", uri, rawJSONRPCRequestID(msg.ID))
 	if span != nil {
 		span.serverStartedAt = time.Now()
 		span.serverManaged = true

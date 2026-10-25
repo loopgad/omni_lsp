@@ -18,6 +18,7 @@ const (
 )
 
 type completionPhaseTraceSample struct {
+	Method                          string          `json:"method,omitempty"`
 	LanguageID                      string          `json:"language_id"`
 	URI                             string          `json:"uri"`
 	ParentRequestID                 json.RawMessage `json:"parent_request_id"`
@@ -99,7 +100,7 @@ func newCompletionPhaseTraceRecorder(path string, sampleLimit int) *completionPh
 	}
 }
 
-func (r *completionPhaseTraceRecorder) begin(languageID, uri string, parentRequestID json.RawMessage) *completionPhaseTraceSpan {
+func (r *completionPhaseTraceRecorder) begin(method, languageID, uri string, parentRequestID json.RawMessage) *completionPhaseTraceSpan {
 	if r == nil {
 		return nil
 	}
@@ -112,6 +113,7 @@ func (r *completionPhaseTraceRecorder) begin(languageID, uri string, parentReque
 	return &completionPhaseTraceSpan{
 		recorder: r,
 		sample: completionPhaseTraceSample{
+			Method:          method,
 			LanguageID:      languageID,
 			URI:             uri,
 			ParentRequestID: cloneCompletionPhaseRequestID(parentRequestID),
@@ -189,7 +191,7 @@ func (r *completionPhaseTraceRecorder) close() error {
 		r.closed = true
 		dropped := r.pending
 		report := completionPhaseTraceReport{
-			Version:               2,
+			Version:               3,
 			RunID:                 strings.TrimSpace(os.Getenv(completionPhaseTraceRunIDEnv)),
 			CandidateSHA256:       strings.ToLower(strings.TrimPrefix(strings.TrimSpace(os.Getenv(completionPhaseTraceCandidateSHAEnv)), "sha256:")),
 			ProcessID:             os.Getpid(),

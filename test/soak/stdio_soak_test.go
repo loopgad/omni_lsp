@@ -711,7 +711,15 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				soakFailed(&evidence, "soak/workers", err.Error())
 				t.Fatal(err)
 			}
+			statusSampleStart := time.Now()
 			statusSample, statusErr := readStdioStatus(session)
+			// Client-observed monitor status latency, bucketed per minute like
+			// the worker query samples. Paired with the candidate's
+			// omnilsp/status phase samples (OMNILSP_S18_COMPLETION_PHASE_TRACE
+			// now records omnilsp/status too), a slow status round trip splits
+			// into scheduler queue wait (scheduling), dispatcher time
+			// (candidate handler), and the remainder (transport/runner).
+			latencies.record(startAt, "omnilsp/status(monitor)", time.Since(statusSampleStart))
 			if statusErr != nil {
 				stopWorkers()
 				soakFailed(&evidence, "soak/scheduler-limit", statusErr.Error())

@@ -102,8 +102,13 @@ func TestCompletionPhaseTraceCorrelatesPhasesAndWritesOnRunTeardown(t *testing.T
 	if err := json.Unmarshal(data, &report); err != nil {
 		t.Fatalf("decode trace report: %v", err)
 	}
-	if report.Version != 2 || report.SampleLimit != maxCompletionPhaseSamples || len(report.Samples) != 1 {
+	// Version 3 adds the optional per-sample `method` field so status samples
+	// can share the report with completion samples.
+	if report.Version != 3 || report.SampleLimit != maxCompletionPhaseSamples || len(report.Samples) != 1 {
 		t.Fatalf("unexpected trace report metadata: %+v", report)
+	}
+	if report.Samples[0].Method != "textDocument/completion" {
+		t.Errorf("sample method = %q, want textDocument/completion", report.Samples[0].Method)
 	}
 	if report.RunID != "trace-run-7" || report.CandidateSHA256 != strings.Repeat("a", 64) || report.ProcessID != os.Getpid() || report.CreatedUTC.IsZero() {
 		t.Fatalf("trace provenance = %+v", report)
@@ -254,12 +259,74 @@ func TestScheduledCompletionPhaseTraceIncludesSchedulerAndResponseStages(t *test
 	}
 }
 
+func TestScheduledStatusPhaseTraceRecordsMethodAndStages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scheduled-status-trace.json")
+	t.Setenv(completionPhaseTraceEnv, path)
+
+	s := New(DefaultConfig())
+	transport := newFakeTransport()
+	s.mu.Lock()
+	s.transport = transport
+	s.state = StateRunning
+	s.mu.Unlock()
+	s.scheduler.Start(context.Background())
+	defer s.scheduler.Shutdown()
+
+	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Num: 21}, "omnilsp/status", nil)
+	s.scheduleMessage(context.Background(), msg)
+	deadline := time.Now().Add(2 * time.Second)
+	var response *jsonrpc.Message
+	for time.Now().Before(deadline) {
+		transport.mu.Lock()
+		if len(transport.writes) > 0 {
+			response = transport.writes[0]
+		}
+		transport.mu.Unlock()
+		if response != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if response == nil || response.Error != nil || !strings.Contains(string(response.Result), "SnapshotEpochs") {
+		t.Fatalf("scheduled status response = %+v", response)
+	}
+	if err := s.completionPhaseTrace.close(); err != nil {
+		t.Fatalf("close trace: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read trace: %v", err)
+	}
+	var report completionPhaseTraceReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("decode trace: %v", err)
+	}
+	if len(report.Samples) != 1 {
+		t.Fatalf("trace sample count = %d, want 1", len(report.Samples))
+	}
+	sample := report.Samples[0]
+	if sample.Method != "omnilsp/status" || string(sample.ParentRequestID) != "21" {
+		t.Fatalf("status trace identity = %+v", sample)
+	}
+	if sample.URI != "" || sample.LanguageID != "" {
+		t.Fatalf("status trace must not claim document identity: %+v", sample)
+	}
+	// The soak's status diagnosis relies on these stages separating
+	// scheduling (queue wait) from the candidate handler (dispatcher) and
+	// transport (response write) inside one per-request sample.
+	if sample.SchedulerQueueWaitNS == 0 || sample.DispatcherCallNS == 0 ||
+		sample.ResponseWriteNS == 0 || sample.ServerRoundTripNS == 0 ||
+		sample.ResponseOutcome != "success" {
+		t.Fatalf("scheduled status trace omitted request stages: %+v", sample)
+	}
+}
+
 func TestCompletionPhaseTraceCapacityAndSafeClose(t *testing.T) {
 	t.Run("sample capacity is bounded", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "bounded.json")
 		recorder := newCompletionPhaseTraceRecorder(path, 1)
 		for i := int64(1); i <= 2; i++ {
-			span := recorder.begin("cpp", "file:///workspace/main.cpp", json.RawMessage("1"))
+			span := recorder.begin("textDocument/completion", "cpp", "file:///workspace/main.cpp", json.RawMessage("1"))
 			span.sample.BackendCompletionListNS = uint64(i)
 			span.finish()
 		}
@@ -282,7 +349,7 @@ func TestCompletionPhaseTraceCapacityAndSafeClose(t *testing.T) {
 	t.Run("late finish is dropped after close", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "pending.json")
 		recorder := newCompletionPhaseTraceRecorder(path, 2)
-		span := recorder.begin("c", "file:///workspace/main.c", json.RawMessage("9"))
+		span := recorder.begin("textDocument/completion", "c", "file:///workspace/main.c", json.RawMessage("9"))
 		if err := recorder.close(); err != nil {
 			t.Fatalf("close recorder with pending sample: %v", err)
 		}
