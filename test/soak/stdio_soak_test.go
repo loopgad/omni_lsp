@@ -39,6 +39,13 @@ const (
 	resourcePrivateGrowthLimit = uint64(512 << 20)
 	resourceHandleGrowthLimit  = uint64(1024)
 
+	// monitorAdvanceAbandonLimit replaces the previous in-loop
+	// "active == 0 && time.Since(startAt) > 30s" check: the dedicated monitor
+	// goroutine advances active duration now, so the main loop instead aborts
+	// when the monitor heartbeat (updated on every processed tick) is this
+	// stale. The 30s threshold and the abort message are unchanged.
+	monitorAdvanceAbandonLimit = 30 * time.Second
+
 	// stdioRequestBudgetEnv widens the per-request stdio budget for local
 	// diagnostic runs (see stdioRequestBudget). It is not a soak-gate
 	// precondition: strict gate semantics do not depend on it.
@@ -145,6 +152,108 @@ type controlledBackendRestartResult struct {
 	oldPID uint32
 	newPID uint32
 	err    error
+}
+
+// soakMonitorFatal is a continuity or liveness fatality detected by the
+// dedicated monitor goroutine. The main test goroutine turns it into evidence
+// entries and t.Fatal, because testing.T may only be touched from the goroutine
+// that started the test.
+type soakMonitorFatal struct {
+	checkID     string
+	message     string
+	notVerified bool
+	continuity  bool
+}
+
+// soakContinuityMonitor owns the soak's 5s continuity tick. It runs on its own
+// goroutine so active-duration advancement, the suspend/resume guard, and the
+// wall/monotonic sampling no longer queue behind blocking request bodies on
+// the main goroutine (gate-20261025T1404Z: the tick shared the main goroutine
+// with those bodies, starved for the whole run, and the harness aborted a
+// healthy run with "active duration monitor did not advance").
+//
+// True starvation still aborts: a monitor tick delayed past 2*soakPollPeriod,
+// a suspend/resume event, or a query-progress stall is fatal, and the main
+// loop additionally watches the heartbeat for a monitor that stopped
+// advancing. Heavy per-tick work (scheduler sampling, minute telemetry,
+// restarts) stays on the main loop and is triggered by dropped-when-busy tick
+// notifications, matching the old time.Ticker buffer-one drop semantics.
+type soakContinuityMonitor struct {
+	ticks     chan struct{}
+	fatal     chan soakMonitorFatal
+	heartbeat atomic.Int64 // UnixNano of the last processed tick
+	active    atomic.Int64 // active elapsed duration in nanoseconds
+	stop      chan struct{}
+	done      chan struct{}
+}
+
+func startSoakContinuityMonitor(guard suspendResumeGuard, completed *atomic.Uint64) *soakContinuityMonitor {
+	monitor := &soakContinuityMonitor{
+		ticks: make(chan struct{}, 1),
+		fatal: make(chan soakMonitorFatal, 1),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	monitor.heartbeat.Store(time.Now().UnixNano())
+	ticker := time.NewTicker(soakPollPeriod)
+	go func() {
+		defer close(monitor.done)
+		defer ticker.Stop()
+		monitor.run(guard, completed, ticker.C)
+	}()
+	return monitor
+}
+
+func (m *soakContinuityMonitor) activeDuration() time.Duration {
+	return time.Duration(m.active.Load())
+}
+
+// halt stops the monitor goroutine and waits for it. Call only once, from the
+// main test goroutine.
+func (m *soakContinuityMonitor) halt() {
+	close(m.stop)
+	<-m.done
+}
+
+// run processes ticks until stopped or a guard fires. It is synchronous so
+// focused tests can drive the tick channel directly.
+func (m *soakContinuityMonitor) run(guard suspendResumeGuard, completed *atomic.Uint64, ticks <-chan time.Time) {
+	lastMono, lastWall := time.Now(), time.Now().UTC()
+	lastProgressCount := completed.Load()
+	lastProgressAt := lastMono
+	for {
+		select {
+		case <-m.stop:
+			return
+		case now := <-ticks:
+			if err := guard.Check(); err != nil {
+				m.fatal <- soakMonitorFatal{checkID: "soak/continuity", message: err.Error(), notVerified: true, continuity: true}
+				return
+			}
+			monoDelta, wallDelta := now.Sub(lastMono), now.UTC().Sub(lastWall)
+			if wallDelta < 0 || wallDelta > 2*soakPollPeriod || wallDelta-monoDelta > 20*time.Second {
+				message := fmt.Sprintf("sleep/interruption invalidated the soak: wall sample gap=%s monotonic gap=%s", wallDelta, monoDelta)
+				m.fatal <- soakMonitorFatal{checkID: "soak/continuity", message: message, notVerified: true, continuity: true}
+				return
+			}
+			m.active.Add(int64(monoDelta))
+			lastMono, lastWall = now, now.UTC()
+			if progressed := completed.Load(); progressed > lastProgressCount {
+				lastProgressCount = progressed
+				lastProgressAt = now
+			}
+			if active := m.activeDuration(); active >= 2*time.Minute && now.Sub(lastProgressAt) > 2*time.Minute {
+				message := fmt.Sprintf("query progress stalled for %s with %d completed requests", now.Sub(lastProgressAt), lastProgressCount)
+				m.fatal <- soakMonitorFatal{checkID: "soak/query-progress", message: message, notVerified: false, continuity: false}
+				return
+			}
+			m.heartbeat.Store(time.Now().UnixNano())
+			select {
+			case m.ticks <- struct{}{}:
+			default:
+			}
+		}
+	}
 }
 
 func TestSoak_RealStdioMixedWorkload(t *testing.T) {
@@ -502,9 +611,6 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 	}
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	results, workerDone, alive := startStdioWorkers(workerCtx, session, workerQueries, &completed, latencies, startAt)
-	active := time.Duration(0)
-	lastMono := startAt
-	lastWall := lastMono.UTC()
 	lastTelemetry := time.Duration(0)
 	lastIndexGeneration := uint64(0)
 	lastSnapshotEpochs := 0
@@ -522,10 +628,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 	backendRestartStarted := false
 	backendRestartDone := make(chan controlledBackendRestartResult, 1)
 	var backendRestartPending <-chan controlledBackendRestartResult
-	lastRequestProgressAt := startAt
-	lastRequestProgress := completed.Load()
-	var ticker = time.NewTicker(soakPollPeriod)
-	defer ticker.Stop()
+	monitor := startSoakContinuityMonitor(continuityGuard, &completed)
 	recordBackendRestart := func(result controlledBackendRestartResult) error {
 		if result.err != nil {
 			return result.err
@@ -534,11 +637,11 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		backendRestarted = true
 		sequence++
 		now := time.Now()
-		writeRow(stdioTelemetry{Sequence: sequence, Kind: "backend-restart", UTC: now.UTC(), ActiveElapsed: active, Requests: completed.Load(), Edits: edits.Load(), Seed: soakSeed, BackendRestarts: backendRestarts, CandidateHash: candidateHash, WorkerHash: workerHash, Server: map[string]any{"backend": "rust/rust-analyzer", "old_pid": result.oldPID, "new_pid": result.newPID}})
+		writeRow(stdioTelemetry{Sequence: sequence, Kind: "backend-restart", UTC: now.UTC(), ActiveElapsed: monitor.activeDuration(), Requests: completed.Load(), Edits: edits.Load(), Seed: soakSeed, BackendRestarts: backendRestarts, CandidateHash: candidateHash, WorkerHash: workerHash, Server: map[string]any{"backend": "rust/rust-analyzer", "old_pid": result.oldPID, "new_pid": result.newPID}})
 		evidence.Checks = append(evidence.Checks, report.Check{ID: "soak/backend-restart", Status: report.Passed, Summary: "terminated the supervised rust-analyzer leaf under active queries; the replacement returned semantic hover and kept one process identity through a stability window", Observed: map[string]any{"backend": "rust/rust-analyzer", "old_pid": result.oldPID, "new_pid": result.newPID, "candidate_pid": candidatePID.Load()}})
 		return nil
 	}
-	for active < duration {
+	for monitor.activeDuration() < duration {
 		select {
 		case result := <-results:
 			if result.err != nil {
@@ -572,42 +675,25 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			lastRequestProgressAt = time.Now()
-			lastRequestProgress = completed.Load()
 		case restartedBackend := <-backendRestartPending:
 			backendRestartPending = nil
 			if err := recordBackendRestart(restartedBackend); err != nil {
 				stopWorkers()
 				soakFailed(&evidence, "soak/backend-restart", err.Error())
-				t.Fatalf("controlled rust-analyzer restart: %v", err)
+				t.Fatalf("controlled rust-analyzer restart: %v", restartedBackend.err)
 			}
-		case <-ticker.C:
-			if err := continuityGuard.Check(); err != nil {
-				stopWorkers()
-				recordContinuityFailure(err.Error())
-				t.Fatal(err)
+		case fatal := <-monitor.fatal:
+			stopWorkers()
+			if fatal.continuity {
+				recordContinuityFailure(fatal.message)
+			} else {
+				soakFailed(&evidence, fatal.checkID, fatal.message)
 			}
+			t.Fatal(fatal.message)
+		case <-monitor.ticks:
 			now := time.Now()
 			wall := now.UTC()
-			monoDelta, wallDelta := now.Sub(lastMono), wall.Sub(lastWall)
-			if wallDelta < 0 || wallDelta > 2*soakPollPeriod || wallDelta-monoDelta > 20*time.Second {
-				stopWorkers()
-				message := fmt.Sprintf("sleep/interruption invalidated the soak: wall sample gap=%s monotonic gap=%s", wallDelta, monoDelta)
-				recordContinuityFailure(message)
-				t.Fatal(message)
-			}
-			active += monoDelta
-			lastMono, lastWall = now, wall
-			if completed.Load() > lastRequestProgress {
-				lastRequestProgress = completed.Load()
-				lastRequestProgressAt = now
-			}
-			if active >= 2*time.Minute && now.Sub(lastRequestProgressAt) > 2*time.Minute {
-				stopWorkers()
-				message := fmt.Sprintf("query progress stalled for %s with %d completed requests", now.Sub(lastRequestProgressAt), lastRequestProgress)
-				soakFailed(&evidence, "soak/query-progress", message)
-				t.Fatal(message)
-			}
+			active := monitor.activeDuration()
 			tree, err := job.sample(os.Getpid(), int(candidatePID.Load()))
 			if err != nil {
 				stopWorkers()
@@ -860,7 +946,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				t.Fatal(message)
 			}
 		}
-		if active == 0 && time.Since(startAt) > 30*time.Second {
+		if time.Since(time.Unix(0, monitor.heartbeat.Load())) > monitorAdvanceAbandonLimit {
 			stopWorkers()
 			message := "active duration monitor did not advance"
 			soakNotVerified(&evidence, "soak/continuity", message)
@@ -868,6 +954,18 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 			t.Fatal(message)
 		}
 	}
+	monitor.halt()
+	select {
+	case fatal := <-monitor.fatal:
+		if fatal.continuity {
+			recordContinuityFailure(fatal.message)
+		} else {
+			soakFailed(&evidence, fatal.checkID, fatal.message)
+		}
+		t.Fatal(fatal.message)
+	default:
+	}
+	active := monitor.activeDuration()
 	continuityCloseAttempted = true
 	closeErr, finalCheckErr := finalizeSuspendResumeGuard(continuityGuard)
 	if closeErr != nil {
