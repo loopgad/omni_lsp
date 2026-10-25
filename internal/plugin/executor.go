@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,33 @@ import (
 	"sync"
 	"time"
 )
+
+// 进程生命周期三态（LSP shutdown/exit 语义的宿主半边，goal.md §C2）：
+//
+//		lcActive --Shutdown()--> lcShutdown --Exit()--> lcExited
+//
+//	  - lcShutdown：shutdown 已应答、exit 未发生——插件仍须响应请求（§C2
+//	    「shutdown 停止接受新的语义工作，同时允许有界清理」），Call 照常放行；
+//	  - lcActive 态直接 Exit 属于不合规退出（LSP：exit 之前必须 shutdown），
+//	    宿主拒绝发送并返回 ErrNonCompliantExit；
+//	  - lcExited 之后一切 Call 被拒。
+type procLifecycle int
+
+const (
+	lcActive procLifecycle = iota
+	lcShutdown
+	lcExited
+)
+
+// ErrNonCompliantExit 表示未先 shutdown 就请求 exit——宿主拒绝发送 plugin/exit
+// （LSP 语义：不合规退出，违反生命周期次序）。
+var ErrNonCompliantExit = errors.New("plugin: 不合规退出：exit 之前必须先 shutdown")
+
+// ErrAlreadyShutdown 表示 shutdown 已完成，重复 shutdown 被拒。
+var ErrAlreadyShutdown = errors.New("plugin: 已 shutdown")
+
+// ErrExited 表示插件已 exit，进程生命周期终态之后的请求一律拒绝。
+var ErrExited = errors.New("plugin: 进程已 exit")
 
 // callTimeout 是单次 Call 读取响应行的上限。
 const callTimeout = 5 * time.Second
@@ -32,10 +60,14 @@ type Process struct {
 	grant  Grant
 
 	writeMu    sync.Mutex // 串行化对 stdin 的写入
-	mu         sync.Mutex // 保护 nextID 与 pending 响应表
+	mu         sync.Mutex // 保护 nextID、pending 响应表与 lifecycle 状态机
 	nextID     int
 	pending    map[int]chan response
+	lifecycle  procLifecycle // shutdown/exit 三态（mu 保护）
 	onExitOnce sync.Once
+	// caps 是 manifest.capabilities 的快照（Launch 后不可变）：Call 级能力门
+	// 的「声明」半边——Launch 已保证声明 ⊆ 授予，故 Call 只需查声明表。
+	caps map[Capability]bool
 	// OnExit 在进程退出后被调用恰好一次，参数为 Wait 的返回值；
 	// 宿主用它接入 Manager.RecordCrash 实现崩溃循环遏制。
 	// 只能在 Launch 时设置（spawn 前接线，见 Launch 文档）。
@@ -64,8 +96,9 @@ type helloFrame struct {
 //
 // 协议完整版已落地：id 关联多路复用（Call 任意并发，按响应 id 配对）、
 // Content-Length 头分帧（附加头容忍、帧边界精确消费、单帧大小上限）、
-// 宿主→插件通知广播（Notify）。剩余升级路径：优雅 shutdown（plugin/shutdown
-// + plugin/exit）、以及按方法到能力的映射把能力门下沉到 Call 级别。
+// 宿主→插件通知广播（Notify）、优雅停机（Shutdown/Exit 三态状态机，
+// LSP shutdown/exit 语义）、以及按方法→能力映射下沉到 Call 级别的能力门
+// （methodCapability + manifest 声明快照，见 Call）。
 func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*Process, error) {
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("plugin: launch 前置完整性校验: %w", err)
@@ -96,7 +129,13 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 		stdout:  bufio.NewReader(stdout),
 		grant:   grant,
 		pending: make(map[int]chan response),
+		caps:    make(map[Capability]bool, len(m.Capabilities)),
 		OnExit:  onExit,
+	}
+	for _, c := range m.Capabilities {
+		if c != "" { // 防御：空能力不进声明表（Validate 已拒，双保险）
+			p.caps[c] = true
+		}
 	}
 	hf := helloFrame{JSONRPC: "2.0", Method: "plugin/hello"}
 	hf.Params.APIVersion = SupportedAPIVersion
@@ -259,10 +298,38 @@ func (p *Process) notifyPendingLocked(err error) {
 	}
 }
 
+// methodCapability 是插件协议「方法 → 所需能力」映射（§O2 能力门下沉）。
+// 映射内的方法，Call 时要求 manifest 已声明对应能力（授予半边由 Launch 的
+// 前置门保证：声明 ⊆ grant）；映射外的方法（plugin/hello、plugin/shutdown、
+// 审计等协议管线）不设能力门——默认 deny 约束能力本身，不约束无能力语义的
+// 协议方法。宿主侧固定映射：方法名由协议定义，不由 manifest 自由扩展。
+var methodCapability = map[string]Capability{
+	"index/query":      CapIndexQuery,
+	"index/write":      CapIndexWrite,
+	"diagnostics/emit": CapDiagnosticsEmit,
+	"code_action/emit": CapCodeActionEmit,
+}
+
 // Call 发送一次 JSON-RPC 请求并按 id 等待对应响应，可任意并发（多路复用），
-// 超时 callTimeout。剩余升级路径（shutdown、按方法下沉能力门）见 Launch 尾注。
+// 超时 callTimeout。
+//
+// 两道 Call 级检查：
+//  1. 生命周期：lcExited 之后一律拒绝（ErrExited）；lcShutdown 照常放行——
+//     LSP 语义 shutdown 之后插件仍须响应，直到 exit；
+//  2. 能力门下沉：映射内方法要求 manifest 已声明所需能力（§O2），
+//     未声明返回 ErrCapabilityDenied。
 func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 	p.mu.Lock()
+	if p.lifecycle == lcExited {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("%w: Call 被拒绝", ErrExited)
+	}
+	if need, mapped := methodCapability[method]; mapped {
+		if !p.caps[need] {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: 方法 %q 需要能力 %q，manifest 未声明", ErrCapabilityDenied, method, need)
+		}
+	}
 	p.nextID++
 	id := p.nextID
 	ch := make(chan response, 1)
@@ -301,6 +368,60 @@ func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("plugin: 响应超时（>%v）", callTimeout)
 	}
+}
+
+// Shutdown 执行优雅停机的第一步：发送 plugin/shutdown 请求并等待插件应答
+// （应答即停机握手确认）。按 LSP shutdown 语义（goal.md §C2）：shutdown 之后
+// 插件仍须响应请求，直到 exit——故 lcShutdown 态下 Call 照常放行。
+//
+// 状态迁移：lcActive → lcShutdown 先行占位（阻止并发 Exit 抢跑），握手失败
+// （写失败/超时）回滚到 lcActive——不合规退出拦截不得因失败的 shutdown 被绕过。
+// 重复 shutdown 返回 ErrAlreadyShutdown；已 exit 后返回 ErrExited。
+func (p *Process) Shutdown() error {
+	p.mu.Lock()
+	cur := p.lifecycle
+	if cur == lcExited {
+		p.mu.Unlock()
+		return fmt.Errorf("%w: shutdown 被拒绝", ErrExited)
+	}
+	if cur == lcShutdown {
+		p.mu.Unlock()
+		return ErrAlreadyShutdown
+	}
+	p.lifecycle = lcShutdown
+	p.mu.Unlock()
+
+	if _, err := p.Call("plugin/shutdown", nil); err != nil {
+		p.mu.Lock()
+		p.lifecycle = lcActive
+		p.mu.Unlock()
+		return fmt.Errorf("plugin: shutdown 握手: %w", err)
+	}
+	return nil
+}
+
+// Exit 是优雅停机的终点：发送 plugin/exit 通知，插件收到后自行退出
+// （干净退出经 OnExit 以 nil 上报）。按 LSP 语义 exit 之前必须先 shutdown——
+// lcActive 态直接 Exit 属于不合规退出，宿主拒绝迁移状态、不向管道写任何
+// 字节，返回 ErrNonCompliantExit。lcExited 态重复 Exit 返回 ErrExited。
+func (p *Process) Exit() error {
+	p.mu.Lock()
+	cur := p.lifecycle
+	if cur == lcActive {
+		p.mu.Unlock()
+		return fmt.Errorf("%w（宿主拒绝发送 plugin/exit）", ErrNonCompliantExit)
+	}
+	if cur == lcExited {
+		p.mu.Unlock()
+		return fmt.Errorf("%w: 重复 exit", ErrExited)
+	}
+	p.lifecycle = lcExited
+	p.mu.Unlock()
+
+	if err := p.Notify("plugin/exit", nil); err != nil {
+		return fmt.Errorf("plugin: exit 通知: %w", err)
+	}
+	return nil
 }
 
 // Notify 是宿主→插件的广播通道：发送一条无 id 的 JSON-RPC 通知帧

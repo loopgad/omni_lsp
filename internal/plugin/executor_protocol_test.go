@@ -177,6 +177,8 @@ func TestFraming_SkipsUnparsableFrame(t *testing.T) {
 	t.Setenv("GO_PLUGIN_MODE", "garbage-then-reply")
 
 	m := newValidManifest([]byte("x"))
+	// index/query 走 Call 级能力门（下沉后），manifest 须声明 index.query。
+	m.Capabilities = []Capability{CapIndexQuery}
 	p := spawnHelper(t, "garbage-then-reply", m, NewGrant(m.Capabilities...))
 
 	res, err := p.Call("index/query", map[string]any{"uri": "file:///ok.go"})

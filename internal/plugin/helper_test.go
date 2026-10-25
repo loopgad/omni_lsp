@@ -37,6 +37,11 @@ func TestMain(m *testing.M) {
 //     （验证单帧损坏不中止连接、不殃及并发请求）；
 //   - collect-notify: 记录 hello 之后所有无 id 的通知帧，收到
 //     broadcast/audit 请求时把它们原样回传（验证 Notify 广播）；
+//   - graceful-shutdown: plugin/shutdown 请求以 null 应答并记录；
+//     plugin/exit 通知只记录不退出（供宿主事后审计）；其余请求回显
+//     （验证 shutdown 后响应仍可用、不合规 exit 零发送）；
+//   - shutdown-exit  : 同 graceful-shutdown，但收到 plugin/exit 通知后
+//     立即干净退出（exit 0）（验证 shutdown→exit 完整生命周期）；
 //   - die       : 立即退出（覆盖宿主的 EOF/进程死亡路径）；
 //   - roundtrip : 默认。回显 {"pong": <原样 params>}，id 与请求一致。
 func helperMain() {
@@ -57,6 +62,7 @@ func helperMain() {
 		Args json.RawMessage
 	}
 	var collected []json.RawMessage
+	var sawShutdown, sawExit bool
 	for {
 		line, err := readHelperFrame(reader)
 		if err != nil {
@@ -84,7 +90,7 @@ func helperMain() {
 		_ = json.Unmarshal(line, &req)
 		if req.ID == nil {
 			// 无 id 的帧是插件→宿主方向的帧在宿主→插件方向上的镜像：
-			// 宿主发出的通知。只有 collect-notify 模式关心它们。
+			// 宿主发出的通知。只有 collect-notify 与 shutdown 两种模式关心。
 			if mode == "collect-notify" {
 				note := struct {
 					Method string          `json:"method"`
@@ -92,6 +98,15 @@ func helperMain() {
 				}{Method: req.Method, Params: req.Args}
 				if b, mErr := json.Marshal(note); mErr == nil {
 					collected = append(collected, b)
+				}
+			}
+			if req.Method == "plugin/exit" && (mode == "graceful-shutdown" || mode == "shutdown-exit") {
+				sawExit = true
+				if mode == "shutdown-exit" {
+					if err := w.Flush(); err != nil {
+						return
+					}
+					return // 干净退出（exit 0）：LSP 语义里 exit 即终止
 				}
 			}
 			continue
@@ -184,6 +199,20 @@ func helperMain() {
 				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"notifications\":%s}}", id, payload)
 				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 			} else {
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+			}
+		case "graceful-shutdown", "shutdown-exit":
+			switch req.Method {
+			case "plugin/shutdown":
+				sawShutdown = true
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+			case "audit/lifecycle":
+				st, _ := json.Marshal(map[string]bool{"sawShutdown": sawShutdown, "sawExit": sawExit})
+				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", id, st)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+			default:
 				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
 				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 			}
