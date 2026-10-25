@@ -39,7 +39,33 @@ func (c *Codec) maxMessageSize() int {
 
 // ReadMessage reads a single JSON-RPC message from the reader.
 // It parses Content-Length header, then reads exactly that many bytes.
+//
+// ReadMessage is the single-message decoder: a batch (array) body cannot be
+// represented as one *Message and fails with a typed ParseError. Frames are
+// classified — batches included, per the JSON-RPC 2.0 §6 ruling — by
+// ReadFrame; the transports read through ReadFrame, so an array body no
+// longer reaches this decoder on a live session.
 func (c *Codec) ReadMessage(r io.Reader) (*Message, error) {
+	body, err := c.readBody(r)
+	if err != nil {
+		return nil, err
+	}
+
+	var msg Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		return nil, &CodecError{
+			Code:    ParseError,
+			Message: fmt.Sprintf("parse error: %v", err),
+		}
+	}
+
+	return &msg, nil
+}
+
+// readBody reads one framed body: Content-Length header, size-cap checks,
+// then exactly that many bytes. Shared by ReadMessage and ReadFrame so both
+// enforce the same framing contract (§C1 cap included).
+func (c *Codec) readBody(r io.Reader) ([]byte, error) {
 	contentLength, err := c.readHeader(r)
 	if err != nil {
 		return nil, err
@@ -60,15 +86,7 @@ func (c *Codec) ReadMessage(r io.Reader) (*Message, error) {
 		return nil, fmt.Errorf("jsonrpc: failed to read message body: %w", err)
 	}
 
-	var msg Message
-	if err := json.Unmarshal(body, &msg); err != nil {
-		return nil, &CodecError{
-			Code:    ParseError,
-			Message: fmt.Sprintf("parse error: %v", err),
-		}
-	}
-
-	return &msg, nil
+	return body, nil
 }
 
 // WriteMessage writes a JSON-RPC message to the writer with LSP framing.

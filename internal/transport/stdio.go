@@ -80,10 +80,17 @@ func NewStdioTransportFromOS() *StdioTransport {
 }
 
 // readLoop is the single goroutine responsible for reading messages (F15).
+//
+// Batch frames (JSON-RPC 2.0 §6, per the 2026-10-25 ruling in
+// docs/audit-longterm-spec.md 终局裁决第 1 条) are expanded here: a valid
+// element is delivered as usual, an element that fails to decode is answered
+// with its single error response on the outbound stream, and the frame never
+// terminates the session. Only framing-level faults — a frame that cannot be
+// parsed at all, a broken header, an oversize body — stay per-stream fatal.
 func (t *StdioTransport) readLoop() {
 	defer close(t.done)
 	for {
-		msg, err := t.codec.ReadMessage(t.stdin)
+		fr, err := t.codec.ReadFrame(t.stdin)
 		if err != nil {
 			select {
 			case t.errCh <- err:
@@ -91,17 +98,55 @@ func (t *StdioTransport) readLoop() {
 			}
 			return
 		}
-		select {
-		case t.msgCh <- msg:
-		default:
-			// Buffer full: drop + terminate — Backpressure policy (F6) above.
-			select {
-			case t.errCh <- io.ErrShortBuffer:
-			default:
+		if fr.Msg != nil {
+			if !t.deliver(fr.Msg) {
+				return
 			}
-			return
+			continue
+		}
+		for _, el := range fr.Elements {
+			if el.Reply != nil {
+				// §6 element isolation: answer this element only.
+				if err := t.writeMessage(el.Reply); err != nil {
+					select {
+					case t.errCh <- err:
+					default:
+					}
+					return
+				}
+				continue
+			}
+			if !t.deliver(el.Msg) {
+				return
+			}
 		}
 	}
+}
+
+// deliver pushes one message into msgCh, applying the F6 backpressure policy
+// (drop + terminal error) when the buffer is full. Reports false when the
+// read loop must exit.
+func (t *StdioTransport) deliver(msg *jsonrpc.Message) bool {
+	select {
+	case t.msgCh <- msg:
+		return true
+	default:
+		// Buffer full: drop + terminate — Backpressure policy (F6) above.
+		select {
+		case t.errCh <- io.ErrShortBuffer:
+		default:
+		}
+		return false
+	}
+}
+
+// writeMessage writes one message to the outbound stream under writeMu, so a
+// batch element's error response cannot interleave with a concurrent Write
+// and corrupt the framing.
+func (t *StdioTransport) writeMessage(msg *jsonrpc.Message) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.codec.WriteMessage(t.stdout, msg)
 }
 
 func (t *StdioTransport) Read(ctx context.Context) (*jsonrpc.Message, error) {
@@ -134,11 +179,8 @@ func (t *StdioTransport) Write(ctx context.Context, msg *jsonrpc.Message) error 
 		return io.ErrClosedPipe
 	}
 
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-
 	// Write is non-cancelable once started to avoid partial messages.
-	return t.codec.WriteMessage(t.stdout, msg)
+	return t.writeMessage(msg)
 }
 
 func (t *StdioTransport) Close() error {
@@ -193,7 +235,7 @@ func NewTCPTransport(conn net.Conn) *TCPTransport {
 func (t *TCPTransport) readLoop() {
 	defer close(t.done)
 	for {
-		msg, err := t.codec.ReadMessage(t.readBuf)
+		fr, err := t.codec.ReadFrame(t.readBuf)
 		if err != nil {
 			select {
 			case t.errCh <- err:
@@ -201,17 +243,54 @@ func (t *TCPTransport) readLoop() {
 			}
 			return
 		}
-		select {
-		case t.msgCh <- msg:
-		default:
-			// Buffer full: drop + terminate — Backpressure policy (F6) above.
-			select {
-			case t.errCh <- io.ErrShortBuffer:
-			default:
+		if fr.Msg != nil {
+			if !t.deliver(fr.Msg) {
+				return
 			}
-			return
+			continue
+		}
+		// Same §6 element isolation as stdio: one semantics across transports.
+		for _, el := range fr.Elements {
+			if el.Reply != nil {
+				if err := t.writeMessage(el.Reply); err != nil {
+					select {
+					case t.errCh <- err:
+					default:
+					}
+					return
+				}
+				continue
+			}
+			if !t.deliver(el.Msg) {
+				return
+			}
 		}
 	}
+}
+
+// deliver pushes one message into msgCh, applying the F6 backpressure policy
+// (drop + terminal error) when the buffer is full. Reports false when the
+// read loop must exit.
+func (t *TCPTransport) deliver(msg *jsonrpc.Message) bool {
+	select {
+	case t.msgCh <- msg:
+		return true
+	default:
+		// Buffer full: drop + terminate — Backpressure policy (F6) above.
+		select {
+		case t.errCh <- io.ErrShortBuffer:
+		default:
+		}
+		return false
+	}
+}
+
+// writeMessage writes one message to the connection under writeMu, so a
+// batch element's error response cannot interleave with a concurrent Write.
+func (t *TCPTransport) writeMessage(msg *jsonrpc.Message) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.codec.WriteMessage(t.conn, msg)
 }
 
 func (t *TCPTransport) Read(ctx context.Context) (*jsonrpc.Message, error) {
@@ -243,9 +322,7 @@ func (t *TCPTransport) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	if t.closed.Load() {
 		return io.ErrClosedPipe
 	}
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	return t.codec.WriteMessage(t.conn, msg)
+	return t.writeMessage(msg)
 }
 
 func (t *TCPTransport) Close() error {

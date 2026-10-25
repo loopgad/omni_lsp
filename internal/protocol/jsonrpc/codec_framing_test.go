@@ -24,17 +24,6 @@ func TestCodecRejectsMalformedBodies(t *testing.T) {
 	}{
 		{"not json at all", frame("{not js")},
 		{"truncated object", frame(`{"jsonrpc":`)},
-		// A JSON-RPC batch is a legal request frame that this decoder cannot
-		// represent: ReadMessage decodes into a single *Message, so an array
-		// body fails. Asserting the typed error documents the shape; it does
-		// not make the behaviour right. transport treats any ReadMessage error
-		// as fatal, so one batch frame currently drops the connection instead of
-		// getting a per-message ParseError as JSON-RPC 2.0 §5.1 requires.
-		// 语义未拍板（§7.5，见 docs/audit-longterm-spec.md §3.1 现状与 §7 第 5 条
-		// 拍板项）：拒绝并保持连接 vs 实现批量；本用例钉的是 codec 半边现状，
-		// 传输半边由 transport.TestBatchFrameIsPerStreamFatal 钉住，拍板后两者
-		// 必须随选定语义改写。
-		{"json-rpc batch array", frame(`[{"jsonrpc":"2.0","id":1,"method":"x"}]`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewCodec().ReadMessage(strings.NewReader(tc.raw))
@@ -46,6 +35,33 @@ func TestCodecRejectsMalformedBodies(t *testing.T) {
 				t.Errorf("code = %d, want ParseError (%d)", codecErr.Code, ParseError)
 			}
 		})
+	}
+}
+
+// TestReadMessageRejectsBatchArraySingleMessageDecoder replaces the
+// "json-rpc batch array" case inside TestCodecRejectsMalformedBodies
+// (commit 9897d0a), per the 2026-10-25 batch ruling (docs/audit-longterm-spec.md
+// 终局裁决第 1 条). The old case pinned a bug-shaped status quo: ReadMessage
+// decodes into a single *Message, so an array body failed with ParseError,
+// and transport treated any ReadMessage error as fatal — one legal batch
+// frame dropped the whole connection. That chain is gone: the transports
+// read through ReadFrame, which classifies array bodies as §6 batches and
+// answers elements individually (batch_test.go, transport
+// TestBatchElementsAnsweredIndividually).
+//
+// What remains true — and what this test now pins — is the narrower fact the
+// old case conflated with the connection kill: ReadMessage is the
+// single-message decoder, and an array body is unrepresentable for it, so it
+// still fails with a typed ParseError. Callers that need batch semantics
+// must go through ReadFrame.
+func TestReadMessageRejectsBatchArraySingleMessageDecoder(t *testing.T) {
+	_, err := NewCodec().ReadMessage(strings.NewReader(frame(`[{"jsonrpc":"2.0","id":1,"method":"x"}]`)))
+	var codecErr *CodecError
+	if !errors.As(err, &codecErr) {
+		t.Fatalf("error = %v (%T), want *CodecError", err, err)
+	}
+	if codecErr.Code != ParseError {
+		t.Errorf("code = %d, want ParseError (%d)", codecErr.Code, ParseError)
 	}
 }
 
