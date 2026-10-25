@@ -741,3 +741,42 @@ offset debt on file in `freeze-record.txt`):
   （`go run ./cmd/omnilsp verify --json`）：coreScore=98.45959595959597、
   x5 域 0.9285714285714286、x9 域 0.75（X9-1 PARTIAL 0.5 + X9-2 AUTO 1.0
   均值），变更前后逐位一致。
+
+
+## Evidence record — 2026-10-25/26 第十六轮开行（九项收口裁决落档）
+
+- 性质：本轮为档案记录轮（第十六轮开行）——把源侧九项收口裁决（含推导链）
+  原样落进 docs/audit-longterm-spec.md §7 新增「终局裁决（2026-10-25）」
+  小节，并在本文件登记本轮运行记录；除两份在案文档与 git 提交外零改动。
+  裁决包日期 2026-10-25，落档动作执行于 2026-10-26。
+- 本轮范围：① 探测——audit §7（docs/audit-longterm-spec.md「§7 需要拍板
+  的开放项」）现状为 6 条编号开放项（§7.1 X5-4 已销；§7.2-§7.6 待拍板在
+  位），acceptance.md 运行记录体例为「## Evidence record —」一轮一节，
+  本节即第十六轮开行记录；② 落档——§7 末尾追加终局裁决小节：第 1-5 条
+  拍板销 §7.2-§7.6 五个待拍板项（批量帧语义、fast 档执行探针、soak
+  form-only 移出 build tag、Semantic Core 进 ci.yml、2s wall-clock 预算
+  派生），第 7 条定 codeAction 收口标准（本轮评估登记差距、不强制全部
+  实现），第 6/8/9 条明确为机械规则非拍板（X10 按 registry Milestone
+  机械排序——X9-1 关账前不解锁，本轮不动插件接线；27 条 DEFERRED 各自
+  Reason/Milestone 字段即规则；tools.lock.json + sha256 可复现性契约维持
+  不变）。
+- 裁决依据（逐条推导链见 audit §7 终局裁决小节，此处记要点）：JSON-RPC
+  2.0 §6 与 LSP 3.17 弃用批量，帧完整性 vs 元素有效性切割；AUTO 的定义
+  就是 Probe 被执行（能力=先探测后承诺）；廉价确定性检查必须常跑；凡记入
+  账面的门必须有 CI 执行面；阈值一律预算派生/证据度量、禁裸常量（第十四轮
+  reindex deadline 先例，commit 9e3b14e）；服务端原生诊断凡修复可机械推导
+  者必须配真实 quickfix。
+- 锚点实测（记账员本轮亲验）：test/perf/perf_test.go:487
+  `if d := time.Since(start); d > 2*time.Second` 在位；
+  internal/transport/stdio_test.go:282 `TestBatchFrameIsPerStreamFatal`
+  在位（codec 侧对应注释见
+  internal/protocol/jsonrpc/codec_framing_test.go:35）；test/soak/
+  resource_trend_test.go:1 仍为 `//go:build soak`。上述即裁决 1/3/5 的
+  现状锚点，本轮不动它们。
+- 本轮不动代码：裁决的工程实现（批量帧用例改写、fast 探针执行、form-only
+  移 tag、ci.yml 门禁接线、perf 阈值派生、codeAction 差距清点）均属后续
+  轮次，本轮只落档。
+- 门禁与提交：`go build ./...` 实跑通过（本轮 docs-only，未触碰任何 Go
+  包，包级 `go test -count=1` 无对象，如实登记为不适用）；
+  `git add docs/audit-longterm-spec.md docs/acceptance.md && git commit
+  -m "docs: record the nine closing rulings with derivations"`。

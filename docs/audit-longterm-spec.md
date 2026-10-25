@@ -649,6 +649,64 @@ registry 的 Text↔探针对齐、X5-4 的降级、`soak` 的默认门禁、
    test/perf/perf_test.go:487（实测 `if d := time.Since(start); d >
    2*time.Second` 在位）；事项仍开放，阈值实测仍在。
 
+### 终局裁决（2026-10-25）
+
+九项收口裁决由源侧下达，全文（含推导链）原样落档如下。第 1-5 条为拍板，
+§7.2-§7.6 五个待拍板项就此销案；第 7 条为收口标准；**第 6、8、9 条为机械
+规则，非拍板**——它们是 registry 与工具锁既有规则的再确认，不新增裁量、
+无实现动作。落点阶段按 §6 长程路线（A 可立即开始 / B 先测量 / C 需拍板 /
+D 结构性）标注；凡属语义变更的落地轮须遵守「语义变更先写验证、先红后绿，
+与旧钉住测试的替换明确切割」的工程纪律。
+
+1. **批量帧语义（源缺口1）**：依 JSON-RPC 2.0 §6 与 LSP 3.17 弃用批量——
+   批量内单元素解析失败只对该元素回单条 error response，其余元素照常处理；
+   整帧不可解析维持 per-stream fatal（帧完整性 vs 元素有效性切割）。
+   **推导**：协议规范明文裁定批量内元素错误按元素隔离；帧完整性（framing
+   层）与元素有效性（batch 内单元素）是两层，前者破坏即 per-stream fatal，
+   后者不再殃及整条连接。**落点**：§7.5 销案；实现归阶段 A——语义变更先
+   红后绿，改写第八轮钉住现状的两处用例（transport/stdio_test.go:282
+   `TestBatchFrameIsPerStreamFatal` 与 codec 侧 9897d0a 用例，后者注释见
+   protocol/jsonrpc/codec_framing_test.go:35），并保留与旧钉住点对应的
+   反例测试（整帧不可解析仍 per-stream fatal）。
+2. **fast 档执行探针（源拍板：fast probe execution）**：fast 档在 AST
+   符号存在性之后执行 AUTO 条目的 Probe 测试（有界、限时）。**推导**：
+   AUTO 的定义就是 Probe 被执行（能力=先探测后承诺）；fast 档 97.71 分在
+   所有被引用测试全红时保持不变，即「分数不能自己解释」（§7.2），故 fast
+   档必须真跑 Probe。**落点**：§7.2 销案；实现归阶段 C（fast 报告语义与
+   `TestConformanceNoRegression` 的真跑探针模式），有界、限时以防 fast
+   门禁超预算。
+3. **soak form-only 测试移出 build tag（源拍板：soak form-only gate）**：
+   廉价确定性检查必须常跑，仅重型负载保留 build tag。**推导**：form-only
+   检查不需要长跑也能给信号（§7.3 建议半边）；资源趋势断言需要时间，留在
+   tag 后。**落点**：§7.3 销案；实现归阶段 A——把 form-only 半边移出
+   `//go:build soak`（test/soak/resource_trend_test.go:1 实测仍带 tag）。
+4. **Semantic Core 进 ci.yml（源拍板：Semantic Core ci.yml）**：凡记入
+   账面的门必须有 CI 执行面；先探运行时，超 CI 预算则裁剪范围并记录。
+   **推导**：账面与执行面一致性——门只有定义而无 CI 执行，等于没门
+   （§7.4 剩余的定义层面半边）。**落点**：§7.4 销案；实现归阶段 A——
+   ci.yml 门禁侧补 internal/index（终审状态段实测：ci.yml:30 归门禁侧），
+   先探运行时成本，超预算裁剪并在本节登记。
+5. **2s wall-clock 改预算派生（源拍板：2s wall clock）**：依第十四轮先例
+   （reindex deadline 预算派生化），阈值一律预算派生/证据度量，禁裸常量。
+   **推导**：2s 是任意值（§7.6）；预算派生让阈值随环境自适应且可解释，
+   commit 9e3b14e（soak reindex deadline 从请求 budget 派生）为先例。
+   **落点**：§7.6 销案；实现归阶段 A——test/perf/perf_test.go:487 的
+   `2*time.Second` 改预算派生/证据度量。
+6. **X10 插件 API 面接线（源缺口6）**：registry 自带 Milestone 规则——
+   X9-1 关账前 X10 不解锁；**机械排序，非拍板项**。本轮不动插件接线。
+   **落点**：无实现动作；X10 解锁条件 = X9-1 关账（registry Milestone
+   字段即规则，禁止绕过字段手工解锁）。
+7. **codeAction 收口标准（源缺口3）**：服务端原生发出的每一类诊断，凡
+   修复可机械推导者必须配真实 quickfix；本轮按此标准评估现状并登记差距，
+   不强制本轮实现全部。**落点**：评估与差距登记归阶段 A，实现按差距清单
+   分轮推进。
+8. **27 条 DEFERRED**：各自 Reason/Milestone 字段即规则，里程碑解锁前
+   维持——**机械规则，非拍板项**。**落点**：无实现动作；解锁条件以
+   registry 字段为准，禁止绕过字段手工升级。
+9. **工具锁 exact-version**：tools.lock.json + sha256 是可复现性契约，
+   维持不变。**落点**：无实现动作；工具链变更一律走锁重建流程（先例：
+   rust-analyzer semantic helper 重建，tools.lock.json 未手改）。
+
 ---
 
 ## §8 工作约束
