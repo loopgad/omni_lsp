@@ -78,7 +78,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| WS-D14 | External changes invalidate semantic state without overwriting editor buffers | D14 file watcher (polling) | `TestWatcherDetectsCreateModifyDelete`, `TestWatcherIgnoresVendoredAndBaselineSilence`, `TestWatchedExternalDependencyInvalidatesGoDefinitionCache`, `TestUnnotifiedExternalDependencyInvalidatesGoDefinitionCache`, `TestRunStartsPollerAfterInitializeAndStopsOnExit`, `TestExternalFileHintsValidateBeforeAdvancingRevision` | PARTIAL (Initialized sessions now poll and invalidate semantic revisions without replacing editor buffers; complete file-operation transitions and candidate-wide external-dependency coverage still require release evidence) |
+| WS-D14 | External changes invalidate semantic state without overwriting editor buffers | D14 file watcher (polling) | `TestWatcherDetectsCreateModifyDelete`, `TestWatcherIgnoresVendoredAndBaselineSilence`, `TestWatcherRenameSurfacesAsDeletePlusCreate`, `TestWatcherDirectoryRenameSurfacesAsPerFileDeletePlusCreate`, `TestWatcherAtomicReplaceSurfacesAsModifyNotDeletePlusCreate`, `TestWatcherFullTransitionSequenceCreateModifyRenameDelete`, `TestWatchedExternalDependencyInvalidatesGoDefinitionCache`, `TestUnnotifiedExternalDependencyInvalidatesGoDefinitionCache`, `TestRunStartsPollerAfterInitializeAndStopsOnExit`, `TestExternalFileHintsValidateBeforeAdvancingRevision`, `TestExternalCreateModifyRenameDeleteTransitionsInvalidateSemanticsKeepBuffer`, `TestExternalDependencyCandidatesAcrossLocations` | AUTO |
 
 ### Y0
 
