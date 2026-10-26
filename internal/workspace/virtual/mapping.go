@@ -23,6 +23,10 @@ var (
 	ErrUnknownVirtual = stderrors.New("virtual: unknown virtual document")
 	// ErrOffsetOutOfRange — the offset is outside the document bounds.
 	ErrOffsetOutOfRange = stderrors.New("virtual: offset outside document bounds")
+	// ErrNotABoundary — the byte offset exists but has no LSP position: it
+	// falls inside a multi-byte rune or within a CRLF terminator, so no
+	// line/character coordinate denotes it exactly.
+	ErrNotABoundary = stderrors.New("virtual: offset has no logical line/character boundary")
 )
 
 // terr builds the structured error for a sentinel cause.
@@ -84,6 +88,14 @@ func ToVirtualOffset(reg *Registry, hostURI string, hostOff uint32) (virtOff uin
 	if !ok {
 		return 0, 0, terr(ierrors.ErrNotFound, op, "UNKNOWN_VIRTUAL", ErrUnknownVirtual)
 	}
+	return toVirtualOffset(d, op, hostOff)
+}
+
+// toVirtualOffset maps a host offset through one document's segments — the
+// body shared by ToVirtualOffset (which resolves the host's first virtual
+// document deterministically) and the projector's host→virtual direction
+// (which must target ITS virtual document, not whichever registered first).
+func toVirtualOffset(d *virtualDoc, op string, hostOff uint32) (uint32, MappingQuality, error) {
 	for _, s := range d.segs {
 		if hostOff >= s.HostStart && hostOff < s.HostEnd {
 			if s.Quality == QualityUnmappedGenerated {

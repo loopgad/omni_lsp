@@ -33,3 +33,29 @@ func ValidateEditSpan(reg *Registry, virtualURI string, start, end uint32) error
 	}
 	return terr(ierrors.ErrUntrustedOperation, op, "UNSAFE_EDIT_SPAN", ErrUnsafeEditSpan)
 }
+
+// validateHostSpan is ValidateEditSpan's mirror on host coordinates, used
+// when a HOST-document edit range is projected into a virtual view: the span
+// must lie wholly inside one Exact segment's host range. Overlap with an
+// UnmappedGenerated segment's host range fails with ErrUnsafeGeneratedEdit
+// (Extract-produced generated segments have empty host ranges and can never
+// be touched by a host edit); anything else fails with ErrUnsafeEditSpan —
+// the same taxonomy as the virtual direction, so both pipeline directions
+// agree with the §Y0-9 gate.
+func validateHostSpan(op string, d *virtualDoc, start, end uint32) error {
+	if start > end {
+		return ierrors.New(ierrors.ErrInvalidArgument, op, "edit start exceeds end")
+	}
+	for _, s := range d.segs {
+		if s.Quality == QualityUnmappedGenerated && s.HostStart < s.HostEnd &&
+			start < s.HostEnd && end > s.HostStart {
+			return terr(ierrors.ErrUntrustedOperation, op, "UNSAFE_GENERATED_EDIT", ErrUnsafeGeneratedEdit)
+		}
+	}
+	for _, s := range d.segs {
+		if s.Quality == QualityExact && start >= s.HostStart && end <= s.HostEnd {
+			return nil
+		}
+	}
+	return terr(ierrors.ErrUntrustedOperation, op, "UNSAFE_EDIT_SPAN", ErrUnsafeEditSpan)
+}

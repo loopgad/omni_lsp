@@ -48,6 +48,7 @@ import (
 	"github.com/omnilsp/omni/internal/telemetry"
 	"github.com/omnilsp/omni/internal/transport"
 	"github.com/omnilsp/omni/internal/trust"
+	"github.com/omnilsp/omni/internal/workspace/position"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
 	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 	"github.com/omnilsp/omni/internal/workspace/vfs"
@@ -1293,13 +1294,17 @@ func (s *Server) captureEnvelopeInputs(ctx context.Context, uri string, source [
 // captured snapshot document wins, then VFS overlay, then empty.
 //
 // §D12 hook: a registered virtual URI reads through to its host content so
-// semantic calls never see an empty source for a virtual document.
-// TODO(D12): full pipeline — region extraction on the way in (host content →
-// virtual slice) and reverse-mapped positions on the way out (virtual result
-// → host result) — requires coordinate projection threaded through every
-// Envelope call site and the languages request/response structs; deferred
-// until a backend actually emits virtual documents. The registry accessor
-// below is the seam those call sites will use.
+// semantic calls never see an empty source for a virtual document. The full
+// pipeline now exists as callable machinery on this seam — inbound region
+// extraction via RegisterVirtualDocument (Host Document → Region Extraction
+// → Virtual Document, backed by virtual.Extract/RegisterExtracted) and
+// outbound coordinate projection via VirtualProjector (Virtual Result →
+// Reverse Source Map → Host Result, backed by virtual.Projector).
+// TODO(D12): threading the projector through every Envelope call site and
+// the languages request/response structs stays deferred until a backend
+// actually emits virtual documents — until then a virtual URI keeps
+// receiving its host content, so request and result positions remain in one
+// coordinate system.
 func (s *Server) semanticSource(uri string) []byte {
 	if s.virtualReg != nil {
 		if host, err := s.virtualReg.ResolveHost(uri); err == nil {
@@ -1320,6 +1325,28 @@ func (s *Server) semanticSource(uri string) []byte {
 // VirtualRegistry exposes the §D12 virtual-document/source-map registry so
 // adapters can register host↔virtual mappings and S3 gates can consult them.
 func (s *Server) VirtualRegistry() *virtual.Registry { return s.virtualReg }
+
+// RegisterVirtualDocument runs the §D12 inbound pipeline on entering host
+// content (Host Document → Region Extraction → Virtual Document): the pieces
+// are extracted from hostContent into the virtual slice and the derived
+// source map is registered under virtualURI (replacing any previous mapping,
+// per the registry contract). The returned slice is the virtual content a
+// backend would eventually receive; the registry stores mappings, not text,
+// so the caller keeps it alongside the host document and hands both back to
+// VirtualProjector on the way out.
+func (s *Server) RegisterVirtualDocument(virtualURI, hostURI string, hostContent []byte, pieces []virtual.Piece) ([]byte, error) {
+	return s.virtualReg.RegisterExtracted(virtualURI, hostURI, hostContent, pieces)
+}
+
+// VirtualProjector builds the §D12 outbound projector (Virtual Result →
+// Reverse Source Map → Host Result) for a registered virtual document over
+// the caller's current host/virtual content, in the §C4-negotiated position
+// encoding. Construction fails closed for unknown virtual URIs and for
+// content that disagrees with the registered Exact segments.
+func (s *Server) VirtualProjector(virtualURI string, hostContent, virtualContent []byte) (*virtual.Projector, error) {
+	return virtual.NewProjector(s.virtualReg, virtualURI, hostContent, virtualContent,
+		position.Encoding(s.negotiatedEncodingInt()))
+}
 
 // queryContext pairs the current snapshot revision with the backend's build
 // context — the two identities every canonical request must carry.
