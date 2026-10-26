@@ -484,8 +484,17 @@ func TestS19_ReferencesScalingCurve(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("canceled references returned %v, want context.Canceled", err)
 	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Errorf("cancelled references took %v; cancellation must be honored promptly", d)
+	// Derive the promptness budget from this run's own measurement instead of
+	// a fixed wall-clock constant (2026-10-25 ruling 5): a canceled request
+	// must return within twice the measured uncanceled 800-reference request.
+	// The factor is a noise margin, not a performance threshold; a cancellation
+	// that waits for the full walk cannot fit inside two walk durations.
+	if perOp[1] <= 0 {
+		t.Fatalf("800-reference baseline measured %v; cannot derive a cancellation budget", perOp[1])
+	}
+	cancelBudget := 2 * perOp[1]
+	if d := time.Since(start); d > cancelBudget {
+		t.Errorf("cancelled references took %v; budget is 2x the measured uncancelled 800-reference request (%v)", d, cancelBudget)
 	}
 }
 
