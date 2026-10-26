@@ -27,7 +27,7 @@ jobs:
       # protocol/LSP, transport, or server-adapter packages.
       - name: Dependency direction check
         run: |
-          if go list -deps ./internal/workspace/... ./internal/languages/... ./internal/runtime/scheduler ./internal/runtime/supervisor | grep -E 'omni/internal/(protocol/(lsp|mcp|dap)|transport|runtime/server)'; then
+          if go list -deps ./internal/workspace/... ./internal/languages/... ./internal/runtime/scheduler ./internal/runtime/supervisor ./internal/index/... | grep -E 'omni/internal/(protocol/(lsp|mcp|dap)|transport|runtime/server)'; then
             echo "::error::INV-ARCH-002 violation: core depends on protocol/transport packages"
             exit 1
           fi
