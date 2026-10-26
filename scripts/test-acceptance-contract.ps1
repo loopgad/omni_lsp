@@ -7,7 +7,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($acceptancePath
 if ($parseErrors.Count -gt 0) {
     throw "acceptance.ps1 PowerShell parse failed: $($parseErrors[0].Message)"
 }
-foreach ($name in @('Get-ClientMatrixCellIds', 'Get-ClientMatrixSummaryIds', 'Get-ClientMatrixRequiredCheckIds', 'Assert-ClientMatrixContract', 'Get-S18StableExceptionLimit', 'Test-S18StableExceptionID', 'Test-S18PercentilesWithin', 'Test-S18FiniteNumber', 'Test-S18FiniteNonnegativeNumber', 'Test-S18IntegerValue', 'Get-S18PercentileNS', 'Get-S18ABBAEligibility', 'Get-S18StableABBAExceptions', 'Get-OptionalAssessmentCheckIDs', 'Assert-S18ReleaseAssessment', 'Assert-GateReleaseAssessment', 'Test-S18MatrixExceptionAccepted', 'Test-S18NormalizedObservation', 'Test-S18CompletionListEvidence', 'Test-S18EditUpdateEvidence', 'Assert-S19ReturnedLocationScale', 'Assert-S19ProcessTreeResourceEvidence', 'Test-S19ConcurrentRequestIdentity', 'Assert-S20KPIEvidence', 'Get-SoakRequiredCheckIds', 'Get-CorpusHash', 'Get-FileSha256', 'Test-CandidateBinaryIdentity', 'Test-ResolvedBinaryLock', 'Get-ResolvedBinaryEntry', 'Get-ResolvedBinaryPath', 'Test-ResolvedBinaryBinding', 'Get-RequiredResolvedBinaryNames', 'Get-WorkspaceContentHash', 'Test-FastSourceTreeIdentity', 'Test-AcceptanceFingerprintIdentity', 'Get-DirectoryContentHash', 'Get-FastEvidenceHashes', 'Assert-FastEvidenceHashes', 'Assert-StructuredReportIdentity', 'Assert-PreSoakReview', 'Get-EvidenceCheckStatus', 'Get-RequirementMatrixDecision', 'ConvertTo-S21Timestamp', 'Assert-S21ReportEvidence', 'Get-S21BucketStatus', 'Write-SoakStageFailure')) {
+foreach ($name in @('Get-ClientMatrixCellIds', 'Get-ClientMatrixSummaryIds', 'Get-ClientMatrixRequiredCheckIds', 'Assert-ClientMatrixContract', 'Get-S18StableExceptionLimit', 'Test-S18StableExceptionID', 'Test-S18PercentilesWithin', 'Test-S18FiniteNumber', 'Test-S18FiniteNonnegativeNumber', 'Test-S18IntegerValue', 'Get-S18PercentileNS', 'Get-S18ABBAEligibility', 'Get-S18StableABBAExceptions', 'Get-OptionalAssessmentCheckIDs', 'Assert-S18ReleaseAssessment', 'Assert-GateReleaseAssessment', 'Test-S18MatrixExceptionAccepted', 'Test-S18NormalizedObservation', 'Test-S18CompletionListEvidence', 'Test-S18EditUpdateEvidence', 'Assert-S19ReturnedLocationScale', 'Assert-S19ProcessTreeResourceEvidence', 'Test-S19ConcurrentRequestIdentity', 'Assert-S20KPIEvidence', 'Get-SoakRequiredCheckIds', 'Get-CorpusHash', 'Get-FileSha256', 'Test-CandidateBinaryIdentity', 'Test-ResolvedBinaryLock', 'Get-ResolvedBinaryEntry', 'Get-ResolvedBinaryPath', 'Test-ResolvedBinaryBinding', 'Get-RequiredResolvedBinaryNames', 'Get-WorkspaceContentHash', 'Test-FastSourceTreeIdentity', 'Test-AcceptanceFingerprintIdentity', 'Get-DirectoryContentHash', 'Get-FastEvidenceHashes', 'Assert-FastEvidenceHashes', 'Assert-StructuredReportIdentity', 'Assert-PreSoakReview', 'Get-EvidenceCheckStatus', 'Get-RequirementMatrixDecision', 'ConvertTo-S21Timestamp', 'Assert-S21ReportEvidence', 'Get-S21BucketStatus', 'Write-SoakStageFailure', 'Get-ToolVersions', 'Get-AcceptanceToolExecutables', 'Get-AcceptanceFingerprint', 'Get-ResolvedExecutionFingerprint', 'Initialize-LockedAcceptanceEnvironment', 'Resolve-FastToolLockGate')) {
     $function = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     if (-not $function) { throw "acceptance.ps1 is missing validator helper '$name'." }
     Invoke-Expression $function.Extent.Text
@@ -21,6 +21,122 @@ if ((Test-AcceptanceFingerprintIdentity $fingerprintFixture ('b' * 64)) -or
     (Test-AcceptanceFingerprintIdentity $null $fingerprintFixture) -or
     (Test-AcceptanceFingerprintIdentity 'missing' $fingerprintFixture)) {
     throw 'Changed or malformed acceptance fingerprints must invalidate frozen Fast evidence.'
+}
+
+# --- Soak/Status cross-process fingerprint recomputation guard --------------
+# Fast freezes the acceptance fingerprint inside its own process (script state
+# bound, env pins removed before freezing); Soak30s/Soak10m/Start1h/Status run
+# in separate pwsh processes where that script state and the env pins no longer
+# exist (docs/acceptance.md:96-99 — every soak phase and the final status check
+# recompute it). Recomputing the fingerprint in a reset process shape must
+# reproduce the frozen value byte-identically.
+$S18Policy = 'strict'
+$localToolBin = Join-Path $repoRoot 'test/acceptance/tools/bin'
+$contractFingerprintEvidence = Join-Path ([IO.Path]::GetTempPath()) ('omnilsp-fingerprint-contract-' + [guid]::NewGuid().ToString('N'))
+$previousFingerprintToolLock = $script:AcceptanceToolLock
+$previousFingerprintResolvedPaths = $script:AcceptanceResolvedPaths
+$previousFingerprintEvidenceDirectory = $EvidenceDirectory
+$contractEnvPins = @('OMNILSP_SEMANTIC_NODE_PATH', 'OMNILSP_SEMANTIC_TYPESCRIPT_PATH', 'OMNILSP_SEMANTIC_PYRIGHT_INTERNAL_PATH', 'OMNILSP_SEMANTIC_PYRIGHT_VENDOR_PATH', 'OMNILSP_SEMANTIC_PYTHON_PATH', 'OMNILSP_ACCEPTANCE_NODE', 'OMNILSP_ACCEPTANCE_NODE_SHA256', 'OMNILSP_ACCEPTANCE_LOCKED_TOOLS', 'OMNILSP_VSCODE_BIN', 'OMNILSP_NVIM_BIN')
+$savedContractEnvPins = [ordered]@{}
+foreach ($pin in $contractEnvPins) {
+    $savedContractEnvPins[$pin] = [Environment]::GetEnvironmentVariable($pin)
+    [Environment]::SetEnvironmentVariable($pin, $null)
+}
+try {
+    $EvidenceDirectory = $contractFingerprintEvidence
+    New-Item -ItemType Directory -Force -Path $contractFingerprintEvidence | Out-Null
+    $contractToolLock = Get-Content -LiteralPath (Join-Path $repoRoot 'test/acceptance/tools/tools.lock.json') -Raw | ConvertFrom-Json
+    $contractResolvedPaths = [ordered]@{}
+    foreach ($contractName in @(Get-RequiredResolvedBinaryNames)) {
+        $contractPath = Get-ResolvedBinaryPath $contractToolLock.resolvedBinaries $contractName
+        if ($contractPath) { $contractResolvedPaths[$contractName] = $contractPath }
+    }
+    # Fast process shape: the parsed lock and its resolved paths live in script state.
+    $script:AcceptanceToolLock = $contractToolLock
+    $script:AcceptanceResolvedPaths = $contractResolvedPaths
+    $frozenAcceptanceFingerprint = Get-AcceptanceFingerprint
+    # Soak/Status process shape: fresh pwsh — no script state, no env pins.
+    $script:AcceptanceToolLock = $null
+    $script:AcceptanceResolvedPaths = [ordered]@{}
+    $soakAcceptanceFingerprint = Get-AcceptanceFingerprint
+    if ([string]$frozenAcceptanceFingerprint.fingerprint_sha256 -cne [string]$soakAcceptanceFingerprint.fingerprint_sha256) {
+        throw "A fresh soak/Status process must recompute the frozen acceptance fingerprint byte-identically: frozen $($frozenAcceptanceFingerprint.fingerprint_sha256), recomputed $($soakAcceptanceFingerprint.fingerprint_sha256)"
+    }
+    # The degraded-field contract: in the soak shape the ten resolved_execution
+    # entries must carry the real lock identities from tools.lock.json — not
+    # empty placeholders — and misleading env pins must not skew them.
+    foreach ($pin in @('OMNILSP_SEMANTIC_NODE_PATH', 'OMNILSP_SEMANTIC_TYPESCRIPT_PATH', 'OMNILSP_ACCEPTANCE_NODE')) {
+        [Environment]::SetEnvironmentVariable($pin, 'C:\omnilsp-contract-misleading\tool.exe')
+    }
+    try {
+        $soakResolvedExecution = Get-ResolvedExecutionFingerprint $null ([ordered]@{})
+    } finally {
+        foreach ($pin in @('OMNILSP_SEMANTIC_NODE_PATH', 'OMNILSP_SEMANTIC_TYPESCRIPT_PATH', 'OMNILSP_ACCEPTANCE_NODE')) {
+            [Environment]::SetEnvironmentVariable($pin, $savedContractEnvPins[$pin])
+        }
+    }
+    foreach ($shaField in @('node_sha256', 'typescript_sha256')) {
+        if ([string]$soakResolvedExecution[$shaField] -cnotmatch '^[0-9a-f]{64}$') {
+            throw "resolved_execution.$shaField must derive the locked SHA-256 from tools.lock.json in a fresh process, got '$($soakResolvedExecution[$shaField])'"
+        }
+    }
+    foreach ($pair in @(@('node_path', 'node'), @('typescript_path', 'typescript'), @('acceptance_node_path', 'node'), @('semantic_python_path', 'python'))) {
+        $expectedLockedPath = Get-ResolvedBinaryPath $contractToolLock.resolvedBinaries $pair[1]
+        if ([string]$soakResolvedExecution[$pair[0]] -cne $expectedLockedPath) {
+            throw "resolved_execution.$($pair[0]) must derive the locked path from tools.lock.json in a fresh process, got '$($soakResolvedExecution[$pair[0]])'"
+        }
+    }
+    Write-Output 'Cross-process acceptance fingerprint recomputation contract passed.'
+} finally {
+    $script:AcceptanceToolLock = $previousFingerprintToolLock
+    $script:AcceptanceResolvedPaths = $previousFingerprintResolvedPaths
+    $EvidenceDirectory = $previousFingerprintEvidenceDirectory
+    foreach ($pin in $contractEnvPins) {
+        [Environment]::SetEnvironmentVariable($pin, $savedContractEnvPins[$pin])
+    }
+    if (Test-Path -LiteralPath $contractFingerprintEvidence) { Remove-Item -LiteralPath $contractFingerprintEvidence -Recurse -Force }
+}
+
+# --- Fast tool-lock gate contract -------------------------------------------
+# Charter policy (docs/acceptance.md "Fixed host tools"): missing resolved
+# files stay not_verified; only changed hashes fail the tool lock. A
+# not_verified lock must therefore keep the locked environment bound so Fast
+# can execute and let Get-OverallDecision close the gate (terminal summary and
+# requirement matrix list every missing tool as not verified), while a failed
+# lock still refuses to execute. This replaces the old hard throw on any
+# non-passed lock, which left no structured record at all.
+$gateToolLockFixture = Get-Content -LiteralPath (Join-Path $repoRoot 'test/acceptance/tools/tools.lock.json') -Raw | ConvertFrom-Json
+$gateToolLockFixture = $gateToolLockFixture | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$gateToolLockFixture.resolvedBinaries.emacs.path = Join-Path ([IO.Path]::GetTempPath()) ('omnilsp-contract-missing\emacs-' + [guid]::NewGuid().ToString('N') + '.exe')
+$previousGateOriginalPath = $script:AcceptanceOriginalPath
+$previousGatePath = $env:PATH
+$previousGateToolLock = $script:AcceptanceToolLock
+$previousGateResolvedPaths = $script:AcceptanceResolvedPaths
+$previousGateGo = $script:go
+try {
+    $script:AcceptanceOriginalPath = $env:PATH
+    $gateBinding = Initialize-LockedAcceptanceEnvironment $gateToolLockFixture
+    if ([string]$gateBinding.status -cne 'not_verified') {
+        throw "A tool lock with one missing resolved file must stay not_verified, got '$($gateBinding.status)'"
+    }
+    if ($null -eq $script:AcceptanceToolLock -or -not $script:go -or -not $script:AcceptanceResolvedPaths -or $script:AcceptanceResolvedPaths.Count -eq 0) {
+        throw 'A not_verified tool lock must still bind the locked environment (script lock, resolved paths, go path) so Fast can proceed to its terminal record.'
+    }
+    $gateNotVerified = Resolve-FastToolLockGate $gateBinding ([ordered]@{ id = 'tool-version-lock'; status = 'not_verified'; detail = 'emacs expected a version, observed MISSING' })
+    if ($gateNotVerified.proceed -ne $true -or $gateNotVerified.status -cne 'not_verified') {
+        throw 'Fast must proceed past a not_verified tool lock and let Get-OverallDecision close the gate.'
+    }
+    $gateFailed = Resolve-FastToolLockGate ([ordered]@{ id = 'resolved-binary-binding'; status = 'failed'; detail = 'node resolved path SHA-256 mismatch' }) $null
+    if ($gateFailed.proceed -ne $false -or $gateFailed.status -cne 'failed') {
+        throw 'Fast must refuse to execute on a failed tool lock; changed hashes fail the tool lock.'
+    }
+    Write-Output 'Fast tool-lock gate contract passed.'
+} finally {
+    $script:AcceptanceOriginalPath = $previousGateOriginalPath
+    $env:PATH = $previousGatePath
+    $script:AcceptanceToolLock = $previousGateToolLock
+    $script:AcceptanceResolvedPaths = $previousGateResolvedPaths
+    $script:go = $previousGateGo
 }
 
 $reparseFixture = Join-Path ([IO.Path]::GetTempPath()) ('omnilsp-directory-hash-reparse-' + [guid]::NewGuid().ToString('N'))

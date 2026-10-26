@@ -652,6 +652,52 @@ function Test-AcceptanceFingerprintIdentity([string] $FrozenFingerprint, [string
         $FrozenFingerprint -ceq $CurrentFingerprint
 }
 
+function Get-ResolvedExecutionFingerprint($ToolLock, $ResolvedPaths) {
+    # The ten resolved_execution fields must recompute identically in every
+    # process of an acceptance run (docs/acceptance.md:96-99). Fast freezes
+    # them in-process; Soak30s/Soak10m/Start1h/Status run in separate pwsh
+    # processes where Fast's script state and the Fast-time env pins no longer
+    # exist. Every field therefore resolves from the tools.lock.json on disk
+    # (any process can load it) after the in-memory script state, falling back
+    # to the env pins and an empty placeholder only when the lock carries no
+    # entry for the tool.
+    $lock = $ToolLock
+    if ($null -eq $lock -or $null -eq $lock.resolvedBinaries) {
+        $lockPath = Join-Path $repoRoot 'test/acceptance/tools/tools.lock.json'
+        if (Test-Path -LiteralPath $lockPath -PathType Leaf) {
+            $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+        }
+    }
+    $pathFor = {
+        param([string] $Name, [string] $EnvName)
+        $inMemory = if ($ResolvedPaths) { $ResolvedPaths[$Name] } else { $null }
+        if ($inMemory) { return [string]$inMemory }
+        $locked = if ($lock) { Get-ResolvedBinaryPath $lock.resolvedBinaries $Name } else { $null }
+        if ($locked) { return $locked }
+        $pinned = [Environment]::GetEnvironmentVariable($EnvName)
+        if ($pinned) { return $pinned }
+        return ''
+    }
+    $shaFor = {
+        param([string] $Name)
+        $entry = if ($lock) { Get-ResolvedBinaryEntry $lock.resolvedBinaries $Name } else { $null }
+        if ($entry -and [string]$entry.sha256) { return ([string]$entry.sha256).ToLowerInvariant() }
+        return ''
+    }
+    return [ordered]@{
+        node_path = & $pathFor 'node' 'OMNILSP_SEMANTIC_NODE_PATH'
+        typescript_path = & $pathFor 'typescript' 'OMNILSP_SEMANTIC_TYPESCRIPT_PATH'
+        pyright_internal_path = & $pathFor 'pyright-internal' 'OMNILSP_SEMANTIC_PYRIGHT_INTERNAL_PATH'
+        pyright_vendor_path = & $pathFor 'pyright-vendor' 'OMNILSP_SEMANTIC_PYRIGHT_VENDOR_PATH'
+        semantic_python_path = & $pathFor 'python' 'OMNILSP_SEMANTIC_PYTHON_PATH'
+        acceptance_node_path = & $pathFor 'node' 'OMNILSP_ACCEPTANCE_NODE'
+        vscode_path = & $pathFor 'vscode' 'OMNILSP_VSCODE_BIN'
+        neovim_path = & $pathFor 'neovim' 'OMNILSP_NVIM_BIN'
+        node_sha256 = & $shaFor 'node'
+        typescript_sha256 = & $shaFor 'typescript'
+    }
+}
+
 function Get-AcceptanceFingerprint {
     $toolRoot = Join-Path $repoRoot 'test/acceptance/tools'
     $vscodeLock = Join-Path $repoRoot 'editors/vscode/package-lock.json'
@@ -690,18 +736,7 @@ function Get-AcceptanceFingerprint {
             helix_runtime = Get-DirectoryContentHash (Join-Path $repoRoot 'test/acceptance/tools/bin/helix-25.07.1/runtime')
         }
         environment = Get-ToolVersions
-        resolved_execution = [ordered]@{
-            node_path = if ($script:AcceptanceResolvedPaths.node) { [string]$script:AcceptanceResolvedPaths.node } else { [string]$env:OMNILSP_SEMANTIC_NODE_PATH }
-            typescript_path = if ($script:AcceptanceResolvedPaths.typescript) { [string]$script:AcceptanceResolvedPaths.typescript } else { [string]$env:OMNILSP_SEMANTIC_TYPESCRIPT_PATH }
-            pyright_internal_path = if ($script:AcceptanceResolvedPaths -and $script:AcceptanceResolvedPaths['pyright-internal']) { [string]$script:AcceptanceResolvedPaths['pyright-internal'] } else { [string]$env:OMNILSP_SEMANTIC_PYRIGHT_INTERNAL_PATH }
-            pyright_vendor_path = if ($script:AcceptanceResolvedPaths -and $script:AcceptanceResolvedPaths['pyright-vendor']) { [string]$script:AcceptanceResolvedPaths['pyright-vendor'] } else { [string]$env:OMNILSP_SEMANTIC_PYRIGHT_VENDOR_PATH }
-            semantic_python_path = if ($script:AcceptanceResolvedPaths.python) { [string]$script:AcceptanceResolvedPaths.python } else { [string]$env:OMNILSP_SEMANTIC_PYTHON_PATH }
-            acceptance_node_path = if ($script:AcceptanceResolvedPaths.node) { [string]$script:AcceptanceResolvedPaths.node } else { [string]$env:OMNILSP_ACCEPTANCE_NODE }
-            vscode_path = if ($script:AcceptanceResolvedPaths.vscode) { [string]$script:AcceptanceResolvedPaths.vscode } else { [string]$env:OMNILSP_VSCODE_BIN }
-            neovim_path = if ($script:AcceptanceResolvedPaths.neovim) { [string]$script:AcceptanceResolvedPaths.neovim } else { [string]$env:OMNILSP_NVIM_BIN }
-            node_sha256 = if ($script:AcceptanceToolLock) { ([string](Get-ResolvedBinaryEntry $script:AcceptanceToolLock.resolvedBinaries 'node').sha256).ToLowerInvariant() } else { '' }
-            typescript_sha256 = if ($script:AcceptanceToolLock) { ([string](Get-ResolvedBinaryEntry $script:AcceptanceToolLock.resolvedBinaries 'typescript').sha256).ToLowerInvariant() } else { '' }
-        }
+        resolved_execution = Get-ResolvedExecutionFingerprint $script:AcceptanceToolLock $script:AcceptanceResolvedPaths
         executables = Get-AcceptanceToolExecutables
     }
     $canonical = $fingerprint | ConvertTo-Json -Depth 8 -Compress
@@ -2086,9 +2121,14 @@ function Initialize-LockedAcceptanceEnvironment($Lock) {
     }
     $requiredNames = @(Get-RequiredResolvedBinaryNames)
     $lockCheck = Test-ResolvedBinaryLock $Lock.resolvedBinaries $requiredNames
-    if ($lockCheck.status -cne 'passed') {
-        return [ordered]@{ id = 'resolved-binary-binding'; status = [string]$lockCheck.status; detail = [string]$lockCheck.detail }
+    if ($lockCheck.status -ceq 'failed') {
+        return [ordered]@{ id = 'resolved-binary-binding'; status = 'failed'; detail = [string]$lockCheck.detail }
     }
+    # A not_verified lock check means required resolved files are absent on
+    # this host. Per the charter (docs/acceptance.md "Fixed host tools") those
+    # stay not_verified: the environment below is still bound to the locked
+    # paths so Fast can execute, and the unverified binding is surfaced to
+    # Get-OverallDecision, which closes the gate on it.
     $paths = [ordered]@{}
     foreach ($name in $requiredNames) {
         $path = Get-ResolvedBinaryPath $Lock.resolvedBinaries $name
@@ -2126,7 +2166,31 @@ function Initialize-LockedAcceptanceEnvironment($Lock) {
     $env:OMNILSP_RUST_SCIP_HELPER_PATH = $paths['rust-analyzer-semantic-helper']
     $env:OMNILSP_RUST_SCIP_HELPER_SHA256 = ([string](Get-ResolvedBinaryEntry $Lock.resolvedBinaries 'rust-analyzer-semantic-helper').sha256).ToLowerInvariant()
     $env:OMNILSP_RUST_SCIP_HELPER_VERSION = 'rust-analyzer ' + [string]$Lock.observed.rustAnalyzerSemanticHelper
+    if ([string]$lockCheck.status -cne 'passed') {
+        return [ordered]@{ id = 'resolved-binary-binding'; status = [string]$lockCheck.status; detail = [string]$lockCheck.detail }
+    }
     return [ordered]@{ id = 'resolved-binary-binding'; status = 'passed'; detail = "$($requiredNames.Count) acceptance tool paths and SHA-256 identities are locked for execution" }
+}
+
+function Resolve-FastToolLockGate($ResolvedBinding, $VersionLock) {
+    # Charter policy (docs/acceptance.md "Fixed host tools"): missing resolved
+    # files stay not_verified; only changed hashes fail the tool lock. A
+    # not_verified lock must not abort Fast before any structured record
+    # exists — Fast proceeds and Get-OverallDecision closes the gate on the
+    # unverified checks, so the terminal summary and requirement matrix list
+    # every missing tool as not verified. A failed lock (changed hash, invalid
+    # pin) still refuses to execute; the Fast caller persists the failure
+    # summary and requirement matrix before throwing.
+    foreach ($check in @($ResolvedBinding, $VersionLock)) {
+        if ($null -ne $check -and [string]$check.status -ceq 'failed') {
+            return [ordered]@{ proceed = $false; status = 'failed'; detail = [string]$check.detail }
+        }
+    }
+    $unverified = @(@($ResolvedBinding, $VersionLock) | Where-Object { $null -ne $_ -and [string]$_.status -cne 'passed' })
+    if ($unverified.Count -gt 0) {
+        return [ordered]@{ proceed = $true; status = 'not_verified'; detail = (@($unverified | ForEach-Object { [string]$_.detail }) -join '; ') }
+    }
+    return [ordered]@{ proceed = $true; status = 'passed'; detail = 'locked acceptance toolchain identity verified' }
 }
 
 function Test-VersionLock {
@@ -2846,12 +2910,22 @@ switch ($Phase) {
         $toolLock = Get-Content (Join-Path $repoRoot 'test/acceptance/tools/tools.lock.json') -Raw | ConvertFrom-Json
         $resolvedBinding = Initialize-LockedAcceptanceEnvironment $toolLock
         $checks.Add($resolvedBinding)
-        if ([string]$resolvedBinding.status -cne 'passed') {
-            throw "Fast gate cannot execute with unresolved acceptance tool paths: $($resolvedBinding.detail)"
-        }
         $checks.Add((Test-VersionLock))
-        if ([string]$checks[-1].status -cne 'passed') {
-            throw "Fast gate cannot execute with an unverified locked toolchain: $($checks[-1].detail)"
+        # Charter policy (docs/acceptance.md "Fixed host tools"): a not_verified
+        # lock (missing resolved files) must not abort Fast before any
+        # structured record exists — Fast proceeds and Get-OverallDecision
+        # closes the gate so the terminal summary lists the missing tools. A
+        # failed lock (changed hashes) still refuses to execute, but only after
+        # the failure summary and requirement matrix are persisted.
+        $toolLockGate = Resolve-FastToolLockGate $resolvedBinding $checks[-1]
+        if ($toolLockGate.status -ceq 'not_verified') {
+            Write-Output "Tool lock not verified; Fast proceeds and the overall decision closes the gate: $($toolLockGate.detail)"
+        }
+        if (-not $toolLockGate.proceed) {
+            $errors.Add("Fast gate cannot execute with an unresolved acceptance toolchain: $($toolLockGate.detail)")
+            $null = Write-Summary 'failed' $checks $errors
+            Write-RequirementMatrix
+            throw "Fast gate cannot execute with an unresolved acceptance toolchain: $($toolLockGate.detail)"
         }
         if (Ensure-LocalToolWrappers) {
             $checks.Add([ordered]@{ id = 'local-language-server-wrappers'; status = 'passed'; detail = 'project-local launchers use locked npm package entrypoints' })
