@@ -466,3 +466,75 @@ func TestCompletionPhaseTraceEnvOverrides(t *testing.T) {
 		t.Fatalf("close fallback: %v", err)
 	}
 }
+
+// TestCompletionPhaseTraceSecondSessionDoesNotOverwritePriorTrace pins the
+// restart-session contract: a controlled candidate restart starts a second
+// server process with the same OMNILSP_S18_COMPLETION_PHASE_TRACE value, and
+// each session's recorder writes at its own close. The second session must
+// not clobber the first session's trace — the restart window is exactly when
+// the phase evidence matters (x9-1-status-10m-20261027T0523Z lost the whole
+// pre-restart trace to the post-restart session's three samples).
+func TestCompletionPhaseTraceSecondSessionDoesNotOverwritePriorTrace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status-phase-trace.json")
+
+	first := newCompletionPhaseTraceRecorder(path, 10)
+	span := first.begin("omnilsp/status", "", "", nil)
+	span.sample.ServerRoundTripNS = 111
+	span.finish()
+	if err := first.close(); err != nil {
+		t.Fatalf("close first session recorder: %v", err)
+	}
+	firstData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read first session trace: %v", err)
+	}
+
+	second := newCompletionPhaseTraceRecorder(path, 10)
+	span = second.begin("textDocument/completion", "cpp", "file:///workspace/main.cpp", nil)
+	span.sample.ServerRoundTripNS = 222
+	span.finish()
+	if err := second.close(); err != nil {
+		t.Fatalf("close second session recorder: %v", err)
+	}
+
+	afterFirst, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read base path after second close: %v", err)
+	}
+	if string(afterFirst) != string(firstData) {
+		t.Fatal("second session overwrote the first session's trace at the base path")
+	}
+	var firstReport completionPhaseTraceReport
+	if err := json.Unmarshal(afterFirst, &firstReport); err != nil {
+		t.Fatalf("decode first report: %v", err)
+	}
+	if len(firstReport.Samples) != 1 || firstReport.Samples[0].ServerRoundTripNS != 111 {
+		t.Fatalf("first report = %+v, want the preserved status sample", firstReport)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read trace dir: %v", err)
+	}
+	var secondPath string
+	for _, entry := range entries {
+		if entry.Name() != "status-phase-trace.json" {
+			secondPath = filepath.Join(dir, entry.Name())
+		}
+	}
+	if secondPath == "" {
+		t.Fatal("second session wrote no trace at all")
+	}
+	secondData, err := os.ReadFile(secondPath)
+	if err != nil {
+		t.Fatalf("read second session trace %s: %v", secondPath, err)
+	}
+	var secondReport completionPhaseTraceReport
+	if err := json.Unmarshal(secondData, &secondReport); err != nil {
+		t.Fatalf("decode second report: %v", err)
+	}
+	if len(secondReport.Samples) != 1 || secondReport.Samples[0].ServerRoundTripNS != 222 {
+		t.Fatalf("second report = %+v, want the second session's completion sample", secondReport)
+	}
+}

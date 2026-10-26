@@ -247,8 +247,19 @@ func (r *completionPhaseTraceRecorder) close() error {
 			r.closeErr = fmt.Errorf("marshal completion phase trace: %w", err)
 			return
 		}
-		if err := os.WriteFile(r.path, data, 0600); err != nil {
-			r.closeErr = fmt.Errorf("write completion phase trace %q: %w", r.path, err)
+		// A controlled candidate restart starts a second server process with
+		// the same trace path, and each session's recorder writes at its own
+		// close. The second close must not clobber the first session's trace —
+		// the pre-restart window is exactly where the phase evidence matters —
+		// so a taken path is left alone and the report lands next to it with
+		// the process id suffix. The first session keeps the base path, which
+		// keeps the acceptance runner's presence check meaningful.
+		writePath := r.path
+		if _, statErr := os.Stat(r.path); statErr == nil {
+			writePath = fmt.Sprintf("%s.pid%d", r.path, os.Getpid())
+		}
+		if err := os.WriteFile(writePath, data, 0600); err != nil {
+			r.closeErr = fmt.Errorf("write completion phase trace %q: %w", writePath, err)
 		}
 	})
 	return r.closeErr
