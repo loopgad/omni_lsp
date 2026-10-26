@@ -2918,6 +2918,15 @@ switch ($Phase) {
         Push-Location $repoRoot
         try { & $CandidateBinary verify 2>&1 | Set-Content -LiteralPath $scoreLog -Encoding utf8 } finally { Pop-Location }
 
+        # 2026-10-25 ruling 2: the fast tier must not stop at AST existence
+        # scoring. The AUTO conformance probes execute here as a real, bounded
+        # step: verify --probe runs every AUTO probe group with a 120s
+        # per-batch budget under the report's global 30m fail-closed ceiling,
+        # and the mode must still meet the committed score floor (exit 1
+        # otherwise). The plain verify above stays as the existence baseline
+        # log; its JSON report lands next to it as probe execution evidence.
+        $checks.Add((Invoke-Step 'verify-probe-execution' $CandidateBinary @('verify', '--probe', '--json')))
+
         $binaryHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash.ToLowerInvariant()
         $env:OMNILSP_BIN = $CandidateBinary
         $env:OMNILSP_ACCEPTANCE = '1'

@@ -161,7 +161,11 @@ func TestSendRequest_TimeoutAndCancel(t *testing.T) {
 	start := time.Now()
 	if _, err := c.SendRequest(context.Background(), "slow", nil); err == nil {
 		t.Error("expected timeout error with no responder")
-	} else if d := time.Since(start); d > 2*time.Second {
+	} else if d := time.Since(start); d > 200*c.cfg.RequestTimeout {
+		// The promptness bound is derived from the configured request budget
+		// (2026-10-25 ruling 5: no bare wall-clock constants) — 200x the 10ms
+		// timeout, the same 2s this guard previously carried as a bare
+		// constant, so it scales with the fixture instead of drifting from it.
 		t.Errorf("timeout took %v, want ~10ms", d)
 	}
 }

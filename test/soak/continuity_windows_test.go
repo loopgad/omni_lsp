@@ -18,10 +18,9 @@ type deviceNotifySubscribeParameters struct {
 	context  uintptr
 }
 
-type suspendResumeGuard interface {
-	Check() error
-	Close() error
-}
+// suspendResumeGuard and the suspend/resume state machine live in the
+// untagged continuity_monitor.go and continuity_state.go; only the real
+// Windows registration stays behind the soak tag.
 
 type windowsSuspendResumeGuard struct {
 	events    suspendResumeEvents

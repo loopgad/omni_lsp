@@ -1,6 +1,9 @@
-//go:build soak
-
 package soak
+
+// This file is deliberately untagged: the suspend/resume state machine is
+// pure logic shared by the platform monitors and the focused form checks,
+// which run in the default suite per the 2026-10-25 ruling 3. The real OS
+// registration stays behind the soak build tag.
 
 import (
 	"fmt"

@@ -1,5 +1,3 @@
-//go:build soak
-
 package soak
 
 import (

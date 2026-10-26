@@ -67,3 +67,22 @@ jobs:
       # Same reasoning as the race job above, minus the detector's constant factor.
       - run: go test -coverprofile=coverage.out -timeout 90m ./...
       - run: go tool cover -func=coverage.out | tail -1
+
+  semantic-core:
+    name: Semantic Core (fast-probe conformance)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # 2026-10-25 ruling 4: every gate on the books needs a CI execution
+      # face. This job runs the semantic-core conformance suite in
+      # real-probe fast mode — AUTO probes execute for real (bounded: 120s
+      # per probe batch under FastProbeReport's global 30m fail-closed
+      # ceiling) and the resulting core score must meet every committed
+      # baseline floor. Measured 130s on the 22-core dev host
+      # (2026-10-26); a 2-core runner is slower, so the 45m -timeout sits
+      # above the internal 30m ceiling and can only ever report a hang.
+      - run: go test -count=1 -timeout 45m -run '^(TestGenerateDocs|TestConformanceNoRegression)$' ./test/conformance/

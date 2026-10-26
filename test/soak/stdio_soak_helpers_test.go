@@ -1,6 +1,8 @@
-//go:build soak
-
 package soak
+
+// The form checks in this file are deliberately untagged per the 2026-10-25
+// ruling 3: they exercise the pure gate predicates in stdio_gates.go with no
+// live server, and must run in the default suite.
 
 import (
 	"context"
@@ -252,5 +254,87 @@ func TestSupervisedRustAnalyzerPIDSelectsActualLeaf(t *testing.T) {
 	sample.Members = append(sample.Members, processTreeMember{PID: 22, ParentPID: 10, Role: "backend", ImagePath: `C:\another\rust-analyzer.exe`})
 	if _, err := supervisedRustAnalyzerPID(sample, 10, `C:\Users\test\.cargo\bin\rust-analyzer.exe`); err == nil || !strings.Contains(err.Error(), "one supervised rust-analyzer leaf") {
 		t.Fatalf("ambiguous supervised backend identity error = %v", err)
+	}
+}
+
+func TestExactSoakToolVersionRejectsSuffixAndPrefixMatches(t *testing.T) {
+	tests := []struct {
+		id, output, expected string
+		want                 bool
+	}{
+		{"go", "go version go1.26.1 windows/amd64", "go1.26.1", true},
+		{"go", "go version go1.26.10 windows/amd64", "go1.26.1", false},
+		{"node", "v24.14.0", "v24.14.0", true},
+		{"node", "v24.14.0-extra", "v24.14.0", false},
+		{"python", "Python 3.13.13", "3.13.13", true},
+		{"clangd", "clangd version 22.1.5", "22.1.5", true},
+		{"clangd", "clangd version 22.1.50", "22.1.5", false},
+		{"rust-analyzer", "rust-analyzer 1.97.0 (2d8144b7 2026-07-07)", "1.97.0 (2d8144b7 2026-07-07)", true},
+		{"rust-analyzer", "rust-analyzer 1.97.0-extra (2d8144b7 2026-07-07)", "1.97.0 (2d8144b7 2026-07-07)", false},
+	}
+	for _, test := range tests {
+		t.Run(test.id+"/"+test.output, func(t *testing.T) {
+			if got := exactSoakToolVersion(test.id, test.output, test.expected); got != test.want {
+				t.Fatalf("exactSoakToolVersion(%q, %q, %q) = %t, want %t", test.id, test.output, test.expected, got, test.want)
+			}
+		})
+	}
+}
+
+func TestMakeStdioQueriesKeepSymbolPositionsIndependent(t *testing.T) {
+	text := stdioGoSource()
+	queries := makeStdioQueries("file:///soak.go", text)
+	base := positionOf(text, "soakTarget", 2)
+	wantOffsets := map[string]int{
+		"textDocument/definition":    0,
+		"textDocument/references":    0,
+		"textDocument/completion":    5,
+		"textDocument/prepareRename": len("soakTarget"),
+	}
+	for _, query := range queries {
+		offset, ok := wantOffsets[query.method]
+		if !ok {
+			continue
+		}
+		position := query.params["position"].(map[string]any)
+		if got, want := number(position["character"]), number(base["character"])+offset; got != want {
+			t.Errorf("%s character = %d, want %d", query.method, got, want)
+		}
+	}
+}
+
+func TestProgressLifecycleMustEndBeforeTerminalResponse(t *testing.T) {
+	progress := func(kind string) *jsonrpc.Message {
+		params, err := json.Marshal(map[string]any{"token": "test-token", "value": map[string]any{"kind": kind}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jsonrpc.NewNotification("$/progress", params)
+	}
+	response := jsonrpc.NewResponse(jsonrpc.RequestID{Num: 1}, json.RawMessage(`[]`))
+	valid := []*jsonrpc.Message{progress("begin"), progress("report"), progress("end"), response}
+	if _, err := progressLifecycleBeforeResponse(valid, "test-token"); err != nil {
+		t.Fatalf("ordered lifecycle rejected: %v", err)
+	}
+	lateEnd := []*jsonrpc.Message{progress("begin"), response, progress("end")}
+	if _, err := progressLifecycleBeforeResponse(lateEnd, "test-token"); err == nil {
+		t.Fatal("lifecycle ending after terminal response was accepted")
+	}
+}
+
+func TestSoak_RequestBudgetDefaultIs30s(t *testing.T) {
+	t.Setenv(stdioRequestBudgetEnv, "")
+	if got := stdioRequestBudget(); got != 30*time.Second {
+		t.Fatalf("stdioRequestBudget() with %s unset = %s, want 30s", stdioRequestBudgetEnv, got)
+	}
+	t.Setenv(stdioRequestBudgetEnv, "90s")
+	if got := stdioRequestBudget(); got != 90*time.Second {
+		t.Fatalf("stdioRequestBudget() with %s=90s = %s, want 90s", stdioRequestBudgetEnv, got)
+	}
+	for _, invalid := range []string{"nope", "0s", "-5s"} {
+		t.Setenv(stdioRequestBudgetEnv, invalid)
+		if got := stdioRequestBudget(); got != 30*time.Second {
+			t.Fatalf("stdioRequestBudget() with %s=%q = %s, want the 30s default", stdioRequestBudgetEnv, invalid, got)
+		}
 	}
 }

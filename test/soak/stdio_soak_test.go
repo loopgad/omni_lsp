@@ -30,36 +30,13 @@ import (
 )
 
 const (
-	soakWorkers         = 8
-	stdioGeneratedFiles = 4096
-	soakMemoryCap       = uint64(8 << 30)
-	soakPollPeriod      = 5 * time.Second
-	soakSeed            = int64(0)
-
-	// monitorAdvanceAbandonLimit replaces the previous in-loop
-	// "active == 0 && time.Since(startAt) > 30s" check: the dedicated monitor
-	// goroutine advances active duration now, so the main loop instead aborts
-	// when the monitor heartbeat (updated on every processed tick) is this
-	// stale. The 30s threshold and the abort message are unchanged.
-	monitorAdvanceAbandonLimit = 30 * time.Second
-
-	// The candidate-restart phase's explicit waits. They are named here because
-	// the maintenance-pause budget is derived from the same values; the budget
-	// must not drift from the work it is supposed to cover.
-	soakSnapshotOpenBudget      = 10 * time.Second
-	soakSnapshotReopenBudget    = 30 * time.Second
-	soakProgressLifecycleBudget = 5 * time.Second
-
-	// stdioRequestBudgetEnv widens the per-request stdio budget for local
-	// diagnostic runs (see stdioRequestBudget). It is not a soak-gate
-	// precondition: strict gate semantics do not depend on it.
-	stdioRequestBudgetEnv = "OMNILSP_SOAK_REQUEST_BUDGET"
+	soakWorkers   = 8
+	soakMemoryCap = uint64(8 << 30)
+	soakSeed      = int64(0)
 )
 
-type stdioQuery struct {
-	method string
-	params map[string]any
-}
+// stdioQuery and progressLifecycleCounts live in the untagged stdio_gates.go
+// alongside the pure gate predicates they feed.
 
 type stdioWorkerResult struct {
 	worker  int
@@ -120,134 +97,10 @@ type stdioTelemetry struct {
 	MaintenanceKind      string                    `json:"maintenance_kind,omitempty"`
 }
 
-type progressLifecycleCounts struct {
-	Begin  uint64 `json:"begin"`
-	Report uint64 `json:"report"`
-	End    uint64 `json:"end"`
-}
-
 type controlledBackendRestartResult struct {
 	oldPID uint32
 	newPID uint32
 	err    error
-}
-
-// soakMonitorFatal is a continuity or liveness fatality detected by the
-// dedicated monitor goroutine. The main test goroutine turns it into evidence
-// entries and t.Fatal, because testing.T may only be touched from the goroutine
-// that started the test.
-type soakMonitorFatal struct {
-	checkID     string
-	message     string
-	notVerified bool
-	continuity  bool
-}
-
-// soakContinuityMonitor owns the soak's 5s continuity tick. It runs on its own
-// goroutine so active-duration advancement, the suspend/resume guard, and the
-// wall/monotonic sampling no longer queue behind blocking request bodies on
-// the main goroutine (gate-20261025T1404Z: the tick shared the main goroutine
-// with those bodies, starved for the whole run, and the harness aborted a
-// healthy run with "active duration monitor did not advance").
-//
-// True starvation still aborts: a monitor tick delayed past 2*soakPollPeriod,
-// a suspend/resume event, or a query-progress stall is fatal, and the main
-// loop additionally watches the heartbeat for a monitor that stopped
-// advancing. Heavy per-tick work (scheduler sampling, minute telemetry,
-// restarts) stays on the main loop and is triggered by dropped-when-busy tick
-// notifications, matching the old time.Ticker buffer-one drop semantics.
-type soakContinuityMonitor struct {
-	ticks       chan struct{}
-	fatal       chan soakMonitorFatal
-	heartbeat   atomic.Int64 // UnixNano of the last processed tick
-	active      atomic.Int64 // active elapsed duration in nanoseconds
-	maintenance atomic.Int32 // known blocking blocks: progress stalls are suspended
-	stop        chan struct{}
-	done        chan struct{}
-}
-
-func startSoakContinuityMonitor(guard suspendResumeGuard, completed *atomic.Uint64) *soakContinuityMonitor {
-	monitor := &soakContinuityMonitor{
-		ticks: make(chan struct{}, 1),
-		fatal: make(chan soakMonitorFatal, 1),
-		stop:  make(chan struct{}),
-		done:  make(chan struct{}),
-	}
-	monitor.heartbeat.Store(time.Now().UnixNano())
-	ticker := time.NewTicker(soakPollPeriod)
-	go func() {
-		defer close(monitor.done)
-		defer ticker.Stop()
-		monitor.run(guard, completed, ticker.C)
-	}()
-	return monitor
-}
-
-func (m *soakContinuityMonitor) activeDuration() time.Duration {
-	return time.Duration(m.active.Load())
-}
-
-// beginMaintenance marks a known blocking block. The monitor keeps sampling
-// wall/monotonic time, but query-progress stalls are suppressed and the
-// progress baseline is reset so the stall clock starts after the block.
-func (m *soakContinuityMonitor) beginMaintenance() { m.maintenance.Add(1) }
-
-func (m *soakContinuityMonitor) endMaintenance() { m.maintenance.Add(-1) }
-
-// halt stops the monitor goroutine and waits for it. Call only once, from the
-// main test goroutine.
-func (m *soakContinuityMonitor) halt() {
-	close(m.stop)
-	<-m.done
-}
-
-// run processes ticks until stopped or a guard fires. It is synchronous so
-// focused tests can drive the tick channel directly.
-func (m *soakContinuityMonitor) run(guard suspendResumeGuard, completed *atomic.Uint64, ticks <-chan time.Time) {
-	lastMono, lastWall := time.Now(), time.Now().UTC()
-	lastProgressCount := completed.Load()
-	lastProgressAt := lastMono
-	for {
-		select {
-		case <-m.stop:
-			return
-		case now := <-ticks:
-			if err := guard.Check(); err != nil {
-				m.fatal <- soakMonitorFatal{checkID: "soak/continuity", message: err.Error(), notVerified: true, continuity: true}
-				return
-			}
-			monoDelta, wallDelta := now.Sub(lastMono), now.UTC().Sub(lastWall)
-			if wallDelta < 0 || wallDelta > 2*soakPollPeriod || wallDelta-monoDelta > 20*time.Second {
-				message := fmt.Sprintf("sleep/interruption invalidated the soak: wall sample gap=%s monotonic gap=%s", wallDelta, monoDelta)
-				m.fatal <- soakMonitorFatal{checkID: "soak/continuity", message: message, notVerified: true, continuity: true}
-				return
-			}
-			m.active.Add(int64(monoDelta))
-			lastMono, lastWall = now, now.UTC()
-			if m.maintenance.Load() > 0 {
-				// A recorded maintenance block legitimately stops query
-				// completions; reset the baseline so the stall clock starts
-				// when the block ends.
-				lastProgressCount = completed.Load()
-				lastProgressAt = now
-			} else {
-				if progressed := completed.Load(); progressed > lastProgressCount {
-					lastProgressCount = progressed
-					lastProgressAt = now
-				}
-				if active := m.activeDuration(); active >= 2*time.Minute && now.Sub(lastProgressAt) > 2*time.Minute {
-					message := fmt.Sprintf("query progress stalled for %s with %d completed requests", now.Sub(lastProgressAt), lastProgressCount)
-					m.fatal <- soakMonitorFatal{checkID: "soak/query-progress", message: message, notVerified: false, continuity: false}
-					return
-				}
-			}
-			m.heartbeat.Store(time.Now().UnixNano())
-			select {
-			case m.ticks <- struct{}{}:
-			default:
-			}
-		}
-	}
 }
 
 func TestSoak_RealStdioMixedWorkload(t *testing.T) {
@@ -1305,8 +1158,16 @@ func rustSoakSource() string {
 }
 
 func hashSoakWorkers(root string) (string, error) {
+	// The untagged harness files carry the continuity monitor, the
+	// suspend/resume state machine, and the gate/budget logic the run
+	// evaluates, so they hash with the workload sources (2026-10-25 ruling 3
+	// moved them out of the build tag without weakening within-run drift
+	// detection).
 	paths := []string{
 		"test/soak/stdio_soak_test.go",
+		"test/soak/continuity_monitor.go",
+		"test/soak/continuity_state.go",
+		"test/soak/stdio_gates.go",
 		"test/soak/process_tree_windows_test.go",
 		"test/soak/process_tree_other_test.go",
 	}
@@ -1427,123 +1288,6 @@ func verifyStdioTools(root string, evidence *report.Report) error {
 	return nil
 }
 
-func exactSoakToolVersion(id, output, expected string) bool {
-	line := strings.TrimSpace(output)
-	if index := strings.IndexAny(line, "\r\n"); index >= 0 {
-		line = line[:index]
-	}
-	fields := strings.Fields(line)
-	switch id {
-	case "go":
-		return len(fields) >= 3 && fields[0] == "go" && fields[1] == "version" && fields[2] == expected
-	case "node":
-		return line == expected
-	case "python":
-		return len(fields) == 2 && fields[0] == "Python" && fields[1] == expected
-	case "clangd":
-		return len(fields) >= 3 && fields[0] == "clangd" && fields[1] == "version" && fields[2] == expected
-	case "rust-analyzer":
-		return len(fields) >= 2 && fields[0] == "rust-analyzer" && strings.Join(fields[1:], " ") == expected
-	default:
-		return false
-	}
-}
-
-func TestExactSoakToolVersionRejectsSuffixAndPrefixMatches(t *testing.T) {
-	tests := []struct {
-		id, output, expected string
-		want                 bool
-	}{
-		{"go", "go version go1.26.1 windows/amd64", "go1.26.1", true},
-		{"go", "go version go1.26.10 windows/amd64", "go1.26.1", false},
-		{"node", "v24.14.0", "v24.14.0", true},
-		{"node", "v24.14.0-extra", "v24.14.0", false},
-		{"python", "Python 3.13.13", "3.13.13", true},
-		{"clangd", "clangd version 22.1.5", "22.1.5", true},
-		{"clangd", "clangd version 22.1.50", "22.1.5", false},
-		{"rust-analyzer", "rust-analyzer 1.97.0 (2d8144b7 2026-07-07)", "1.97.0 (2d8144b7 2026-07-07)", true},
-		{"rust-analyzer", "rust-analyzer 1.97.0-extra (2d8144b7 2026-07-07)", "1.97.0 (2d8144b7 2026-07-07)", false},
-	}
-	for _, test := range tests {
-		t.Run(test.id+"/"+test.output, func(t *testing.T) {
-			if got := exactSoakToolVersion(test.id, test.output, test.expected); got != test.want {
-				t.Fatalf("exactSoakToolVersion(%q, %q, %q) = %t, want %t", test.id, test.output, test.expected, got, test.want)
-			}
-		})
-	}
-}
-
-func TestMakeStdioQueriesKeepSymbolPositionsIndependent(t *testing.T) {
-	text := stdioGoSource()
-	queries := makeStdioQueries("file:///soak.go", text)
-	base := positionOf(text, "soakTarget", 2)
-	wantOffsets := map[string]int{
-		"textDocument/definition":    0,
-		"textDocument/references":    0,
-		"textDocument/completion":    5,
-		"textDocument/prepareRename": len("soakTarget"),
-	}
-	for _, query := range queries {
-		offset, ok := wantOffsets[query.method]
-		if !ok {
-			continue
-		}
-		position := query.params["position"].(map[string]any)
-		if got, want := number(position["character"]), number(base["character"])+offset; got != want {
-			t.Errorf("%s character = %d, want %d", query.method, got, want)
-		}
-	}
-}
-
-func makeStdioQueries(docURI, text string) []stdioQuery {
-	definition := positionOf(text, "soakTarget", 1)
-	call := positionOf(text, "soakTarget", 2)
-	completion := positionOf(text, "soakTarget", 2)
-	completion["character"] = number(completion["character"]) + 5
-	prepareRename := positionOf(text, "soakTarget", 2)
-	prepareRename["character"] = number(prepareRename["character"]) + len("soakTarget")
-	textDoc := map[string]any{"uri": docURI}
-	return []stdioQuery{
-		{method: "textDocument/hover", params: map[string]any{"textDocument": textDoc, "position": definition}},
-		{method: "textDocument/definition", params: map[string]any{"textDocument": textDoc, "position": call}},
-		{method: "textDocument/completion", params: map[string]any{"textDocument": textDoc, "position": completion}},
-		{method: "textDocument/references", params: map[string]any{"textDocument": textDoc, "position": call, "context": map[string]any{"includeDeclaration": true}, "workDoneToken": "soak-references"}},
-		{method: "textDocument/documentSymbol", params: map[string]any{"textDocument": textDoc}},
-		{method: "textDocument/prepareRename", params: map[string]any{"textDocument": textDoc, "position": prepareRename}},
-		{method: "omnilsp/status", params: map[string]any{}},
-		{method: "omnilsp/indexStats", params: map[string]any{}},
-	}
-}
-
-func withoutProgressTokens(queries []stdioQuery) []stdioQuery {
-	result := make([]stdioQuery, len(queries))
-	for i, query := range queries {
-		params := make(map[string]any, len(query.params))
-		for key, value := range query.params {
-			params[key] = value
-		}
-		delete(params, "workDoneToken")
-		result[i] = stdioQuery{method: query.method, params: params}
-	}
-	return result
-}
-
-func positionOf(text, symbol string, occurrence int) map[string]any {
-	index := -1
-	start := 0
-	for i := 0; i < occurrence; i++ {
-		next := strings.Index(text[start:], symbol)
-		if next < 0 {
-			return map[string]any{"line": -1, "character": -1}
-		}
-		index = start + next
-		start = index + len(symbol)
-	}
-	line := strings.Count(text[:index], "\n")
-	lastNewline := strings.LastIndex(text[:index], "\n")
-	return map[string]any{"line": line, "character": index - lastNewline - 1}
-}
-
 func assertStdioQuerySet(session *lspdriver.Session, queries []stdioQuery) error {
 	for _, query := range queries {
 		eventStart := len(session.Events())
@@ -1573,149 +1317,6 @@ func queryURI(query stdioQuery) string {
 	document, _ := query.params["textDocument"].(map[string]any)
 	value, _ := document["uri"].(string)
 	return value
-}
-
-func assertStdioQuery(method string, raw json.RawMessage, docURI, text string) error {
-	switch method {
-	case "textDocument/hover":
-		var value map[string]any
-		if err := json.Unmarshal(raw, &value); err != nil || value == nil || value["contents"] == nil {
-			return fmt.Errorf("hover has no contents: %s", raw)
-		}
-		content, _ := json.Marshal(value["contents"])
-		if !bytes.Contains(content, []byte("soakTarget")) {
-			return fmt.Errorf("hover did not identify soakTarget: %s", raw)
-		}
-	case "textDocument/definition", "textDocument/references":
-		locations, err := decodeStdioLocations(raw)
-		if err != nil || len(locations) == 0 {
-			return fmt.Errorf("location result is empty or invalid: %s", raw)
-		}
-		declaration := positionOf(text, "soakTarget", 1)
-		if method == "textDocument/definition" {
-			if !hasLocationAt(locations, docURI, declaration) {
-				return fmt.Errorf("definition did not target soakTarget at %s:%v: %s", docURI, declaration, raw)
-			}
-		} else {
-			use := positionOf(text, "soakTarget", 2)
-			if len(locations) < stdioGeneratedFiles+2 {
-				return fmt.Errorf("long references query returned only %d locations; want at least %d", len(locations), stdioGeneratedFiles+2)
-			}
-			if !hasLocationAt(locations, docURI, declaration) || !hasLocationAt(locations, docURI, use) {
-				return fmt.Errorf("references did not include the exact declaration and use ranges in %s: %s", docURI, raw)
-			}
-		}
-	case "textDocument/completion":
-		var list struct {
-			Items []struct {
-				Label string `json:"label"`
-			} `json:"items"`
-		}
-		if err := json.Unmarshal(raw, &list.Items); err != nil || len(list.Items) == 0 {
-			if err := json.Unmarshal(raw, &list); err != nil || len(list.Items) == 0 {
-				return fmt.Errorf("completion list is empty or invalid: %s", raw)
-			}
-		}
-		found := false
-		for _, item := range list.Items {
-			if item.Label == "soakTarget" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("completion did not include the soakTarget symbol: %s", raw)
-		}
-	case "textDocument/documentSymbol":
-		var value []struct {
-			Name     string `json:"name"`
-			Children []struct {
-				Name string `json:"name"`
-			} `json:"children"`
-		}
-		if err := json.Unmarshal(raw, &value); err != nil || len(value) == 0 {
-			return fmt.Errorf("document symbols are empty or invalid: %s", raw)
-		}
-		found := false
-		for _, symbol := range value {
-			found = found || symbol.Name == "soakTarget"
-			for _, child := range symbol.Children {
-				found = found || child.Name == "soakTarget"
-			}
-		}
-		if !found {
-			return fmt.Errorf("document symbols did not include soakTarget: %s", raw)
-		}
-	case "textDocument/prepareRename":
-		var value struct {
-			Placeholder string `json:"placeholder"`
-		}
-		if err := json.Unmarshal(raw, &value); err != nil || value.Placeholder != "soakTarget" {
-			return fmt.Errorf("prepareRename did not identify soakTarget: %s", raw)
-		}
-	case "omnilsp/status":
-		var value struct{ SnapshotEpochs int64 }
-		if err := json.Unmarshal(raw, &value); err != nil || value.SnapshotEpochs < 1 {
-			return fmt.Errorf("status snapshot epochs are not positive: %s", raw)
-		}
-	case "omnilsp/indexStats":
-		var value struct {
-			Enabled bool `json:"enabled"`
-		}
-		if err := json.Unmarshal(raw, &value); err != nil || !value.Enabled {
-			return fmt.Errorf("persistent index is not enabled: %s", raw)
-		}
-	default:
-		return fmt.Errorf("unrecognized query method %q", method)
-	}
-	return nil
-}
-
-type stdioPosition struct {
-	Line      uint32 `json:"line"`
-	Character uint32 `json:"character"`
-}
-
-type stdioRange struct {
-	Start stdioPosition `json:"start"`
-}
-
-type stdioLocation struct {
-	URI                  string     `json:"uri"`
-	Range                stdioRange `json:"range"`
-	TargetURI            string     `json:"targetUri"`
-	TargetRange          stdioRange `json:"targetRange"`
-	TargetSelectionRange stdioRange `json:"targetSelectionRange"`
-}
-
-func decodeStdioLocations(raw []byte) ([]stdioLocation, error) {
-	var locations []stdioLocation
-	if err := json.Unmarshal(raw, &locations); err == nil {
-		return locations, nil
-	}
-	var location stdioLocation
-	if err := json.Unmarshal(raw, &location); err != nil {
-		return nil, err
-	}
-	return []stdioLocation{location}, nil
-}
-
-func hasLocationAt(locations []stdioLocation, uri string, position map[string]any) bool {
-	wantLine, wantCharacter := uint32(number(position["line"])), uint32(number(position["character"]))
-	for _, location := range locations {
-		gotURI, gotPosition := location.URI, location.Range.Start
-		if location.TargetURI != "" {
-			gotURI, gotPosition = location.TargetURI, location.TargetSelectionRange.Start
-		}
-		if gotURI == uri && gotPosition.Line == wantLine && gotPosition.Character == wantCharacter {
-			return true
-		}
-	}
-	return false
-}
-
-func stdioGoSource() string {
-	return "package soak\n\nfunc soakTarget(value int) int { return value + 1 }\nfunc useTarget() int { return soakTarget(1) }\n"
 }
 
 func assertUnsafeStdioRename(session *lspdriver.Session, docURI string) error {
@@ -1830,8 +1431,15 @@ func restartControlledRustBackend(session *lspdriver.Session, job *processTreeBu
 		if identityErr == nil && pid != oldPID {
 			// A process image appearing is not enough: wait for a semantic
 			// response, then resolve identity again so a transient rustup shim
-			// cannot be mistaken for the supervised language server.
-			if hoverErr := waitForRustSoakHoverAfter(session, rustURI, rustText, 2*time.Second, restartAt); hoverErr == nil {
+			// cannot be mistaken for the supervised language server. The probe
+			// window is the same derived per-request budget the stability
+			// window uses (2026-10-25 ruling 5: no bare wall-clock constants) —
+			// a replacement that is still re-indexing under the worker load
+			// cannot answer a hover within an arbitrary 2s, and the fixed 2s
+			// this line previously carried starved the identity confirmation
+			// below the inner 3s request timeout. Identity is re-sampled after
+			// the probe, so a longer budget cannot hide a backend restart.
+			if hoverErr := waitForRustSoakHoverAfter(session, rustURI, rustText, soakRustStabilityProbeBudget(), restartAt); hoverErr == nil {
 				confirmed, confirmErr := job.sample(runnerPID, candidatePID)
 				if confirmErr == nil {
 					confirmedPID, confirmedErr := supervisedRustAnalyzerPID(confirmed, uint32(candidatePID), expected)
@@ -1890,79 +1498,6 @@ func verifyRustBackendStable(session *lspdriver.Session, job *processTreeBudget,
 	return nil
 }
 
-func supervisedRustAnalyzerPID(sample processTreeSample, candidatePID uint32, executable string) (uint32, error) {
-	members := make(map[uint32]processTreeMember, len(sample.Members))
-	for _, member := range sample.Members {
-		members[member.PID] = member
-	}
-	if _, ok := members[candidatePID]; !ok {
-		return 0, fmt.Errorf("candidate PID %d is absent from the measured process tree", candidatePID)
-	}
-	candidates := make(map[uint32]struct{})
-	for _, member := range sample.Members {
-		if isRustAnalyzerImage(member.ImagePath, executable) && processDescendsFrom(member.PID, candidatePID, members) {
-			candidates[member.PID] = struct{}{}
-		}
-	}
-	if len(candidates) == 0 {
-		return 0, fmt.Errorf("no rust-analyzer process descends from candidate PID %d", candidatePID)
-	}
-	var leaves []uint32
-	for pid := range candidates {
-		hasCandidateDescendant := false
-		for other := range candidates {
-			if other != pid && processDescendsFrom(other, pid, members) {
-				hasCandidateDescendant = true
-				break
-			}
-		}
-		if !hasCandidateDescendant {
-			leaves = append(leaves, pid)
-		}
-	}
-	if len(leaves) != 1 {
-		sort.Slice(leaves, func(i, j int) bool { return leaves[i] < leaves[j] })
-		return 0, fmt.Errorf("expected one supervised rust-analyzer leaf process, got %v from candidates %v", leaves, sortedProcessPIDs(candidates))
-	}
-	return leaves[0], nil
-}
-
-func processDescendsFrom(pid, ancestor uint32, members map[uint32]processTreeMember) bool {
-	seen := make(map[uint32]struct{}, len(members))
-	for steps := 0; steps < len(members); steps++ {
-		member, ok := members[pid]
-		if !ok || member.ParentPID == 0 {
-			return false
-		}
-		if member.ParentPID == ancestor {
-			return true
-		}
-		if _, duplicate := seen[member.ParentPID]; duplicate {
-			return false
-		}
-		seen[member.ParentPID] = struct{}{}
-		pid = member.ParentPID
-	}
-	return false
-}
-
-func sortedProcessPIDs(values map[uint32]struct{}) []uint32 {
-	pids := make([]uint32, 0, len(values))
-	for pid := range values {
-		pids = append(pids, pid)
-	}
-	sort.Slice(pids, func(i, j int) bool { return pids[i] < pids[j] })
-	return pids
-}
-
-func isRustAnalyzerImage(image, expected string) bool {
-	if sameExecutablePath(image, expected) {
-		return true
-	}
-	base := strings.TrimSuffix(strings.ToLower(filepath.Base(filepath.Clean(image))), strings.ToLower(filepath.Ext(image)))
-	return base == "rust-analyzer"
-}
-
 func containsProcessPID(sample processTreeSample, pid uint32) bool {
 	for _, member := range sample.Members {
 		if member.PID == pid {
@@ -1970,14 +1505,6 @@ func containsProcessPID(sample processTreeSample, pid uint32) bool {
 		}
 	}
 	return false
-}
-
-func sameExecutablePath(left, right string) bool {
-	clean := func(value string) string {
-		value = strings.TrimPrefix(filepath.Clean(value), `\\?\`)
-		return strings.ToLower(value)
-	}
-	return clean(left) == clean(right)
 }
 
 func waitForRustSoakHover(session *lspdriver.Session, rustURI, rustText string, timeout time.Duration) error {
@@ -2149,90 +1676,6 @@ func verifyPersistentStdioIndex(session *lspdriver.Session, expectedGeneration u
 	return verifyStdioIndexContent(session, docURI, text)
 }
 
-func validatePersistentIndexRecovery(generation, expectedGeneration uint64, enabled, fresh bool) error {
-	if !enabled || !fresh || generation == 0 {
-		return fmt.Errorf("index is not enabled with a nonzero fresh generation: enabled=%t fresh=%t generation=%d", enabled, fresh, generation)
-	}
-	if expectedGeneration != 0 && generation != expectedGeneration {
-		return fmt.Errorf("persistent index recovery changed generation: got %d want the previously committed fresh generation %d", generation, expectedGeneration)
-	}
-	return nil
-}
-
-func requestReindexWithRetry(ctx context.Context, request func(context.Context) (json.RawMessage, error)) (json.RawMessage, error) {
-	// The retry window is the same per-request allowance requestStdio uses.
-	// The fixed 10s this line previously carried was proven insufficient for
-	// the pinned rust-analyzer 1.97.0 cold start under full-corpus load
-	// (gate-20261025T0716Z: soak/reindex died on it), so it must not survive
-	// as a floor: max(budget, 10s) would keep a proven-bad bound and defeat
-	// deliberately small diagnostic budgets. stdioRequestBudget() widens the
-	// window with OMNILSP_SOAK_REQUEST_BUDGET (default 30s).
-	retryCtx, cancel := context.WithTimeout(ctx, stdioRequestBudget())
-	defer cancel()
-	var lastBusy error
-	for {
-		if err := retryCtx.Err(); err != nil {
-			if lastBusy != nil {
-				return nil, fmt.Errorf("reindex remained busy until retry deadline: %w (last response: %v)", err, lastBusy)
-			}
-			return nil, err
-		}
-		result, err := request(retryCtx)
-		if err == nil || !isReindexAlreadyRunning(err) {
-			return result, err
-		}
-		lastBusy = err
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case <-retryCtx.Done():
-			timer.Stop()
-			return nil, fmt.Errorf("reindex remained busy until retry deadline: %w (last response: %v)", retryCtx.Err(), lastBusy)
-		case <-timer.C:
-		}
-	}
-}
-
-func isReindexAlreadyRunning(err error) bool {
-	var responseErr *jsonrpc.ResponseError
-	return errors.As(err, &responseErr) && responseErr.Code == jsonrpc.RequestFailed && responseErr.Message == "reindex already running"
-}
-
-func validateReindexGeneration(before, after uint64, files int) error {
-	if after == 0 || after <= before {
-		return fmt.Errorf("generation did not advance: before=%d after=%d", before, after)
-	}
-	if files < 100 {
-		return fmt.Errorf("indexed only %d files, want at least 100", files)
-	}
-	return nil
-}
-
-func validateFinalStdioProgress(generation, lastCommitted uint64, snapshot, lastSnapshot int, enabled, fresh bool) error {
-	if lastCommitted == 0 || generation != lastCommitted {
-		return fmt.Errorf("final generation does not match the last successful commit: generation=%d last_committed=%d", generation, lastCommitted)
-	}
-	if !enabled || !fresh {
-		return fmt.Errorf("last committed generation is not enabled and fresh: enabled=%t fresh=%t", enabled, fresh)
-	}
-	if snapshot == 0 || snapshot < lastSnapshot {
-		return fmt.Errorf("document snapshot is missing or regressed: snapshot=%d last_snapshot=%d", snapshot, lastSnapshot)
-	}
-	return nil
-}
-
-func parseStdioSoakDuration(value string) (time.Duration, error) {
-	duration, err := time.ParseDuration(value)
-	if err != nil {
-		return 0, fmt.Errorf("invalid SOAK_DURATION %q: %w", value, err)
-	}
-	switch duration {
-	case 30 * time.Second, 10 * time.Minute, time.Hour:
-		return duration, nil
-	default:
-		return 0, fmt.Errorf("SOAK_DURATION must select the 30s preflight, 10m preflight, or continuous 1h gate; got %q", value)
-	}
-}
-
 func verifyStdioIndexContent(session *lspdriver.Session, docURI, text string) error {
 	position := positionOf(text, "soakTarget", 2)
 	result, err := requestStdio(session, "textDocument/references", map[string]any{
@@ -2247,10 +1690,6 @@ func verifyStdioIndexContent(session *lspdriver.Session, docURI, text string) er
 		return fmt.Errorf("persistent index content: %w", err)
 	}
 	return nil
-}
-
-func validateStdioIndexContent(result json.RawMessage, docURI, text string) error {
-	return assertStdioQuery("textDocument/references", result, docURI, text)
 }
 
 func assertStdioOverlaySymbol(session *lspdriver.Session, docURI string) error {
@@ -2495,98 +1934,6 @@ func waitForProgressLifecycle(session *lspdriver.Session, token string, timeout 
 	return counts, fmt.Errorf("progress token %q did not produce both begin/end events: %+v", token, counts)
 }
 
-func countProgressLifecycle(events []*jsonrpc.Message, token string) progressLifecycleCounts {
-	counts, _ := progressLifecycleInEvents(events, token)
-	return counts
-}
-
-func progressLifecycleInEvents(events []*jsonrpc.Message, token string) (progressLifecycleCounts, error) {
-	counts := progressLifecycleCounts{}
-	beginAt, endAt := -1, -1
-	for index, event := range events {
-		if event.Method != "$/progress" {
-			continue
-		}
-		var params struct {
-			Token string `json:"token"`
-			Value struct {
-				Kind string `json:"kind"`
-			} `json:"value"`
-		}
-		if json.Unmarshal(event.Params, &params) != nil || params.Token != token {
-			continue
-		}
-		switch params.Value.Kind {
-		case "begin":
-			counts.Begin++
-			if beginAt < 0 {
-				beginAt = index
-			}
-		case "report":
-			counts.Report++
-		case "end":
-			counts.End++
-			endAt = index
-		}
-	}
-	if beginAt < 0 || endAt < 0 || endAt <= beginAt {
-		return counts, fmt.Errorf("progress token %q did not produce an ordered begin/end lifecycle: %+v", token, counts)
-	}
-	return counts, nil
-}
-
-func progressLifecycleBeforeResponse(events []*jsonrpc.Message, token string) (progressLifecycleCounts, error) {
-	counts, err := progressLifecycleInEvents(events, token)
-	if err != nil {
-		return counts, err
-	}
-	endAt, responseAt := -1, -1
-	for index, event := range events {
-		if event.Method == "$/progress" {
-			var params struct {
-				Token string `json:"token"`
-				Value struct {
-					Kind string `json:"kind"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(event.Params, &params) == nil && params.Token == token && params.Value.Kind == "end" {
-				endAt = index
-			}
-		}
-		// The initial semantic query set is sequential, so the first terminal
-		// response after event capture belongs to the request under observation.
-		if responseAt < 0 && event.IsResponse() {
-			responseAt = index
-		}
-	}
-	if responseAt < 0 {
-		return counts, fmt.Errorf("request for progress token %q had no terminal response in the event stream", token)
-	}
-	if endAt < 0 || endAt >= responseAt {
-		return counts, fmt.Errorf("progress token %q did not end before its terminal response (end index=%d response index=%d)", token, endAt, responseAt)
-	}
-	return counts, nil
-}
-
-func TestProgressLifecycleMustEndBeforeTerminalResponse(t *testing.T) {
-	progress := func(kind string) *jsonrpc.Message {
-		params, err := json.Marshal(map[string]any{"token": "test-token", "value": map[string]any{"kind": kind}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return jsonrpc.NewNotification("$/progress", params)
-	}
-	response := jsonrpc.NewResponse(jsonrpc.RequestID{Num: 1}, json.RawMessage(`[]`))
-	valid := []*jsonrpc.Message{progress("begin"), progress("report"), progress("end"), response}
-	if _, err := progressLifecycleBeforeResponse(valid, "test-token"); err != nil {
-		t.Fatalf("ordered lifecycle rejected: %v", err)
-	}
-	lateEnd := []*jsonrpc.Message{progress("begin"), response, progress("end")}
-	if _, err := progressLifecycleBeforeResponse(lateEnd, "test-token"); err == nil {
-		t.Fatal("lifecycle ending after terminal response was accepted")
-	}
-}
-
 func processTreeHandleTotal(sample processTreeSample) uint64 {
 	var total uint64
 	for _, count := range sample.HandleCounts {
@@ -2602,49 +1949,6 @@ func medianUint(values []uint64) uint64 {
 	sorted := append([]uint64(nil), values...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	return sorted[len(sorted)/2]
-}
-
-// minuteCadenceBudget is the unexplained part of a minute window: one minute
-// plus two poll periods of scheduling slack.
-func minuteCadenceBudget() time.Duration { return time.Minute + 2*soakPollPeriod }
-
-// minuteWindowGapContinuous separates the nominal cadence from recorded
-// maintenance. The raw active gap must still reach a minute (a row is due one
-// minute after the previous one), while a bounded maintenance interval is
-// subtracted from both raw gaps before the unexplained-stall ceiling applies.
-// A pause larger than either gap, or a negative pause, is rejected.
-func minuteWindowGapContinuous(wallGap, activeGap, maintenancePause time.Duration) bool {
-	if wallGap <= 0 || activeGap < time.Minute {
-		return false
-	}
-	if maintenancePause < 0 || maintenancePause > wallGap || maintenancePause > activeGap {
-		return false
-	}
-	budget := minuteCadenceBudget()
-	return wallGap-maintenancePause <= budget && activeGap-maintenancePause <= budget
-}
-
-// soakMaintenanceBudget bounds the known main-loop pauses. The reindex budget
-// is the request budget it runs under; the restart budget is the rust
-// cold-start allowance plus the phase's own explicit waits. Each pause is
-// checked at record time, so a recorded pause can never be unbounded.
-func soakMaintenanceBudget(kind string) time.Duration {
-	switch kind {
-	case "periodic-reindex":
-		return stdioRequestBudget() + 2*soakPollPeriod
-	case "candidate-restart":
-		return stdioColdStartAllowance(90*time.Second) + soakSnapshotOpenBudget + soakSnapshotReopenBudget + soakProgressLifecycleBudget + 2*soakPollPeriod
-	default:
-		return 0
-	}
-}
-
-// soakRustStabilityProbeBudget uses the same per-request stdio budget as every
-// other request. A fixed 3s probe was too tight while the replacement
-// re-indexes under the eight-worker load; identity is re-sampled after the
-// probe, so a longer budget cannot hide a backend restart.
-func soakRustStabilityProbeBudget() time.Duration {
-	return stdioRequestBudget()
 }
 
 func summarizeResourceWindow(minute int64, private, handles []uint64) resourceWindow {
@@ -2715,65 +2019,6 @@ func requestStdio(session *lspdriver.Session, method string, params any) (json.R
 	ctx, cancel := context.WithTimeout(context.Background(), stdioRequestBudget())
 	defer cancel()
 	return session.RequestContext(ctx, method, params)
-}
-
-// stdioRequestBudget is the wall-clock budget every requestStdio caller gets.
-// The default stays at the historical hard-coded 30s; §S16 fixes no
-// per-request timeout, so this is harness plumbing, not a soak-gate value.
-// OMNILSP_SOAK_REQUEST_BUDGET exists so a diagnostic run can widen it — the
-// Y1-10 GATE (internal/conformance/registry.go) records this host's 30s
-// preflights dying on the fixed budget — without touching the strict gates.
-// A malformed or non-positive value must not silently mimic a widened run: it
-// falls back to the default, announced on stderr.
-func stdioRequestBudget() time.Duration {
-	const defaultBudget = 30 * time.Second
-	text := strings.TrimSpace(os.Getenv(stdioRequestBudgetEnv))
-	if text == "" {
-		return defaultBudget
-	}
-	budget, err := time.ParseDuration(text)
-	if err != nil || budget <= 0 {
-		fmt.Fprintf(os.Stderr, "soak: ignoring invalid %s=%q (want a positive duration like 90s); using default %s\n", stdioRequestBudgetEnv, text, defaultBudget)
-		return defaultBudget
-	}
-	return budget
-}
-
-// stdioColdStartAllowance sizes a soak phase that must outlast the locked
-// rust-analyzer cold start (e.g. the first semantic rust hover). The 300s
-// standard budget was established against rust-analyzer 1.97.0 and remains a
-// floor if the host lock moves.
-// OMNILSP_SOAK_REQUEST_BUDGET may widen the phase but never tightens it below
-// the historical sizing: a small diagnostic budget must not shrink an
-// allowance whose fit at smaller values has never been observed. Phases whose
-// window does not span cold start (e.g. cancellation acknowledgments) stay
-// fixed constants instead.
-func stdioColdStartAllowance(historical time.Duration) time.Duration {
-	if budget := stdioRequestBudget(); budget > historical {
-		return budget
-	}
-	return historical
-}
-
-// TestSoak_RequestBudgetDefaultIs30s pins the requestStdio budget semantics:
-// default 30s when the env is unset, and the env override honored when valid.
-// The soak-gate test TestSoak_SustainedMixedLoadBounded never calls
-// requestStdio, so without this pin the 30s default would be unobserved.
-func TestSoak_RequestBudgetDefaultIs30s(t *testing.T) {
-	t.Setenv(stdioRequestBudgetEnv, "")
-	if got := stdioRequestBudget(); got != 30*time.Second {
-		t.Fatalf("stdioRequestBudget() with %s unset = %s, want 30s", stdioRequestBudgetEnv, got)
-	}
-	t.Setenv(stdioRequestBudgetEnv, "90s")
-	if got := stdioRequestBudget(); got != 90*time.Second {
-		t.Fatalf("stdioRequestBudget() with %s=90s = %s, want 90s", stdioRequestBudgetEnv, got)
-	}
-	for _, invalid := range []string{"nope", "0s", "-5s"} {
-		t.Setenv(stdioRequestBudgetEnv, invalid)
-		if got := stdioRequestBudget(); got != 30*time.Second {
-			t.Fatalf("stdioRequestBudget() with %s=%q = %s, want the 30s default", stdioRequestBudgetEnv, invalid, got)
-		}
-	}
 }
 
 func waitForStdioRuntimeBounds(baselineGoroutines int, baselineHeap uint64) (int, uint64) {
@@ -2859,20 +2104,7 @@ func cloneCounts(source map[string]uint64) map[string]uint64 {
 	return copy
 }
 
-func number(value any) int {
-	switch n := value.(type) {
-	case int:
-		return n
-	case int64:
-		return int(n)
-	case uint64:
-		return int(n)
-	case float64:
-		return int(n)
-	default:
-		return 0
-	}
-}
+// number lives in the untagged stdio_gates.go with the pure gate predicates.
 
 func soakFailed(evidence *report.Report, id, message string) {
 	evidence.Checks = append(evidence.Checks, report.Check{ID: id, Status: report.Failed, Summary: message})
