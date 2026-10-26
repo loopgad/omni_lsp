@@ -54,6 +54,8 @@ func TestCompletionPhaseTraceDisabledByDefault(t *testing.T) {
 func TestCompletionPhaseTraceCorrelatesPhasesAndWritesOnRunTeardown(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "completion-phase-trace.json")
 	t.Setenv(completionPhaseTraceEnv, path)
+	t.Setenv(completionPhaseTraceLimitEnv, "")
+	t.Setenv(completionPhaseTraceStatusEveryEnv, "")
 	t.Setenv(completionPhaseTraceRunIDEnv, "trace-run-7")
 	t.Setenv(completionPhaseTraceCandidateSHAEnv, "sha256:"+strings.Repeat("a", 64))
 
@@ -102,9 +104,9 @@ func TestCompletionPhaseTraceCorrelatesPhasesAndWritesOnRunTeardown(t *testing.T
 	if err := json.Unmarshal(data, &report); err != nil {
 		t.Fatalf("decode trace report: %v", err)
 	}
-	// Version 3 adds the optional per-sample `method` field so status samples
-	// can share the report with completion samples.
-	if report.Version != 3 || report.SampleLimit != maxCompletionPhaseSamples || len(report.Samples) != 1 {
+	// Version 4 records the status sampling divisor alongside the shared
+	// per-sample `method` field; the divisor defaults to 1 (record every sample).
+	if report.Version != 4 || report.SampleLimit != maxCompletionPhaseSamples || report.StatusSampleEvery != 1 || len(report.Samples) != 1 {
 		t.Fatalf("unexpected trace report metadata: %+v", report)
 	}
 	if report.Samples[0].Method != "textDocument/completion" {
@@ -149,6 +151,8 @@ func TestCompletionPhaseTraceCorrelatesPhasesAndWritesOnRunTeardown(t *testing.T
 func TestCompletionPhaseTraceProviderErrorDoesNotClaimProjection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "completion-phase-error.json")
 	t.Setenv(completionPhaseTraceEnv, path)
+	t.Setenv(completionPhaseTraceLimitEnv, "")
+	t.Setenv(completionPhaseTraceStatusEveryEnv, "")
 	t.Setenv(completionPhaseTraceRunIDEnv, "trace-error-run")
 	t.Setenv(completionPhaseTraceCandidateSHAEnv, strings.Repeat("b", 64))
 
@@ -194,6 +198,8 @@ func TestCompletionPhaseTraceProviderErrorDoesNotClaimProjection(t *testing.T) {
 func TestScheduledCompletionPhaseTraceIncludesSchedulerAndResponseStages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scheduled-completion-trace.json")
 	t.Setenv(completionPhaseTraceEnv, path)
+	t.Setenv(completionPhaseTraceLimitEnv, "")
+	t.Setenv(completionPhaseTraceStatusEveryEnv, "")
 
 	s := New(DefaultConfig())
 	backend := &completionPhaseTraceTestBackend{mockBackend: mockBackend{
@@ -262,6 +268,8 @@ func TestScheduledCompletionPhaseTraceIncludesSchedulerAndResponseStages(t *test
 func TestScheduledStatusPhaseTraceRecordsMethodAndStages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scheduled-status-trace.json")
 	t.Setenv(completionPhaseTraceEnv, path)
+	t.Setenv(completionPhaseTraceLimitEnv, "")
+	t.Setenv(completionPhaseTraceStatusEveryEnv, "")
 
 	s := New(DefaultConfig())
 	transport := newFakeTransport()
@@ -376,4 +384,85 @@ func TestCompletionPhaseTraceCapacityAndSafeClose(t *testing.T) {
 			t.Fatalf("pending close report = %+v", report)
 		}
 	})
+}
+
+func TestCompletionPhaseTraceStatusSampling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status-sampled.json")
+	recorder := newCompletionPhaseTraceRecorder(path, 100)
+	recorder.statusSampleEvery = 4
+	for i := 0; i < 9; i++ {
+		span := recorder.begin("omnilsp/status", "", "", nil)
+		span.finish()
+	}
+	span := recorder.begin("textDocument/completion", "", "file:///workspace/main.go", json.RawMessage(`7`))
+	span.finish()
+	if err := recorder.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read trace: %v", err)
+	}
+	var report completionPhaseTraceReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("decode trace: %v", err)
+	}
+	if report.Version != 4 || report.StatusSampleEvery != 4 || report.SamplesTruncated {
+		t.Fatalf("sampled report metadata = %+v", report)
+	}
+	status, completion := 0, 0
+	for _, sample := range report.Samples {
+		switch sample.Method {
+		case "omnilsp/status":
+			status++
+		case "textDocument/completion":
+			completion++
+		}
+	}
+	if status != 3 || completion != 1 {
+		t.Fatalf("samples = status %d completion %d, want 3 status (every fourth of nine) and 1 completion", status, completion)
+	}
+
+	limited := newCompletionPhaseTraceRecorder(filepath.Join(t.TempDir(), "limited.json"), 2)
+	for i := 0; i < 3; i++ {
+		recorderSpan := limited.begin("omnilsp/status", "", "", nil)
+		recorderSpan.finish()
+	}
+	if err := limited.close(); err != nil {
+		t.Fatalf("close limited: %v", err)
+	}
+	data, err = os.ReadFile(limited.path)
+	if err != nil {
+		t.Fatalf("read limited trace: %v", err)
+	}
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("decode limited trace: %v", err)
+	}
+	if len(report.Samples) != 2 || !report.SamplesTruncated || report.SampleLimit != 2 {
+		t.Fatalf("limited report = %+v, want 2 samples and samples_truncated", report)
+	}
+}
+
+func TestCompletionPhaseTraceEnvOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "env-trace.json")
+	t.Setenv(completionPhaseTraceEnv, path)
+	t.Setenv(completionPhaseTraceLimitEnv, "7")
+	t.Setenv(completionPhaseTraceStatusEveryEnv, "3")
+	recorder := newCompletionPhaseTraceFromEnv()
+	if recorder == nil || recorder.sampleLimit != 7 || recorder.statusSampleEvery != 3 {
+		t.Fatalf("env overrides = %+v, want limit 7 and status every 3", recorder)
+	}
+	if err := recorder.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	t.Setenv(completionPhaseTraceLimitEnv, "0")
+	t.Setenv(completionPhaseTraceStatusEveryEnv, "not-a-number")
+	recorder = newCompletionPhaseTraceFromEnv()
+	if recorder.sampleLimit != maxCompletionPhaseSamples || recorder.statusSampleEvery != 1 {
+		t.Fatalf("invalid env fallback = %+v, want default limit %d and every 1", recorder, maxCompletionPhaseSamples)
+	}
+	if err := recorder.close(); err != nil {
+		t.Fatalf("close fallback: %v", err)
+	}
 }

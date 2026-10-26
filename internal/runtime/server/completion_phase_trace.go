@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,8 @@ import (
 
 const (
 	completionPhaseTraceEnv             = "OMNILSP_S18_COMPLETION_PHASE_TRACE"
+	completionPhaseTraceLimitEnv        = "OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT"
+	completionPhaseTraceStatusEveryEnv  = "OMNILSP_S18_COMPLETION_PHASE_TRACE_STATUS_EVERY"
 	completionPhaseTraceRunIDEnv        = "OMNILSP_RUN_ID"
 	completionPhaseTraceCandidateSHAEnv = "OMNILSP_CANDIDATE_SHA256"
 	maxCompletionPhaseSamples           = 16384
@@ -50,18 +53,21 @@ type completionPhaseTraceReport struct {
 	ProcessID             int                          `json:"process_id"`
 	CreatedUTC            time.Time                    `json:"created_utc"`
 	SampleLimit           int                          `json:"sample_limit"`
+	StatusSampleEvery     int                          `json:"status_sample_every,omitempty"`
 	SamplesTruncated      bool                         `json:"samples_truncated"`
 	DroppedPendingSamples uint64                       `json:"dropped_pending_samples"`
 	Samples               []completionPhaseTraceSample `json:"samples"`
 }
 
 type completionPhaseTraceRecorder struct {
-	path        string
-	sampleLimit int
+	path              string
+	sampleLimit       int
+	statusSampleEvery int
 
 	mu               sync.Mutex
 	samples          []completionPhaseTraceSample
 	pending          uint64
+	statusBegun      uint64
 	closed           bool
 	samplesTruncated bool
 	closeOnce        sync.Once
@@ -83,7 +89,32 @@ func newCompletionPhaseTraceFromEnv() *completionPhaseTraceRecorder {
 	if path == "" {
 		return nil
 	}
-	return newCompletionPhaseTraceRecorder(path, maxCompletionPhaseSamples)
+	limit, limitErr := positiveIntFromEnv(completionPhaseTraceLimitEnv, maxCompletionPhaseSamples)
+	if limitErr != nil {
+		fmt.Fprintln(os.Stderr, limitErr)
+	}
+	every, everyErr := positiveIntFromEnv(completionPhaseTraceStatusEveryEnv, 1)
+	if everyErr != nil {
+		fmt.Fprintln(os.Stderr, everyErr)
+	}
+	recorder := newCompletionPhaseTraceRecorder(path, limit)
+	recorder.statusSampleEvery = every
+	return recorder
+}
+
+// positiveIntFromEnv parses a positive integer override. An invalid or
+// non-positive value falls back to the caller's default instead of silently
+// changing the sampling shape; the caller announces the fallback on stderr.
+func positiveIntFromEnv(name string, fallback int) (int, error) {
+	text := strings.TrimSpace(os.Getenv(name))
+	if text == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(text)
+	if err != nil || value <= 0 {
+		return fallback, fmt.Errorf("ignoring invalid %s=%q (want a positive integer); using %d", name, text, fallback)
+	}
+	return value, nil
 }
 
 func newCompletionPhaseTraceRecorder(path string, sampleLimit int) *completionPhaseTraceRecorder {
@@ -94,9 +125,10 @@ func newCompletionPhaseTraceRecorder(path string, sampleLimit int) *completionPh
 		sampleLimit = maxCompletionPhaseSamples
 	}
 	return &completionPhaseTraceRecorder{
-		path:        path,
-		sampleLimit: sampleLimit,
-		samples:     make([]completionPhaseTraceSample, 0, min(sampleLimit, 256)),
+		path:              path,
+		sampleLimit:       sampleLimit,
+		statusSampleEvery: 1,
+		samples:           make([]completionPhaseTraceSample, 0, min(sampleLimit, 256)),
 	}
 }
 
@@ -108,6 +140,12 @@ func (r *completionPhaseTraceRecorder) begin(method, languageID, uri string, par
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil
+	}
+	if method == "omnilsp/status" {
+		r.statusBegun++
+		if r.statusSampleEvery > 1 && (r.statusBegun-1)%uint64(r.statusSampleEvery) != 0 {
+			return nil
+		}
 	}
 	r.pending++
 	return &completionPhaseTraceSpan{
@@ -191,12 +229,13 @@ func (r *completionPhaseTraceRecorder) close() error {
 		r.closed = true
 		dropped := r.pending
 		report := completionPhaseTraceReport{
-			Version:               3,
+			Version:               4,
 			RunID:                 strings.TrimSpace(os.Getenv(completionPhaseTraceRunIDEnv)),
 			CandidateSHA256:       strings.ToLower(strings.TrimPrefix(strings.TrimSpace(os.Getenv(completionPhaseTraceCandidateSHAEnv)), "sha256:")),
 			ProcessID:             os.Getpid(),
 			CreatedUTC:            time.Now().UTC(),
 			SampleLimit:           r.sampleLimit,
+			StatusSampleEvery:     r.statusSampleEvery,
 			SamplesTruncated:      r.samplesTruncated || dropped > 0,
 			DroppedPendingSamples: dropped,
 			Samples:               append([]completionPhaseTraceSample(nil), r.samples...),
