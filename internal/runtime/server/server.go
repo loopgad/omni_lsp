@@ -521,6 +521,7 @@ func (s *Server) scheduleMessage(parentCtx context.Context, msg *jsonrpc.Message
 		OriginalID:  origID,
 		Workspace:   s.workspaceID,
 		Priority:    priority,
+		CostClass:   scheduler.ClassifyCost(msg.Method), // §F8 dispatch-point classification
 		Snapshot:    snap,
 		CoalesceKey: coalesceKeyFor(msg, snap),
 		EnqueuedAt:  enqueuedAt,

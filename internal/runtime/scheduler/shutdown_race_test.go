@@ -299,6 +299,7 @@ func TestScheduler_BoostNeverDropsRequests(t *testing.T) {
 	req := &Request{
 		RequestID:  "boost-drop",
 		Priority:   PriorityMaintenance,
+		CostClass:  DefaultCostClass,               // as Submit would resolve it; aging runs per §F8 class lane
 		EnqueuedAt: time.Now().Add(-1 * time.Hour), // definitely stale
 		Result:     make(chan Result, 1),
 		Execute: func(ctx context.Context, snap *snapshot.Snapshot) (any, error) {
@@ -308,7 +309,7 @@ func TestScheduler_BoostNeverDropsRequests(t *testing.T) {
 	// Park the request in its queue without a worker consuming it. Workers
 	// are NOT started here: a running worker would race boostStaleRequests
 	// for the same channel and the test would be flaky by construction.
-	if !s.trySend(int(req.Priority), req) {
+	if !s.trySend(req.CostClass, int(req.Priority), req) {
 		t.Fatal("setup: could not enqueue request")
 	}
 	s.Shutdown() // closed=true → every trySend now refuses

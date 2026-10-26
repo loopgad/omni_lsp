@@ -6,6 +6,10 @@
 //  2. Cancellation is propagated via context.Context from LSP request to worker (C7).
 //  3. Stale writes cannot publish results (stale snapshot rejection in handler).
 //  4. P0 requests are never starved by P4/P5 background work (F7 fairness).
+//  5. Per-class concurrency caps bind at the pick point (F8): a request is
+//     dequeued only while its class holds a token, so a worker never blocks
+//     behind another class; Large/VeryLarge run under strictly smaller caps.
+//     Unclassified requests resolve to DefaultCostClass at Submit (fail-closed).
 //
 // Corresponds to goal.md §F3–F12.
 package scheduler
@@ -19,7 +23,7 @@ package scheduler
 //     cancellation as a drain signal and keeps scanning the queues.
 //
 // F2 Locking policy:
-//   - Protected: queues[9], config, closed, inFlight, stats
+//   - Protected: queues[NumCostClasses][9], config, closed, inFlight, stats
 //   - No nested locks; atomic ops for inFlight/stats counters
 //   - No blocking I/O under lock
 //   - Goroutines owned by Start/Shutdown lifecycle
@@ -35,23 +39,44 @@ import (
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
 )
 
-// CostClass is a reserved axis for goal.md §F8's cost-based concurrency
-// caps. Nothing sets Request.CostClass and the worker pool applies one cap to
-// every request regardless of it, so §F8's stricter caps for large work are not
-// in effect; §F8 states them as SHOULD rather than MUST, so this is a gap
-// rather than a violation.
+// CostClass classifies a request's resource cost for goal.md §F8's per-class
+// concurrency caps ("Large work MUST have stricter concurrency caps"). The
+// worker pool enforces one cap per class at the pick point; ClassifyCost maps
+// LSP method families to classes at the dispatch point.
+//
+// The zero value is CostUnset, NOT CostTiny: an unclassified request must
+// never silently land in the widest lane (fail-closed). Submit resolves
+// CostUnset to DefaultCostClass before admission, so queues and the worker
+// pool only ever see resolved classes.
 type CostClass int
 
 const (
-	CostTiny      CostClass = iota // local lookup / cache hit
-	CostSmall                      // single-file parse / query
-	CostMedium                     // package-level semantic work
-	CostLarge                      // workspace references / index query
-	CostVeryLarge                  // full indexing / rebuild
+	// CostUnset is the zero value of CostClass: "not classified". It is
+	// resolved to DefaultCostClass on admission and never reaches a queue.
+	CostUnset     CostClass = iota
+	CostTiny                // local lookup / cache hit
+	CostSmall               // single-file parse / query
+	CostMedium              // package-level semantic work
+	CostLarge               // workspace references / index query
+	CostVeryLarge           // full indexing / rebuild
 )
+
+// NumCostClasses counts CostClass values including the CostUnset slot. Queue
+// lanes and class caps are indexed by raw CostClass value, so slot 0 exists
+// but carries no traffic (see resolveClass).
+const NumCostClasses = CostVeryLarge + 1
+
+// DefaultCostClass is what Submit resolves an unclassified request to.
+// Medium is the safe middle: its derived cap (¾ of the pool) bounds an
+// unclassified flood below the full worker pool, so classified interactive
+// work always keeps workers, and unknown work can neither hog the Tiny/Small
+// lanes nor dodge the strict Large/VeryLarge caps (§F8 fail-closed).
+const DefaultCostClass = CostMedium
 
 func (c CostClass) String() string {
 	switch c {
+	case CostUnset:
+		return "unset"
 	case CostTiny:
 		return "tiny"
 	case CostSmall:
@@ -133,14 +158,18 @@ type Request struct {
 	Snapshot     *snapshot.Snapshot
 	SnapshotID   identity.SnapshotID
 	BuildContext identity.BuildContextID
-	CostClass    CostClass // F8: resource cost classification
-	Priority     Priority
-	Deadline     time.Time // zero means no deadline
-	CoalesceKey  string
-	ClientClass  string
-	EnqueuedAt   time.Time
-	Execute      func(ctx context.Context, snap *snapshot.Snapshot) (any, error)
-	Result       chan Result
+	// CostClass is the §F8 resource cost classification. The zero value
+	// CostUnset means "not classified"; Submit resolves it to DefaultCostClass
+	// before admission (fail-closed). ClassifyCost provides the method-family
+	// mapping the server uses at its dispatch point.
+	CostClass   CostClass
+	Priority    Priority
+	Deadline    time.Time // zero means no deadline
+	CoalesceKey string
+	ClientClass string
+	EnqueuedAt  time.Time
+	Execute     func(ctx context.Context, snap *snapshot.Snapshot) (any, error)
+	Result      chan Result
 
 	// Cancellation support (C7/F11). cancelMu guards cancel/cancelled so a
 	// Cancel() racing with worker start is not lost.
@@ -331,6 +360,14 @@ type Config struct {
 	MaxQueueSize    int // per-priority, total max = MaxQueueSize * numPriorities
 	MaxInFlight     int // global in-flight cap (admission control)
 	PriorityAgingMs int // after this many ms, boost a queued request by one priority
+
+	// ClassCaps optionally overrides the per-class concurrency caps (§F8).
+	// Indexed by CostClass value; the CostUnset slot is ignored. A nil map or
+	// a non-positive entry derives the cap from MaxConcurrent (see
+	// derivedClassCap): Tiny/Small span the pool, Medium ¾, Large ½,
+	// VeryLarge ¼ — "Large work MUST have stricter concurrency caps". An
+	// explicit positive entry wins, clamped to [1, MaxConcurrent].
+	ClassCaps map[CostClass]int
 }
 
 func DefaultConfig() Config {
@@ -345,14 +382,25 @@ func DefaultConfig() Config {
 // Scheduler manages request admission, prioritization, and execution.
 //
 // Architecture:
-//   - Separate bounded channel per priority (P0–P5).
-//   - Worker pool fetches from highest non-empty priority (with aging boost).
+//   - Separate bounded channel per priority (P0–P5) inside per-class §F8 lanes.
+//   - Worker pool fetches from the highest non-empty priority whose class
+//     still holds concurrency capacity (with aging boost).
 //   - Admission control rejects when in-flight or queue budget exceeded.
 type Scheduler struct {
 	config Config
-	queues [9]chan *Request // indexed by Priority
+	// queues is indexed [CostClass][Priority] (§F8 lanes inside §F3 lanes).
+	// The CostUnset row exists to keep the index identical to the class
+	// value; it carries no traffic — resolveClass guarantees every enqueued
+	// request carries a resolved class.
+	queues [NumCostClasses][9]chan *Request
 	closed atomic.Bool
 	cancel context.CancelFunc
+
+	// §F8 per-class concurrency tokens: classTokens[c] holds cap(c) slots; a
+	// request is dequeued only while its class token is held (acquired at
+	// pick time, released when execution ends), so a class at its cap simply
+	// stops being picked from — workers never block behind another class.
+	classTokens [NumCostClasses]chan struct{}
 
 	// queueMu arbitrates queue send (trySend, RLock) against Shutdown's
 	// close(queues) (Lock): a bare closed-flag double-check cannot make
@@ -380,8 +428,13 @@ func New(cfg Config) *Scheduler {
 		tracker: NewInFlightTracker(),
 		notify:  make(chan struct{}, 1),
 	}
-	for i := range s.queues {
-		s.queues[i] = make(chan *Request, cfg.MaxQueueSize)
+	for c := range s.queues {
+		for i := range s.queues[c] {
+			s.queues[c][i] = make(chan *Request, cfg.MaxQueueSize)
+		}
+	}
+	for c := CostTiny; c <= CostVeryLarge; c++ {
+		s.classTokens[c] = make(chan struct{}, classCapFor(cfg, c))
 	}
 	return s
 }
@@ -399,11 +452,14 @@ func (s *Scheduler) Start(ctx context.Context) {
 	go s.agingLoop(ctx)
 }
 
-// trySend enqueues a request without racing Shutdown: the closed flag is
-// re-checked inside the select window, and a send that would hit a closed
-// queue is dropped instead of panicking. The caller owns the "request never
-// reaches a worker" consequence (report rejection / fail the Result).
-func (s *Scheduler) trySend(pq int, req *Request) bool {
+// trySend enqueues a request into class c's pq lane without racing Shutdown:
+// the closed flag is re-checked inside the select window, and a send that
+// would hit a closed queue is dropped instead of panicking. The caller owns
+// the "request never reaches a worker" consequence (report rejection / fail
+// the Result). c is resolved through resolveClass so the dead CostUnset row
+// can never receive traffic.
+func (s *Scheduler) trySend(c CostClass, pq int, req *Request) bool {
+	c = resolveClass(c)
 	if s.closed.Load() {
 		return false
 	}
@@ -413,7 +469,7 @@ func (s *Scheduler) trySend(pq int, req *Request) bool {
 		return false
 	}
 	select {
-	case s.queues[pq] <- req:
+	case s.queues[c][pq] <- req:
 		return true
 	default:
 		return false
@@ -427,6 +483,11 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 	if s.closed.Load() {
 		return RejectedCancelled
 	}
+
+	// §F8 fail-closed default: resolve an unclassified request before
+	// admission so it can never reach the dead CostUnset lane or dodge the
+	// per-class caps. Explicit classes pass through untouched.
+	req.CostClass = resolveClass(req.CostClass)
 
 	// Create result channel if not provided.
 	if req.Result == nil {
@@ -476,10 +537,10 @@ func (s *Scheduler) Submit(req *Request) AdmissionResult {
 
 	// Per-priority queue full check.
 	pq := int(req.Priority)
-	if pq >= len(s.queues) {
-		pq = len(s.queues) - 1
+	if pq >= len(s.queues[req.CostClass]) {
+		pq = len(s.queues[req.CostClass]) - 1
 	}
-	if s.trySend(pq, req) {
+	if s.trySend(req.CostClass, pq, req) {
 		s.totalEnqueued.Add(1)
 		select { // wake an idle worker immediately (no polling delay)
 		case s.notify <- struct{}{}:
@@ -515,67 +576,90 @@ func (s *Scheduler) worker(ctx context.Context) {
 		if req == nil {
 			return
 		}
+		// pickRequest returned this request holding its §F8 class token;
+		// runRequest releases it on every exit path.
+		s.runRequest(ctx, req)
+	}
+}
 
-		// Check cancellation before executing.
-		select {
-		case <-ctx.Done():
-			req.releaseSharedWaiter()
-			s.deliverRollback(req, ctx.Err())
-			req.finish(Result{Err: ctx.Err()})
-			continue
-		default:
-		}
+// runRequest carries one dequeued request from the cancellation checks
+// through execution and result delivery. The §F8 class token for
+// req.CostClass was acquired by pickClassAware before the dequeue; it is
+// released here on every exit path, and a wake token is posted so workers
+// sleeping on class capacity re-scan the queues.
+func (s *Scheduler) runRequest(ctx context.Context, req *Request) {
+	defer s.releaseClass(req.CostClass)
 
-		// Deadlines belong to each request. A timed-out leader still runs for
-		// its live joiners; shared work is skipped only after its last waiter
-		// has left.
-		if !req.Deadline.IsZero() && time.Now().After(req.Deadline) {
-			req.cancelWithError(context.DeadlineExceeded)
-		}
-		if req.Cancelled() && (req.sharedCall == nil || s.tracker.waiterCount(req.sharedCall) == 0) {
-			err := req.cancelError()
-			req.releaseSharedWaiter()
-			s.deliverRollback(req, err)
-			req.finish(Result{Err: err})
-			continue
-		}
+	// Check cancellation before executing.
+	select {
+	case <-ctx.Done():
+		req.releaseSharedWaiter()
+		s.deliverRollback(req, ctx.Err())
+		req.finish(Result{Err: ctx.Err()})
+		return
+	default:
+	}
 
-		s.inFlight.Add(1)
+	// Deadlines belong to each request. A timed-out leader still runs for
+	// its live joiners; shared work is skipped only after its last waiter
+	// has left.
+	if !req.Deadline.IsZero() && time.Now().After(req.Deadline) {
+		req.cancelWithError(context.DeadlineExceeded)
+	}
+	if req.Cancelled() && (req.sharedCall == nil || s.tracker.waiterCount(req.sharedCall) == 0) {
+		err := req.cancelError()
+		req.releaseSharedWaiter()
+		s.deliverRollback(req, err)
+		req.finish(Result{Err: err})
+		return
+	}
 
-		execCtx, cancelExec := context.WithCancel(ctx)
-		if req.sharedCall != nil {
-			s.tracker.setCancel(req.sharedCall, cancelExec)
-		} else {
-			req.setCancel(cancelExec)
-		}
-		if req.Cancelled() && (req.sharedCall == nil || s.tracker.waiterCount(req.sharedCall) == 0) {
-			err := req.cancelError()
-			cancelExec()
-			req.clearCancel()
-			s.inFlight.Add(-1)
-			req.releaseSharedWaiter()
-			s.deliverRollback(req, err)
-			req.finish(Result{Err: err})
-			continue
-		}
+	s.inFlight.Add(1)
 
-		s.totalExecuted.Add(1)
-
-		// Shared execution uses a context canceled only when its final waiter
-		// leaves. Panics are converted into a terminal error so worker and
-		// singleflight cleanup always run.
-		val, err := executeSafely(req, execCtx)
+	execCtx, cancelExec := context.WithCancel(ctx)
+	if req.sharedCall != nil {
+		s.tracker.setCancel(req.sharedCall, cancelExec)
+	} else {
+		req.setCancel(cancelExec)
+	}
+	if req.Cancelled() && (req.sharedCall == nil || s.tracker.waiterCount(req.sharedCall) == 0) {
+		err := req.cancelError()
 		cancelExec()
 		req.clearCancel()
-		// Note: cancelExec() cancels execCtx after Execute returns. We must NOT
-		// check execCtx.Err() here — it will always be cancelled at this point.
-		// The only case where err should be ctx.Err() is if Execute itself
-		// observed the parent ctx cancellation during execution.
-
-		s.deliverResult(req, val, err) // F11: broadcast real values to joined waiters
-		req.finish(Result{Value: val, Err: err})
-		req.releaseSharedWaiter()
 		s.inFlight.Add(-1)
+		req.releaseSharedWaiter()
+		s.deliverRollback(req, err)
+		req.finish(Result{Err: err})
+		return
+	}
+
+	s.totalExecuted.Add(1)
+
+	// Shared execution uses a context canceled only when its final waiter
+	// leaves. Panics are converted into a terminal error so worker and
+	// singleflight cleanup always run.
+	val, err := executeSafely(req, execCtx)
+	cancelExec()
+	req.clearCancel()
+	// Note: cancelExec() cancels execCtx after Execute returns. We must NOT
+	// check execCtx.Err() here — it will always be cancelled at this point.
+	// The only case where err should be ctx.Err() is if Execute itself
+	// observed the parent ctx cancellation during execution.
+
+	s.deliverResult(req, val, err) // F11: broadcast real values to joined waiters
+	req.finish(Result{Value: val, Err: err})
+	req.releaseSharedWaiter()
+	s.inFlight.Add(-1)
+}
+
+// releaseClass returns the request's §F8 class token and wakes one worker:
+// queued same-class requests become runnable the moment a token frees, and
+// sleeping workers only ever wait on s.notify.
+func (s *Scheduler) releaseClass(c CostClass) {
+	<-s.classTokens[resolveClass(c)]
+	select {
+	case s.notify <- struct{}{}:
+	default:
 	}
 }
 
@@ -589,21 +673,16 @@ func executeSafely(req *Request, ctx context.Context) (value any, err error) {
 	return req.Execute(ctx, req.Snapshot)
 }
 
-// pickRequest selects the highest-priority ready request. It skips closed
-// empty queues so shutdown drains buffered requests at every priority before
+// pickRequest selects the highest-priority ready request whose §F8 class
+// still has capacity (see pickClassAware). It skips closed empty lanes so
+// shutdown drains buffered requests at every class and priority before
 // workers exit. Idle workers block on the notify signal instead of polling —
-// Submit wakes one immediately.
+// Submit and releaseClass each wake one.
 func (s *Scheduler) pickRequest(ctx context.Context) *Request {
 	draining := false
 	for {
-		for pq := 0; pq < len(s.queues); pq++ {
-			select {
-			case req, ok := <-s.queues[pq]:
-				if ok {
-					return req
-				}
-			default:
-			}
+		if req := s.pickClassAware(); req != nil {
+			return req
 		}
 		if draining {
 			return nil
@@ -626,6 +705,36 @@ func (s *Scheduler) pickRequest(ctx context.Context) *Request {
 	}
 }
 
+// pickClassAware scans priorities outer and classes inner, returning the
+// highest-priority request whose class holds a free §F8 concurrency token.
+// The token is acquired BEFORE the dequeue (both non-blocking), so a request
+// is never pulled out of a queue without capacity to run it: the worker
+// holding it goes straight to execution and never blocks behind another
+// class, which is what keeps P0 interactive work moving while Large lanes
+// sit at their cap (F7). At shutdown, closed lanes drain: a closed-empty
+// receive reports !ok, the token goes back, and the scan continues.
+func (s *Scheduler) pickClassAware() *Request {
+	for pq := 0; pq < 9; pq++ {
+		for c := CostTiny; c <= CostVeryLarge; c++ {
+			select {
+			case s.classTokens[c] <- struct{}{}:
+				select {
+				case req, ok := <-s.queues[c][pq]:
+					if ok && req != nil {
+						return req // token held for the duration of execution
+					}
+					<-s.classTokens[c] // lane empty or closed: give the slot back
+				default:
+					<-s.classTokens[c]
+				}
+			default:
+				// class at cap: skip its lanes entirely
+			}
+		}
+	}
+	return nil
+}
+
 // agingLoop boosts priorities of long-queued requests to prevent starvation (F7).
 func (s *Scheduler) agingLoop(ctx context.Context) {
 	interval := time.Duration(s.config.PriorityAgingMs) / 2
@@ -645,32 +754,36 @@ func (s *Scheduler) agingLoop(ctx context.Context) {
 }
 
 // boostStaleRequests lifts requests that have been queued longer than PriorityAgingMs.
+// Aging moves requests between priorities within their own §F8 class lane —
+// boosting changes §F3 order, never §F8 cost.
 func (s *Scheduler) boostStaleRequests() {
 	boosted := false
 	for pq := PriorityMaintenance; pq > PriorityCompletion; pq-- {
-		src := s.queues[pq]
-		if len(src) == 0 {
-			continue
-		}
-		destPq := pq - 1
-		// Drain one stale request and re-queue at higher priority.
-		select {
-		case req := <-src:
-			if time.Since(req.EnqueuedAt) <= time.Duration(s.config.PriorityAgingMs) {
-				// Not stale yet, put back; never drop silently.
-				if !s.trySend(int(pq), req) {
-					s.rejectDropped(req, "scheduler: dropped during priority aging")
-				}
+		for c := CostTiny; c <= CostVeryLarge; c++ {
+			src := s.queues[c][pq]
+			if len(src) == 0 {
 				continue
 			}
-			if s.trySend(int(destPq), req) {
-				boosted = true
-			} else if !s.trySend(int(pq), req) {
-				// Destination full AND origin refused: fail fast instead of
-				// vanishing (historical double-default silent drop).
-				s.rejectDropped(req, "scheduler: queues saturated during priority aging")
+			destPq := pq - 1
+			// Drain one stale request and re-queue at higher priority.
+			select {
+			case req := <-src:
+				if time.Since(req.EnqueuedAt) <= time.Duration(s.config.PriorityAgingMs) {
+					// Not stale yet, put back; never drop silently.
+					if !s.trySend(c, int(pq), req) {
+						s.rejectDropped(req, "scheduler: dropped during priority aging")
+					}
+					continue
+				}
+				if s.trySend(c, int(destPq), req) {
+					boosted = true
+				} else if !s.trySend(c, int(pq), req) {
+					// Destination full AND origin refused: fail fast instead of
+					// vanishing (historical double-default silent drop).
+					s.rejectDropped(req, "scheduler: queues saturated during priority aging")
+				}
+			default:
 			}
-		default:
 		}
 	}
 	if boosted {
@@ -706,8 +819,10 @@ func (s *Scheduler) Shutdown() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	for i := range s.queues {
-		close(s.queues[i])
+	for c := range s.queues {
+		for i := range s.queues[c] {
+			close(s.queues[c][i])
+		}
 	}
 }
 
@@ -723,8 +838,10 @@ type Stats struct {
 
 func (s *Scheduler) Stats() Stats {
 	st := Stats{}
-	for i := range s.queues {
-		st.QueueLengths[i] = len(s.queues[i])
+	for i := range st.QueueLengths {
+		for c := range s.queues {
+			st.QueueLengths[i] += len(s.queues[c][i])
+		}
 	}
 	st.InFlight = s.inFlight.Load()
 	st.TotalEnqueued = s.totalEnqueued.Load()
@@ -737,8 +854,10 @@ func (s *Scheduler) Stats() Stats {
 // QueueLen returns the total number of requests currently queued.
 func (s *Scheduler) QueueLen() int {
 	n := 0
-	for i := range s.queues {
-		n += len(s.queues[i])
+	for c := range s.queues {
+		for i := range s.queues[c] {
+			n += len(s.queues[c][i])
+		}
 	}
 	return n
 }
