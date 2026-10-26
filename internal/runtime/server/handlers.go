@@ -1097,18 +1097,31 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 				})
 			}
 			// §C9 SHOULD: version-aware documentChanges when the client
-			// negotiated it; legacy changes form otherwise.
+			// negotiated it; legacy changes form otherwise. Each
+			// TextDocumentEdit carries that document's own version (LSP
+			// 3.17): a conforming client discards an edit whose version does
+			// not match the document it tracks, so the workspace revision is
+			// not a valid substitute. The captured snapshot is the exact
+			// state the rename was computed against; the live VFS covers
+			// documents outside it; a document tracked by neither reports 0.
 			if s.wantsDocumentChanges() {
-				version := 0
-				if cur := s.snapMgr.Current(); cur != nil {
-					version = int(cur.ID().Revision)
+				documentVersion := func(uri string) int {
+					if captured := snapshotFromCtx(ctx); captured != nil {
+						if doc := captured.Document(uri); doc != nil {
+							return int(doc.Version)
+						}
+					}
+					if state := s.vfs.Get(uri); state != nil {
+						return int(state.Version)
+					}
+					return 0
 				}
 				docs := make([]lsp.TextDocumentEdit, 0, len(changeMap))
 				for uri, edits := range changeMap {
 					docs = append(docs, lsp.TextDocumentEdit{
 						TextDocument: lsp.OptionalVersionedTextDocumentIdentifier{
 							URI:     lsp.DocumentURI(uri),
-							Version: version,
+							Version: documentVersion(uri),
 						},
 						Edits: edits,
 					})

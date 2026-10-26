@@ -78,8 +78,60 @@ func TestY24_WorkspaceEditCapabilityMatrix(t *testing.T) {
 		if len(docs) != 1 || docs[0].TextDocument.URI != uri {
 			t.Fatalf("docs = %+v", docs)
 		}
-		if docs[0].TextDocument.Version < 0 {
-			t.Errorf("version must be non-negative snapshot revision, got %d", docs[0].TextDocument.Version)
+		// §C9/LSP 3.17: the version must be the document's own version (the
+		// doc was opened at version 1), not a workspace revision or a
+		// placeholder — a conforming client discards a TextDocumentEdit whose
+		// version does not match the document it tracks.
+		if docs[0].TextDocument.Version != 1 {
+			t.Errorf("version must be the document's own version (1), got %d", docs[0].TextDocument.Version)
+		}
+	})
+
+	t.Run("documentChanges carries each document's own version", func(t *testing.T) {
+		mainURI := "file:///w/main.go"
+		otherURI := "file:///w/other.go"
+		s := New(DefaultConfig())
+		s.RegisterBackend("go", &mockBackend{langID: "go", exts: []string{".go"},
+			renResult: languages.ValidatedEdit{Complete: true,
+				Edits: []languages.TextEdit{
+					{URI: mainURI, StartLine: 0, StartChar: 0, EndLine: 0, EndChar: 7, NewText: "renamed"},
+					{URI: otherURI, StartLine: 1, StartChar: 0, EndLine: 1, EndChar: 5, NewText: "renamed"},
+				}}})
+		s.vfs.Open(mainURI, "go", 7, []byte("package main\n"), vfs.SourceEditor)
+		s.vfs.Open(otherURI, "go", 41, []byte("package other\n"), vfs.SourceEditor)
+		s.publishSnapshot()
+		if cur := s.snapMgr.Current(); cur == nil || cur.ID().Revision == 7 || cur.ID().Revision == 41 {
+			t.Fatalf("fixture precondition: workspace revision must differ from both document versions, got %+v", cur)
+		}
+		initParams := `{"rootUri":"file:///w","capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}`
+		initMsg := jsonrpc.NewRequest(jsonrpc.RequestID{Num: 0}, "initialize", json.RawMessage(initParams))
+		if resp := s.dispatcher.Dispatch(context.Background(), initMsg); resp != nil && resp.Error != nil {
+			t.Fatalf("initialize failed: %+v", resp.Error)
+		}
+		edit := rename(s)
+		dc, ok := edit["documentChanges"]
+		if !ok {
+			t.Fatalf("want documentChanges form, got %v", edit)
+		}
+		var docs []struct {
+			TextDocument struct {
+				URI     string `json:"uri"`
+				Version int    `json:"version"`
+			} `json:"textDocument"`
+			Edits []json.RawMessage `json:"edits"`
+		}
+		if err := json.Unmarshal(dc, &docs); err != nil {
+			t.Fatalf("documentChanges decode: %v", err)
+		}
+		if len(docs) != 2 {
+			t.Fatalf("docs = %+v", docs)
+		}
+		want := map[string]int{mainURI: 7, otherURI: 41}
+		for _, doc := range docs {
+			if doc.TextDocument.Version != want[doc.TextDocument.URI] {
+				t.Errorf("%s: version must be that document's own version (%d), got %d",
+					doc.TextDocument.URI, want[doc.TextDocument.URI], doc.TextDocument.Version)
+			}
 		}
 	})
 
