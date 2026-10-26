@@ -24,14 +24,14 @@ func (g *stubSuspendResumeGuard) Close() error {
 	return g.closeErr
 }
 
-func newMonitorUnderTest(completed *atomic.Uint64) (*soakContinuityMonitor, chan time.Time, chan struct{}) {
+func newMonitorUnderTest(completed *atomic.Uint64, tickBuffer int) (*soakContinuityMonitor, chan time.Time, chan struct{}) {
 	monitor := &soakContinuityMonitor{
 		ticks: make(chan struct{}, 1),
 		fatal: make(chan soakMonitorFatal, 1),
 		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
-	ticks := make(chan time.Time, 64)
+	ticks := make(chan time.Time, tickBuffer)
 	runDone := make(chan struct{})
 	go func() {
 		monitor.run(&stubSuspendResumeGuard{}, completed, ticks)
@@ -60,7 +60,7 @@ func syntheticTicks(start time.Time, count int) []time.Time {
 func TestSoakContinuityMonitorAdvancesWithoutTickConsumers(t *testing.T) {
 	completed := &atomic.Uint64{}
 	completed.Store(7)
-	monitor, ticks, runDone := newMonitorUnderTest(completed)
+	monitor, ticks, runDone := newMonitorUnderTest(completed, 64)
 	base := time.Now()
 
 	for _, tick := range syntheticTicks(base, 6) {
@@ -208,6 +208,63 @@ func TestSoakContinuityMonitorDetectsProgressStall(t *testing.T) {
 	<-runDone
 }
 
+func TestSoakContinuityMonitorSuppressesProgressStallDuringMaintenance(t *testing.T) {
+	completed := &atomic.Uint64{}
+	completed.Store(3)
+	// Unbuffered ticks ensure every maintenance-window tick is processed while
+	// the flag is still set; with a buffered channel the producer could call
+	// endMaintenance first, and a later stall would make the test pass without
+	// ever exercising suppression.
+	monitor, ticks, runDone := newMonitorUnderTest(completed, 0)
+	base := time.Now()
+	monitor.beginMaintenance()
+	for _, tick := range syntheticTicks(base, 40) {
+		select {
+		case ticks <- tick:
+		case fatal := <-monitor.fatal:
+			t.Fatalf("maintenance window produced a fatal: %+v", fatal)
+		case <-time.After(2 * time.Second):
+			t.Fatal("monitor stopped consuming ticks during maintenance")
+		}
+	}
+	select {
+	case fatal := <-monitor.fatal:
+		t.Fatalf("maintenance window produced a fatal: %+v", fatal)
+	default:
+	}
+
+	// After the recorded block ends, a frozen completion counter must again
+	// trip the unchanged two-minute progress-stall guard. The send select also
+	// watches fatal because the monitor exits as soon as it trips.
+	monitor.endMaintenance()
+	var stalled *soakMonitorFatal
+	for _, tick := range syntheticTicks(base.Add(40*soakPollPeriod), 40) {
+		select {
+		case ticks <- tick:
+		case fatal := <-monitor.fatal:
+			stalled = &fatal
+		case <-time.After(2 * time.Second):
+			t.Fatal("monitor stopped consuming ticks after maintenance")
+		}
+		if stalled != nil {
+			break
+		}
+	}
+	if stalled == nil {
+		select {
+		case fatal := <-monitor.fatal:
+			stalled = &fatal
+		case <-time.After(2 * time.Second):
+			t.Fatal("a frozen completed counter after maintenance did not fatal")
+		}
+	}
+	if stalled.checkID != "soak/query-progress" {
+		t.Fatalf("post-maintenance fatal = %+v, want soak/query-progress", *stalled)
+	}
+	close(monitor.stop)
+	<-runDone
+}
+
 func TestSoakContinuityMonitorProgressingWorkloadDoesNotStall(t *testing.T) {
 	completed := &atomic.Uint64{}
 	monitor := &soakContinuityMonitor{
@@ -216,7 +273,10 @@ func TestSoakContinuityMonitorProgressingWorkloadDoesNotStall(t *testing.T) {
 		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
-	ticks := make(chan time.Time, 64)
+	// Unbuffered: the producer must not run ahead of the monitor, or all ticks
+	// are queued with the completion counter already at its final value and the
+	// monitor correctly sees the counter frozen for the whole synthetic window.
+	ticks := make(chan time.Time)
 	runDone := make(chan struct{})
 	go func() {
 		monitor.run(&stubSuspendResumeGuard{}, completed, ticks)

@@ -165,6 +165,79 @@ func TestStdioIndexContentGateRequiresFullCrossFileReferences(t *testing.T) {
 	}
 }
 
+func TestMinuteWindowGapContinuityThresholds(t *testing.T) {
+	// A healthy first minute row lands ~65s after loop start with ~60s of
+	// active time; the 70s ceiling tolerates tick scheduling only.
+	if !minuteWindowGapContinuous(65*time.Second, time.Minute, 0) {
+		t.Fatal("healthy first minute row rejected")
+	}
+	if !minuteWindowGapContinuous(minuteCadenceBudget(), minuteCadenceBudget(), 0) {
+		t.Fatal("inclusive cadence ceiling rejected")
+	}
+	// A recorded maintenance pause explains the excess; the raw active gap
+	// still has to contain a full minute of soak time.
+	if !minuteWindowGapContinuous(3*time.Minute, 3*time.Minute, 2*time.Minute) {
+		t.Fatal("bounded maintenance pause rejected")
+	}
+	for name, gap := range map[string]time.Duration{
+		"zero wall gap":     0,
+		"wall gap over 70s": minuteCadenceBudget() + time.Second,
+		"negative wall gap": -time.Second,
+	} {
+		if minuteWindowGapContinuous(gap, time.Minute, 0) {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	for name, gap := range map[string]time.Duration{
+		"active gap under a minute": 59 * time.Second,
+		"active gap over 70s":       minuteCadenceBudget() + time.Second,
+	} {
+		if minuteWindowGapContinuous(65*time.Second, gap, 0) {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	for name, tc := range map[string]struct{ wall, active, pause time.Duration }{
+		"pause exceeds wall gap":   {2 * time.Minute, 3 * time.Minute, 2*time.Minute + time.Second},
+		"pause exceeds active gap": {3 * time.Minute, 2 * time.Minute, 2*time.Minute + time.Second},
+		"negative pause":           {3 * time.Minute, 3 * time.Minute, -time.Second},
+	} {
+		if minuteWindowGapContinuous(tc.wall, tc.active, tc.pause) {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestSoakMaintenanceBudgetsAreDerived(t *testing.T) {
+	t.Setenv(stdioRequestBudgetEnv, "")
+	if got, want := soakMaintenanceBudget("periodic-reindex"), 30*time.Second+2*soakPollPeriod; got != want {
+		t.Fatalf("periodic reindex budget = %s, want %s", got, want)
+	}
+	if got, want := soakMaintenanceBudget("candidate-restart"), stdioColdStartAllowance(90*time.Second)+soakSnapshotOpenBudget+soakSnapshotReopenBudget+soakProgressLifecycleBudget+2*soakPollPeriod; got != want {
+		t.Fatalf("candidate restart budget = %s, want %s", got, want)
+	}
+	if got := soakMaintenanceBudget("unknown"); got != 0 {
+		t.Fatalf("unknown budget = %s, want 0", got)
+	}
+	t.Setenv(stdioRequestBudgetEnv, "90s")
+	if got, want := soakMaintenanceBudget("periodic-reindex"), 90*time.Second+2*soakPollPeriod; got != want {
+		t.Fatalf("widened periodic reindex budget = %s, want %s", got, want)
+	}
+	if got, want := soakMaintenanceBudget("candidate-restart"), stdioColdStartAllowance(90*time.Second)+soakSnapshotOpenBudget+soakSnapshotReopenBudget+soakProgressLifecycleBudget+2*soakPollPeriod; got != want {
+		t.Fatalf("widened candidate restart budget = %s, want %s", got, want)
+	}
+}
+
+func TestSoakRustStabilityProbeBudgetIsRequestBudget(t *testing.T) {
+	t.Setenv(stdioRequestBudgetEnv, "")
+	if got, want := soakRustStabilityProbeBudget(), 30*time.Second; got != want {
+		t.Fatalf("default stability probe budget = %s, want %s", got, want)
+	}
+	t.Setenv(stdioRequestBudgetEnv, "45s")
+	if got, want := soakRustStabilityProbeBudget(), 45*time.Second; got != want {
+		t.Fatalf("widened stability probe budget = %s, want %s", got, want)
+	}
+}
+
 func TestSupervisedRustAnalyzerPIDSelectsActualLeaf(t *testing.T) {
 	sample := processTreeSample{Members: []processTreeMember{
 		{PID: 10, Role: "candidate", ImagePath: `C:\omnilsp.exe`},

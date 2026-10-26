@@ -30,14 +30,11 @@ import (
 )
 
 const (
-	soakWorkers                = 8
-	stdioGeneratedFiles        = 4096
-	soakMemoryCap              = uint64(8 << 30)
-	soakPollPeriod             = 5 * time.Second
-	soakSeed                   = int64(0)
-	resourceTrendWindows       = 10
-	resourcePrivateGrowthLimit = uint64(512 << 20)
-	resourceHandleGrowthLimit  = uint64(1024)
+	soakWorkers         = 8
+	stdioGeneratedFiles = 4096
+	soakMemoryCap       = uint64(8 << 30)
+	soakPollPeriod      = 5 * time.Second
+	soakSeed            = int64(0)
 
 	// monitorAdvanceAbandonLimit replaces the previous in-loop
 	// "active == 0 && time.Since(startAt) > 30s" check: the dedicated monitor
@@ -45,6 +42,13 @@ const (
 	// when the monitor heartbeat (updated on every processed tick) is this
 	// stale. The 30s threshold and the abort message are unchanged.
 	monitorAdvanceAbandonLimit = 30 * time.Second
+
+	// The candidate-restart phase's explicit waits. They are named here because
+	// the maintenance-pause budget is derived from the same values; the budget
+	// must not drift from the work it is supposed to cover.
+	soakSnapshotOpenBudget      = 10 * time.Second
+	soakSnapshotReopenBudget    = 30 * time.Second
+	soakProgressLifecycleBudget = 5 * time.Second
 
 	// stdioRequestBudgetEnv widens the per-request stdio budget for local
 	// diagnostic runs (see stdioRequestBudget). It is not a soak-gate
@@ -77,34 +81,6 @@ type latencySummary struct {
 type latencyBucket struct {
 	count  uint64
 	values []float64
-}
-
-type resourceWindow struct {
-	Minute                           int64   `json:"minute"`
-	SampleCount                      int     `json:"sample_count"`
-	FirstPrivate                     uint64  `json:"first_private_bytes"`
-	LastPrivate                      uint64  `json:"last_private_bytes"`
-	MedianPrivate                    uint64  `json:"median_private_bytes"`
-	MinPrivate                       uint64  `json:"min_private_bytes"`
-	MaxPrivate                       uint64  `json:"max_private_bytes"`
-	FirstHandles                     uint64  `json:"first_handles"`
-	LastHandles                      uint64  `json:"last_handles"`
-	MedianHandles                    uint64  `json:"median_handles"`
-	MinHandles                       uint64  `json:"min_handles"`
-	MaxHandles                       uint64  `json:"max_handles"`
-	TrendWindowCount                 int     `json:"trend_window_count,omitempty"`
-	TrendFirstPrivate                uint64  `json:"trend_first_private_bytes,omitempty"`
-	TrendLastPrivate                 uint64  `json:"trend_last_private_bytes,omitempty"`
-	TrendPrivateDelta                int64   `json:"trend_private_delta_bytes,omitempty"`
-	TrendFirstHandles                uint64  `json:"trend_first_handles,omitempty"`
-	TrendLastHandles                 uint64  `json:"trend_last_handles,omitempty"`
-	TrendHandlesDelta                int64   `json:"trend_handles_delta"`
-	TrendPrivateSlopeBytesPerMinute  float64 `json:"trend_private_slope_bytes_per_minute"`
-	TrendHandlesSlopePerMinute       float64 `json:"trend_handles_slope_per_minute"`
-	TrendPrivateEstimatedGrowthBytes float64 `json:"trend_private_estimated_growth_bytes"`
-	TrendHandlesEstimatedGrowth      float64 `json:"trend_handles_estimated_growth"`
-	PrivateTrendPositive             bool    `json:"private_trend_positive"`
-	HandlesTrendPositive             bool    `json:"handles_trend_positive"`
 }
 
 type latencyCollector struct {
@@ -140,6 +116,8 @@ type stdioTelemetry struct {
 	CanceledQueries      uint64                    `json:"canceled_query_requests"`
 	QueryCancelOutcomes  map[string]uint64         `json:"query_cancellation_outcomes"`
 	Resource             *resourceWindow           `json:"resource_window,omitempty"`
+	MaintenancePause     time.Duration             `json:"maintenance_pause,omitempty"`
+	MaintenanceKind      string                    `json:"maintenance_kind,omitempty"`
 }
 
 type progressLifecycleCounts struct {
@@ -179,12 +157,13 @@ type soakMonitorFatal struct {
 // restarts) stays on the main loop and is triggered by dropped-when-busy tick
 // notifications, matching the old time.Ticker buffer-one drop semantics.
 type soakContinuityMonitor struct {
-	ticks     chan struct{}
-	fatal     chan soakMonitorFatal
-	heartbeat atomic.Int64 // UnixNano of the last processed tick
-	active    atomic.Int64 // active elapsed duration in nanoseconds
-	stop      chan struct{}
-	done      chan struct{}
+	ticks       chan struct{}
+	fatal       chan soakMonitorFatal
+	heartbeat   atomic.Int64 // UnixNano of the last processed tick
+	active      atomic.Int64 // active elapsed duration in nanoseconds
+	maintenance atomic.Int32 // known blocking blocks: progress stalls are suspended
+	stop        chan struct{}
+	done        chan struct{}
 }
 
 func startSoakContinuityMonitor(guard suspendResumeGuard, completed *atomic.Uint64) *soakContinuityMonitor {
@@ -207,6 +186,13 @@ func startSoakContinuityMonitor(guard suspendResumeGuard, completed *atomic.Uint
 func (m *soakContinuityMonitor) activeDuration() time.Duration {
 	return time.Duration(m.active.Load())
 }
+
+// beginMaintenance marks a known blocking block. The monitor keeps sampling
+// wall/monotonic time, but query-progress stalls are suppressed and the
+// progress baseline is reset so the stall clock starts after the block.
+func (m *soakContinuityMonitor) beginMaintenance() { m.maintenance.Add(1) }
+
+func (m *soakContinuityMonitor) endMaintenance() { m.maintenance.Add(-1) }
 
 // halt stops the monitor goroutine and waits for it. Call only once, from the
 // main test goroutine.
@@ -238,14 +224,22 @@ func (m *soakContinuityMonitor) run(guard suspendResumeGuard, completed *atomic.
 			}
 			m.active.Add(int64(monoDelta))
 			lastMono, lastWall = now, now.UTC()
-			if progressed := completed.Load(); progressed > lastProgressCount {
-				lastProgressCount = progressed
+			if m.maintenance.Load() > 0 {
+				// A recorded maintenance block legitimately stops query
+				// completions; reset the baseline so the stall clock starts
+				// when the block ends.
+				lastProgressCount = completed.Load()
 				lastProgressAt = now
-			}
-			if active := m.activeDuration(); active >= 2*time.Minute && now.Sub(lastProgressAt) > 2*time.Minute {
-				message := fmt.Sprintf("query progress stalled for %s with %d completed requests", now.Sub(lastProgressAt), lastProgressCount)
-				m.fatal <- soakMonitorFatal{checkID: "soak/query-progress", message: message, notVerified: false, continuity: false}
-				return
+			} else {
+				if progressed := completed.Load(); progressed > lastProgressCount {
+					lastProgressCount = progressed
+					lastProgressAt = now
+				}
+				if active := m.activeDuration(); active >= 2*time.Minute && now.Sub(lastProgressAt) > 2*time.Minute {
+					message := fmt.Sprintf("query progress stalled for %s with %d completed requests", now.Sub(lastProgressAt), lastProgressCount)
+					m.fatal <- soakMonitorFatal{checkID: "soak/query-progress", message: message, notVerified: false, continuity: false}
+					return
+				}
 			}
 			m.heartbeat.Store(time.Now().UnixNano())
 			select {
@@ -393,9 +387,22 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 	writer := bufio.NewWriterSize(logFile, 32*1024)
 	var sequence int64
 	var writtenSequence int64
-	var activeStart time.Time
+	// loopStart is when the continuity monitor began accumulating active time.
+	// The first minute telemetry row references it instead of the pre-loop
+	// startAt: startup request work between startAt and the loop (cancellations
+	// and the cold full-corpus reindex) legitimately runs for minutes under a
+	// widened request budget, and none of it is active soak time (attempt
+	// soak-monitor-fix-20261025T2015Z aborted on a 3m33s first-row wall gap
+	// that was entirely cold-start reindex).
+	var loopStart time.Time
 	var lastWrittenAt time.Time
 	var lastWrittenActive time.Duration
+	// Maintenance pauses are wall-clock intervals in which the main loop is
+	// intentionally inside a known, bounded block (periodic reindex or the
+	// candidate restart). They are recorded in the next minute row and
+	// subtracted from the gap before applying the unexplained-stall budget.
+	var pendingMaintenancePause time.Duration
+	var pendingMaintenanceKinds []string
 	defer func() {
 		if err := writer.Flush(); err != nil {
 			t.Errorf("flush telemetry: %v", err)
@@ -410,14 +417,20 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		if row.Kind == "minute" {
 			referenceTime, referenceActive := lastWrittenAt, lastWrittenActive
 			if referenceTime.IsZero() {
-				referenceTime = activeStart.UTC()
+				referenceTime = loopStart.UTC()
 			}
 			wallGap := row.UTC.Sub(referenceTime)
 			activeGap := row.ActiveElapsed - referenceActive
-			if wallGap <= 0 || wallGap > time.Minute+2*soakPollPeriod || activeGap < time.Minute || activeGap > time.Minute+2*soakPollPeriod {
-				message := fmt.Sprintf("minute JSONL window discontinuity: wall=%s active=%s", wallGap, activeGap)
+			if !minuteWindowGapContinuous(wallGap, activeGap, pendingMaintenancePause) {
+				message := fmt.Sprintf("minute JSONL window discontinuity: wall=%s active=%s maintenance=%s", wallGap, activeGap, pendingMaintenancePause)
 				soakNotVerified(&evidence, "soak/telemetry-continuity", message)
 				t.Fatal(message)
+			}
+			if pendingMaintenancePause > 0 {
+				row.MaintenancePause = pendingMaintenancePause
+				row.MaintenanceKind = strings.Join(pendingMaintenanceKinds, "+")
+				pendingMaintenancePause = 0
+				pendingMaintenanceKinds = nil
 			}
 		}
 		if !lastWrittenAt.IsZero() && (row.UTC.Before(lastWrittenAt) || row.ActiveElapsed < lastWrittenActive) {
@@ -588,7 +601,6 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		t.Fatal(err)
 	}
 	startAt := time.Now()
-	activeStart = startAt
 	latencies := &latencyCollector{buckets: make(map[int64]map[string]*latencyBucket)}
 	if err := cancelStdioReindex(session, startAt, latencies); err != nil {
 		soakFailed(&evidence, "soak/cancel-repeated", err.Error())
@@ -628,6 +640,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 	backendRestartStarted := false
 	backendRestartDone := make(chan controlledBackendRestartResult, 1)
 	var backendRestartPending <-chan controlledBackendRestartResult
+	loopStart = time.Now()
 	monitor := startSoakContinuityMonitor(continuityGuard, &completed)
 	recordBackendRestart := func(result controlledBackendRestartResult) error {
 		if result.err != nil {
@@ -640,6 +653,24 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		writeRow(stdioTelemetry{Sequence: sequence, Kind: "backend-restart", UTC: now.UTC(), ActiveElapsed: monitor.activeDuration(), Requests: completed.Load(), Edits: edits.Load(), Seed: soakSeed, BackendRestarts: backendRestarts, CandidateHash: candidateHash, WorkerHash: workerHash, Server: map[string]any{"backend": "rust/rust-analyzer", "old_pid": result.oldPID, "new_pid": result.newPID}})
 		evidence.Checks = append(evidence.Checks, report.Check{ID: "soak/backend-restart", Status: report.Passed, Summary: "terminated the supervised rust-analyzer leaf under active queries; the replacement returned semantic hover and kept one process identity through a stability window", Observed: map[string]any{"backend": "rust/rust-analyzer", "old_pid": result.oldPID, "new_pid": result.newPID, "candidate_pid": candidatePID.Load()}})
 		return nil
+	}
+	recordMaintenancePause := func(kind string, started time.Time) {
+		pause := time.Since(started)
+		budget := soakMaintenanceBudget(kind)
+		if budget <= 0 {
+			stopWorkers()
+			message := fmt.Sprintf("unknown maintenance kind %q", kind)
+			soakFailed(&evidence, "soak/maintenance-budget", message)
+			t.Fatal(message)
+		}
+		if pause > budget {
+			stopWorkers()
+			message := fmt.Sprintf("%s pause %s exceeded the derived maintenance budget %s", kind, pause, budget)
+			soakNotVerified(&evidence, "soak/maintenance-budget", message)
+			t.Fatal(message)
+		}
+		pendingMaintenancePause += pause
+		pendingMaintenanceKinds = append(pendingMaintenanceKinds, kind)
 	}
 	for monitor.activeDuration() < duration {
 		select {
@@ -755,9 +786,15 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 			heapSamples = append(heapSamples, float64(currentMem.HeapAlloc))
 			goroutineSamples = append(goroutineSamples, float64(runtime.NumGoroutine()))
 			if active-lastTelemetry >= time.Minute {
-				if active-lastTelemetry > time.Minute+2*soakPollPeriod {
+				referenceTime := lastWrittenAt
+				if referenceTime.IsZero() {
+					referenceTime = loopStart.UTC()
+				}
+				wallGap := wall.Sub(referenceTime)
+				activeGap := active - lastTelemetry
+				if !minuteWindowGapContinuous(wallGap, activeGap, pendingMaintenancePause) {
 					stopWorkers()
-					message := fmt.Sprintf("missed minute telemetry interval: previous=%s active=%s", lastTelemetry, active)
+					message := fmt.Sprintf("minute telemetry window discontinuity: wall=%s active=%s maintenance=%s", wallGap, activeGap, pendingMaintenancePause)
 					soakNotVerified(&evidence, "soak/telemetry-continuity", message)
 					t.Fatal(message)
 				}
@@ -827,12 +864,16 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				writeRow(row)
 				lastTelemetry = active
 				minutePrivate, minuteHandles = minutePrivate[:0], minuteHandles[:0]
+				monitor.beginMaintenance()
+				reindexStarted := time.Now()
 				generation, rebuildErr := rebuildStdioIndex(session)
+				monitor.endMaintenance()
 				if rebuildErr != nil {
 					stopWorkers()
 					soakFailed(&evidence, "soak/reindex-periodic", rebuildErr.Error())
 					t.Fatal(rebuildErr)
 				}
+				recordMaintenancePause("periodic-reindex", reindexStarted)
 				lastCommittedIndexGeneration = generation
 			}
 			if !backendRestartStarted && active >= duration/3 {
@@ -844,6 +885,8 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				}()
 			}
 			if !restarted && backendRestarted && active >= duration/2 {
+				monitor.beginMaintenance()
+				restartStarted := time.Now()
 				stopWorkers()
 				waitStdioWorkers(workerDone)
 				persistedGeneration, indexErr := freshPersistentStdioIndexGeneration(session)
@@ -875,7 +918,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				session.Notify(t, "textDocument/didOpen", map[string]any{"textDocument": map[string]any{
 					"uri": docURI, "languageId": "go", "version": 1, "text": text,
 				}})
-				if err := waitForStdioSnapshot(session, before, 10*time.Second); err != nil {
+				if err := waitForStdioSnapshot(session, before, soakSnapshotOpenBudget); err != nil {
 					soakFailed(&evidence, "soak/restart-open", err.Error())
 					t.Fatal(err)
 				}
@@ -887,7 +930,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				session.Notify(t, "textDocument/didOpen", map[string]any{"textDocument": map[string]any{
 					"uri": cancelQueryURI, "languageId": "go", "version": 1, "text": cancelQueryText,
 				}})
-				if err := waitForStdioSnapshot(session, beforeCancelQueryReopen, 30*time.Second); err != nil {
+				if err := waitForStdioSnapshot(session, beforeCancelQueryReopen, soakSnapshotReopenBudget); err != nil {
 					soakFailed(&evidence, "soak/restart-cancel-query-open", err.Error())
 					t.Fatal(err)
 				}
@@ -929,7 +972,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 					soakFailed(&evidence, "soak/restart-queries", err.Error())
 					t.Fatal(err)
 				}
-				restartedProgress, progressErr := waitForProgressLifecycle(session, "soak-references", 5*time.Second)
+				restartedProgress, progressErr := waitForProgressLifecycle(session, "soak-references", soakProgressLifecycleBudget)
 				if progressErr != nil {
 					soakFailed(&evidence, "soak/restart-progress", progressErr.Error())
 					t.Fatal(progressErr)
@@ -945,6 +988,8 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 					report.Check{ID: "soak/backend-close", Status: report.Passed, Summary: "candidate and backend process-tree members and handles returned to zero after graceful LSP shutdown"},
 					report.Check{ID: "soak/restart", Status: report.Passed, Summary: "second real stdio process reopened the unchanged disk index at the same fresh generation, returned the expected cross-file references, preserved the dirty editor overlay, and restarted all eight workers"},
 				)
+				monitor.endMaintenance()
+				recordMaintenancePause("candidate-restart", restartStarted)
 			}
 		case worker := <-workerDone:
 			if workerCtx.Err() == nil {
@@ -1823,8 +1868,20 @@ func verifyRustBackendStable(session *lspdriver.Session, job *processTreeBudget,
 			return fmt.Errorf("rust-analyzer did not remain stable for %s: expected replacement PID %d, observed PID %d (identity error %v, old PID present %t)", duration, newPID, pid, err, containsProcessPID(sample, oldPID))
 		}
 		if time.Since(lastSemanticProbe) >= 3*time.Second {
-			if err := waitForRustSoakHoverAfter(session, rustURI, rustText, 3*time.Second, recoveredAfter); err != nil {
-				return fmt.Errorf("replacement rust-analyzer lost semantic recovery during stability window: %w", err)
+			budget := soakRustStabilityProbeBudget()
+			if err := waitForRustSoakHoverAfterWithRequestTimeout(session, rustURI, rustText, budget, budget, recoveredAfter); err != nil {
+				return fmt.Errorf("replacement rust-analyzer lost semantic recovery during stability window (budget %s): %w", budget, err)
+			}
+			// The probe may outlast the nominal window while the replacement
+			// re-indexes. Re-sample identity afterwards so a replacement that
+			// changed during the probe cannot pass unnoticed.
+			probeSample, sampleErr := job.sample(runnerPID, candidatePID)
+			if sampleErr != nil {
+				return fmt.Errorf("sample after semantic recovery probe: %w", sampleErr)
+			}
+			probePID, identityErr := supervisedRustAnalyzerPID(probeSample, uint32(candidatePID), executable)
+			if identityErr != nil || probePID != newPID || containsProcessPID(probeSample, oldPID) {
+				return fmt.Errorf("rust-analyzer changed identity during semantic recovery probe: expected replacement PID %d, observed PID %d (identity error %v, old PID present %t)", newPID, probePID, identityErr, containsProcessPID(probeSample, oldPID))
 			}
 			lastSemanticProbe = time.Now()
 		}
@@ -1928,11 +1985,15 @@ func waitForRustSoakHover(session *lspdriver.Session, rustURI, rustText string, 
 }
 
 func waitForRustSoakHoverAfter(session *lspdriver.Session, rustURI, rustText string, timeout time.Duration, after time.Time) error {
+	return waitForRustSoakHoverAfterWithRequestTimeout(session, rustURI, rustText, timeout, 3*time.Second, after)
+}
+
+func waitForRustSoakHoverAfterWithRequestTimeout(session *lspdriver.Session, rustURI, rustText string, timeout, requestTimeout time.Duration, after time.Time) error {
 	deadline := time.Now().Add(timeout)
 	position := positionOf(rustText, "rustSoakTarget", 1)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 		raw, err := session.RequestContext(ctx, "textDocument/hover", map[string]any{
 			"textDocument": map[string]any{"uri": rustURI},
 			"position":     position,
@@ -2543,6 +2604,49 @@ func medianUint(values []uint64) uint64 {
 	return sorted[len(sorted)/2]
 }
 
+// minuteCadenceBudget is the unexplained part of a minute window: one minute
+// plus two poll periods of scheduling slack.
+func minuteCadenceBudget() time.Duration { return time.Minute + 2*soakPollPeriod }
+
+// minuteWindowGapContinuous separates the nominal cadence from recorded
+// maintenance. The raw active gap must still reach a minute (a row is due one
+// minute after the previous one), while a bounded maintenance interval is
+// subtracted from both raw gaps before the unexplained-stall ceiling applies.
+// A pause larger than either gap, or a negative pause, is rejected.
+func minuteWindowGapContinuous(wallGap, activeGap, maintenancePause time.Duration) bool {
+	if wallGap <= 0 || activeGap < time.Minute {
+		return false
+	}
+	if maintenancePause < 0 || maintenancePause > wallGap || maintenancePause > activeGap {
+		return false
+	}
+	budget := minuteCadenceBudget()
+	return wallGap-maintenancePause <= budget && activeGap-maintenancePause <= budget
+}
+
+// soakMaintenanceBudget bounds the known main-loop pauses. The reindex budget
+// is the request budget it runs under; the restart budget is the rust
+// cold-start allowance plus the phase's own explicit waits. Each pause is
+// checked at record time, so a recorded pause can never be unbounded.
+func soakMaintenanceBudget(kind string) time.Duration {
+	switch kind {
+	case "periodic-reindex":
+		return stdioRequestBudget() + 2*soakPollPeriod
+	case "candidate-restart":
+		return stdioColdStartAllowance(90*time.Second) + soakSnapshotOpenBudget + soakSnapshotReopenBudget + soakProgressLifecycleBudget + 2*soakPollPeriod
+	default:
+		return 0
+	}
+}
+
+// soakRustStabilityProbeBudget uses the same per-request stdio budget as every
+// other request. A fixed 3s probe was too tight while the replacement
+// re-indexes under the eight-worker load; identity is re-sampled after the
+// probe, so a longer budget cannot hide a backend restart.
+func soakRustStabilityProbeBudget() time.Duration {
+	return stdioRequestBudget()
+}
+
 func summarizeResourceWindow(minute int64, private, handles []uint64) resourceWindow {
 	window := resourceWindow{Minute: minute, SampleCount: len(private)}
 	if len(private) == 0 || len(handles) == 0 {
@@ -2571,67 +2675,6 @@ func summarizeResourceWindow(minute int64, private, handles []uint64) resourceWi
 		}
 	}
 	return window
-}
-
-type resourceTrendSummary struct {
-	firstPrivate, lastPrivate  uint64
-	firstHandles, lastHandles  uint64
-	privateSlopeBytesPerMinute float64
-	handlesSlopePerMinute      float64
-	privateEstimatedGrowth     float64
-	handlesEstimatedGrowth     float64
-}
-
-func resourceTrend(windows []resourceWindow) resourceTrendSummary {
-	trend := resourceTrendSummary{}
-	if len(windows) == 0 {
-		return trend
-	}
-	trend.firstPrivate, trend.lastPrivate = windows[0].MedianPrivate, windows[len(windows)-1].MedianPrivate
-	trend.firstHandles, trend.lastHandles = windows[0].MedianHandles, windows[len(windows)-1].MedianHandles
-	trend.privateSlopeBytesPerMinute = theilSenSlope(windows, func(window resourceWindow) uint64 { return window.MedianPrivate })
-	trend.handlesSlopePerMinute = theilSenSlope(windows, func(window resourceWindow) uint64 { return window.MedianHandles })
-	spanMinutes := float64(windows[len(windows)-1].Minute - windows[0].Minute)
-	if spanMinutes > 0 {
-		trend.privateEstimatedGrowth = trend.privateSlopeBytesPerMinute * spanMinutes
-		trend.handlesEstimatedGrowth = trend.handlesSlopePerMinute * spanMinutes
-	}
-	return trend
-}
-
-func theilSenSlope(windows []resourceWindow, value func(resourceWindow) uint64) float64 {
-	slopes := make([]float64, 0, len(windows)*(len(windows)-1)/2)
-	for i := 0; i < len(windows); i++ {
-		for j := i + 1; j < len(windows); j++ {
-			elapsed := windows[j].Minute - windows[i].Minute
-			if elapsed <= 0 {
-				continue
-			}
-			delta := float64(value(windows[j])) - float64(value(windows[i]))
-			slopes = append(slopes, delta/float64(elapsed))
-		}
-	}
-	if len(slopes) == 0 {
-		return 0
-	}
-	sort.Float64s(slopes)
-	middle := len(slopes) / 2
-	if len(slopes)%2 == 1 {
-		return slopes[middle]
-	}
-	return (slopes[middle-1] + slopes[middle]) / 2
-}
-
-func resourceTrendExceeded(trend resourceTrendSummary) bool {
-	return trend.privateEstimatedGrowth >= float64(resourcePrivateGrowthLimit) ||
-		trend.handlesEstimatedGrowth >= float64(resourceHandleGrowthLimit)
-}
-
-func signedDelta(last, first uint64) int64 {
-	if last >= first {
-		return int64(last - first)
-	}
-	return -int64(first - last)
 }
 
 func lastResourceWindow(windows []resourceWindow) any {
@@ -2696,8 +2739,10 @@ func stdioRequestBudget() time.Duration {
 	return budget
 }
 
-// stdioColdStartAllowance sizes a soak phase that must outlast the pinned
-// rust-analyzer 1.97.0 cold start (e.g. the first semantic rust hover).
+// stdioColdStartAllowance sizes a soak phase that must outlast the locked
+// rust-analyzer cold start (e.g. the first semantic rust hover). The 300s
+// standard budget was established against rust-analyzer 1.97.0 and remains a
+// floor if the host lock moves.
 // OMNILSP_SOAK_REQUEST_BUDGET may widen the phase but never tightens it below
 // the historical sizing: a small diagnostic budget must not shrink an
 // allowance whose fit at smaller values has never been observed. Phases whose
