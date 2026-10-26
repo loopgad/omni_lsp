@@ -338,3 +338,60 @@ func TestSoak_RequestBudgetDefaultIs30s(t *testing.T) {
 		}
 	}
 }
+
+// TestLatencyWallWindowUsesWallClockNotActiveDuration pins the telemetry-row
+// contract for latency buckets: records are keyed on wall minutes since the
+// pre-loop startAt (latencyCollector.record), so rows must take buckets with
+// latencyWallWindow, not with monitor active minutes. The active-based take
+// dropped every sample recorded while the pre-loop startup ran — a passing 30s
+// stage emitted an empty final latency_by_method (local-20261026T0925Z,
+// soak/coverage passed), and a 10m stage lost its first ~8 minutes.
+func TestLatencyWallWindowUsesWallClockNotActiveDuration(t *testing.T) {
+	startAt := time.Now()
+	// A 30s-active run whose pre-loop startup consumed 3m40s of wall time:
+	// the active-based formula (active/minute) picks window 0, the wall-based
+	// contract picks window 3 where record actually keyed the sample.
+	now := startAt.Add(3*time.Minute + 40*time.Second)
+	if got, want := latencyWallWindow(startAt, now), int64(3); got != want {
+		t.Fatalf("latencyWallWindow(startAt, now) = %d, want %d", got, want)
+	}
+	if got := latencyWallWindow(startAt, startAt.Add(59*time.Second)); got != 0 {
+		t.Fatalf("latencyWallWindow inside the first wall minute = %d, want 0", got)
+	}
+}
+
+// TestLatencyCollectorTakeAllDrainsStartupShiftedWindows pins the final
+// telemetry row's zero-loss drain: a sample recorded while the pre-loop
+// startup ran (wall window shifted past every active-cadence window) must
+// still surface in the run's client-side latency evidence.
+func TestLatencyCollectorTakeAllDrainsStartupShiftedWindows(t *testing.T) {
+	collector := &latencyCollector{buckets: make(map[int64]map[string]*latencyBucket)}
+	startAt := time.Now()
+	// record measures time.Since(startAt) itself, so backdate startAt to
+	// simulate the pre-loop startup having consumed 3m40s before this sample.
+	shifted := startAt.Add(-3*time.Minute - 40*time.Second)
+	collector.record(shifted, "omnilsp/status(monitor)", 5*time.Millisecond)
+	collector.record(shifted, "omnilsp/status(monitor)", 10*time.Millisecond)
+	collector.record(shifted, "omnilsp/status(monitor)", 15*time.Millisecond)
+	collector.record(shifted, "textDocument/hover", 7*time.Millisecond)
+	// A minute row taking its own (shifted) wall window must not see the
+	// startup-window sample, and must not consume it either.
+	if got := collector.take(latencyWallWindow(shifted, startAt) - 1); len(got) != 0 {
+		t.Fatalf("minute-row window take returned startup-shifted samples: %+v", got)
+	}
+	drained := collector.takeAll()
+	summary, present := drained["omnilsp/status(monitor)"]
+	if !present || summary.Count != 3 || summary.SampleCount != 3 {
+		t.Fatalf("takeAll lost startup-shifted status samples: %+v (present=%t)", summary, present)
+	}
+	if summary.P50MS != 10 {
+		t.Fatalf("takeAll p50 = %f, want the merged 10ms median", summary.P50MS)
+	}
+	hover, present := drained["textDocument/hover"]
+	if !present || hover.Count != 1 || hover.P50MS != 7 {
+		t.Fatalf("takeAll lost the hover sample: %+v (present=%t)", hover, present)
+	}
+	if again := collector.takeAll(); len(again) != 0 {
+		t.Fatalf("takeAll must drain: second call returned %+v", again)
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
@@ -457,6 +458,131 @@ func progressLifecycleBeforeResponse(events []*jsonrpc.Message, token string) (p
 		return counts, fmt.Errorf("progress token %q did not end before its terminal response (end index=%d response index=%d)", token, endAt, responseAt)
 	}
 	return counts, nil
+}
+
+// latencyWallWindow converts a wall measurement into the latency bucket index
+// latencyCollector.record keys samples on: the elapsed wall minutes since the
+// pre-loop startAt. Telemetry rows must take buckets with this same formula —
+// taking monitor active minutes instead silently drops every sample recorded
+// while the pre-loop startup (cold reindex, startup cancellations) ran, which
+// a passing 30s stage demonstrated by emitting an empty final
+// latency_by_method (local-20261026T0925Z, soak/coverage passed). The clock is
+// injected so the contract is pinned without waiting on wall time.
+func latencyWallWindow(startAt, now time.Time) int64 {
+	return int64(now.Sub(startAt) / time.Minute)
+}
+
+type latencySummary struct {
+	Count       uint64    `json:"count"`
+	SampleCount int       `json:"sample_count"`
+	Truncated   bool      `json:"truncated"`
+	RawMS       []float64 `json:"raw_ms"`
+	P50MS       float64   `json:"p50_ms"`
+	P95MS       float64   `json:"p95_ms"`
+	P99MS       float64   `json:"p99_ms"`
+}
+
+type latencyBucket struct {
+	count  uint64
+	values []float64
+}
+
+// latencyCollector buckets client-observed request latencies per wall minute
+// and per method. It is pure harness logic (no server, no OS handles), so it
+// and its form guards run in the default suite per the 2026-10-25 ruling 3.
+type latencyCollector struct {
+	mu      sync.Mutex
+	buckets map[int64]map[string]*latencyBucket
+}
+
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := int(float64(len(sorted)-1) * q)
+	return sorted[index]
+}
+
+func (c *latencyCollector) record(startAt time.Time, method string, elapsed time.Duration) {
+	window := int64(time.Since(startAt) / time.Minute)
+	if window < 0 {
+		window = 0
+	}
+	value := float64(elapsed) / float64(time.Millisecond)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.buckets[window] == nil {
+		c.buckets[window] = make(map[string]*latencyBucket)
+	}
+	bucket := c.buckets[window][method]
+	if bucket == nil {
+		bucket = &latencyBucket{}
+		c.buckets[window][method] = bucket
+	}
+	bucket.count++
+	const sampleLimit = 256
+	if len(bucket.values) < sampleLimit {
+		bucket.values = append(bucket.values, value)
+		return
+	}
+	// Deterministic reservoir replacement keeps per-minute raw data bounded
+	// while allowing late-window requests to contribute to the percentiles.
+	index := (bucket.count*11400714819323198485 + 14029467366897019727) % bucket.count
+	if index < sampleLimit {
+		bucket.values[index] = value
+	}
+}
+
+func (c *latencyCollector) take(window int64) map[string]latencySummary {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byMethod := c.buckets[window]
+	delete(c.buckets, window)
+	result := make(map[string]latencySummary, len(byMethod))
+	for method, bucket := range byMethod {
+		sorted := append([]float64(nil), bucket.values...)
+		sort.Float64s(sorted)
+		result[method] = latencySummary{
+			Count: bucket.count, SampleCount: len(bucket.values), Truncated: bucket.count > uint64(len(bucket.values)),
+			RawMS: append([]float64(nil), bucket.values...),
+			P50MS: percentile(sorted, 0.50), P95MS: percentile(sorted, 0.95), P99MS: percentile(sorted, 0.99),
+		}
+	}
+	return result
+}
+
+// takeAll drains every remaining window into one summary per method. The final
+// telemetry row uses it: record keys samples on wall minutes since the
+// pre-loop startAt (latencyWallWindow), so any window a minute row did not
+// consume — including everything recorded while the pre-loop startup ran —
+// would otherwise never be taken and the run's client-side latency evidence
+// would be silently lost. Reservoir caps stay per window, so the merged raw
+// sample set stays bounded by windows × 256.
+func (c *latencyCollector) takeAll() map[string]latencySummary {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	merged := make(map[string]*latencyBucket, len(c.buckets))
+	for _, byMethod := range c.buckets {
+		for method, bucket := range byMethod {
+			if merged[method] == nil {
+				merged[method] = &latencyBucket{}
+			}
+			merged[method].count += bucket.count
+			merged[method].values = append(merged[method].values, bucket.values...)
+		}
+	}
+	c.buckets = make(map[int64]map[string]*latencyBucket)
+	result := make(map[string]latencySummary, len(merged))
+	for method, bucket := range merged {
+		sorted := append([]float64(nil), bucket.values...)
+		sort.Float64s(sorted)
+		result[method] = latencySummary{
+			Count: bucket.count, SampleCount: len(bucket.values), Truncated: bucket.count > uint64(len(bucket.values)),
+			RawMS: append([]float64(nil), bucket.values...),
+			P50MS: percentile(sorted, 0.50), P95MS: percentile(sorted, 0.95), P99MS: percentile(sorted, 0.99),
+		}
+	}
+	return result
 }
 
 // minuteCadenceBudget is the unexplained part of a minute window: one minute

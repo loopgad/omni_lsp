@@ -18,7 +18,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,25 +44,9 @@ type stdioWorkerResult struct {
 	err     error
 }
 
-type latencySummary struct {
-	Count       uint64    `json:"count"`
-	SampleCount int       `json:"sample_count"`
-	Truncated   bool      `json:"truncated"`
-	RawMS       []float64 `json:"raw_ms"`
-	P50MS       float64   `json:"p50_ms"`
-	P95MS       float64   `json:"p95_ms"`
-	P99MS       float64   `json:"p99_ms"`
-}
-
-type latencyBucket struct {
-	count  uint64
-	values []float64
-}
-
-type latencyCollector struct {
-	mu      sync.Mutex
-	buckets map[int64]map[string]*latencyBucket
-}
+// latencySummary, latencyBucket, latencyCollector, and percentile live in the
+// untagged stdio_gates.go per the 2026-10-25 ruling 3: they are pure harness
+// logic whose form guards must run in the default suite.
 
 type stdioTelemetry struct {
 	Sequence             int64                     `json:"sequence"`
@@ -680,7 +663,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				lastIndexGeneration, lastSnapshotEpochs = row.IndexGeneration, row.SnapshotEpochs
 				row.Seed = soakSeed
 				row.BackendRestarts = backendRestarts
-				row.LatencyByMethod = latencies.take(int64(active/time.Minute) - 1)
+				row.LatencyByMethod = latencies.take(latencyWallWindow(startAt, time.Now()) - 1)
 				row.CanceledRequests = canceledReindexes
 				row.CancellationOutcomes = cloneCounts(cancellationOutcomes)
 				row.CanceledQueries = canceledQueries
@@ -940,7 +923,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		Threshold: map[string]any{"active_processes": 1, "candidate_handles": 0, "backend_handles": 0},
 		Observed:  map[string]any{"active_processes": tree.ActiveProcesses, "candidate_handles": tree.HandleCounts["candidate"], "backend_handles": tree.HandleCounts["backend"]},
 	})
-	finalLatency := latencies.take(int64(active / time.Minute))
+	finalLatency := latencies.takeAll()
 	if completed.Load() < uint64(soakWorkers) || edits.Load() == 0 || peakPrivate == 0 {
 		message := fmt.Sprintf("insufficient workload coverage: requests=%d edits=%d peakPrivate=%d", completed.Load(), edits.Load(), peakPrivate)
 		soakFailed(&evidence, "soak/coverage", message)
@@ -2040,61 +2023,9 @@ func waitForStdioRuntimeBounds(baselineGoroutines int, baselineHeap uint64) (int
 	}
 }
 
-func percentile(sorted []float64, q float64) float64 {
-	if len(sorted) == 0 {
-		return 0
-	}
-	index := int(float64(len(sorted)-1) * q)
-	return sorted[index]
-}
-
-func (c *latencyCollector) record(startAt time.Time, method string, elapsed time.Duration) {
-	window := int64(time.Since(startAt) / time.Minute)
-	if window < 0 {
-		window = 0
-	}
-	value := float64(elapsed) / float64(time.Millisecond)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.buckets[window] == nil {
-		c.buckets[window] = make(map[string]*latencyBucket)
-	}
-	bucket := c.buckets[window][method]
-	if bucket == nil {
-		bucket = &latencyBucket{}
-		c.buckets[window][method] = bucket
-	}
-	bucket.count++
-	const sampleLimit = 256
-	if len(bucket.values) < sampleLimit {
-		bucket.values = append(bucket.values, value)
-		return
-	}
-	// Deterministic reservoir replacement keeps per-minute raw data bounded
-	// while allowing late-window requests to contribute to the percentiles.
-	index := (bucket.count*11400714819323198485 + 14029467366897019727) % bucket.count
-	if index < sampleLimit {
-		bucket.values[index] = value
-	}
-}
-
-func (c *latencyCollector) take(window int64) map[string]latencySummary {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	byMethod := c.buckets[window]
-	delete(c.buckets, window)
-	result := make(map[string]latencySummary, len(byMethod))
-	for method, bucket := range byMethod {
-		sorted := append([]float64(nil), bucket.values...)
-		sort.Float64s(sorted)
-		result[method] = latencySummary{
-			Count: bucket.count, SampleCount: len(bucket.values), Truncated: bucket.count > uint64(len(bucket.values)),
-			RawMS: append([]float64(nil), bucket.values...),
-			P50MS: percentile(sorted, 0.50), P95MS: percentile(sorted, 0.95), P99MS: percentile(sorted, 0.99),
-		}
-	}
-	return result
-}
+// percentile and the latencyCollector live in the untagged stdio_gates.go per
+// the 2026-10-25 ruling 3: pure harness logic whose form guards must run in
+// the default suite.
 
 func cloneCounts(source map[string]uint64) map[string]uint64 {
 	copy := make(map[string]uint64, len(source))
