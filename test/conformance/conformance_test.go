@@ -56,11 +56,13 @@ func TestGenerateDocs(t *testing.T) {
 	}
 }
 
-// TestConformanceNoRegression is the closed-loop gate: fast-mode core score
-// must meet or beat every recorded category floor. Improvements are adopted
+// TestConformanceNoRegression is the closed-loop gate: the real-probe fast
+// mode executes AUTO probes (2026-10-25 ruling 2) and the resulting core
+// score must meet or beat every recorded category floor. GATE commands stay
+// out of this mode; the full report runs them. Improvements are adopted
 // explicitly via OMNISP_UPDATE_CONFORMANCE=1 so any silent drop is loud.
 func TestConformanceNoRegression(t *testing.T) {
-	rep, err := conformance.FastReport("../..")
+	rep, err := conformance.FastProbeReport("../..", "120s")
 	if err != nil {
 		t.Fatal(err)
 	}

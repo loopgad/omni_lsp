@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 // categoryWeights are the core-domain category weights (user-approved):
@@ -42,16 +43,22 @@ func FastReport(root string) (*Report, error) {
 	return score(sym, nil, "fast"), nil
 }
 
-// FullReport additionally batch-executes AUTO probes per package and runs
-// gate commands; gates earn full credit only here.
-func FullReport(root string, timeout string) (*Report, error) {
-	// Recursion guard: the race-all gate re-runs this package's tests, and
-	// without this marker TestFullReport_RunsAutoProbes would execute a
-	// second full probe+gate pass inside the first (2x wall clock, and the
-	// outer verify then times out). Engine tests set the same var themselves.
-	if os.Getenv("OMNILSP_CONFORMANCE_NESTED") == "" {
-		os.Setenv("OMNILSP_CONFORMANCE_NESTED", "1")
-	}
+// fastProbeBudget bounds the real-probe fast gate. A probe that hangs cannot
+// turn the gate into an unbounded run: batches still ahead of the deadline
+// fail closed with a budget-exhausted error, which drops the score.
+const fastProbeBudget = 30 * time.Minute
+
+// FastProbeReport executes AUTO probes (not GATE commands) and scores their
+// results. It is the fast gate's real-probe mode (2026-10-25 ruling 2): AUTO
+// credit means the probe actually ran, while GATE entries keep existence-only
+// fast credit because their commands are heavyweight. Probes run without
+// -race; the full report remains the race-running mode.
+func FastProbeReport(root string, timeout string) (*Report, error) {
+	return probeReport(root, timeout, time.Now().Add(fastProbeBudget))
+}
+
+func probeReport(root string, timeout string, deadline time.Time) (*Report, error) {
+	ensureNestedGuard()
 	if root == "" {
 		var err error
 		if root, err = RequireModuleRoot(); err != nil {
@@ -62,19 +69,28 @@ func FullReport(root string, timeout string) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	exec := map[string]error{}
-	for _, c := range Registry.Checks {
-		if c.Probe == nil {
-			continue
-		}
-		for _, g := range c.Probe.Groups {
-			key := g.Pkg + "\x00" + strings.Join(g.Tests, "\x00")
-			if _, done := exec[key]; done {
-				continue
-			}
-			exec[key] = runTestsBatch(g.Pkg, g.Tests, timeout)
+	return score(sym, executeAutoProbes(timeout, false, deadline), "fast-probe"), nil
+}
+
+// FullReport additionally batch-executes AUTO probes per package and runs
+// gate commands; gates earn full credit only here.
+func FullReport(root string, timeout string) (*Report, error) {
+	// Recursion guard: the race-all gate re-runs this package's tests, and
+	// without this marker TestFullReport_RunsAutoProbes would execute a
+	// second full probe+gate pass inside the first (2x wall clock, and the
+	// outer verify then times out). Engine tests set the same var themselves.
+	ensureNestedGuard()
+	if root == "" {
+		var err error
+		if root, err = RequireModuleRoot(); err != nil {
+			return nil, err
 		}
 	}
+	sym, err := testSymbols(root)
+	if err != nil {
+		return nil, err
+	}
+	exec := executeAutoProbes(timeout, true, time.Time{})
 	for _, c := range Registry.Checks {
 		if c.Gate == nil {
 			continue
@@ -86,6 +102,33 @@ func FullReport(root string, timeout string) (*Report, error) {
 		exec[key] = runGateCmd(c.Gate.Cmd)
 	}
 	return score(sym, exec, "full"), nil
+}
+
+func ensureNestedGuard() {
+	if os.Getenv("OMNILSP_CONFORMANCE_NESTED") == "" {
+		os.Setenv("OMNILSP_CONFORMANCE_NESTED", "1")
+	}
+}
+
+func executeAutoProbes(timeout string, race bool, deadline time.Time) map[string]error {
+	exec := map[string]error{}
+	for _, c := range Registry.Checks {
+		if c.Probe == nil {
+			continue
+		}
+		for _, g := range c.Probe.Groups {
+			key := g.Pkg + "\x00" + strings.Join(g.Tests, "\x00")
+			if _, done := exec[key]; done {
+				continue
+			}
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				exec[key] = fmt.Errorf("fast-probe budget exhausted before running %s/%s", g.Pkg, strings.Join(g.Tests, ","))
+				continue
+			}
+			exec[key] = runTestsBatch(g.Pkg, g.Tests, timeout, race)
+		}
+	}
+	return exec
 }
 
 func runGateCmd(cmd string) error {
@@ -236,7 +279,7 @@ func checkResult(c *Check, sym map[string][]string, exec map[string]error, mode 
 		if p := c.Probe; p != nil && len(p.Groups) > 0 {
 			if missing := hasAllGroups(sym, p.Groups); len(missing) > 0 {
 				detail += " | missing probe symbols: " + strings.Join(missing, ",")
-			} else if mode == "full" {
+			} else if mode == "full" || mode == "fast-probe" {
 				for _, g := range p.Groups {
 					if err := exec[g.Pkg+"\x00"+strings.Join(g.Tests, "\x00")]; err != nil {
 						detail += " | probe failed: " + truncate(err.Error(), 200)
@@ -257,12 +300,12 @@ func checkResult(c *Check, sym map[string][]string, exec map[string]error, mode 
 		if g.TargetTest != "" {
 			groups[0].Tests = []string{g.TargetTest}
 		}
-		if missing := hasAllGroups(sym, groups); mode == "fast" || g.TargetTest == "" {
+		if missing := hasAllGroups(sym, groups); mode != "full" || g.TargetTest == "" {
 			if len(missing) > 0 {
 				return res{Result: 0, Detail: "missing symbols: " + strings.Join(missing, ",")}
 			}
-			if mode == "fast" {
-				return res{Result: creditGateFast, Detail: "existence (fast); full runs: " + g.Cmd}
+			if mode != "full" {
+				return res{Result: creditGateFast, Detail: "existence (" + mode + "); full runs: " + g.Cmd}
 			}
 		}
 		if err := exec["gate\x00"+c.ID]; err != nil {
@@ -277,7 +320,7 @@ func checkResult(c *Check, sym map[string][]string, exec map[string]error, mode 
 		if missing := hasAllGroups(sym, p.Groups); len(missing) > 0 {
 			return res{Result: 0, Detail: "missing symbols: " + strings.Join(missing, ",")}
 		}
-		if mode == "full" {
+		if mode == "full" || mode == "fast-probe" {
 			for _, g := range p.Groups {
 				key := g.Pkg + "\x00" + strings.Join(g.Tests, "\x00")
 				if err := exec[key]; err != nil {

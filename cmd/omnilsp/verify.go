@@ -28,6 +28,7 @@ func cmdVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON (schema omnilsp.verify.v1)")
 	full := fs.Bool("full", false, "execute AUTO probes and GATE commands (slow)")
+	probe := fs.Bool("probe", false, "execute AUTO probes without GATE commands (real-probe fast mode)")
 	minScore := fs.Float64("min", defaultScoreFloor, "minimum core score to pass")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -37,9 +38,12 @@ func cmdVerify(args []string) error {
 		rep *conformance.Report
 		err error
 	)
-	if *full {
+	switch {
+	case *full:
 		rep, err = conformance.FullReport("", "600s")
-	} else {
+	case *probe:
+		rep, err = conformance.FastProbeReport("", "120s")
+	default:
 		rep, err = conformance.FastReport("")
 	}
 	if err != nil {

@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -225,6 +226,27 @@ func TestBaselineRoundTrip(t *testing.T) {
 // TestFullReport_RunsAutoProbes executes every AUTO probe batch and gate
 // command on this module — slow (minutes) by design. All AUTO checks must
 // earn full credit on a green tree.
+func TestFastProbeModeRequiresExecutedAutoProbe(t *testing.T) {
+	probe := &Check{ID: "FAKE-AUTO", Status: StatusAuto, Probe: &Probe{Groups: []ProbeGroup{{Pkg: "pkg", Tests: []string{"TestProbe"}}}}}
+	sym := map[string][]string{"pkg": {"TestProbe"}}
+	failing := map[string]error{"pkg\x00TestProbe": errors.New("probe failed")}
+	if got := checkResult(probe, sym, failing, "fast-probe"); got.Result != 0 {
+		t.Fatalf("fast-probe failing AUTO = %v, want 0 (probe must actually run)", got.Result)
+	}
+	if got := checkResult(probe, sym, nil, "fast"); got.Result != 1 {
+		t.Fatalf("fast existence-only AUTO = %v, want 1", got.Result)
+	}
+
+	gate := &Check{ID: "FAKE-GATE", Status: StatusGate, Gate: &Gate{Cmd: "false", TargetPkg: "pkg", TargetTest: "TestProbe"}}
+	gateFail := map[string]error{"gate\x00FAKE-GATE": errors.New("gate failed")}
+	if got := checkResult(gate, sym, gateFail, "fast-probe"); got.Result != creditGateFast {
+		t.Fatalf("fast-probe gate = %v, want existence credit %v", got.Result, creditGateFast)
+	}
+	if got := checkResult(gate, sym, gateFail, "full"); got.Result != 0 {
+		t.Fatalf("full failing gate = %v, want 0", got.Result)
+	}
+}
+
 func TestFullReport_RunsAutoProbes(t *testing.T) {
 	// ponytail: executes the whole tree (~20min warm, longer under -race);
 	// run explicitly via OMNILSP_CONFORMANCE_FULL=1 go test ./internal/conformance/

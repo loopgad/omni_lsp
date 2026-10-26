@@ -92,8 +92,12 @@ func hasAllGroups(sym map[string][]string, groups []ProbeGroup) (missing []strin
 // mattering when the frozen-candidate run moved to DEF-S21CORPUS and PERF-3
 // was left probing only its in-package gate guard.
 
-func runTestsBatch(pkg string, tests []string, timeout string) error {
-	args := []string{"test", "-race", "-count=1"}
+func runTestsBatch(pkg string, tests []string, timeout string, race bool) error {
+	args := []string{"test"}
+	if race {
+		args = append(args, "-race")
+	}
+	args = append(args, "-count=1")
 	if timeout != "" {
 		args = append(args, "-timeout", timeout)
 	}

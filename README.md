@@ -77,8 +77,13 @@ Windows has no `make` by default; use `mingw32-make` with the same targets
 make test                          # fmt + vet + build + full suite + verify
 make race                          # the mode CI runs: go test -race -count=1 ./...
 make short                         # skip packages that shell out to language toolchains
+make verify-probe                  # execute AUTO probes before scoring (no GATE commands)
 go run ./cmd/omnilsp verify --min 90   # conformance scorecard against the 90 floor
 ```
+
+`verify --probe` scores the same registry but actually runs each AUTO probe
+(without `-race`), with GATE entries kept at existence-only credit; use it when
+the fast score alone is not enough evidence that a probe still passes.
 
 `docs/conformance.md` is generated from `internal/conformance/registry.go`;
 regenerate with `OMNISP_UPDATE_CONFORMANCE=1 go test ./test/conformance -run
