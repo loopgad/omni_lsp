@@ -1279,6 +1279,148 @@ func lockedSublimeDriverPython(t *testing.T) (string, string) {
 	return root, python
 }
 
+// Zed has no runnable native client driver on this host, and the Helix ConPTY
+// pattern cannot reach it: Zed is a GPU-rendered GUI client with no terminal
+// UI and no headless LSP-client mode, so there is nothing to send keys to and
+// no frame stream to parse. Precise blockers, probed 2026-10-26:
+//
+//  1. tools.lock.json (exact-version + sha256, ruling 9: never upgrade) has no
+//     Zed entry at all — no pinned version, URL, or digest — and that lock file
+//     is outside this lane's file boundary, so no pinned download is possible.
+//     The host has no zed executable either (not on PATH, absent from
+//     %LOCALAPPDATA%\Programs\Zed).
+//  2. Even with a pinned binary, client-visible hover/definition/completion/
+//     diagnostics/references/rename-refusal evidence requires a UI automation
+//     adapter for Zed's rendered window, which the repository does not have.
+//
+// The test-side Zed driver therefore pins the contract of the existing Zed
+// preflight (zed/driver.py): it must materialize the isolated trusted profile,
+// map every matrix case onto an adapter bound to the candidate binary, keep
+// every row not_verified, and refuse to establish the JSX languageId mapping
+// without a pinned-client didOpen observation.
+func TestZedPreflightDriverKeepsRowsNotVerifiedWithoutNativeUIAdapter(t *testing.T) {
+	// The locked interpreter is shared by the Python client drivers.
+	root, python := lockedSublimeDriverPython(t)
+	driverPath := filepath.Join(root, "test", "acceptance", "clients", "zed", "driver.py")
+
+	workspace := t.TempDir()
+	userData := t.TempDir()
+	// The preflight only binds the candidate path into the generated settings;
+	// it never launches the server, so a stub file is a valid binding target.
+	candidate := filepath.Join(t.TempDir(), "omnilsp-candidate.exe")
+	if err := os.WriteFile(candidate, []byte("stub candidate binding target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(t.TempDir(), "zed-preflight-result.json")
+
+	command := exec.Command(python, "-I", "-B", driverPath,
+		"--workspace", workspace,
+		"--user-data-dir", userData,
+		"--omnilsp-bin", candidate,
+		"--result", resultPath)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Zed preflight driver failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	serialized, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("Zed preflight driver did not write its structured result: %v", err)
+	}
+	var result struct {
+		Client               string `json:"client"`
+		Status               string `json:"status"`
+		Stage                string `json:"stage"`
+		CleanExit            bool   `json:"cleanExit"`
+		ClientTestsCompleted bool   `json:"clientTestsCompleted"`
+		ServerExitConfirmed  bool   `json:"serverExitConfirmed"`
+		Error                string `json:"error"`
+		Cases                []struct {
+			Name       string `json:"name"`
+			LanguageID string `json:"languageId"`
+			Status     string `json:"status"`
+			Reason     string `json:"reason"`
+		} `json:"cases"`
+		Observed struct {
+			SettingsContract  string `json:"settings_contract"`
+			NativeResultSeen  bool   `json:"native_result_observed"`
+			LanguageIDMapping struct {
+				Status string `json:"status"`
+			} `json:"language_id_mapping"`
+			Profile struct {
+				Trust     string         `json:"trust"`
+				Languages map[string]any `json:"languages"`
+			} `json:"profile"`
+		} `json:"observed"`
+	}
+	if err := json.Unmarshal(serialized, &result); err != nil {
+		t.Fatalf("decode Zed preflight result: %v", err)
+	}
+
+	if result.Client != "zed" {
+		t.Fatalf("Zed preflight client = %q, want zed", result.Client)
+	}
+	if result.Status != "not_verified" || result.Stage != "native-result-consumption" {
+		t.Fatalf("Zed preflight status/stage = %q/%q, want not_verified/native-result-consumption", result.Status, result.Stage)
+	}
+	if result.CleanExit || result.ClientTestsCompleted || result.ServerExitConfirmed {
+		t.Fatalf("Zed preflight must not claim a completed client pass: cleanExit=%t clientTestsCompleted=%t serverExitConfirmed=%t",
+			result.CleanExit, result.ClientTestsCompleted, result.ServerExitConfirmed)
+	}
+	if strings.TrimSpace(result.Error) == "" || !strings.Contains(result.Error, "Zed") {
+		t.Fatalf("Zed preflight blocker text must name the missing native client: %q", result.Error)
+	}
+
+	if len(result.Cases) != len(expectedEditorCaseManifest) {
+		t.Fatalf("Zed preflight returned %d rows, want %d manifest rows", len(result.Cases), len(expectedEditorCaseManifest))
+	}
+	for index, row := range result.Cases {
+		want := expectedEditorCaseManifest[index]
+		if row.Name != want.Name || row.LanguageID != want.LanguageID {
+			t.Fatalf("Zed preflight row %d = %s/%s, want %s/%s", index, row.Name, row.LanguageID, want.Name, want.LanguageID)
+		}
+		if row.Status != "not_verified" || strings.TrimSpace(row.Reason) == "" {
+			t.Fatalf("Zed preflight row %s must stay not_verified with a blocker reason, got %q/%q", row.Name, row.Status, row.Reason)
+		}
+	}
+
+	if result.Observed.SettingsContract != "passed" {
+		t.Fatalf("Zed preflight settings contract = %q, want passed", result.Observed.SettingsContract)
+	}
+	if result.Observed.NativeResultSeen {
+		t.Fatal("Zed preflight must not claim native UI results")
+	}
+	if result.Observed.LanguageIDMapping.Status != "not_verified" {
+		t.Fatalf("Zed languageId mapping must stay not_verified without a pinned didOpen observation, got %q", result.Observed.LanguageIDMapping.Status)
+	}
+	if result.Observed.Profile.Trust != "trusted disposable worktrees" {
+		t.Fatalf("Zed preflight profile trust = %q", result.Observed.Profile.Trust)
+	}
+	if len(result.Observed.Profile.Languages) != len(expectedEditorCaseManifest) {
+		t.Fatalf("Zed preflight profile mapped %d cases, want %d", len(result.Observed.Profile.Languages), len(expectedEditorCaseManifest))
+	}
+
+	// The isolated user profile must be the only trusted surface.
+	userSettings, err := os.ReadFile(filepath.Join(userData, "User", "settings.json"))
+	if err != nil {
+		t.Fatalf("Zed preflight did not write the isolated user settings: %v", err)
+	}
+	var user struct {
+		Session struct {
+			TrustAllWorktrees bool `json:"trust_all_worktrees"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(userSettings, &user); err != nil {
+		t.Fatalf("decode isolated Zed user settings: %v", err)
+	}
+	if !user.Session.TrustAllWorktrees {
+		t.Fatal("isolated Zed user settings must set session.trust_all_worktrees=true")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".zed", "settings.json")); err != nil {
+		t.Fatalf("Zed preflight did not write project-local settings: %v", err)
+	}
+}
+
 func TestSublimeDriverWritesBoundedFailureWhenLSPImportFails(t *testing.T) {
 	root, python := lockedSublimeDriverPython(t)
 	driverPath := filepath.Join(root, "test", "acceptance", "clients", "sublime", "driver.py")

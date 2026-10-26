@@ -26,6 +26,22 @@ local function response_result(response, label)
   return response.result
 end
 
+-- guard:canonical_uri begin
+-- OmniLSP records omnilsp/explain evidence under its canonical document
+-- identity (internal/workspace/uri: lowercase Windows drive letter, decoded
+-- drive-colon escape). Neovim spells the same document as
+-- "file:///C:/Users/…", so byte equality against the raw wire URI rejects
+-- every evidence entry; compare against the canonical identity instead.
+local function canonical_uri(uri)
+  local decoded = uri:gsub("%%([0-9A-Fa-f][0-9A-Fa-f])", function(hex)
+    return string.char(tonumber(hex, 16))
+  end)
+  local prefix, drive, rest = decoded:match("^(file:///)([A-Za-z]):(.*)$")
+  if not prefix then return decoded end
+  return prefix .. drive:lower() .. ":" .. rest
+end
+-- guard:canonical_uri end
+
 local function pull_diagnostics(client, uri, buf)
   local response = response_result(client:request_sync("textDocument/diagnostic", {
     textDocument = { uri = uri },
@@ -56,7 +72,7 @@ end
 local function assert_evidence(response, uri, backend)
   if type(response.evidence) ~= "table" then error("explain returned no evidence array") end
   for _, entry in ipairs(response.evidence) do
-    if entry.method == "textDocument/hover" and entry.uri == uri then
+    if entry.method == "textDocument/hover" and entry.uri == canonical_uri(uri) then
       if type(entry.backend) ~= "string" or not vim.startswith(entry.backend, backend .. "/") then
         error("unexpected hover evidence backend " .. vim.inspect(entry.backend))
       end
@@ -69,7 +85,7 @@ end
 local function assert_method_evidence(client, uri, method, backend, buf)
   local response = response_result(client:request_sync("omnilsp/explain", { uri = uri }, 30000, buf), "omnilsp/explain")
   for _, entry in ipairs(response.evidence or {}) do
-    if entry.method == method and entry.uri == uri then
+    if entry.method == method and entry.uri == canonical_uri(uri) then
       if type(entry.backend) ~= "string" or not vim.startswith(entry.backend, backend .. "/") then
         error(method .. " used unexpected backend " .. vim.inspect(entry.backend))
       end

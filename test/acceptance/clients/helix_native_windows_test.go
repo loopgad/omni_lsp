@@ -128,7 +128,15 @@ func TestHelixNativeGoVertical(t *testing.T) {
 	terminalContext, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	logPath := filepath.Join(workspace, "helix.log")
-	terminal, err := startHelixTerminal(terminalContext, helixPath, []string{"--log", logPath, mainPath + ":6:34"}, workspace, env, 120, 40)
+	// -v keeps the client transport wire log at info level; the session
+	// readiness gate reads that client-side evidence because the server's
+	// --record trace is buffered and only flushes on clean close.
+	// 200 columns: the pinned Helix truncates (not wraps) both the diagnostics
+	// picker rows (which share the screen with the editor pane) and the
+	// status-line rename refusal ("…importer packages are not loaded, so
+	// reference completeness cannot be proven (SEM-SAFE-001)" is ~165 chars),
+	// so narrower viewports hide the SEM-SAFE-001 tail from the client screen.
+	terminal, err := startHelixTerminal(terminalContext, helixPath, []string{"-v", "--log", logPath, mainPath + ":6:34"}, workspace, env, 200, 40)
 	if err != nil {
 		t.Fatalf("start locked Helix in ConPTY: %v", err)
 	}
@@ -154,6 +162,12 @@ func TestHelixNativeGoVertical(t *testing.T) {
 			} else {
 				t.Logf("Helix trace was empty at failure; source path was %s", tracePath)
 			}
+			evidenceClientLog := filepath.Join(evidenceDir, "helix-go-client.log")
+			if size, copyErr := copyHelixNativeTrace(logPath, evidenceClientLog); copyErr != nil {
+				t.Logf("Helix client log preservation failed: %v", copyErr)
+			} else {
+				t.Logf("Helix client log retained at %s (%d bytes)", evidenceClientLog, size)
+			}
 		}
 		t.Logf("compact LSP trace summary: %s", boundedHelixFailureText(helixFailureTraceSummary(tracePath)))
 	})
@@ -175,7 +189,7 @@ func TestHelixNativeGoVertical(t *testing.T) {
 		return helixStatusHasCursorLine(frame, 6) && strings.Contains(frame.Text(), "func UseTarget() int { return SoakTarget(1) }")
 	})
 	goURI := (&url.URL{Scheme: "file", Path: "/" + filepath.ToSlash(mainPath)}).String()
-	awaitHelixSessionReady(t, tracePath, terminalContext, goURI)
+	awaitHelixSessionReady(t, logPath, terminalContext, goURI)
 	observed := map[string]any{
 		"candidate_path":            candidatePath,
 		"candidate_sha256":          candidateHash,
@@ -363,6 +377,9 @@ func TestHelixNativeGoVertical(t *testing.T) {
 		if err := writeHelixNativeEvidence(evidenceDir, observed, tracePath); err != nil {
 			t.Fatalf("write persisted Helix Go evidence: %v", err)
 		}
+		if _, err := copyHelixNativeTrace(logPath, filepath.Join(evidenceDir, "helix-go-client.log")); err != nil {
+			t.Fatalf("persist Helix client log evidence: %v", err)
+		}
 	}
 	evidenceJSON, _ := json.Marshal(observed)
 	t.Logf("HELIX_NATIVE_GO_EVIDENCE %s", boundedHelixText(string(evidenceJSON)))
@@ -462,14 +479,20 @@ func awaitHelixFrame(t *testing.T, terminal *helixTerminal, parent context.Conte
 	}
 }
 
-func awaitHelixSessionReady(t *testing.T, path string, parent context.Context, expectedURI string) {
+// awaitHelixSessionReady polls the client-side Helix transport log for the
+// initialize response, the initialized notification, and the fixture didOpen.
+// The server's --record trace is intentionally not used here: RecorderTransport
+// buffers every entry and flushes only on close, so mid-session reads would
+// always observe an empty file. The recorded trace is still fully verified
+// after the normal exit below.
+func awaitHelixSessionReady(t *testing.T, clientLogPath string, parent context.Context, expectedURI string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(parent, 25*time.Second)
 	defer cancel()
 	for {
-		ready, err := helixTraceHasReadyGoDocument(path, expectedURI)
+		ready, err := helixClientLogHasReadyGoDocument(clientLogPath, expectedURI)
 		if err != nil {
-			t.Fatalf("read OmniLSP trace while waiting for initialized Go didOpen: %v", err)
+			t.Fatalf("read Helix client log while waiting for initialized Go didOpen: %v", err)
 		}
 		if ready {
 			return
@@ -479,12 +502,17 @@ func awaitHelixSessionReady(t *testing.T, path string, parent context.Context, e
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
-			t.Fatalf("timed out waiting for initialize response, initialized, and Go didOpen %q", expectedURI)
+			t.Fatalf("timed out waiting for initialize response, initialized, and Go didOpen %q in %s", expectedURI, clientLogPath)
 		}
 	}
 }
 
-func helixTraceHasReadyGoDocument(path, expectedURI string) (bool, error) {
+// helixClientLogHasReadyGoDocument scans the Helix --log output for the three
+// ordered client-visible session milestones: the server's initialize result,
+// the client's initialized notification, and the client's didOpen of the
+// expected document. Transport entries render as "helix_lsp::transport [INFO]
+// omnilsp <- {…}" for received and "… omnilsp -> {…}" for sent wire messages.
+func helixClientLogHasReadyGoDocument(path, expectedURI string) (bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -498,45 +526,26 @@ func helixTraceHasReadyGoDocument(path, expectedURI string) (bool, error) {
 		return false, err
 	}
 	if len(data) > helixNativeTraceLimit {
-		return false, fmt.Errorf("session trace exceeds %d-byte limit", helixNativeTraceLimit)
+		return false, fmt.Errorf("Helix client log exceeds %d-byte limit", helixNativeTraceLimit)
 	}
-	var initializeID *jsonrpc.RequestID
-	initializeCompleted := false
+	initializeResult := false
 	initialized := false
 	for _, line := range strings.Split(string(data), "\n") {
-		var entry struct {
-			Dir     string          `json:"dir"`
-			Payload json.RawMessage `json:"payload"`
-		}
-		if json.Unmarshal([]byte(line), &entry) != nil {
+		received := strings.Contains(line, "omnilsp <-")
+		sent := strings.Contains(line, "omnilsp ->")
+		if !received && !sent {
 			continue
 		}
-		var message jsonrpc.Message
-		if json.Unmarshal(entry.Payload, &message) != nil {
+		if !initializeResult && received && strings.Contains(line, `"result":{"capabilities"`) {
+			initializeResult = true
 			continue
 		}
-		if entry.Dir == "in" && message.Method == "initialize" && message.ID != nil {
-			initializeID = message.ID
-			continue
-		}
-		if initializeID != nil && entry.Dir == "out" && message.ID != nil &&
-			message.Method == "" && message.ID.Equals(*initializeID) {
-			initializeCompleted = message.Error == nil
-			continue
-		}
-		if initializeCompleted && entry.Dir == "in" && message.Method == "initialized" && message.ID == nil {
+		if initializeResult && sent && strings.Contains(line, `"method":"initialized"`) {
 			initialized = true
 			continue
 		}
-		if initialized && entry.Dir == "in" && message.Method == "textDocument/didOpen" && message.ID == nil {
-			var params struct {
-				TextDocument struct {
-					URI string `json:"uri"`
-				} `json:"textDocument"`
-			}
-			if json.Unmarshal(message.Params, &params) == nil && params.TextDocument.URI == expectedURI {
-				return true, nil
-			}
+		if initialized && sent && strings.Contains(line, `"method":"textDocument/didOpen"`) && strings.Contains(line, expectedURI) {
+			return true, nil
 		}
 	}
 	return false, nil
@@ -591,9 +600,18 @@ func helixCompletionMenuItemVisible(frame, baseline terminalFrame, line int) boo
 	return false
 }
 
+// helixCompletionMenuItemRow recognizes the pinned Helix completion item row.
+// The terminal menu renders inline with its own line-number gutter, so the
+// "SoakTarget function" pair may be preceded by gutter fields; only the
+// adjacent label/kind pair is decisive.
 func helixCompletionMenuItemRow(row string) bool {
 	fields := strings.Fields(row)
-	return len(fields) >= 2 && fields[0] == "SoakTarget" && fields[1] == "function"
+	for index := 0; index+1 < len(fields); index++ {
+		if fields[index] == "SoakTarget" && fields[index+1] == "function" {
+			return true
+		}
+	}
+	return false
 }
 
 func helixCompletionSelected(frame, baseline terminalFrame, line int, expectedBufferLine string) bool {
@@ -699,6 +717,36 @@ func TestHelixCompletionRequiresSelectedMenuItem(t *testing.T) {
 	}
 }
 
+// The pinned Helix 25.07.1 terminal renders the completion menu as an inline
+// popup that occupies a screen row with its own line-number gutter, so the
+// item row arrives as "11  SoakTarget      function" instead of a bare
+// "SoakTarget function". The matcher must recognize the guttered form while
+// still rejecting source lines that merely contain the symbol.
+func TestHelixCompletionMenuRowRecognizesLineNumberGutter(t *testing.T) {
+	baseline := terminalFrame{Lines: []string{
+		"10 func completionProbe() int { return SoakT(3) }",
+		"NOR main.go 10:42",
+	}}
+	guttered := terminalFrame{Lines: []string{
+		"M-bM-^WM-^O  10  func completionProbe() int { return SoakT(3) }",
+		"           11  SoakTarget      function",
+		"M-bM-^WM-^O  12  var _ = omnilspMissingSymbol",
+		" INS   main.go   M-bM-^WM-^O 2  1 sel  10:42",
+	}}
+	if !helixCompletionMenuItemVisible(guttered, baseline, 10) {
+		t.Fatal("guttered Helix completion menu row was not recognized")
+	}
+	if helixCompletionMenuItemVisible(guttered, guttered, 10) {
+		t.Fatal("a menu row already present in the baseline was counted as newly visible")
+	}
+	if helixCompletionMenuItemRow("10 func completionProbe() int { return SoakT(3) }") {
+		t.Fatal("a source line containing SoakT( was accepted as a completion menu row")
+	}
+	if helixCompletionMenuItemRow("4  func SoakTarget(value int) int { return value + 1 }") {
+		t.Fatal("the SoakTarget definition line was accepted as a completion menu row")
+	}
+}
+
 func helixReferencesListVisible(frame terminalFrame, file string) bool {
 	text := frame.Text()
 	return strings.Contains(text, "3/3") &&
@@ -766,7 +814,10 @@ func helixReferencesResponseMatches(raw json.RawMessage, expectedURI string, exp
 	}
 	lines := make(map[int]struct{}, len(locations))
 	for _, location := range locations {
-		if location.URI != expectedURI {
+		// Windows document paths are case-insensitive and the pinned Helix and
+		// the server disagree only on the drive-letter case, so compare the
+		// document URI case-insensitively; a different path still fails.
+		if !strings.EqualFold(location.URI, expectedURI) {
 			return false
 		}
 		lines[location.Range.Start.Line] = struct{}{}
@@ -796,6 +847,26 @@ func TestHelixReferencesResponseMatchesPickerLocations(t *testing.T) {
 	wrongLines := json.RawMessage(strings.Replace(string(valid), `"line":7`, `"line":9`, 1))
 	if helixReferencesResponseMatches(wrongLines, uri, []int{3, 5, 7}) {
 		t.Fatal("a response missing the selected picker line was accepted")
+	}
+}
+
+// The pinned Helix sends document URIs with one drive-letter case while
+// OmniLSP echoes the document URI it canonicalized; on Windows the drive
+// letter is not semantic, so the matcher must accept case-differing URIs for
+// the same document while still rejecting a different path.
+func TestHelixReferencesResponseMatchesCaseDifferingWindowsDriveURI(t *testing.T) {
+	upper := "file:///C:/Users/dev/workspace/main.go"
+	lower := json.RawMessage(`[
+		{"uri":"file:///c:/Users/dev/workspace/main.go","range":{"start":{"line":3,"character":0},"end":{"line":3,"character":10}}},
+		{"uri":"file:///c:/Users/dev/workspace/main.go","range":{"start":{"line":5,"character":0},"end":{"line":5,"character":10}}},
+		{"uri":"file:///c:/Users/dev/workspace/main.go","range":{"start":{"line":7,"character":0},"end":{"line":7,"character":10}}}
+	]`)
+	if !helixReferencesResponseMatches(lower, upper, []int{3, 5, 7}) {
+		t.Fatal("references for the same document with a case-differing Windows drive letter were rejected")
+	}
+	otherPath := json.RawMessage(strings.ReplaceAll(string(lower), "/Users/dev/workspace/main.go", "/Users/dev/other/main.go"))
+	if helixReferencesResponseMatches(otherPath, upper, []int{3, 5, 7}) {
+		t.Fatal("references in a different document with a case-insensitive compare were accepted")
 	}
 }
 
@@ -895,10 +966,10 @@ func verifyHelixGoTrace(session *replay.Session, methods map[string]int, goURI s
 	}) {
 		return errors.New("Helix references request did not return the three Go fixture locations shown in the native picker")
 	}
-	if !traceNotificationContains(session, "textDocument/didChange", "SoakTarget") {
+	if !traceNotificationContains(session, "in", "textDocument/didChange", "SoakTarget") {
 		return errors.New("Helix didChange notification did not carry the accepted SoakTarget completion edit")
 	}
-	if !traceNotificationContains(session, "textDocument/publishDiagnostics", "omnilspMissingSymbol") {
+	if !traceNotificationContains(session, "out", "textDocument/publishDiagnostics", "omnilspMissingSymbol") {
 		return errors.New("OmniLSP did not publish the expected unresolved Go diagnostic")
 	}
 	return nil
@@ -930,9 +1001,15 @@ func traceRequestReturned(session *replay.Session, method string, accept func(js
 	return false
 }
 
-func traceNotificationContains(session *replay.Session, method, text string) bool {
+// traceNotificationContains reports whether the recorded session carries a
+// notification with the given method whose params contain the given text, in
+// the given direction: "in" for client→server notifications such as
+// textDocument/didChange, "out" for server→client notifications such as
+// textDocument/publishDiagnostics. The recorded trace is written from the
+// server's perspective, so requesting the wrong direction never matches.
+func traceNotificationContains(session *replay.Session, dir, method, text string) bool {
 	for _, entry := range session.Entries {
-		if entry.Dir != "out" {
+		if entry.Dir != dir {
 			continue
 		}
 		var message jsonrpc.Message
@@ -941,6 +1018,25 @@ func traceNotificationContains(session *replay.Session, method, text string) boo
 		}
 	}
 	return false
+}
+
+func TestTraceNotificationContainsRequiresMatchingDirection(t *testing.T) {
+	session := &replay.Session{Entries: []replay.Entry{
+		{Seq: 1, Dir: "in", Payload: json.RawMessage(`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"contentChanges":[{"text":"SoakTarget"}]}}`)},
+		{Seq: 2, Dir: "out", Payload: json.RawMessage(`{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"diagnostics":[{"message":"undefined: omnilspMissingSymbol"}]}}`)},
+	}}
+	if !traceNotificationContains(session, "in", "textDocument/didChange", "SoakTarget") {
+		t.Fatal("the inbound didChange notification carrying the accepted edit was not found")
+	}
+	if traceNotificationContains(session, "out", "textDocument/didChange", "SoakTarget") {
+		t.Fatal("an inbound didChange was matched when the outbound direction was requested")
+	}
+	if !traceNotificationContains(session, "out", "textDocument/publishDiagnostics", "omnilspMissingSymbol") {
+		t.Fatal("the outbound publishDiagnostics notification was not found")
+	}
+	if traceNotificationContains(session, "in", "textDocument/publishDiagnostics", "omnilspMissingSymbol") {
+		t.Fatal("an outbound publishDiagnostics was matched when the inbound direction was requested")
+	}
 }
 
 func helixJSONContainsLabel(raw json.RawMessage, label string) bool {

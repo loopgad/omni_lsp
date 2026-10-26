@@ -821,6 +821,86 @@ func TestFileURIUsesCanonicalWindowsDrivePath(t *testing.T) {
 	}
 }
 
+// The native client harnesses must compare omnilsp/explain evidence against
+// the server's canonical document identity (internal/workspace/uri: lowercase
+// Windows drive letter, decoded drive-colon escape), not against the client's
+// raw wire spelling — VS Code sends "file:///c%3A/Users/…" and Neovim sends
+// "file:///C:/Users/…", while the evidence ring records "file:///c:/Users/…".
+// Raw byte equality rejects every real client, which is exactly how the
+// 2026-10-26 matrix run failed. These probes evaluate the guarded helpers
+// straight from the shipped harness sources, so a reverted matcher fails here
+// before any editor is launched.
+func TestClientHarnessesMatchCanonicalEvidenceURI(t *testing.T) {
+	root := repoRoot(t)
+	lock, err := readToolLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("vscode-canonicalClientURI", func(t *testing.T) {
+		node, err := verifyLockedBinary(lock, "node")
+		if err != nil {
+			t.Fatalf("locked node is unavailable: %v", err)
+		}
+		const script = `
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const begin = source.indexOf("/* guard:canonicalClientURI begin */");
+const end = source.indexOf("/* guard:canonicalClientURI end */");
+if (begin < 0 || end < 0 || end < begin) throw new Error("canonicalClientURI guard block missing from test-entry.js");
+eval(source.slice(begin, end));
+const encoded = canonicalClientURI("file:///c%3A/Users/dev/w/fixture.go");
+const upper = canonicalClientURI("file:///C:/Users/dev/w/fixture.go");
+if (encoded !== "file:///c:/Users/dev/w/fixture.go") throw new Error("encoded drive colon did not canonicalize: " + encoded);
+if (upper !== "file:///c:/Users/dev/w/fixture.go") throw new Error("uppercase drive letter did not canonicalize: " + upper);
+if (canonicalClientURI("untitled:Untitled-1") !== "untitled:Untitled-1") throw new Error("non-file URIs must pass through unchanged");
+`
+		output, err := exec.Command(node, "-e", script, filepath.Join(root, "test", "acceptance", "clients", "vscode", "test-entry.js")).CombinedOutput()
+		if err != nil {
+			t.Fatalf("vscode canonical URI probe failed: %v: %s", err, strings.TrimSpace(string(output)))
+		}
+	})
+
+	t.Run("neovim-canonical-uri", func(t *testing.T) {
+		nvim, err := verifyLockedBinary(lock, "neovim")
+		if err != nil {
+			t.Fatalf("locked Neovim is unavailable: %v", err)
+		}
+		probe := filepath.Join(t.TempDir(), "canonical_uri_probe.lua")
+		const script = `
+local source_path = vim.env.OMNILSP_PROBE_RUN_LUA
+local file = assert(io.open(source_path, "r"))
+local source = file:read("*a")
+file:close()
+local begin = source:find("-- guard:canonical_uri begin", 1, true)
+local marker = "-- guard:canonical_uri end"
+local finish = source:find(marker, 1, true)
+assert(begin and finish and finish > begin, "canonical_uri guard block missing from run.lua")
+-- Slice through the end of the marker line so the chunk never ends on a
+-- partially captured token.
+local block = source:sub(begin, finish + #marker)
+local loader = loadstring or load
+local factory = assert(loader(block .. "\nreturn canonical_uri"))()
+local encoded = factory("file:///c%3A/Users/dev/w/fixture.go")
+local upper = factory("file:///C:/Users/dev/w/fixture.go")
+assert(encoded == "file:///c:/Users/dev/w/fixture.go", "encoded drive colon did not canonicalize: " .. tostring(encoded))
+assert(upper == "file:///c:/Users/dev/w/fixture.go", "uppercase drive letter did not canonicalize: " .. tostring(upper))
+assert(factory("untitled:Untitled-1") == "untitled:Untitled-1", "non-file URIs must pass through unchanged")
+`
+		if err := os.WriteFile(probe, []byte(script), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(nvim, "--headless", "-l", probe)
+		command.Env = mergeEnv(os.Environ(), map[string]string{
+			"OMNILSP_PROBE_RUN_LUA": filepath.Join(root, "test", "acceptance", "clients", "neovim", "run.lua"),
+		})
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("neovim canonical URI probe failed: %v: %s", err, strings.TrimSpace(string(output)))
+		}
+	})
+}
+
 func TestReadClientOutputCapsDiagnostics(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client-output.log")
 	payload := bytes.Repeat([]byte("x"), maxClientOutputBytes+1024)

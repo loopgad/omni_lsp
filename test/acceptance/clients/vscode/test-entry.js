@@ -19,6 +19,24 @@ function writeResult() {
   fs.writeFileSync(target, `${JSON.stringify(result, null, 2)}\n`);
 }
 
+/* guard:canonicalClientURI begin */
+// OmniLSP records omnilsp/explain evidence under its canonical document
+// identity (internal/workspace/uri: lowercase Windows drive letter, decoded
+// drive-colon escape). VS Code spells the same document as
+// "file:///c%3A/Users/…", so byte equality against the raw wire URI rejects
+// every evidence entry; compare against the canonical identity instead.
+function canonicalClientURI(uri) {
+  try {
+    let canonical = decodeURIComponent(uri);
+    const drive = canonical.match(/^(file:\/\/\/)([A-Za-z]):(.*)$/s);
+    if (drive) canonical = `${drive[1]}${drive[2].toLowerCase()}:${drive[3]}`;
+    return canonical;
+  } catch {
+    return uri;
+  }
+}
+/* guard:canonicalClientURI end */
+
 async function runStep(row, stage, action, timeoutMs = 60000) {
   row.stage = stage;
   result.stage = `${row.name}: ${stage}`;
@@ -60,7 +78,7 @@ function evidenceCursor(response, uri, method) {
     throw new Error(`omnilsp/explain returned no evidence array for ${method}`);
   }
   return new Set(response.evidence
-    .filter((item) => item.method === method && item.uri === uri)
+    .filter((item) => item.method === method && item.uri === canonicalClientURI(uri))
     .map((item) => item.at)
     .filter((at) => typeof at === "string" && at.length > 0));
 }
@@ -73,7 +91,7 @@ function assertMethodEvidence(response, uri, method, backendLanguage, previousEv
     throw new Error(`missing prior evidence cursor for ${method}`);
   }
   const entry = response.evidence.find((item) =>
-    item.method === method && item.uri === uri &&
+    item.method === method && item.uri === canonicalClientURI(uri) &&
     typeof item.at === "string" && item.at.length > 0 && !previousEvidenceAt.has(item.at)
   );
   if (!entry) throw new Error(`no fresh OmniLSP evidence recorded for ${method} on ${uri}`);
