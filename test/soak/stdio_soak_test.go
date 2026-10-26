@@ -233,6 +233,14 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 	var loopStart time.Time
 	var lastWrittenAt time.Time
 	var lastWrittenActive time.Duration
+	// Minute-cadence references: only "minute" rows advance them. Event rows
+	// (backend-restart) may land between a reindex end and a due minute row —
+	// the restart drain runs before the tick case — and must not become the
+	// next minute row's reference, or the row-to-row wall gap collapses to the
+	// inter-row scheduling slop and a healthy window is rejected
+	// (x9-1-status-10m-20261027T0400Z: wall=20.6ms against a 2m55s active gap).
+	var lastMinuteAt time.Time
+	var lastMinuteActive time.Duration
 	// Maintenance pauses are wall-clock intervals in which the main loop is
 	// intentionally inside a known, bounded block (periodic reindex or the
 	// candidate restart). They are recorded in the next minute row and
@@ -251,7 +259,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 			t.Fatal(message)
 		}
 		if row.Kind == "minute" {
-			referenceTime, referenceActive := lastWrittenAt, lastWrittenActive
+			referenceTime, referenceActive := lastMinuteAt, lastMinuteActive
 			if referenceTime.IsZero() {
 				referenceTime = loopStart.UTC()
 			}
@@ -268,6 +276,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				pendingMaintenancePause = 0
 				pendingMaintenanceKinds = nil
 			}
+			lastMinuteAt, lastMinuteActive = row.UTC, row.ActiveElapsed
 		}
 		if !lastWrittenAt.IsZero() && (row.UTC.Before(lastWrittenAt) || row.ActiveElapsed < lastWrittenActive) {
 			message := "telemetry UTC or active elapsed time moved backwards"
@@ -508,7 +517,32 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		pendingMaintenancePause += pause
 		pendingMaintenanceKinds = append(pendingMaintenanceKinds, kind)
 	}
+	// handleBackendRestart is shared by the priority drain below and the main
+	// select's restart case. It runs only on the main test goroutine, so
+	// t.Fatal stays legal.
+	handleBackendRestart := func(restartedBackend controlledBackendRestartResult) {
+		if err := recordBackendRestart(restartedBackend); err != nil {
+			stopWorkers()
+			soakFailed(&evidence, "soak/backend-restart", err.Error())
+			t.Fatalf("controlled rust-analyzer restart: %v", restartedBackend.err)
+		}
+	}
 	for monitor.activeDuration() < duration {
+		// Drain the completed backend restart with priority over the tick
+		// notification. The minute-row block couples a full-corpus reindex to
+		// every row (x9-1-status-10m-20261027T0303Z: 167s per reindex under
+		// the worker load), so with a uniform select the ready tick can win
+		// every cycle of a 10m run and the candidate restart trigger — which
+		// requires the backend restart to be recorded first — never starts
+		// (soak/restart not_verified). A pending restart result must not queue
+		// behind reindex-coupled tick work; draining it cannot delay a due
+		// minute row by more than the record itself.
+		select {
+		case restartedBackend := <-backendRestartPending:
+			backendRestartPending = nil
+			handleBackendRestart(restartedBackend)
+		default:
+		}
 		select {
 		case result := <-results:
 			if result.err != nil {
@@ -544,11 +578,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 			}
 		case restartedBackend := <-backendRestartPending:
 			backendRestartPending = nil
-			if err := recordBackendRestart(restartedBackend); err != nil {
-				stopWorkers()
-				soakFailed(&evidence, "soak/backend-restart", err.Error())
-				t.Fatalf("controlled rust-analyzer restart: %v", restartedBackend.err)
-			}
+			handleBackendRestart(restartedBackend)
 		case fatal := <-monitor.fatal:
 			stopWorkers()
 			if fatal.continuity {
@@ -622,7 +652,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 			heapSamples = append(heapSamples, float64(currentMem.HeapAlloc))
 			goroutineSamples = append(goroutineSamples, float64(runtime.NumGoroutine()))
 			if active-lastTelemetry >= time.Minute {
-				referenceTime := lastWrittenAt
+				referenceTime := lastMinuteAt
 				if referenceTime.IsZero() {
 					referenceTime = loopStart.UTC()
 				}
