@@ -1734,11 +1734,30 @@ func assertStdioOverlaySymbol(session *lspdriver.Session, docURI string) error {
 
 func cancelStdioReindex(session *lspdriver.Session, startAt time.Time, latencies *latencyCollector) error {
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer cancel()
-	id, _, err := session.RequestIDContext(ctx, "omnilsp/reindex", map[string]any{})
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("reindex request did not enter cancellation path: id=%d err=%v", id, err)
+	// Admission retry window: the probe requires the reindex to be admitted so
+	// it can cancel it, but the server legitimately rejects a reindex with the
+	// exact busy response while another rebuild holds the build lock
+	// (x9-1-status-10m-20261027T0447Z: one -32803 among ~1000 probes at active
+	// 33s, with no periodic reindex due and every prior probe's terminal
+	// response proving its handler had released the lock). Retry the exact
+	// busy rejection with the same classification as requestReindexWithRetry,
+	// bounded to the worker per-request timeout so a stuck holder fails the
+	// probe instead of starving the main loop past the minute-cadence budget.
+	admissionDeadline := time.Now().Add(30 * time.Second)
+	var id int64
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		var requestErr error
+		id, _, requestErr = session.RequestIDContext(ctx, "omnilsp/reindex", map[string]any{})
+		cancel()
+		if errors.Is(requestErr, context.DeadlineExceeded) || errors.Is(requestErr, context.Canceled) {
+			break
+		}
+		if isReindexAlreadyRunning(requestErr) && time.Now().Before(admissionDeadline) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		return fmt.Errorf("reindex request did not enter cancellation path: id=%d err=%v", id, requestErr)
 	}
 	// terminalCtx bounds only the terminal cancellation acknowledgment: the
 	// reindex request is canceled 1ms after issue, so this window never spans
