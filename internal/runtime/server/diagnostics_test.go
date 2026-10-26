@@ -25,6 +25,16 @@ type diagBackend struct {
 	last  atomic.Value
 }
 
+type unusedImportDiagBackend struct{ diagBackend }
+
+func (b *unusedImportDiagBackend) Diagnostics(context.Context, string, []byte) ([]languages.Diagnostic, error) {
+	return []languages.Diagnostic{{
+		StartLine: 0, StartChar: 0, EndLine: 0, EndChar: 12,
+		Severity: 1, Code: "unused-import", Source: "omnilsp-go",
+		Message: `"fmt" imported and not used`,
+	}}, nil
+}
+
 type cancelAwareDiagBackend struct {
 	mockBackend
 	started  chan struct{}
@@ -881,6 +891,59 @@ func TestI19_CodeActionInRangeOnly(t *testing.T) {
 	var empty []map[string]any
 	if err := json.Unmarshal(miss, &empty); err != nil || len(empty) != 0 {
 		t.Fatalf("out-of-range should yield empty actions, got %s", miss)
+	}
+}
+
+func TestI19_UnusedImportQuickfixRemovesLineContent(t *testing.T) {
+	const uri = "file:///w/main.go"
+	s := New(DefaultConfig())
+	s.RegisterBackend("go", &unusedImportDiagBackend{diagBackend: diagBackend{mockBackend: mockBackend{langID: "go", exts: []string{".go"}}}})
+	s.vfs.Open(uri, "go", 1, []byte("import \"fmt\"\n"), 0)
+	s.publishSnapshot()
+
+	resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(
+		jsonrpc.RequestID{Num: 6}, "textDocument/codeAction",
+		json.RawMessage(`{"textDocument":{"uri":"`+uri+`"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"context":{}}`)))
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("codeAction failed: %+v", resp)
+	}
+	var env struct {
+		Result json.RawMessage `json:"result"`
+	}
+	raw, _ := json.Marshal(resp)
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	var actions []map[string]any
+	if err := json.Unmarshal(env.Result, &actions); err != nil {
+		t.Fatalf("decode actions: %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("actions = %+v, want exactly one quickfix", actions)
+	}
+	action := actions[0]
+	if action["title"] != "Remove unused import" || action["kind"] != "quickfix" {
+		t.Fatalf("action identity = %+v", action)
+	}
+	edit, ok := action["edit"].(map[string]any)
+	if !ok {
+		t.Fatalf("action has no edit: %+v", action)
+	}
+	if edit["newText"] != "" {
+		t.Fatalf("quickfix newText = %v, want empty deletion", edit["newText"])
+	}
+	rng, ok := edit["range"].(map[string]any)
+	if !ok {
+		t.Fatalf("edit has no range: %+v", edit)
+	}
+	start, okStart := rng["start"].(map[string]any)
+	end, okEnd := rng["end"].(map[string]any)
+	if !okStart || !okEnd {
+		t.Fatalf("edit range shape = %+v", rng)
+	}
+	if start["line"] != float64(0) || start["character"] != float64(0) ||
+		end["line"] != float64(0) || end["character"] != float64(12) {
+		t.Fatalf("quickfix range = %v-%v, want 0:0-0:12 (whole import line)", start, end)
 	}
 }
 

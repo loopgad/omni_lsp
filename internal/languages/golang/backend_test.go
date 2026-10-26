@@ -266,6 +266,70 @@ func TestDiagnosticsCoverWholeGoIdentifiersInClientEncoding(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsUnusedImportCarriesWholeLineQuickfixRange(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		content  string
+		wantLine uint32
+		wantEnd  uint32
+		wantCode string
+	}{
+		{
+			name:     "single import declaration",
+			content:  "package main\n\nimport \"fmt\"\n\nfunc main() {}\n",
+			wantLine: 2,
+			wantEnd:  uint32(len(`import "fmt"`)),
+			wantCode: "unused-import",
+		},
+		{
+			name:     "grouped import spec",
+			content:  "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() { _ = os.Args }\n",
+			wantLine: 3,
+			wantEnd:  uint32(len("\t\"fmt\"")),
+			wantCode: "unused-import",
+		},
+		{
+			name:     "same-line declaration is not deleted",
+			content:  "package main\n\nimport \"fmt\"; func main() {}\n",
+			wantLine: 2,
+			wantCode: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBackend(t)
+			defer b.Close()
+			content := []byte(tc.content)
+			uri := writeGoFile(t, b, "unused.go", tc.content)
+			diags, err := b.DiagnosticsWithEncoding(context.Background(), uri, content, 1, 1)
+			if err != nil {
+				t.Fatalf("DiagnosticsWithEncoding: %v", err)
+			}
+			var found *languages.Diagnostic
+			for i := range diags {
+				if strings.Contains(diags[i].Message, "imported and not used") {
+					found = &diags[i]
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("no unused-import diagnostic in %+v", diags)
+			}
+			if found.Code != tc.wantCode {
+				t.Fatalf("Code = %q, want %q", found.Code, tc.wantCode)
+			}
+			if found.StartLine != tc.wantLine || found.EndLine != tc.wantLine {
+				t.Fatalf("line range = %d-%d, want %d", found.StartLine, found.EndLine, tc.wantLine)
+			}
+			if tc.wantCode == "" {
+				return
+			}
+			if found.StartChar != 0 || found.EndChar != tc.wantEnd {
+				t.Fatalf("character range = %d-%d, want 0-%d (full import line)", found.StartChar, found.EndChar, tc.wantEnd)
+			}
+		})
+	}
+}
+
 func editRangesOverlap(left, right languages.TextEdit) bool {
 	positionBefore := func(line, character, otherLine, otherCharacter uint32) bool {
 		return line < otherLine || (line == otherLine && character < otherCharacter)

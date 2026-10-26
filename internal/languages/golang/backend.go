@@ -1100,10 +1100,21 @@ func (b *Backend) DiagnosticsWithEncoding(ctx context.Context, uri string, conte
 		if e.Kind != packages.ParseError {
 			ec += diagnosticWidth(content, line, column, requestEncoding(encoding, true))
 		}
+		code := ""
+		if e.Kind != packages.ParseError && isUnusedImportMessage(e.Msg) {
+			if endChar, ok := unusedImportLineRange(content, idx, line); ok {
+				// The quickfix removes the whole line content; the diagnostic
+				// range must match or the edit would leave a bare `import`
+				// token for a single-import declaration. The line terminator
+				// stays, so applying it leaves a blank line.
+				code = "unused-import"
+				sc, ec, el = 0, endChar, sl
+			}
+		}
 		diags = append(diags, languages.Diagnostic{
 			StartLine: sl, StartChar: sc,
 			EndLine: el, EndChar: ec,
-			Severity: 1, Source: "omnilsp-go", Message: e.Msg,
+			Severity: 1, Source: "omnilsp-go", Message: e.Msg, Code: code,
 		})
 	}
 	return diags, nil
@@ -1206,6 +1217,61 @@ func compilerPositionAtEOF(content []byte, line, column int) bool {
 		lineStart += next + 1
 	}
 	return lineStart+column-1 == len(content)
+}
+
+func isUnusedImportMessage(message string) bool {
+	return strings.Contains(message, "imported and not used")
+}
+
+// unusedImportLineRange returns the character end of the full line carrying
+// the unused import, but only when removing that line's content is provably
+// safe. A
+// single import declaration and a grouped import spec are isolated on their
+// line; a line that also carries a declaration separator or a block delimiter
+// is refused, so the quickfix falls back to explanation-only instead of
+// deleting code.
+func unusedImportLineRange(content []byte, idx *position.Index, line int) (uint32, bool) {
+	if line < 1 {
+		return 0, false
+	}
+	start := 0
+	for current := 1; current < line; current++ {
+		next := bytes.IndexByte(content[start:], '\n')
+		if next < 0 {
+			return 0, false
+		}
+		start += next + 1
+	}
+	end := len(content)
+	if next := bytes.IndexByte(content[start:], '\n'); next >= 0 {
+		end = start + next
+	}
+	if end > start && content[end-1] == '\r' {
+		end--
+	}
+	if !safeImportRemovalLine(strings.TrimSpace(string(content[start:end]))) {
+		return 0, false
+	}
+	pos, err := idx.OffsetToPosition(content, uint32(end))
+	if err != nil {
+		return 0, false
+	}
+	return pos.Col, true
+}
+
+func safeImportRemovalLine(line string) bool {
+	if line == "" || strings.ContainsAny(line, ";{}") {
+		return false
+	}
+	if comment := strings.Index(line, "//"); comment >= 0 {
+		line = strings.TrimSpace(line[:comment])
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return false
+	}
+	last := fields[len(fields)-1]
+	return strings.HasPrefix(last, "\"") || strings.HasPrefix(last, "`")
 }
 
 func diagnosticPosition(content []byte, idx *position.Index, line, column int) (uint32, uint32, bool) {
