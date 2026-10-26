@@ -2675,6 +2675,27 @@ function Invoke-Soak([string] $Duration, [string] $RunIdForSoak) {
     $soakJsonl = Join-Path $EvidenceDirectory "soak-$Duration.jsonl"
     $soakReport = Join-Path $EvidenceDirectory "soak-$Duration-report.json"
     Remove-Item -LiteralPath $soakJsonl, $soakReport -Force -ErrorAction SilentlyContinue
+    # X9-1 diagnostic opt-in: a status phase trace for the whole soak. The
+    # eight-worker workload drives roughly 5,000 status requests/second, so
+    # the server's default 16k cap fills in seconds; the sample interval and
+    # cap scale with the stage length below. The trace is evidence, not a gate
+    # input, and is only required when explicitly requested.
+    $phaseTraceRequested = $env:OMNILSP_SOAK_PHASE_TRACE -eq '1'
+    $phaseTracePath = Join-Path $EvidenceDirectory "status-phase-trace-$Duration.json"
+    if ($phaseTraceRequested) {
+        Remove-Item -LiteralPath $phaseTracePath -Force -ErrorAction SilentlyContinue
+        $env:OMNILSP_S18_COMPLETION_PHASE_TRACE = $phaseTracePath
+        # The 8-worker workload drives ~5,000 status requests/second
+        # (2026-10-26 local run: 15,308 sampled at every=8 in ~25s), so a
+        # fixed every=8 covers only the first minute of a 1h stage. Scale the
+        # sample interval and cap by duration; the trace is diagnostic.
+        if (-not $env:OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT) {
+            $env:OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT = if ($Duration -eq '1h') { '131072' } elseif ($Duration -eq '10m') { '65536' } else { '32768' }
+        }
+        if (-not $env:OMNILSP_S18_COMPLETION_PHASE_TRACE_STATUS_EVERY) {
+            $env:OMNILSP_S18_COMPLETION_PHASE_TRACE_STATUS_EVERY = if ($Duration -eq '1h') { '512' } elseif ($Duration -eq '10m') { '128' } else { '8' }
+        }
+    }
     $stageStarted = (Get-Date).ToUniversalTime()
     $env:SOAK_DURATION = $Duration
     $env:SOAK_JSONL = $soakJsonl
@@ -2692,7 +2713,16 @@ function Invoke-Soak([string] $Duration, [string] $RunIdForSoak) {
     # value. From 2026-10-25 on, 300s is the standard harness budget.
     $env:OMNILSP_SOAK_REQUEST_BUDGET = '300s'
     $result = Invoke-Step "soak-$Duration" $testExe @('-test.run=^TestSoak_RealStdioMixedWorkload$', '-test.count=1', '-test.timeout=90m')
-    Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID, Env:OMNILSP_SOAK_GATE, Env:OMNILSP_SOAK_REQUEST_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID, Env:OMNILSP_SOAK_GATE, Env:OMNILSP_SOAK_REQUEST_BUDGET, Env:OMNILSP_S18_COMPLETION_PHASE_TRACE, Env:OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT, Env:OMNILSP_S18_COMPLETION_PHASE_TRACE_STATUS_EVERY -ErrorAction SilentlyContinue
+    if ($phaseTraceRequested) {
+        $traceInfo = Get-Item -LiteralPath $phaseTracePath -ErrorAction SilentlyContinue
+        $traceWritten = $null -ne $traceInfo -and $traceInfo.Length -gt 0
+        if (-not $traceWritten -and $result.status -eq 'passed') {
+            throw "Phase trace was requested but was not written or is empty: $phaseTracePath"
+        }
+        if ($traceWritten) { Write-Output "Phase trace: $phaseTracePath ($($traceInfo.Length) bytes)" }
+        else { Write-Output "Phase trace requested but missing/empty for the failed soak: $phaseTracePath" }
+    }
     $hashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash.ToLowerInvariant()
     if ($hashBefore -ne $hashAfter) { throw 'Candidate binary hash changed during soak.' }
     $testHashAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $testExe).Hash.ToLowerInvariant()
