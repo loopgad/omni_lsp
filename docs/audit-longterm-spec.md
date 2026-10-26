@@ -31,16 +31,22 @@
   ed5226f（2026-10-25 16:17，X5-7 PARTIAL→AUTO）之前的旧值，其余域与
   verify 输出逐位一致。
 - **剩余台账分类**：
-  - **待拍板（5）**：§7.2 fast 模式探针执行；§7.3 soak 默认门禁（决策包
-    §1.3 建议的 form-only 测试移出 tag 未执行——resource_trend_test.go:1
-    实测仍 `//go:build soak`）；§7.4 Semantic Core 定义层面确认（ci.yml:30
-    补 internal/index 归门禁侧）；§7.5 批量帧语义（现状已钉住待拍板）；
-    §7.6 2s 墙钟阈值（现位于 test/perf/perf_test.go:487，阈值实测仍在）。
+  - **已拍板并落地（5，2026-10-25 终局裁决；2026-10-26 工程落地）**：
+    §7.2 fast 探针执行——`FastProbeReport` 真跑 AUTO 探针，
+    `TestConformanceNoRegression` 已切换并实测 124.57s PASS（2026-10-26
+    复验；首次落地轮 128.59s）；§7.3 form-only
+    移出 tag——纯函数移入 `test/soak/resource_trend.go`，4 项 form-only
+    测试在无 tag 套件实跑；§7.4 Semantic Core 进 ci.yml——`internal/index/...`
+    已加入 `go list -deps` 依赖方向门，实跑 CLEAN；§7.5 批量帧语义——
+    5da1c6d 实现元素隔离；§7.6 2s 墙钟——改为 2× 同轮实测 800-ref 请求
+    （2026-10-26 复验 933.14µs），不再使用裸常量。详见文末
+    「2026-10-26 补缺验证」。
   - **PARTIAL 收口台账（7）**：X5-4（graph 死码删除后 probe-less，恒 0.5，
     待 X10 接线方有回 AUTO 通道）、WS-D14、Y2-5、DEF-EDITORS、DEF-IDXWIRE、
-    X8-2（客户端矩阵 not_verified 半边）、X9-1（1h 连续档证据仍缺席——
-    registry X9-1 Reason 记 gate-20261025T1404Z-soak 红于 586.42s 连续性
-    守卫，见 §5.4 注记）。
+    X8-2（客户端矩阵 not_verified 半边）、X9-1（1h 连续档证据仍缺席；
+    gate-20261025T1404Z-soak 红于 586.42s 监控器饥饿，监控器已独立
+    goroutine 化；后续 10m 诊断红于冷启动首行断层，loopStart + 有界维护窗
+    修复已落地、尚无绿色 10m/1h 复跑）。
   - **GATE（2）**：Y1-10（soak 长跑闸门）、X8-1（multiplatform 发布门禁）。
   - **DEFERRED（27）**：结构性缓期、probe-less 不计分（含 DEF-S21CORPUS
     的机器依赖候选证据）。
@@ -753,3 +759,160 @@ D 结构性）标注；凡属语义变更的落地轮须遵守「语义变更先
   避免重复劳动（5 个后端的编译期符合性、`wrap` 的调用点）。
 - **只读代码的子代理结论一律 `[推断]`。** 本会话三路审计累计约 15 处需要
   修正（不存在的文件、不存在的包、不存在的符号、错误前提）。
+
+---
+
+## 2026-10-26 补缺验证
+
+本节是「终审状态」中五项已拍板裁决的工程落地与复验记录，同时登记本轮
+附带修复的两处真实缺口（codeAction 可达性、soak 监控器测试的同步性）。
+口径：每条结论附本轮实跑命令与输出摘要；未取得绿色证据的项目在第 4 小节
+单列边界，不以推断替代实测。
+
+### 1. 裁决落地
+
+| 裁决 | 实现落点 | 本轮验证 | 实测结果 |
+|---|---|---|---|
+| §7.2 fast 档执行 AUTO 探针 | internal/conformance/report.go 新增 `FastProbeReport`（AUTO 真跑、GATE 保留存在性 0.5、全局 30m 预算）；probe.go 的 `runTestsBatch` 仅在 full 档加 `-race`；cmd/omnilsp/verify.go 新增 `--probe`；Makefile 新增 `verify-probe`；test/conformance/conformance_test.go 改用 `FastProbeReport` | `go test -count=1 -timeout 900s -run '^(TestGenerateDocs\|TestConformanceNoRegression)$' ./test/conformance/`；`go run ./cmd/omnilsp verify --probe --json` | PASS 124.57s（真跑探针）；exit 0，mode=fast-probe，coreScore=98.45959595959597，124 checks |
+| §7.3 form-only 移出 build tag | test/soak/resource_trend.go（纯函数、无 tag）；resource_trend_test.go 删除 tag | `go test -count=1 ./test/soak/` | 4 tests PASS（0.040s） |
+| §7.4 Semantic Core 进 ci.yml | .github/workflows/ci.yml 的依赖方向门加入 `./internal/index/...` | 本地执行同一条 `go list -deps ... \| grep -E ...` | DEP_CLEAN（无命中） |
+| §7.5 批量帧元素隔离 | 已在 HEAD 5da1c6d：元素逐个应答，坏元素不拖垮整帧 | `go test -count=1 -run 'Batch' ./internal/protocol/... ./internal/transport/...` | jsonrpc PASS 0.092s；transport PASS 0.509s |
+| §7.6 2s 墙钟改预算派生 | test/perf/perf_test.go：取消预算 = 2× 同轮 800-ref 实测单请求耗时 | `go test -count=1 -timeout 900s -run '^TestS19_ReferencesScalingCurve$' ./test/perf/` | PASS；本轮 371.46µs@200、933.14µs@800、2.95933ms@3200 |
+
+- §7.2 的得分语义：AUTO 探针失败在 fast-probe 档记 0
+  （`TestFastProbeModeRequiresExecutedAutoProbe` 钉住），GATE 条目仅保留
+  0.5 存在性分；full 档仍是唯一执行 GATE 命令并给满分的模式。本轮
+  fast-probe 与 fast 的 coreScore 相同（98.4596），因为当前 88 条 AUTO 的
+  探针全绿；分数不变不代表探针没跑，124.57s 的运行时长与 `mode` 字段即
+  执行证据。
+- §7.3 的阈值未变：10 个一分钟窗、512 MiB 私有内存增长、1,024 句柄增长；
+  Theil-Sen 斜率逻辑保持。
+- §7.5 的测试名：`TestReadFrameClassifiesBatchElements`、
+  `TestReadFrameEmptyBatchIsSilent`、`TestBatchElementReplyMarshaledShape`、
+  `TestBatchElementsAnsweredIndividually`、
+  `TestTCPBatchElementsAnsweredIndividually`。
+- §7.6 本轮 800-ref 单请求 933.14µs，取消预算即 1.86628ms；预算与测量在
+  同一测试运行内配对，不跨轮复用数值。
+
+### 2. codeAction 差距清单（裁决 7）
+
+裁决标准：服务端原生发出的每一类诊断，凡修复可机械推导者必须配真实
+quickfix。本轮按此标准清点，并先修复了一个可达性缺陷。
+
+**可达性缺陷（本轮已修）**：internal/runtime/server/codeaction.go:96 早就
+有 `unused-import`/`imported-and-not-used` 分支，但 golang 后端此前从不写
+`Diagnostic.Code`，该分支在生产中不可达——即「有 quickfix 实现、没有诊断
+能进来」。本轮在 internal/languages/golang/backend.go:1109 为 unused-import
+写入 `Code: "unused-import"`，并仅当整行内容可安全删除时把范围扩到整行
+（`unusedImportLineRange`；含 `;{}` 或非 import 内容时拒绝扩行，保留编译器
+范围且不写 code，回退为 explanation-only）。换行符保留，应用后该行成为
+空行。验证：
+`TestDiagnosticsUnusedImportCarriesWholeLineQuickfixRange`（单行 import、
+分组 import、同行不安全三子测试）与
+`TestI19_UnusedImportQuickfixRemovesLineContent` 均 PASS。
+
+**现状清单**：
+
+| 诊断来源 | 机械修复 | 当前 codeAction |
+|---|---|---|
+| Go unused import（server 原生分类） | 整行内容删除（保留换行，留空行；仅在证明安全时给范围） | 真实 quickfix |
+| Go 解析/类型错误（go/packages 透传） | 未证明可机械推导 | explanation-only |
+| ccls / rust-analyzer / pyright / TypeScript 诊断 | 后端各自可能有 fix，但 server 不转发 backend codeAction | explanation-only（携带 source/code 数据） |
+
+`handleCodeAction` 只读 server 诊断缓存并对 `Diagnostic.Code` 做白名单匹配，
+不调用任何后端的 `textDocument/codeAction`。因此即使嵌套后端自带修复建议，
+当前也不会出现在响应里。未实现的机械修复候选（缺 import、未使用变量等）
+在语法层无法证明安全，维持 explanation-only，避免假一键修复。
+
+### 3. soak 连续性与 X9-1 插桩
+
+- harness 缺口：周期 reindex 与受控候选重启会在主循环内阻塞超过一分钟
+  遥测窗口，旧逻辑会把它误判为窗口断层/进度停滞。本轮新增 maintenance
+  窗口：JSONL 行记录 `maintenance_pause`/`maintenance_kind`；墙钟与 active
+  断层谓词共享 `minuteWindowGapContinuous`，在扣除已登记的维护暂停后仍须
+  ≤ `time.Minute + 2*soakPollPeriod`（70s），且维护暂停不得超过任一原始
+  间隔；预算按来源派生（reindex = 请求预算 + 2×poll；候选重启 =
+  max(请求预算, 90s 冷启动) + 10s 快照打开 + 30s 重开 + 5s 生命周期
+  + 2×poll；默认请求预算 30s 时为 145s，acceptance 设 300s 时为 355s）。
+  监控器在 maintenance>0 期间重置进度基线，避免把已知阻塞记成
+  query-progress。
+- X9-1 诊断：phase trace schema 升到 v4，新增 `status_sample_every`；
+  `OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT`（默认 16384）与
+  `..._STATUS_EVERY`（默认 1）可调；acceptance.ps1 仅在显式
+  `OMNILSP_SOAK_PHASE_TRACE=1` 时启用，默认 limit=32768、every=8，soak
+  通过但 trace 未写/为空时抛错（失败关闭），soak 失败则只告警不覆盖失败。
+  trace 是诊断证据，不是门禁输入。
+- 测试：6 个监控器测试 + `TestSoakMaintenanceBudgetsAreDerived` +
+  `TestSoak_RequestBudgetDefaultIs30s` 全 PASS；`-count=100` 复跑 6 个
+  监控器测试全绿。修复了两处测试自身的时序缺陷：原 progressing-workload
+  测试使用 64 缓冲 tick，生产者可先灌满队列并把 completed 推到终值，监控
+  正确看到「冻结计数」而报红（本轮 `-count=20` 复现 3 次）；改为无缓冲
+  逐拍交付后 `-count=100` 全绿。维护窗测试同样改为无缓冲，并显式接住
+  fatal，使「抑制缺失」会在维护窗内立即暴露，而不是靠之后才发生的停滞
+  把测试喂绿。
+- 敏感性：把监控器的进度更新条件变异为 `false` → progressing-workload
+  测试红（冻结 2m5s）；把 maintenance 分支变异为 `false` → 维护窗测试在
+  维护期内即红并报 query-progress（continuity_monitor_test.go:225）。两处
+  均恢复后复跑绿。
+
+### 4. 未闭合边界（本轮不做假绿）
+
+- 30s 真实 stdio soak 冒烟未通过前置条件：本机 `go1.27.1` ≠
+  tools.lock 的 `go1.26.1`，`rust-analyzer 1.99.0` ≠ `1.97.0`；测试在
+  0.49s 内失败关闭，decision=not_verified，未启动候选、未产生 telemetry
+  或 phase trace。证据：out/soak-verify/{soak.log, soak-report.json,
+  omnilsp.exe, soak.test.exe}。没有 10m/1h 绿色证据，X9-1 维持 PARTIAL
+  （registry Milestone x9）。
+- 恢复路径只有两条：把工具链恢复到锁定版本，或按锁重建流程正式换锁；
+  本轮不绕过测试内的 pin 检查。
+- 本轮未重跑完整 `go test ./...`（90m 档）与全包 `-race`；已跑的是
+  定向包测试、真实探针 conformance 与 fast/probe verify。该边界如实登记。
+
+### 5. 本轮门禁汇总
+
+- `gofmt -l internal cmd test`（Makefile 同口径，过滤 evidence 夹具）→
+  无输出。
+- `go build ./...` → 通过。
+- `go vet ./...` → VET_ALL_OK（exit 0）。
+- 定向测试 → 见 §1/§3，全 PASS。
+- `TestGenerateDocs` → PASS（docs/conformance.md 与 registry 同步）。
+- `TestConformanceNoRegression` → PASS 124.57s（真跑 AUTO 探针）。
+- `verify --probe` → exit 0，coreScore 98.45959595959597；`verify --min 90`
+  → exit 0，同分。
+- 依赖方向本机复跑 → DEP_CLEAN。
+- 工作树未提交（本轮无提交授权）；改动范围见 `git status`。
+
+### 6. 本机工具链重锁与重启探针预算（2026-10-26 续）
+
+用户裁决：以本机环境为标准，环境可更新。据此重建验收锁，不再要求安装
+旧版工具。
+
+- 锁更新：`observed` 改为 go1.27.1、rust-analyzer
+  1.99.0 (b940084d 2026-09-28)、rustc 1.99.0 (b940084d7 2026-09-28)、
+  cargo 1.99.0 (5f94df478 2026-08-27)、VS Code 1.143.1、npm 11.9.0；
+  `resolvedBinaries` 的 go / rust-analyzer / rustc / cargo /
+  rust-analyzer-proc-macro-srv / vscode / npm 路径或 SHA-256 按本机文件复算。
+  全表复算：30 项中 0 处 SHA 失配，10 项本就缺失（7 个 Sublime 工件 +
+  Neovim/Helix/Emacs），按既有策略维持 `not_verified`。
+- 语义 helper 仍为 1.97.0（独立产物，锁内 provenance 未变）；
+  `TestRustAnalyzerLockedSCIPDifferential` 在本机 1.99.0
+  rustc/cargo/rust-analyzer + 1.97.0 helper 组合下实跑 PASS（12.25s），
+  说明“live RA 与 helper 分离”的锁口径可用。
+- 30s 预检暴露 harness 的固定预算：重启后稳定性探针原为固定 3s，替换
+  rust-analyzer 在八个 worker 负载下重索引时超时。改为
+  `soakRustStabilityProbeBudget()` = `stdioRequestBudget()`（默认 30s；
+  acceptance 设 300s），并在探针后重新采样进程身份，防止长等待掩盖重启；
+  新增 `TestSoakRustStabilityProbeBudgetIsRequestBudget` 钉住派生关系。
+- 诊断 30s A（固定 3s，`out/soak-local/local-20261026T0855Z`）在
+  replacement rust-analyzer 稳定性窗口红；诊断 30s B（派生预算，
+  `out/soak-local/local-20261026T0907Z`）的 backend-restart、candidate
+  restart、continuity、duration、coverage 等功能检查全部绿，唯因运行期间
+  编辑了 worker 源文件触发 `soak/worker-identity`（initial≠final）——
+  这是身份守卫按设计工作，不是产品失败。正式链使用冻结源重跑。
+- phase trace 采样率实测：30s 诊断运行的首个候选在约 25s 内记录了 15,308
+  条 status 样本（`STATUS_EVERY=8`），反推约 4.9k status/s；此前文档按
+  “~32/s、16k 覆盖 8.5 分钟”估算，严重低估。acceptance 默认改为按档位：
+  30s `32768/8`、10m `65536/128`、1h `131072/512`；1h 约 10 samples/s，
+  不会在一分钟后即截断。
+- 30s 预检与更长档的实测结果见 docs/acceptance.md 的对应证据记录；本节
+  不预写结果。

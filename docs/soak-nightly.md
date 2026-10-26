@@ -74,9 +74,11 @@ The per-request stdio budget is harness plumbing, not a §S16 value. Every
 `OMNILSP_SOAK_REQUEST_BUDGET` accepts a positive Go duration to widen that
 wait for a diagnostic run; `scripts/acceptance.ps1` sets `300s` for its own
 soak stages and cleans the variable afterwards. Since 2026-10-25 `300s` is
-the standard harness budget: `90s` was proven insufficient for the pinned
-rust-analyzer 1.97.0 cold start by the gate-20261025T0716Z diagnosis
-(initial-queries passed only at 300s there). A malformed
+the standard harness budget: `90s` was proven insufficient for the locked
+rust-analyzer cold start by the gate-20261025T0716Z diagnosis
+(initial-queries passed only at 300s there; the live pin was rust-analyzer
+1.97.0 at that time and moved to the host's 1.99.0 in the 2026-10-26 tool
+re-lock). A malformed
 or non-positive value falls back to the 30s default with a stderr warning —
 it never silently mimics a widened run. The budget only bounds how long one
 request may take before the harness gives up; recorded latencies are the real
@@ -104,3 +106,50 @@ The real stdio gate also retains the post-GC growth bounds from the accelerated
 soak: at most 50 additional Go goroutines and less than 256 MiB additional
 heap. `TestSoak_SustainedMixedLoadBounded` remains available as a short
 in-process test; it is not a substitute for the real stdio process-tree gate.
+
+## X9-1 status phase trace and maintenance pauses
+
+The candidate can record a per-request phase trace for `omnilsp/status`
+alongside completions. Set `OMNILSP_S18_COMPLETION_PHASE_TRACE` to a file path
+to enable it. Each sample carries scheduler queue wait, dispatcher time,
+response-write time, and the server round trip; schema version 4 adds
+`status_sample_every` to the report. Two sampling controls keep a one-hour run
+inside a bounded file:
+
+- `OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT` bounds the sample buffer (default
+  16384). Once full, the report is marked `samples_truncated`.
+- `OMNILSP_S18_COMPLETION_PHASE_TRACE_STATUS_EVERY` records every Nth status
+  request (default 1, i.e. all). The eight-worker workload drives roughly
+  5,000 status requests/second (2026-10-26 local run: 15,308 samples at
+  every=8 in about 25 seconds), so every=8 fills a 32k cap in about a minute.
+  Scale the interval with the stage length. Invalid or non-positive values
+  fall back to the defaults with a stderr warning.
+
+`scripts/acceptance.ps1` exposes the trace as an explicit opt-in:
+`OMNILSP_SOAK_PHASE_TRACE=1` makes each soak stage write
+`status-phase-trace-<Duration>.json` in its evidence directory. Unless the
+caller overrides them, the 30s stage uses `LIMIT=32768`/`STATUS_EVERY=8`, the
+10m stage `65536`/`128`, and the 1h stage `131072`/`512`; the 1h settings keep
+about 10 samples/second for the full hour instead of truncating after the
+first minute. A
+requested trace that is missing or empty fails the stage when the soak itself
+passed; on a failed soak it is reported but not treated as a second failure.
+The trace is diagnostic evidence, not a gate input.
+
+The five-second continuity monitor runs on its own goroutine. Periodic reindex
+and the candidate restart are recorded as bounded maintenance pauses: the
+monitor suspends the query-progress stall check and resets its baseline during
+the block, and the next minute row records `maintenance_pause` and
+`maintenance_kind`. The minute-continuity predicate subtracts that recorded,
+budget-derived pause before applying the unexplained-stall ceiling. A pause
+larger than the interval, a negative pause, an unknown kind, or a pause beyond
+its derived budget (reindex: request budget; restart: rust cold-start
+allowance plus the phase's explicit waits) fails the run instead of being
+silently accepted.
+
+The post-restart stability hover uses the same per-request stdio budget as
+every other request (30s default, `OMNILSP_SOAK_REQUEST_BUDGET` when set)
+rather than a fixed 3s; a replacement that is re-indexing under the eight
+worker load can legitimately take longer than three seconds to answer. After
+the probe the harness re-samples process identity, so a longer wait cannot
+hide a backend restart or a lost replacement PID.

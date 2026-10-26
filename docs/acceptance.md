@@ -24,6 +24,15 @@ therefore remains blocked; installation or a successful subset is not a pass.
 versions plus selected executable paths and SHA-256 values. Fast verifies every
 resolved file identity before freezing a release candidate; missing files stay
 `not_verified` and changed hashes fail the tool lock.
+
+On 2026-10-26 the lock was rebuilt against this host: `go1.27.1`,
+`rust-analyzer 1.99.0 (b940084d 2026-09-28)`, `rustc/cargo 1.99.0`,
+VS Code `1.143.1`, and npm `11.9.0`; the resolved SHA-256 values for those
+entries were recomputed from the local files. The same-source Rust semantic
+helper remains `1.97.0+omnilsp-semantic…` and is pinned independently; the
+locked Rust SCIP differential passes with the host's 1.99.0 live toolchain.
+Ten editor/tool entries (seven Sublime artifacts, Neovim, Helix, Emacs) are
+absent on this host and remain `not_verified` under the existing policy.
 `test/acceptance/tools/package-lock.json` pins and checksums the project-local
 Pyright, TypeScript language server, and TypeScript dependency tree. VS Code
 language client dependencies are separately pinned in
@@ -780,3 +789,100 @@ offset debt on file in `freeze-record.txt`):
   包，包级 `go test -count=1` 无对象，如实登记为不适用）；
   `git add docs/audit-longterm-spec.md docs/acceptance.md && git commit
   -m "docs: record the nine closing rulings with derivations"`。
+
+## Evidence record — 2026-10-26 第十七轮（五项裁决工程落地 + codeAction 可达性修复）
+
+- 性质：本轮为工程落地与复验轮（第十七轮）。第十六轮只落档九项裁决；本轮
+  把其中五项工程项真正落地并逐项实跑验证，同时修复 codeAction 的可达性
+  缺陷与两处 soak 监控器测试的时序缺陷。详细推导、差距清单与逐条输出见
+  docs/audit-longterm-spec.md「2026-10-26 补缺验证」。
+- 本轮改动（按面积）：
+  - 合规闸：internal/conformance/report.go 新增 `FastProbeReport` /
+    `probeReport` / `executeAutoProbes`（AUTO 探针真跑、GATE 仅保留
+    存在性 0.5、全局 30m 预算）；probe.go 的 `runTestsBatch` 按 race 参数
+    决定 `-race`；cmd/omnilsp/verify.go 新增 `--probe`；Makefile 新增
+    `verify-probe`；test/conformance/conformance_test.go 切到真实探针模式；
+    internal/conformance/engine_test.go 新增
+    `TestFastProbeModeRequiresExecutedAutoProbe`（失败的 AUTO 在 fast-probe
+    记 0、GATE 0.5；full 档 GATE 0）。
+  - form-only 常跑：test/soak/resource_trend.go 无 build tag；
+    resource_trend_test.go 去 tag；4 项阈值/斜率测试进入普通套件。
+  - CI 依赖方向：ci.yml 的 `go list -deps` 加入 `./internal/index/...`。
+  - perf 阈值：test/perf/perf_test.go 的取消预算改为 2× 同轮 800-ref
+    实测值，删除裸 2s 常量。
+  - codeAction 可达性：golang backend 为 unused-import 写入
+    `Code: "unused-import"`，仅在证明安全时把范围扩到整行内容（换行保留，
+    应用后留空行）；新增 backend 三子测试（单行/分组/同行不安全）与
+    server §I19 集成测试。
+  - soak harness：`maintenance_pause`/`maintenance_kind` 遥测字段、
+    `minuteWindowGapContinuous` 共享谓词、按来源派生的维护预算、监控器
+    维护窗抑制；phase trace schema v4（limit/status-every 环境变量、
+    `status_sample_every`）；acceptance.ps1 的
+    `OMNILSP_SOAK_PHASE_TRACE=1` 显式 opt-in 与失败关闭证据检查。
+- 验收证据（本轮实跑）：
+  - `go test -count=1 ./test/soak/` → 4 form-only tests PASS。
+  - `go test -tags soak -count=1 -run '^(TestSoakContinuityMonitor.*|
+    TestSoakMaintenanceBudgetsAreDerived|TestSoak_RequestBudgetDefaultIs30s)$'
+    ./test/soak/` → 8 tests PASS；监控器 6 项另以 `-count=100` 复跑全绿。
+  - `go test -count=1 -run 'Batch' ./internal/protocol/... ./internal/transport/...`
+    → jsonrpc 0.092s、transport 0.509s PASS。
+  - `go test -count=1 -timeout 900s -run '^TestS19_ReferencesScalingCurve$'
+    ./test/perf/` → PASS；371.46µs@200、933.14µs@800、2.95933ms@3200。
+  - `TestDiagnosticsUnusedImportCarriesWholeLineQuickfixRange`、
+    `TestI19_UnusedImportQuickfixRemovesLineContent`、
+    `TestCompletionPhaseTrace*`、conformance shape tests → PASS。
+  - `go test -count=1 -timeout 900s ./test/conformance/`（`TestGenerateDocs`
+    + `TestConformanceNoRegression`）→ PASS，124.57s（真跑 AUTO 探针）。
+  - `go run ./cmd/omnilsp verify --probe --json` → exit 0，mode=fast-probe，
+    coreScore=98.45959595959597，124 checks；`verify --min 90` → exit 0，
+    同分。
+  - `go build ./...`、`go vet ./...` → 通过（VET_ALL_OK）；依赖方向本机
+    复跑 DEP_CLEAN；gofmt 按 Makefile 口径无输出。
+- 未闭合边界：
+  - 30s 真实 stdio soak 冒烟在 0.49s 因工具 pin 漂移失败关闭：
+    `go1.27.1`≠`1.26.1`、`rust-analyzer 1.99.0`≠`1.97.0`；
+    decision=not_verified，未启动候选、无 telemetry/phase trace。证据
+    out/soak-verify/{soak.log, soak-report.json, omnilsp.exe, soak.test.exe}。
+  - 无 10m/1h 绿色证据；X9-1 维持 PARTIAL（registry Milestone x9），本轮
+    不写任何升级依据。恢复需还原锁定工具链或按流程换锁，禁止绕过 pin。
+  - 未重跑完整 `go test ./...`（90m 档）与全包 `-race`；本轮证据只覆盖
+    定向包、真实探针 conformance 与 fast/probe verify。
+- 提交：本轮未提交（无提交授权）；工作树改动保留待审。
+
+## Evidence record — 2026-10-26 本机工具链重锁与 soak 正式链
+
+- 性质：按用户裁决「以本机环境为标准，环境可以更新」，把验收工具锁从
+  go1.26.1 / rust-analyzer 1.97.0 重建为本机版本，并恢复真实 stdio soak。
+  本轮不修改 §S16 契约；工具锁只跟随本机，语义 helper 仍是独立钉版的
+  1.97.0 产物。
+- 工具锁运行记录（全部本轮实跑）：
+  - `observed`：go1.27.1；rust-analyzer 1.99.0 (b940084d 2026-09-28)；
+    rustc 1.99.0 (b940084d7 2026-09-28)；cargo 1.99.0 (5f94df478
+    2026-08-27)；VS Code 1.143.1；npm 11.9.0。
+  - `resolvedBinaries`：go / rust-analyzer / rustc / cargo /
+    rust-analyzer-proc-macro-srv / vscode / npm 按本机文件复算路径与
+    SHA-256；全表 30 项复算 0 处失配，10 项（7 个 Sublime 工件 +
+    Neovim/Helix/Emacs）缺失，按既有策略维持 `not_verified`。
+  - `TestRustAnalyzerLockedSCIPDifferential`：本机 1.99.0
+    rustc/cargo/rust-analyzer + 1.97.0 helper 组合实跑 PASS（12.25s），
+    证明 live RA 与语义 helper 分离的锁口径可用。
+- harness 预算修正：重启后的稳定性 hover 原为固定 3s；本机 8 worker
+  负载下替换 rust-analyzer 重索引时会超时。改为
+  `soakRustStabilityProbeBudget()` = `stdioRequestBudget()`（默认 30s；
+  acceptance 300s），探针后重新采样进程身份；
+  `TestSoakRustStabilityProbeBudgetIsRequestBudget` 钉住派生关系。
+- 诊断运行 A（`out/soak-local/local-20261026T0855Z`，30s，固定 3s）：
+  552.41s 后在 replacement rust-analyzer 稳定性窗口失败（hover 3s 超时）；
+  其余工具、初始化、取消、reindex、语义负载检查通过。
+- 诊断运行 B（`out/soak-local/local-20261026T0907Z`，30s，派生预算）：
+  941.40s；backend-restart、candidate restart、continuity、duration、
+  coverage 等功能检查全部通过；唯一失败是 `soak/worker-identity`——
+  运行期间编辑了 worker 源文件，initial=faac4d9d… 与 final=fb7208c9…
+  不同。该失败是测试的身份守卫在工作，不是产品失败。
+- 采样率实测：运行 B 首个候选约 25s 内记录 15,308 条 status 样本
+  （`STATUS_EVERY=8`），反推约 4.9k status/s；acceptance 的 trace 默认已
+  按档位改为 30s `32768/8`、10m `65536/128`、1h `131072/512`。
+- 正式链 C（`out/soak-local/local-20261026T0925Z`）：同一冻结候选
+  （sha256 `c66fa11e…`）与 soak 测试（sha256 `3ebcee73…`），30s/10m/1h
+  顺序执行。`test/acceptance/evidence` 子目录创建被 ACL 拒绝，故本地证据
+  目录为 `out/soak-local/`；正式链结果待报告落盘后补记。
