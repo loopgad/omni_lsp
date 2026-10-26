@@ -89,6 +89,12 @@ func TestP0_SyncBypassesSaturatedScheduler(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		if res := s.scheduler.Submit(&scheduler.Request{
 			Priority:   scheduler.PriorityHover,
+			// The class must be stated explicitly: §F8 resolves an unset
+			// CostClass to DefaultCostClass (Medium), whose ¾ cap can never
+			// occupy all `workers` slots — the saturation this F1 test
+			// exists to arrange. CostTiny is the hover family's own class
+			// and spans the full pool.
+			CostClass:  scheduler.CostTiny,
 			EnqueuedAt: time.Now(),
 			Execute: func(ctx context.Context, _ *snapshot.Snapshot) (any, error) {
 				started <- struct{}{}
