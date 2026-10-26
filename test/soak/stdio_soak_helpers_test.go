@@ -198,10 +198,22 @@ func TestMinuteWindowGapContinuityThresholds(t *testing.T) {
 			t.Errorf("%s accepted", name)
 		}
 	}
+	// The dedicated monitor goroutine (b7a1139) advances active duration
+	// through maintenance blocks, so a post-maintenance row's active gap
+	// tracks the wall gap within tick-read slop and may sit slightly below
+	// the recorded pause. This is the real-world shape that aborted
+	// x9-1-status-10m-20261027T0233Z (a 2m58s periodic reindex inside its
+	// 310s budget) and must be accepted.
+	if !minuteWindowGapContinuous(2*time.Minute+59*time.Second+2620297*time.Nanosecond, 2*time.Minute+55*time.Second, 2*time.Minute+58*time.Second+43519*time.Nanosecond) {
+		t.Fatal("tick-quantized post-maintenance row rejected (active gap under the recorded pause)")
+	}
 	for name, tc := range map[string]struct{ wall, active, pause time.Duration }{
-		"pause exceeds wall gap":   {2 * time.Minute, 3 * time.Minute, 2*time.Minute + time.Second},
-		"pause exceeds active gap": {3 * time.Minute, 2 * time.Minute, 2*time.Minute + time.Second},
-		"negative pause":           {3 * time.Minute, 3 * time.Minute, -time.Second},
+		"pause exceeds wall gap": {2 * time.Minute, 3 * time.Minute, 2*time.Minute + time.Second},
+		"negative pause":         {3 * time.Minute, 3 * time.Minute, -time.Second},
+		// Active freezing for a minute inside the window is the old
+		// in-loop-tick failure signature: active must track the wall within
+		// the two-poll tick slop even across a maintenance pause.
+		"active gap lags wall beyond tick slop": {3 * time.Minute, 2 * time.Minute, 2*time.Minute + time.Second},
 	} {
 		if minuteWindowGapContinuous(tc.wall, tc.active, tc.pause) {
 			t.Errorf("%s accepted", name)

@@ -594,11 +594,22 @@ func minuteCadenceBudget() time.Duration { return time.Minute + 2*soakPollPeriod
 // minute after the previous one), while a bounded maintenance interval is
 // subtracted from both raw gaps before the unexplained-stall ceiling applies.
 // A pause larger than either gap, or a negative pause, is rejected.
+//
+// Arrangement note (b7a1139): the continuity monitor runs on its own
+// goroutine, so active duration keeps advancing through a maintenance block —
+// the active gap of a post-maintenance row tracks the wall gap within the
+// two-poll tick-read slop and can legitimately sit a few seconds below the
+// recorded pause. The pause is therefore bounded by its wall gap, and an
+// active gap lagging the wall by more than the tick slop (the old in-loop
+// tick freezing inside request bodies) is what still rejects.
 func minuteWindowGapContinuous(wallGap, activeGap, maintenancePause time.Duration) bool {
 	if wallGap <= 0 || activeGap < time.Minute {
 		return false
 	}
-	if maintenancePause < 0 || maintenancePause > wallGap || maintenancePause > activeGap {
+	if maintenancePause < 0 || maintenancePause > wallGap {
+		return false
+	}
+	if wallGap-activeGap > 2*soakPollPeriod {
 		return false
 	}
 	budget := minuteCadenceBudget()
