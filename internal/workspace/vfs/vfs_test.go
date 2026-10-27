@@ -280,7 +280,7 @@ func TestNoClosedDocumentContentRetention(t *testing.T) {
 	if v.Get(uri) != nil {
 		t.Fatal("file should be closed")
 	}
-	if findReachableBytes(reflect.ValueOf(*v), []byte(marker), 0) {
+	if findReachableBytes(reflect.ValueOf(v), []byte(marker), 0) {
 		t.Fatal("closed document content still reachable from VFS internal state (monotonic retention)")
 	}
 }
