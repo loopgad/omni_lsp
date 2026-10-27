@@ -604,7 +604,10 @@ function Assert-GateReleaseAssessment($Gates, [string] $Stage) {
 }
 
 function Get-WorkspaceContentHash {
-    $excludedDirectoryNames = @('.git', '.tmp-gocache', '.npm-cache', 'node_modules', 'evidence', 'rust-analyzer-helper-target')
+    # 'out' aligns with the .gitignore per-run artifacts entry (/out/ — local
+    # iteration/audit reports): concurrent writers inside it must not churn
+    # the frozen acceptance fingerprint or invalidate a continuous soak run.
+    $excludedDirectoryNames = @('.git', '.tmp-gocache', '.npm-cache', 'node_modules', 'evidence', 'rust-analyzer-helper-target', 'out')
     $evidenceRoot = $null
     $repoPrefix = $repoRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if ($EvidenceDirectory.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {

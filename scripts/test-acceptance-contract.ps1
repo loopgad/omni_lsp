@@ -321,6 +321,16 @@ try {
     if ((Get-WorkspaceContentHash) -cne $beforeCacheWrite) {
         throw 'A generated .tmp-gocache-* directory changed the workspace source fingerprint.'
     }
+    # out/ is the .gitignore-managed per-run artifact location: concurrent
+    # writers inside it (agent runs, audit reports) must not churn the frozen
+    # acceptance fingerprint while a soak or Status phase recomputes it.
+    $beforeOutWrite = Get-WorkspaceContentHash
+    $contractOut = Join-Path $contractWorkspace 'out'
+    New-Item -ItemType Directory -Force -Path $contractOut | Out-Null
+    Set-Content -LiteralPath (Join-Path $contractOut 'audit-report.md') -Value 'per-run artifact' -Encoding utf8
+    if ((Get-WorkspaceContentHash) -cne $beforeOutWrite) {
+        throw 'A generated out/ directory changed the workspace source fingerprint.'
+    }
     $script:FastSourceTreeHash = $beforeEvidenceWrite
     Set-Content -LiteralPath $contractSource -Value 'package sample // changed after build' -Encoding utf8
     $changedSource = Test-FastSourceTreeIdentity 'source-stability-contract'
