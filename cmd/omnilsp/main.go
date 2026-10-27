@@ -267,23 +267,7 @@ func cmdServe(args []string) {
 			sessionSrv := server.New(serverConfigFrom(cfg))
 			registerBackends(sessionSrv, cfg)
 			sharedCore.srv.Store(sessionSrv)
-			tr = transport.NewTCPTransport(conn)
-			// §P9 session recording wraps whichever transport was selected.
-			// Each TCP connection is one session (v1: one at a time), so the
-			// recorder wraps the per-connection transport and the recording
-			// file is recreated per session. It must be closed here, not with
-			// a defer — a defer inside this loop would only run at cmdServe
-			// exit and hold every recording open.
-			var rec *replay.RecorderTransport
-			if rec = startSessionRecorder(sessionSrv, cfg, tr, *recordPath); rec != nil {
-				tr = rec
-			}
-			if rerr := sessionSrv.Run(ctx, tr); rerr != nil && ctx.Err() == nil {
-				fmt.Fprintf(os.Stderr, "omnilsp: session %d ended: %v\n", session, rerr)
-			}
-			if rec != nil {
-				_ = rec.Close()
-			}
+			runTCPSession(ctx, session, conn, sessionSrv, cfg, *recordPath)
 			fmt.Fprintln(os.Stderr, "omnilsp: client disconnected; waiting for reconnect")
 		}
 	default:
@@ -301,6 +285,34 @@ func cmdServe(args []string) {
 	if err := srv.Run(ctx, tr); err != nil && ctx.Err() == nil {
 		fatal("server error: %v", err)
 	}
+}
+
+// runTCPSession serves one accepted TCP connection to completion. Each TCP
+// connection is one session (v1: one at a time); the recorder wraps the
+// per-connection transport and the recording file is recreated per session,
+// so it is closed here rather than with a defer — a defer inside the accept
+// loop would only run at cmdServe exit and hold every recording open.
+func runTCPSession(ctx context.Context, session int, conn net.Conn, srv *server.Server, cfg config.Config, recordPath string) {
+	tr := transport.NewTCPTransport(conn)
+	var sessionTr transport.Transport = tr
+	var rec *replay.RecorderTransport
+	if rec = startSessionRecorder(srv, cfg, tr, recordPath); rec != nil {
+		sessionTr = rec
+	}
+	if rerr := srv.Run(ctx, sessionTr); rerr != nil && ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "omnilsp: session %d ended: %v\n", session, rerr)
+	}
+	if rec != nil {
+		_ = rec.Close()
+	}
+	// Teardown must close the accepted connection no matter how the session
+	// ended (audit finding 7): the exit handshake closes the transport from
+	// the server side, but a clean EOF, a transport fault or a cancellation
+	// used to leave the conn open and the transport's readLoop goroutine
+	// blocked in ReadFrame — one fd and one goroutine leaked per reconnect.
+	// Close is idempotent (closeOnce), and it unblocks readLoop, which then
+	// exits through its own done channel.
+	_ = tr.Close()
 }
 
 // registerBackends discovers available language toolchains and registers the
