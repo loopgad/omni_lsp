@@ -87,12 +87,17 @@ func (s *FileStore) recover() error {
 
 	if s.current == nil {
 		// Fall back through history until one generation verifies fully.
+		// Integrity failures corrupt a candidate for good; a transient
+		// I/O failure (errSegmentIO) only hides the candidate for this
+		// open — the retry budget below absorbs AV locks and sharing
+		// violations, and the on-disk history is left untouched so the
+		// next recover reconsiders it (nothing is quarantined here).
 		for len(s.history) > 0 {
 			cand := s.history[0]
 			view := GenerationView{Generation: *cand, dir: s.root}
 			ok := true
 			for _, seg := range cand.Segments {
-				if _, err := view.ReadSegment(seg.ID); err != nil {
+				if _, err := view.readSegmentWithIORetry(seg.ID); err != nil {
 					ok = false
 					break
 				}

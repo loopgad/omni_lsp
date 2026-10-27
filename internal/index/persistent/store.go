@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 // ErrDiskBudgetExceeded reports a write refused because the store directory
@@ -18,6 +19,43 @@ var ErrDiskBudgetExceeded = errors.New("persistent: disk budget exceeded")
 
 // ErrNoGeneration reports that no verified generation could be recovered.
 var ErrNoGeneration = errors.New("persistent: no usable generation")
+
+// errSegmentIO marks a ReadSegment failure caused by the filesystem itself
+// rather than by segment content: sharing violations, AV locks, permission
+// errors, transient device failures. Content-integrity failures (missing
+// manifest-referenced file, decode, checksum, length) do not carry it, so
+// recovery can restrict quarantine to real corruption (L7/L8 only sanction
+// isolation for integrity failures).
+var errSegmentIO = errors.New("persistent: transient segment I/O")
+
+// isSegmentIOError reports whether err is a filesystem-level read failure
+// rather than a content-integrity failure.
+func isSegmentIOError(err error) bool { return errors.Is(err, errSegmentIO) }
+
+// Segment I/O retry budget: transient Windows faults (AV scan, sharing
+// violation) usually clear within milliseconds.
+const (
+	segIORetryAttempts = 3
+	segIORetryDelay    = 5 * time.Millisecond
+)
+
+// readSegmentWithIORetry re-reads one segment with a small bounded backoff
+// while the failure is transient I/O. Integrity failures return immediately.
+// The last error is returned once the retry budget is spent.
+func (v GenerationView) readSegmentWithIORetry(id SegmentID) ([]byte, error) {
+	var payload []byte
+	var err error
+	for attempt := 0; attempt < segIORetryAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(segIORetryDelay)
+		}
+		payload, err = v.ReadSegment(id)
+		if err == nil || !isSegmentIOError(err) {
+			return payload, err
+		}
+	}
+	return payload, err
+}
 
 var (
 	ErrBuildAborted   = errors.New("persistent: build aborted")
@@ -62,7 +100,14 @@ func (v GenerationView) ReadSegment(id SegmentID) ([]byte, error) {
 	}
 	raw, err := os.ReadFile(filepath.Join(v.dir, segFileName(id)))
 	if err != nil {
-		return nil, fmt.Errorf("persistent: read %s: %w", id, err)
+		if os.IsNotExist(err) {
+			// The manifest references a segment that is gone: that is
+			// generation corruption (integrity), not transient I/O.
+			return nil, fmt.Errorf("persistent: read %s: %w", id, err)
+		}
+		// Everything else (sharing violation, permission, device error)
+		// is filesystem-level and potentially transient (L7).
+		return nil, fmt.Errorf("persistent: read %s: %w: %w", id, errSegmentIO, err)
 	}
 	if int64(len(raw)) != ref.Len {
 		return nil, fmt.Errorf("persistent: segment %s length %d, manifest says %d", id, len(raw), ref.Len)
@@ -202,10 +247,23 @@ func (s *FileStore) openSnapshotWithWriterLock(ctx context.Context) (GenerationV
 
 		view := GenerationView{Generation: *cur, dir: s.root}
 		var bad []SegmentID
+		var ioErr error
 		for _, seg := range cur.Segments {
-			if _, err := view.ReadSegment(seg.ID); err != nil {
-				bad = append(bad, seg.ID)
+			if _, err := view.readSegmentWithIORetry(seg.ID); err != nil {
+				if isSegmentIOError(err) {
+					ioErr = err
+				} else {
+					bad = append(bad, seg.ID) // integrity failure only (L7)
+				}
 			}
+		}
+		if ioErr != nil {
+			// Transient I/O survived the retry budget (whether or not
+			// integrity failures sit alongside it). Quarantining or dropping
+			// a possibly healthy generation is not sanctioned (L7/L8 isolate
+			// integrity failures only): fail the open loudly and leave the
+			// store untouched — the next open retries.
+			return GenerationView{}, ioErr
 		}
 		if len(bad) == 0 {
 			return view, nil
