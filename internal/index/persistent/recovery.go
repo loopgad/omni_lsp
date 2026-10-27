@@ -208,6 +208,92 @@ func (s *FileStore) cleanupOrphanSegments() {
 	for _, gen := range retired {
 		_ = s.removeGenerationSegments(gen)
 	}
+	s.recycleQuarantine()
+}
+
+// quarantineBudgetDivisor bounds quarantined forensic files at
+// DiskBudgetBytes/quarantineBudgetDivisor so repeated corruption cannot
+// monotonically exhaust storage (§L17) — quarantine no longer counts against
+// the live write budget (build.go), so this cap is its only bound.
+const quarantineBudgetDivisor = 4
+
+// recycleQuarantine deletes quarantined segment files beyond the quarantine
+// capacity cap, oldest generation first, and drops the recycled IDs from the
+// in-memory quarantine list. Quarantine is forensic only — no code path reads
+// quarantined files back — so dropping the oldest evidence is safe. Caller
+// must hold the writer lock (cleanupOrphanSegments contract). With
+// DiskBudgetBytes = 0 (unlimited) no cap applies.
+func (s *FileStore) recycleQuarantine() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit := s.cfg.DiskBudgetBytes / quarantineBudgetDivisor
+	if limit <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(s.quarantineDir())
+	if err != nil {
+		return
+	}
+	type quarantinedFile struct {
+		id   SegmentID
+		gen  uint64
+		size int64
+	}
+	var files []quarantinedFile
+	var total int64
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".bin") {
+			continue
+		}
+		id := SegmentID(strings.TrimSuffix(strings.TrimPrefix(name, "seg-"), ".bin"))
+		if !validSegmentID(id) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		// validSegmentID already guaranteed the prefix before the only '-'
+		// parses as a canonical uint64 (format.go), so the error is ignored.
+		separator := strings.IndexByte(string(id), '-')
+		genID, _ := strconv.ParseUint(string(id[:separator]), 10, 64)
+		files = append(files, quarantinedFile{id: id, gen: genID, size: info.Size()})
+		total += info.Size()
+	}
+	if total <= limit {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].gen != files[j].gen {
+			return files[i].gen < files[j].gen
+		}
+		return files[i].id < files[j].id
+	})
+	pruned := make(map[SegmentID]bool)
+	for _, f := range files {
+		if total <= limit {
+			break
+		}
+		if err := os.Remove(filepath.Join(s.quarantineDir(), segFileName(f.id))); err != nil && !os.IsNotExist(err) {
+			continue
+		}
+		total -= f.size
+		pruned[f.id] = true
+	}
+	if len(pruned) == 0 {
+		return
+	}
+	kept := s.quarantined[:0]
+	for _, id := range s.quarantined {
+		if !pruned[id] {
+			kept = append(kept, id)
+		}
+	}
+	s.quarantined = kept
 }
 
 func (s *FileStore) readQuarantined() []SegmentID {

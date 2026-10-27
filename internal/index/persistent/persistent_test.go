@@ -992,3 +992,102 @@ func TestL10_FreshnessTupleGatesVisibility(t *testing.T) {
 		t.Error("truncated seal accepted")
 	}
 }
+
+// TestBudget_QuarantineExcludedFromWriteWalk: quarantined forensic files do
+// not count against the live write budget (§L17). Repeated corruption moves
+// full-size segments into quarantine/; if the budget walk counted them,
+// every corruption event would permanently shrink publishable capacity and
+// eventually block index publication outright. Quarantine is budgeted
+// separately (recycleQuarantine), not by starving WriteSegment.
+func TestBudget_QuarantineExcludedFromWriteWalk(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewFileStore(dir, Config{DiskBudgetBytes: 8192})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Publish one 6 KiB generation, corrupt its segment on disk, and let the
+	// next open quarantine it: quarantine/ now holds a full-size segment
+	// while the store root holds only small infrastructure files.
+	b, err := s.BeginBuild(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := b.WriteSegment(make([]byte, 6<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(s.root, segFileName(id))
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[segHeaderSz] ^= 0x01 // integrity failure (L7): quarantine on open
+	if err := os.WriteFile(p, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OpenSnapshot(ctx); !errors.Is(err, ErrNoGeneration) {
+		t.Fatalf("fully corrupt store: want ErrNoGeneration, got %v", err)
+	}
+	qentries, err := os.ReadDir(filepath.Join(s.root, dirQuarantine))
+	if err != nil || len(qentries) != 1 {
+		t.Fatalf("setup: corrupt segment not quarantined (%v, %d entries)", err, len(qentries))
+	}
+
+	// A fresh 6 KiB segment still fits the 8 KiB budget: only the quarantined
+	// copy would push a whole-tree walk past it.
+	b2, err := s.BeginBuild(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b2.WriteSegment(make([]byte, 6<<10)); err != nil {
+		t.Fatalf("quarantined forensics must not starve live writes: %v", err)
+	}
+	if err := b2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestQuarantine_RecycledUnderCapacityCap: quarantine holds at most
+// DiskBudgetBytes/quarantineBudgetDivisor of forensic segment files; the
+// overflow is recycled oldest generation first. Without recycling, repeated
+// corruption accumulates quarantined files monotonically (§L17 audit: the
+// default 256MB budget would eventually be exhausted by dead weight).
+func TestQuarantine_RecycledUnderCapacityCap(t *testing.T) {
+	dir := t.TempDir()
+	qdir := filepath.Join(dir, dirQuarantine)
+	plant := func(id SegmentID, size int) {
+		t.Helper()
+		if !validSegmentID(id) {
+			t.Fatalf("planted %q is not a valid segment ID", id)
+		}
+		if err := os.MkdirAll(qdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(qdir, segFileName(id)), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plant("1-aaaaaaaa", 900) // oldest generation: recycled first
+	plant("2-bbbbbbbb", 900) // newest: fits the cap alone
+
+	// A reopen runs cleanupOrphanSegments, which recycles the cap overflow.
+	s, err := NewFileStore(dir, Config{DiskBudgetBytes: 4096}) // cap = 1024
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(qdir, "seg-1-aaaaaaaa.bin")); !os.IsNotExist(err) {
+		t.Fatalf("oldest quarantined generation still on disk: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(qdir, "seg-2-bbbbbbbb.bin")); err != nil {
+		t.Fatalf("newest quarantined generation must survive: %v", err)
+	}
+	want := []SegmentID{"2-bbbbbbbb"}
+	if got := s.Quarantined(); len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("quarantine list: want %v, got %v", want, got)
+	}
+}

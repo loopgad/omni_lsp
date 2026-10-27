@@ -49,11 +49,24 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 	budget := b.store.cfg.DiskBudgetBytes
 	b.store.mu.Unlock()
 
+	// §L17 budget walk counts only live store content. The quarantine
+	// directory holds forensic copies of corrupt segments that no write can
+	// shrink; counting it here would let every corruption event permanently
+	// shrink publishable capacity until index publication blocks outright.
+	// Quarantine is bounded separately by recycleQuarantine (recovery.go).
+	quarantine := b.store.quarantineDir()
 	var used int64
 	_ = filepath.Walk(b.store.root, func(p string, fi os.FileInfo, err error) error {
-		if err == nil && !fi.IsDir() {
-			used += fi.Size()
+		if err != nil {
+			return nil
 		}
+		if fi.IsDir() {
+			if p == quarantine {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		used += fi.Size()
 		return nil
 	})
 	if budget > 0 && used+int64(len(payload))+int64(segHeaderSz)+16 > budget {
