@@ -516,6 +516,19 @@ func projectDiagnostics(items []languages.Diagnostic) []map[string]any {
 }
 
 // handlePullDiagnostics serves textDocument/diagnostic (§C11 pull path).
+//
+// Failure contract: only ContentModified and client/clock cancellation answer
+// with a typed error the client already understands, and only a closed or
+// absent document answers an empty full report — that report is truthful for a
+// document with no open editor state. Every other computation failure is
+// returned as a JSON-RPC error (InternalError via the dispatcher): under pull
+// semantics the client replaces its diagnostic set with whatever a full report
+// carries, so answering an empty report on a transient backend failure would
+// erase every diagnostic the editor is showing. Returning the error instead
+// makes the client keep its previous set, mirroring the push path where a
+// failed computation simply does not publish (§Q4: no silent fallback — the
+// failure is visible both as the error response and in backend-failure
+// metrics).
 func (s *Server) handlePullDiagnostics(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params struct {
 		TextDocument struct {
@@ -530,11 +543,18 @@ func (s *Server) handlePullDiagnostics(ctx context.Context, msg *jsonrpc.Message
 		if ierrors.IsKind(err, ierrors.ErrContentModified) {
 			return nil, err
 		}
-		// §Q4 no silent fallback: an unanalyzable document answers empty-full,
-		// never stale data; the failure stays visible in metrics/logs.
-		if !errors.Is(err, errDiagnosticDocumentClosed) && !errors.Is(err, context.Canceled) {
-			s.metrics.BackendFails.Inc(1)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, &jsonrpc.ResponseError{
+				Code:    jsonrpc.RequestCancelled,
+				Message: "diagnostic pull cancelled",
+			}
 		}
+		if !errors.Is(err, errDiagnosticDocumentClosed) {
+			s.metrics.BackendFails.Inc(1)
+			return nil, err
+		}
+		// Closed/absent document: the empty full report below is the
+		// truthful answer (§Q4), and no backend work was spent.
 		items = nil
 	}
 	payload, _ := json.Marshal(map[string]any{

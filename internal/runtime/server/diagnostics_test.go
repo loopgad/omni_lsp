@@ -593,6 +593,93 @@ func TestC11_DidCloseCancelsInFlightPullDiagnostics(t *testing.T) {
 	}
 }
 
+// failingDiagBackend injects a backend failure into every Diagnostics call.
+type failingDiagBackend struct {
+	diagBackend
+	err error
+}
+
+func (b *failingDiagBackend) Diagnostics(context.Context, string, []byte) ([]languages.Diagnostic, error) {
+	b.calls.Add(1)
+	return nil, b.err
+}
+
+// TestC11_PullBackendFailureReturnsErrorNotEmptyFull pins the pull-diagnostics
+// failure contract: a backend failure that is neither ContentModified nor a
+// closed-document case must surface as a JSON-RPC error, so the client keeps
+// the diagnostic set it already pulled. The old behavior — an empty full
+// report with a fresh resultId — made one transient failure erase every
+// diagnostic the editor was showing, diverging from the push path where a
+// failed computation simply does not publish.
+func TestC11_PullBackendFailureReturnsErrorNotEmptyFull(t *testing.T) {
+	const uri = "file:///w/failing-pull.go"
+	s := New(DefaultConfig())
+	be := &failingDiagBackend{
+		diagBackend: diagBackend{mockBackend: mockBackend{langID: "go", exts: []string{".go"}}},
+		err:         fmt.Errorf("backend exploded"),
+	}
+	s.RegisterBackend("go", be)
+	s.vfs.Open(uri, "go", 1, []byte("package main\n"), vfs.SourceEditor)
+	s.publishSnapshot()
+
+	resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(
+		jsonrpc.RequestID{Num: 3}, "textDocument/diagnostic",
+		json.RawMessage(`{"textDocument":{"uri":"`+uri+`"}}`)))
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("pull with failing backend = %+v, want a JSON-RPC error that preserves the client's diagnostics", resp)
+	}
+	if resp.Error.Code != jsonrpc.InternalError {
+		t.Fatalf("pull failure code = %d, want InternalError", resp.Error.Code)
+	}
+	if be.calls.Load() != 1 {
+		t.Fatalf("backend calls = %d, want the failure to come from the backend itself", be.calls.Load())
+	}
+	s.diag.mu.Lock()
+	defer s.diag.mu.Unlock()
+	if _, ok := s.diag.cache[uri]; ok {
+		t.Fatal("a failed computation must not populate the diagnostic cache")
+	}
+}
+
+// TestC11_PullCancellationReturnsRequestCancelled pins that a cancelled pull
+// for an OPEN document answers RequestCancelled, not an empty full report:
+// cancellation must not wipe the client's existing diagnostics either.
+func TestC11_PullCancellationReturnsRequestCancelled(t *testing.T) {
+	const uri = "file:///w/cancelled-pull.go"
+	s := New(DefaultConfig())
+	be := &cancelAwareDiagBackend{
+		mockBackend: mockBackend{langID: "go", exts: []string{".go"}},
+		started:     make(chan struct{}, 1), finished: make(chan struct{}),
+	}
+	s.RegisterBackend("go", be)
+	s.vfs.Open(uri, "go", 1, []byte("package main\n"), vfs.SourceEditor)
+	s.publishSnapshot()
+	ctx, cancel := context.WithCancel(context.Background())
+	response := make(chan *jsonrpc.Message, 1)
+	go func() {
+		response <- s.Dispatcher().Dispatch(ctx, jsonrpc.NewRequest(
+			jsonrpc.RequestID{Num: 4}, "textDocument/diagnostic",
+			json.RawMessage(`{"textDocument":{"uri":"`+uri+`"}}`)))
+	}()
+	select {
+	case <-be.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pull diagnostic backend was not invoked")
+	}
+	cancel()
+	select {
+	case resp := <-response:
+		if resp == nil || resp.Error == nil {
+			t.Fatalf("cancelled pull = %+v, want RequestCancelled so the client keeps its diagnostics", resp)
+		}
+		if resp.Error.Code != jsonrpc.RequestCancelled {
+			t.Fatalf("cancelled pull code = %d, want RequestCancelled", resp.Error.Code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled pull did not complete")
+	}
+}
+
 func TestC11_PullStableResultIdAndCache(t *testing.T) {
 	const uri = "file:///w/main.go"
 	s := New(DefaultConfig())
