@@ -109,7 +109,7 @@
 | Y1-8 | Panic boundary tested | §F16 | `TestINV_ARCH_001_ServerResilience`, `TestRoutingErrors` | AUTO |
 | Y1-9 | Registered probe packages clean under -race (server, scheduler); the full-tree 51-package -race run is release-side evidence for candidate gate-20261004T2347Z (exit 0), not a probe this registry executes | §S14/F17 | `TestS13_HalfFrameDisconnect`, `TestS4CancelRace`, `TestScheduler_ShutdownNoPanicOnConcurrentSubmit`, `TestScheduler_BoostNeverDropsRequests` | AUTO |
 | Y1-10 | Soak has no monotonic resource leak (accelerated gate green; the real-stdio RC opt-in gate remains release evidence — its 30s preflight attempts still miss the fixed 30s initial-query budget on the current host) | §S16 | `go test -tags soak -count=1 -timeout 300s ./test/soak/` | GATE |
-| Y1-11 | Memory budgets enforced (global soft/hard + per-backend quotas) | F13/F14 memory budget | `TestF13_SoftLimitWarnsHardLimitRefuses`, `TestF14_PerBackendQuotaIsolated` | AUTO |
+| Y1-11 | Budget managers verified at unit-test level only (F13 per-category threshold ladder + F14 global soft/hard limits with per-backend quotas); neither budget.Manager nor scheduler.BudgetManager has a production construction point, so no byte accounting runs inside the live server or backends (wiring deferred as DEF-BUDWIRE) | F13/F14 memory budget | `TestF13_SoftLimitWarnsHardLimitRefuses`, `TestF14_PerBackendQuotaIsolated` | AUTO |
 
 ### Y2
 
@@ -251,6 +251,12 @@
 | X6-C15GRPC | gRPC v1 projection of the read API | C15 gRPC v1 | — | DEFERRED→post-X8 |
 
 ## Deferred domain POST-X9 (independent denominator)
+
+### BUDGET
+
+| ID | Item | Clause | Tests / Gate | Status |
+|---|---|---|---|---|
+| DEF-BUDWIRE | Real memory metering wired into the live server/backend path (F13 category accounting on the actual allocation sites, F14 quotas enforced on backend buffers) | F13/F14 production wiring | — | DEFERRED→X10 |
 
 ### BUILDCTX
 
