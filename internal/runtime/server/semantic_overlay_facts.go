@@ -285,9 +285,18 @@ func (c *goSnapshotSemanticFactsCache) getOrLoad(
 		c.mu.Unlock()
 
 		facts, err := load()
+		// Freshness is evaluated OUTSIDE c.mu: the probe re-hashes the pinned
+		// tool binaries from disk (toolPathStillMatches → whole-file SHA-256,
+		// seconds on real toolchains), and holding the service-wide cache lock
+		// through that walk stalled every concurrent overlay request. The hit
+		// path above has always validated after Unlock; a world change between
+		// this evaluation and the insert only costs one bounded LRU slot,
+		// because hits re-validate outside the lock as well.
+		insert := err == nil && facts != nil && ctx.Err() == nil && stillCurrent() &&
+			facts.retainedBytes <= goOverlayCacheMaxBytes
 		c.mu.Lock()
 		delete(c.flights, key)
-		if err == nil && facts != nil && ctx.Err() == nil && stillCurrent() && facts.retainedBytes <= goOverlayCacheMaxBytes {
+		if insert {
 			c.insertLocked(key, facts)
 		}
 		close(flight.done)

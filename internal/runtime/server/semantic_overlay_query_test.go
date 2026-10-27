@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/index/model"
@@ -490,6 +492,84 @@ func TestGoSnapshotSemanticFactsCacheCancellationCleansFlight(t *testing.T) {
 	defer cache.mu.Unlock()
 	if len(cache.flights) != 0 || len(cache.entries) != 0 || cache.used != 0 {
 		t.Fatalf("cache retained canceled work: flights=%d entries=%d bytes=%d", len(cache.flights), len(cache.entries), cache.used)
+	}
+}
+
+// TestGoSnapshotSemanticFactsCacheInsertEvaluatesFreshnessOutsideLock pins
+// the insert-path locking shape: the freshness probe walks the pinned tool
+// binaries on disk and hashes them whole (toolPathStillMatches → SHA-256,
+// hundreds of MB for real toolchains), so it must run without the
+// service-wide cache mutex held. A concurrent cache hit must be served while
+// an in-flight insert is still probing; before the fix the probe ran under
+// c.mu and stalled every overlay request behind the disk walk.
+func TestGoSnapshotSemanticFactsCacheInsertEvaluatesFreshnessOutsideLock(t *testing.T) {
+	cache := newGoSnapshotSemanticFactsCache()
+	loadKey := goOverlayFactsKey{workspace: "workspace", language: "go", diskDigest: "sha256:disk", overlayDigest: "sha256:overlay", snapshotInstance: 1, revision: 1, builder: 1, provider: 2}
+	hitKey := goOverlayFactsKey{workspace: "workspace", language: "go", diskDigest: "sha256:disk", overlayDigest: "sha256:overlay", snapshotInstance: 1, revision: 1, builder: 3, provider: 4}
+	hitFacts := &goSnapshotSemanticFacts{language: "go", retainedBytes: 1}
+	cache.mu.Lock()
+	cache.insertLocked(hitKey, hitFacts)
+	cache.mu.Unlock()
+
+	enteredStillCurrent := make(chan struct{})
+	releaseStillCurrent := make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	stillCurrentDuringInsert := func() bool {
+		enterOnce.Do(func() { close(enteredStillCurrent) })
+		<-releaseStillCurrent
+		return true
+	}
+
+	// The miss drives a full load and then blocks inside its freshness probe
+	// — under c.mu before the fix, outside it after the fix.
+	insertDone := make(chan error, 1)
+	go func() {
+		_, err := cache.getOrLoad(context.Background(), loadKey, func() (*goSnapshotSemanticFacts, error) {
+			return &goSnapshotSemanticFacts{language: "go", retainedBytes: 1}, nil
+		}, stillCurrentDuringInsert)
+		insertDone <- err
+	}()
+	select {
+	case <-enteredStillCurrent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("insert path never reached its freshness probe")
+	}
+
+	type hitResult struct {
+		facts *goSnapshotSemanticFacts
+		err   error
+	}
+	hitDone := make(chan hitResult, 1)
+	go func() {
+		facts, err := cache.getOrLoad(context.Background(), hitKey, func() (*goSnapshotSemanticFacts, error) {
+			t.Error("hit key must be served from the cache, not a fresh load")
+			return nil, errGoSemanticOverlayUnavailable
+		}, func() bool { return true })
+		hitDone <- hitResult{facts, err}
+	}()
+	select {
+	case got := <-hitDone:
+		if got.err != nil || got.facts != hitFacts {
+			t.Fatalf("concurrent hit = (%v, %v), want the cached facts", got.facts, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent overlay hit stalled behind the insert-path freshness probe: stillCurrent still runs under the cache lock")
+	}
+
+	releaseOnce.Do(func() { close(releaseStillCurrent) })
+	select {
+	case err := <-insertDone:
+		if err != nil {
+			t.Fatalf("insert-path getOrLoad = %v, want the cached facts", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("insert-path getOrLoad never returned after its probe was released")
+	}
+	cache.mu.Lock()
+	_, cached := cache.entries[loadKey]
+	cache.mu.Unlock()
+	if !cached {
+		t.Fatal("completed load was not inserted after its freshness probe passed")
 	}
 }
 
