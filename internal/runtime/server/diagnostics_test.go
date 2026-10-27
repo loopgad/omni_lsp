@@ -1036,6 +1036,61 @@ func TestI10_PrepareRenameGate(t *testing.T) {
 		resp := prep(0, 3) // inside `package` keyword — still an ident, but line 0 char 3
 		_ = resp           // either placeholder or null is protocol-valid; must not error
 	})
+
+	// §I10 的 range 半边：range 必须按标识符真实字节起点换算成协商编码列。
+	// 历史缺陷是「光标列 − 标识符字节长」——光标不在标识符末尾时 uint32
+	// 下溢回绕，且把字节长当列宽（协商编码默认 UTF-16，两者不等）。
+	decodeRange := func(t *testing.T, result json.RawMessage) (startChar, endChar uint32) {
+		t.Helper()
+		var decoded struct {
+			Range struct {
+				Start struct {
+					Line      uint32 `json:"line"`
+					Character uint32 `json:"character"`
+				} `json:"start"`
+				End struct {
+					Line      uint32 `json:"line"`
+					Character uint32 `json:"character"`
+				} `json:"end"`
+			} `json:"range"`
+		}
+		if err := json.Unmarshal(result, &decoded); err != nil {
+			t.Fatalf("decode prepareRename result: %v (%s)", err, result)
+		}
+		return decoded.Range.Start.Character, decoded.Range.End.Character
+	}
+
+	t.Run("range covers identifier when cursor is mid-identifier", func(t *testing.T) {
+		resp := prep(3, 3) // on the second char of `total`, not its end
+		if resp == nil || resp.Error != nil || resp.Result == nil {
+			t.Fatalf("prepareRename failed: %+v", resp)
+		}
+		start, end := decodeRange(t, resp.Result)
+		// line 3 = "\ttotal := 1"：标识符字节区间 [1,6)，UTF-16 列与字节一致。
+		if start != 1 || end != 6 {
+			t.Errorf("range = [%d,%d), want [1,6) (uint32 underflow or byte/UTF-16 mixup)",
+				start, end)
+		}
+	})
+
+	t.Run("range projected into utf-16 columns on non-ascii line", func(t *testing.T) {
+		const uni = "file:///w/uni.go"
+		// line 3 = "\tαlpha := 1"：'α' 占 2 字节但仅 1 个 UTF-16 列。
+		s.vfs.Open(uni, "go", 1, []byte("package main\n\nfunc main() {\n\tαlpha := 1\n}\n"), 0)
+		s.publishSnapshot()
+		resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(
+			jsonrpc.RequestID{Num: 2}, "textDocument/prepareRename",
+			json.RawMessage(`{"textDocument":{"uri":"`+uni+`"},"position":{"line":3,"character":4}}`)))
+		if resp == nil || resp.Error != nil || resp.Result == nil {
+			t.Fatalf("prepareRename failed: %+v", resp)
+		}
+		start, end := decodeRange(t, resp.Result)
+		// 标识符 "lpha" 字节区间 [3,7)：UTF-16 起点 = width("\tα") = 2，
+		// 终点 = 2 + width("lpha") = 6。字节直接当列会给出 [0,4)。
+		if start != 2 || end != 6 {
+			t.Errorf("range = [%d,%d), want [2,6) in UTF-16 columns", start, end)
+		}
+	})
 }
 
 // TestT2_DeclarationServedAndDeclared pins §I14/T2: textDocument/declaration

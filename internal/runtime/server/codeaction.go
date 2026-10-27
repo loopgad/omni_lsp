@@ -127,7 +127,7 @@ func (s *Server) handlePrepareRename(ctx context.Context, msg *jsonrpc.Message) 
 		return nil, err
 	}
 	src := s.vfs.Content(params.TextDocument.URI)
-	ident := identAt(src, params.Position.Line, params.Position.Character)
+	startChar, endChar, ident := identSpanAt(src, params.Position.Line, params.Position.Character, s.negotiatedEncodingInt())
 	if ident == "" {
 		return json.RawMessage("null"), nil
 	}
@@ -139,44 +139,51 @@ func (s *Server) handlePrepareRename(ctx context.Context, msg *jsonrpc.Message) 
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"range": map[string]any{
-			"start": map[string]any{"line": params.Position.Line, "character": params.Position.Character - uint32(len(ident))},
-			"end":   map[string]any{"line": params.Position.Line, "character": params.Position.Character},
+			"start": map[string]any{"line": params.Position.Line, "character": startChar},
+			"end":   map[string]any{"line": params.Position.Line, "character": endChar},
 		},
 		"placeholder": ident,
 	})
 	return payload, nil
 }
 
-// identAt extracts the identifier overlapping the given line/character using
-// simple Go-ish lexical rules sufficient for placeholder reporting.
-func identAt(src []byte, line, char uint32) string {
+// identSpanAt extracts the identifier overlapping the given line/character and
+// reports its span projected into the negotiated encoding's columns: start
+// (inclusive) and end (exclusive) on the identifier's line. The scan itself is
+// byte-based (§I10 syntax tier is ASCII-identifier shaped); the byte span is
+// then converted with encodingWidth, so the reported range always bounds the
+// identifier in the encoding the client negotiated — never "cursor column
+// minus byte length", which underflows uint32 whenever the cursor is not at
+// the identifier's end and mismatches UTF-16 on non-ASCII lines.
+func identSpanAt(src []byte, line, char uint32, encoding int) (start, end uint32, ident string) {
 	lines := strings.Split(string(src), "\n")
 	if int(line) >= len(lines) {
-		return ""
+		return 0, 0, ""
 	}
 	l := lines[line]
 	if int(char) > len(l) {
-		return ""
+		return 0, 0, ""
 	}
 	isIdent := func(c byte) bool {
 		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 	}
-	start := int(char)
-	for start > 0 && isIdent(l[start-1]) {
-		start--
+	bStart := int(char)
+	for bStart > 0 && isIdent(l[bStart-1]) {
+		bStart--
 	}
-	end := int(char)
-	for end < len(l) && isIdent(l[end]) {
-		end++
+	bEnd := int(char)
+	for bEnd < len(l) && isIdent(l[bEnd]) {
+		bEnd++
 	}
-	if start == end {
-		return ""
+	if bStart == bEnd {
+		return 0, 0, ""
 	}
-	c := l[start]
-	if c >= '0' && c <= '9' {
-		return "" // numbers are not identifiers
+	if c := l[bStart]; c >= '0' && c <= '9' {
+		return 0, 0, "" // numbers are not identifiers
 	}
-	return l[start:end]
+	start = encodingWidth(l[:bStart], encoding)
+	end = start + encodingWidth(l[bStart:bEnd], encoding)
+	return start, end, l[bStart:bEnd]
 }
 
 func isExportedIdent(ident string) bool {
