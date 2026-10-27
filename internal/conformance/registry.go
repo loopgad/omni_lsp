@@ -450,7 +450,7 @@ var Registry = struct{ Checks []Check }{
 			Milestone: "post-X9", Reason: "policies exist in code comments and ADR fragments; consolidation page is editorial work"},
 		{ID: "DEF-COMPACT", Domain: "post-x9", Category: "INDEX", Clause: "L16 compaction scheduling", Weight: 1,
 			Text: "background-triggered generation compaction", Status: StatusDeferred,
-			Milestone: "X10", Reason: "Compact() verified in tests; production scheduling attaches when the persistent store enters the live server path (index service)"},
+			Milestone: "X10", Reason: "the declared attach premise is met — persistent.NewFileStore is live in the index service (server initIndex assigns idx.store) — but scheduling still cannot attach: Compact() verified in tests only against opaque payloads at the persistent layer, and as implemented it merges every segment of the pinned snapshot into one physical segment, while the live semantic format requires exactly one JSON batch per segment plus a terminal metadata segment (OpenReader reads the last segment as metadata and decodeStrict rejects trailing JSON), so compacting a real semantic generation would render it unreadable. Attaching needs structure-bounded compaction (re-partitioned batches, terminal metadata) first; until then fragmentation is bounded only by KeepGenerations retirement and the disk budget"},
 		{ID: "X6-C15GRPC", Domain: "post-x8", Category: "GRPC", Clause: "C15 gRPC v1", Weight: 1,
 			Text: "gRPC v1 projection of the read API", Status: StatusDeferred,
 			Milestone: "post-X8", Reason: "HTTP covers the read-API semantics; gRPC is a duplicate surface deferred until a consumer requires it"},
