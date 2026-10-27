@@ -107,7 +107,7 @@ func TestWatcherSkipsRepositoryArtifactsButIncludesDependencies(t *testing.T) {
 		}
 	}
 
-	wantPath := filepath.Join("node_modules", "pkg", "index.js")
+	wantPath := filepath.Join(root, "node_modules", "pkg", "index.js")
 	evs := p.Scan()
 	if len(evs) != 1 || evs[0].Path != wantPath || evs[0].Kind != Modified {
 		t.Fatalf("unexpected artifact/dependency changes: %+v", evs)

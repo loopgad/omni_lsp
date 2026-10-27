@@ -74,9 +74,11 @@ func TestPollerExcludedRootUsesPathBoundariesAndKeepsPeerDirectories(t *testing.
 		}
 	}
 	events := p.Scan()
+	// Event paths are absolute since the audit fix (finding 6); the want keys
+	// resolve against the workspace root to keep the fixtures readable.
 	want := map[string]Kind{
-		filepath.Join("packages", "index", "source.ts"):                   Modified,
-		filepath.Join("cache", "nested", "index-backup", "manifest.json"): Modified,
+		filepath.Join(root, "packages", "index", "source.ts"):                   Modified,
+		filepath.Join(root, "cache", "nested", "index-backup", "manifest.json"): Modified,
 	}
 	if len(events) != len(want) {
 		t.Fatalf("unexpected events around excluded root: got %+v, want exactly %+v", events, want)

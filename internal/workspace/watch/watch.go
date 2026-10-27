@@ -24,7 +24,9 @@ const (
 // create/modify/delete events. Depth and interval are bounded; the poller is
 // opt-in per session so tests and constrained deployments stay deterministic.
 
-// Event is one detected file-system change.
+// Event is one detected file-system change. Path is an absolute path — the
+// server converts each event straight into a file URI, and a relative path
+// would parse as a UNC host (audit finding 6).
 type Event struct {
 	Path string
 	Kind Kind
@@ -168,7 +170,6 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 			scanErr = err
 		}
 	}
-	base := len(p.root) + 1
 	walkErr := filepath.WalkDir(p.root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			recordError(fmt.Errorf("watch: walk %q: %w", path, walkErr))
@@ -231,13 +232,20 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 			copy(digest[:], hasher.Sum(nil))
 			totalBytes += readBytes
 		}
-		key := path
-		if len(path) > base && strings.HasPrefix(path, p.root+string(os.PathSeparator)) {
-			key = path[base:]
-		} else {
-			key = filepath.Base(path)
-		}
-		out[key] = finger{mtime: info.ModTime().UnixNano(), size: info.Size(), digest: digest}
+			key := path
+			if !filepath.IsAbs(key) {
+				// New accepts a relative root (SetExcludedRoots anchors it
+				// only when called), and WalkDir then yields relative paths.
+				// Events feed the server's file-URI conversion directly, so
+				// the fingerprint key — and every event derived from it —
+				// must be absolute: a relative key parses as a UNC host and
+				// loses the per-file invalidation for the real file (audit
+				// finding 6).
+				if abs, absErr := filepath.Abs(key); absErr == nil {
+					key = abs
+				}
+			}
+			out[key] = finger{mtime: info.ModTime().UnixNano(), size: info.Size(), digest: digest}
 		return nil
 	})
 	if walkErr != nil {

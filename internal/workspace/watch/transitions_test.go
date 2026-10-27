@@ -27,7 +27,7 @@ func TestWatcherRenameSurfacesAsDeletePlusCreate(t *testing.T) {
 	if err := os.Rename(original, filepath.Join(root, "after.txt")); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{
 		"before.txt": Deleted,
 		"after.txt":  Created,
 	})
@@ -57,11 +57,11 @@ func TestWatcherDirectoryRenameSurfacesAsPerFileDeletePlusCreate(t *testing.T) {
 	if err := os.Rename(oldDir, newDir); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{
-		filepath.Join("staging", "one.go"):  Deleted,
-		filepath.Join("staging", "two.go"):  Deleted,
-		filepath.Join("promoted", "one.go"): Created,
-		filepath.Join("promoted", "two.go"): Created,
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{
+		"staging/one.go":  Deleted,
+		"staging/two.go":  Deleted,
+		"promoted/one.go": Created,
+		"promoted/two.go": Created,
 	})
 }
 
@@ -84,7 +84,7 @@ func TestWatcherAtomicReplaceSurfacesAsModifyNotDeletePlusCreate(t *testing.T) {
 	if err := os.Rename(temp, target); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{"editor.go": Modified})
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{"editor.go": Modified})
 }
 
 func TestWatcherFullTransitionSequenceCreateModifyRenameDelete(t *testing.T) {
@@ -99,18 +99,18 @@ func TestWatcherFullTransitionSequenceCreateModifyRenameDelete(t *testing.T) {
 	if err := os.WriteFile(created, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{"candidate.txt": Created})
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{"candidate.txt": Created})
 
 	if err := os.WriteFile(created, []byte("v2-longer"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{"candidate.txt": Modified})
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{"candidate.txt": Modified})
 
 	renamed := filepath.Join(root, "renamed.txt")
 	if err := os.Rename(created, renamed); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{
 		"candidate.txt": Deleted,
 		"renamed.txt":   Created,
 	})
@@ -118,7 +118,7 @@ func TestWatcherFullTransitionSequenceCreateModifyRenameDelete(t *testing.T) {
 	if err := os.Remove(renamed); err != nil {
 		t.Fatal(err)
 	}
-	assertTransitionEvents(t, p.Scan(), map[string]Kind{"renamed.txt": Deleted})
+	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{"renamed.txt": Deleted})
 
 	// The full create→modify→rename→delete migration ends in silence, and no
 	// transition along the way invalidated the scan.
@@ -131,9 +131,15 @@ func TestWatcherFullTransitionSequenceCreateModifyRenameDelete(t *testing.T) {
 }
 
 // assertTransitionEvents requires the scan to report exactly the wanted
-// rel-path→kind pairs: no missing events, no duplicates, no extras.
-func assertTransitionEvents(t *testing.T, events []Event, want map[string]Kind) {
+// root-relative path→kind pairs (resolved to the absolute event paths): no
+// missing events, no duplicates, no extras.
+func assertTransitionEvents(t *testing.T, root string, events []Event, want map[string]Kind) {
 	t.Helper()
+	absoluteWant := make(map[string]Kind, len(want))
+	for rel, kind := range want {
+		absoluteWant[filepath.Join(root, rel)] = kind
+	}
+	want = absoluteWant
 	got := make(map[string]Kind, len(events))
 	for _, event := range events {
 		if _, duplicate := got[event.Path]; duplicate {
