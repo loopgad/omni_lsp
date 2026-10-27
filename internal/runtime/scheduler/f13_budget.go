@@ -96,27 +96,46 @@ func (bm *BudgetManager) CategoryPressure(cat BudgetCategory) float64 {
 	return float64(bm.usage[cat]) / float64(limit)
 }
 
+// State maps total pressure onto the goal.md §F13 ladder:
+//
+//	< Soft (0.70)          normal
+//	>= Soft (0.70)         evict    — evict cold caches
+//	>= Medium (0.80)       throttle — pause/throttle background work
+//	>= High (0.90)         reject   — reject expensive work / emergency eviction
+//	>= Critical (1.0)      critical — budget exhausted
+//
+// The band boundaries were shifted one tier up when this manager was written
+// (80% -> evict, 90% -> throttle, refusal only at 100%) while the Soft
+// threshold was consumed by no branch at all; TestBudgetManagerPressureLadder
+// pins the clause mapping above.
 func (bm *BudgetManager) State() string {
 	p := bm.Pressure()
 	switch {
 	case p >= bm.thresholds.Critical:
 		return "critical"
 	case p >= bm.thresholds.High:
-		return "throttle"
+		return "reject"
 	case p >= bm.thresholds.Medium:
+		return "throttle"
+	case p >= bm.thresholds.Soft:
 		return "evict"
 	default:
 		return "normal"
 	}
 }
 
+// CanAllocate reports whether an allocation of n bytes is admissible. Per
+// goal.md §F13 the >= 90% band (High) rejects expensive work, so any
+// allocation that would land total pressure at or above High is refused —
+// rejection deferred to Critical(1.0) left the whole 90-100% band admissible
+// and contradicted the clause.
 func (bm *BudgetManager) CanAllocate(n int64) bool {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	if bm.totalLimit == 0 {
 		return true
 	}
-	return float64(bm.totalUsed+n)/float64(bm.totalLimit) < bm.thresholds.Critical
+	return float64(bm.totalUsed+n)/float64(bm.totalLimit) < bm.thresholds.High
 }
 
 func (bm *BudgetManager) SetLimit(cat BudgetCategory, bytes int64) {

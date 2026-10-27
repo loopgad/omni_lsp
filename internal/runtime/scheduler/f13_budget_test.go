@@ -51,27 +51,85 @@ func TestBudgetManagerThresholds(t *testing.T) {
 }
 
 func TestBudgetManagerCanAllocate(t *testing.T) {
+	// REPLACED (deliberate semantic cut): this test used to pin rejection
+	// deferred to 100% pressure ("should allow 50 bytes at 90% total
+	// pressure"), which contradicted goal.md §F13 — the >= 90% band is
+	// "reject expensive work". CanAllocate now refuses any allocation that
+	// would land total pressure at or above the High threshold (0.90 by
+	// default); the band mapping itself is locked by
+	// TestBudgetManagerPressureLadder.
 	bm := NewBudgetManager(DefaultBudgetThresholds())
 	for cat := CatDocumentText; cat <= CatRPCBuffers; cat++ {
 		bm.SetLimit(cat, 1000)
 	}
-	// Fill all categories to near-critical total pressure
-	bm.RecordUsage(CatSnapshots, 900)
-	bm.RecordUsage(CatQueryCache, 900)
-	bm.RecordUsage(CatSyntaxTrees, 900)
-	bm.RecordUsage(CatLineIndex, 900)
-	bm.RecordUsage(CatDocumentText, 900)
-	bm.RecordUsage(CatDynamicIndex, 900)
-	bm.RecordUsage(CatBackendRSS, 900)
-	bm.RecordUsage(CatRPCBuffers, 900)
-	// totalUsed=7200, totalLimit=8000 -> 90% -> can still allocate small amount
-	if !bm.CanAllocate(50) {
-		t.Error("should allow 50 bytes at 90% total pressure")
+	// totalUsed=6400, totalLimit=8000 -> 80%: inside the throttle band, still
+	// admits allocations that stay below the 90% reject line.
+	bm.RecordUsage(CatSnapshots, 6400)
+	if !bm.CanAllocate(719) {
+		t.Error("should admit an allocation landing at 88.9% (< High 0.90)")
 	}
-	// 7200+300=7500/8000=93.75% < 100% -> still allows
-	// Need to push above critical: use larger alloc
-	if bm.CanAllocate(1000) {
-		t.Error("should reject 1000 bytes at 90% total pressure")
+	if bm.CanAllocate(800) {
+		t.Error("should reject an allocation landing exactly at the 90% reject line")
+	}
+	// Cross the line: at 90% total pressure nothing more is admitted.
+	bm.RecordUsage(CatQueryCache, 800)
+	if bm.CanAllocate(1) {
+		t.Error("should reject any allocation at >= 90% total pressure")
+	}
+}
+
+// TestBudgetManagerPressureLadder locks the goal.md §F13 band mapping:
+//
+//	< 70%   normal
+//	70-80%  evict cold caches
+//	80-90%  pause/throttle background work
+//	>= 90%  reject expensive work / emergency eviction
+//	100%    budget exhausted (critical)
+//
+// Before this ladder was enforced, State() shifted every band one tier up
+// (80% -> evict, 90% -> throttle, rejection only at 100%) and the Soft(0.70)
+// threshold was consumed by no branch at all.
+func TestBudgetManagerPressureLadder(t *testing.T) {
+	bm := NewBudgetManager(DefaultBudgetThresholds())
+	for cat := CatDocumentText; cat <= CatRPCBuffers; cat++ {
+		bm.SetLimit(cat, 1000)
+	}
+	cases := []struct {
+		total int64  // totalUsed out of totalLimit=8000
+		state string // goal.md §F13 band
+	}{
+		{0, "normal"},
+		{5520, "normal"},   // 69.0%
+		{5600, "evict"},    // 70.0% exactly — the Soft tier must fire
+		{6399, "evict"},    // 79.99%
+		{6400, "throttle"}, // 80.0% exactly
+		{7199, "throttle"}, // 89.99%
+		{7200, "reject"},   // 90.0% exactly — the High tier rejects
+		{7999, "reject"},   // 99.99%
+		{8000, "critical"}, // 100% — exhausted
+	}
+	for _, tc := range cases {
+		bm2 := NewBudgetManager(DefaultBudgetThresholds())
+		for cat := CatDocumentText; cat <= CatRPCBuffers; cat++ {
+			bm2.SetLimit(cat, 1000)
+		}
+		fillUsage(bm2, tc.total)
+		if got := bm2.State(); got != tc.state {
+			t.Errorf("pressure %d/8000: State() = %q, want %q", tc.total, got, tc.state)
+		}
+	}
+}
+
+// fillUsage records total bytes spread across categories in 1000-byte chunks
+// so no single category limit interferes with the total-pressure ladder.
+func fillUsage(bm *BudgetManager, total int64) {
+	for cat := CatDocumentText; cat <= CatRPCBuffers && total > 0; cat++ {
+		n := total
+		if n > 1000 {
+			n = 1000
+		}
+		bm.RecordUsage(cat, n)
+		total -= n
 	}
 }
 
