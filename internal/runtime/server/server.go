@@ -212,6 +212,24 @@ type evidenceRecord struct {
 	Completeness identity.Completeness
 }
 
+// defaultRequestDeadlines is the §F9 server-default deadline table, applied
+// per §F8 cost class when Config.RequestDeadlines does not override a class.
+// §F9: "Protocol adapters MAY supply deadlines; otherwise server defaults
+// apply." Deadlines are a resource policy, never a semantic shortcut: they
+// bound how long one request may occupy its scheduler worker, and expiry runs
+// the §F9 path (scheduler cancels the work → drainResult answers the typed
+// RequestCancelled response; nothing partial is published). The values scale
+// with the §F8 ladder (more work ⇒ more wall clock) and sit above the soak
+// harness's 30s default request budget and its 300s acceptance reindex
+// budget, so under normal operation they only fire on work that is stuck.
+var defaultRequestDeadlines = map[scheduler.CostClass]time.Duration{
+	scheduler.CostTiny:      30 * time.Second,
+	scheduler.CostSmall:     60 * time.Second,
+	scheduler.CostMedium:    90 * time.Second,
+	scheduler.CostLarge:     120 * time.Second,
+	scheduler.CostVeryLarge: 600 * time.Second,
+}
+
 // Config holds server configuration.
 type Config struct {
 	Scheduler            scheduler.Config
@@ -221,11 +239,34 @@ type Config struct {
 	// changes are rescanned on this cadence). Zero disables it: editors that
 	// drive didChangeWatchedFiles themselves need no second opinion.
 	WatchInterval time.Duration
+	// RequestDeadlines maps each §F8 cost class to the default wall-clock
+	// deadline applied to scheduled requests of that class (§F9: protocol
+	// adapters MAY supply deadlines; otherwise server defaults apply —
+	// DefaultConfig fills this table). The deadline bounds the request's
+	// whole scheduled lifetime, queue wait included, so a stuck backend
+	// cannot pin a worker forever; on expiry the scheduler stops the work and
+	// the client receives the typed RequestCancelled response. A zero or
+	// missing entry means the class runs without a server-imposed deadline.
+	RequestDeadlines map[scheduler.CostClass]time.Duration
 }
 
 // DefaultConfig returns default server configuration.
 func DefaultConfig() Config {
-	return Config{Scheduler: scheduler.DefaultConfig(), IndexDiskBudgetBytes: 256 << 20}
+	deadlines := make(map[scheduler.CostClass]time.Duration, len(defaultRequestDeadlines))
+	for class, d := range defaultRequestDeadlines {
+		deadlines[class] = d
+	}
+	return Config{
+		Scheduler:            scheduler.DefaultConfig(),
+		IndexDiskBudgetBytes: 256 << 20,
+		RequestDeadlines:     deadlines,
+	}
+}
+
+// requestDeadline returns the §F9 default deadline for a cost class; zero
+// means the class runs without a server-imposed deadline.
+func (s *Server) requestDeadline(class scheduler.CostClass) time.Duration {
+	return s.config.RequestDeadlines[class]
 }
 
 // New creates a new LSP server.
@@ -517,12 +558,13 @@ func (s *Server) scheduleMessage(parentCtx context.Context, msg *jsonrpc.Message
 		origID = &scheduler.ClientID{Str: msg.ID.Str, Num: msg.ID.Num, IsStr: msg.ID.IsStr, IsNull: msg.ID.IsNull}
 	}
 	enqueuedAt := time.Now()
+	costClass := scheduler.ClassifyCost(msg.Method) // §F8 dispatch-point classification
 	req := &scheduler.Request{
 		RequestID:   identity.RequestID(fmt.Sprintf("%s-%v", msg.Method, msg.ID)),
 		OriginalID:  origID,
 		Workspace:   s.workspaceID,
 		Priority:    priority,
-		CostClass:   scheduler.ClassifyCost(msg.Method), // §F8 dispatch-point classification
+		CostClass:   costClass,
 		Snapshot:    snap,
 		CoalesceKey: coalesceKeyFor(msg, snap),
 		EnqueuedAt:  enqueuedAt,
@@ -548,6 +590,13 @@ func (s *Server) scheduleMessage(parentCtx context.Context, msg *jsonrpc.Message
 			}
 			return resp, nil
 		},
+	}
+	// §F9: the server default deadline bounds the request's whole scheduled
+	// lifetime (queue wait included). Expiry makes the scheduler stop the
+	// work and finish the request with context.DeadlineExceeded, which
+	// drainResult projects to the typed RequestCancelled response.
+	if d := s.requestDeadline(costClass); d > 0 {
+		req.Deadline = enqueuedAt.Add(d)
 	}
 
 	if reqID != "" {
@@ -802,6 +851,13 @@ func (s *Server) drainResult(req *scheduler.Request, reqID string) {
 		phaseSpan.sample.SchedulerResultDeliveryNS = elapsedNanoseconds(phaseSpan.dispatcherReturnedAt)
 	}
 	if res.Err != nil {
+		// Notifications have no wire ID to answer: a scheduler-level failure
+		// (e.g. §F9 deadline expiry while queued) must stay silent instead of
+		// emitting a response with a fabricated ID.
+		if req.OriginalID == nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: scheduled notification %s terminated: %v\n", req.RequestID, res.Err)
+			return
+		}
 		// Echo the client's wire ID when we captured it; fall back to the
 		// internal RequestID string only for requests that had none.
 		respID := parseRequestID(req.RequestID)
