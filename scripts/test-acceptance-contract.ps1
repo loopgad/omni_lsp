@@ -331,6 +331,21 @@ try {
     if ((Get-WorkspaceContentHash) -cne $beforeOutWrite) {
         throw 'A generated out/ directory changed the workspace source fingerprint.'
     }
+    # A SOURCE directory that merely shares a name with a .gitignore-anchored
+    # artifact location must stay inside the fingerprint (audit circle 1,
+    # finding 8): the name-based exclusion blinded the identity hash to
+    # same-named subtrees at any depth, so a frozen source-tree identity
+    # check could not see changes under e.g. src/out/.
+    $beforeNestedWrite = Get-WorkspaceContentHash
+    foreach ($nestedName in @('out', 'evidence', 'node_modules')) {
+        $nested = Join-Path $contractWorkspace (Join-Path 'src' $nestedName)
+        New-Item -ItemType Directory -Force -Path $nested | Out-Null
+        Set-Content -LiteralPath (Join-Path $nested 'source.txt') -Value 'source content' -Encoding utf8
+    }
+    if ((Get-WorkspaceContentHash) -ceq $beforeNestedWrite) {
+        throw 'A source directory sharing an artifact name was silently excluded from the workspace fingerprint.'
+    }
+
     $script:FastSourceTreeHash = $beforeEvidenceWrite
     Set-Content -LiteralPath $contractSource -Value 'package sample // changed after build' -Encoding utf8
     $changedSource = Test-FastSourceTreeIdentity 'source-stability-contract'

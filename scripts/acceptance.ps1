@@ -604,10 +604,26 @@ function Assert-GateReleaseAssessment($Gates, [string] $Stage) {
 }
 
 function Get-WorkspaceContentHash {
-    # 'out' aligns with the .gitignore per-run artifacts entry (/out/ — local
-    # iteration/audit reports): concurrent writers inside it must not churn
-    # the frozen acceptance fingerprint or invalidate a continuous soak run.
-    $excludedDirectoryNames = @('.git', '.tmp-gocache', '.npm-cache', 'node_modules', 'evidence', 'rust-analyzer-helper-target', 'out')
+    # Exclusions mirror the .gitignore-anchored per-run artifact locations and
+    # are matched as repoRoot-relative paths (the same anchoring watch.go's
+    # skipDirectory uses), NOT by bare directory name: a SOURCE directory that
+    # merely shares an artifact name ('src/out/', 'docs/evidence/') must stay
+    # inside the fingerprint so the frozen source-tree identity check is not
+    # blind to changes under it (audit circle 1, finding 8).
+    $excludedRelativePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($excluded in @(
+        'out',                                  # /out/ — per-run agent/audit artifacts; concurrent writers must not churn the fingerprint
+        '.tmp-gocache',                         # /.tmp-gocache/ — go build cache root
+        'test/acceptance/evidence',             # /test/acceptance/evidence/ (also skipped dynamically below via $EvidenceDirectory)
+        'test/acceptance/tools/.npm-cache',     # /test/acceptance/tools/.npm-cache/
+        'test/acceptance/tools/node_modules',   # /test/acceptance/tools/node_modules/
+        'editors/vscode/node_modules'           # /editors/vscode/node_modules/
+    )) { [void]$excludedRelativePaths.Add($excluded) }
+    # Name-based at any depth, on purpose: VCS metadata is conventional at any
+    # depth (watch.go's skipDirectory matches '.git' by name too), and the
+    # rust-analyzer helper target's creation site is not pinned in-repo, so
+    # anchoring it would risk a blind spot.
+    $excludedDirectoryNames = @('.git', 'rust-analyzer-helper-target')
     $evidenceRoot = $null
     $repoPrefix = $repoRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if ($EvidenceDirectory.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
@@ -624,8 +640,10 @@ function Get-WorkspaceContentHash {
             if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
             if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
                 $directoryName = [IO.Path]::GetFileName($entry)
+                $relativeDirectory = [IO.Path]::GetRelativePath($repoRoot, $entry).Replace('\', '/')
                 if ($directoryName -notin $excludedDirectoryNames -and
-                    -not $directoryName.StartsWith('.tmp-gocache-', [StringComparison]::Ordinal)) {
+                    -not $excludedRelativePaths.Contains($relativeDirectory) -and
+                    -not $relativeDirectory.StartsWith('.tmp-gocache-', [StringComparison]::Ordinal)) {
                     $pending.Push($entry)
                 }
                 continue
