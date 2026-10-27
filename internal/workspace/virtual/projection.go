@@ -118,14 +118,40 @@ func (p *Projector) HostToVirtualPosition(line, character uint32) (position.LSPP
 	return position.LSPPosition{Line: vline, Character: vchar}, q, nil
 }
 
+// validateEditSpanDoc is the §Y0/SEM-SAFE-001 gate applied to an already
+// resolved mapping snapshot — the same rule ValidateEditSpan (safety.go)
+// enforces after its own registry read. The projector keeps a snapshot-local
+// form so the gate and the segment lookup in VirtualToHostRange consume ONE
+// doc() read: re-registering the virtual URI between a gate read and a
+// second read must not turn an admitted edit into a pseudo ErrUnsafeEditSpan
+// (audit finding 4 TOCTOU). If the rule in safety.go changes, change both —
+// TestProjectorEditGateMatchesValidateEditSpan pins their agreement.
+func validateEditSpanDoc(op string, d *virtualDoc, start, end uint32) error {
+	if start > end {
+		return ierrors.New(ierrors.ErrInvalidArgument, op, "edit start exceeds end")
+	}
+	// Fail closed on generated gaps first — the strongest, cheapest check.
+	for _, s := range d.segs {
+		if s.Quality == QualityUnmappedGenerated && start < s.VirtEnd && end > s.VirtStart {
+			return terr(ierrors.ErrUntrustedOperation, op, "UNSAFE_GENERATED_EDIT", ErrUnsafeGeneratedEdit)
+		}
+	}
+	for _, s := range d.segs {
+		if s.Quality == QualityExact && start >= s.VirtStart && end <= s.VirtEnd {
+			return nil
+		}
+	}
+	return terr(ierrors.ErrUntrustedOperation, op, "UNSAFE_EDIT_SPAN", ErrUnsafeEditSpan)
+}
+
 // VirtualToHostRange maps a half-open virtual edit range to host coordinates.
-// The §Y0/SEM-SAFE-001 gate is applied unchanged — ValidateEditSpan runs on
-// the resolved byte span — so the projector and the Y0-9 gate cannot
-// disagree: an edit crossing an UnmappedGenerated region fails with
-// ErrUnsafeGeneratedEdit, any other span not wholly inside one Exact segment
-// fails with ErrUnsafeEditSpan. Both endpoints then map linearly inside that
-// segment, so a range ending on the segment's closing boundary (which the
-// gate admits) projects to the host segment's end.
+// The §Y0/SEM-SAFE-001 gate is applied unchanged — on the same single
+// registry snapshot the span lookup consumes — so the projector and the
+// Y0-9 gate cannot disagree: an edit crossing an UnmappedGenerated region
+// fails with ErrUnsafeGeneratedEdit, any other span not wholly inside one
+// Exact segment fails with ErrUnsafeEditSpan. Both endpoints then map
+// linearly inside that segment, so a range ending on the segment's closing
+// boundary (which the gate admits) projects to the host segment's end.
 func (p *Projector) VirtualToHostRange(start, end position.LSPPosition) (position.LSPRange, MappingQuality, error) {
 	const op = "virtual.Projector.VirtualToHostRange"
 	vstart, err := p.virtIdx.OffsetOfLineChar(p.virt, start.Line, start.Character)
@@ -136,15 +162,19 @@ func (p *Projector) VirtualToHostRange(start, end position.LSPPosition) (positio
 	if err != nil {
 		return position.LSPRange{}, 0, err
 	}
-	if err := ValidateEditSpan(p.reg, p.virtualURI, vstart, vend); err != nil {
-		return position.LSPRange{}, 0, err
-	}
+	// One snapshot for the gate and the span lookup alike: reading the
+	// registry twice lets a concurrent RegisterVirtual replace the mapping
+	// in between, and a span the gate admitted under mapping A would then be
+	// judged against mapping B's segments (audit finding 4).
 	d, ok := p.reg.doc(p.virtualURI)
 	if !ok { // the mapping was unregistered after construction
 		return position.LSPRange{}, 0, terr(ierrors.ErrNotFound, op, "UNKNOWN_VIRTUAL", ErrUnknownVirtual)
 	}
+	if err := validateEditSpanDoc(op, d, vstart, vend); err != nil {
+		return position.LSPRange{}, 0, err
+	}
 	seg, ok := exactVirtualSpanContaining(d.segs, vstart, vend)
-	if !ok { // unreachable: ValidateEditSpan just admitted the span
+	if !ok { // unreachable: the gate above ran on this same snapshot
 		return position.LSPRange{}, 0, terr(ierrors.ErrUntrustedOperation, op, "UNSAFE_EDIT_SPAN", ErrUnsafeEditSpan)
 	}
 	hstart := seg.HostStart + (vstart - seg.VirtStart)
