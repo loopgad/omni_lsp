@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/runtime/supervisor"
 )
@@ -2069,4 +2070,151 @@ func TestNestedRPCTimingMarksSampleOverflow(t *testing.T) {
 	if report.SampleLimit != maxRequestTimingSamples || len(report.Samples) != maxRequestTimingSamples {
 		t.Fatalf("overflow sample bounds = limit %d samples %d", report.SampleLimit, len(report.Samples))
 	}
+}
+
+// blockingWriteCloser models a child that never drains stdin: every Write
+// parks until the pipe is closed (the OS-pipe-buffer-full wedge). It lets
+// the write-phase deadline tests pin the fenced-write behavior without a
+// real process.
+type blockingWriteCloser struct {
+	block     chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockingWriteCloser() *blockingWriteCloser {
+	return &blockingWriteCloser{block: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (b *blockingWriteCloser) Write(p []byte) (int, error) {
+	<-b.block
+	return len(p), nil
+}
+
+func (b *blockingWriteCloser) Close() error {
+	b.closeOnce.Do(func() {
+		close(b.closed)
+		close(b.block)
+	})
+	return nil
+}
+
+// wedgedWriteFixture supervises a fake worker whose stdin is never drained
+// while its stdout stays silent, and whose watchdog is disabled via a huge
+// grace so ONLY the write-phase deadline can rescue a blocked writer.
+func wedgedWriteFixture(t *testing.T) (*Conn, *atomic.Int32, func() *blockingWriteCloser) {
+	t.Helper()
+	sup := fastSup()
+	sup.HungGrace = time.Hour // the §G5 watchdog must not be the rescuer here
+	spawns := &atomic.Int32{}
+	c := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir(), Sup: sup, RequestTimeout: 80 * time.Millisecond})
+	var stdinMu sync.Mutex
+	lastStdin := (*blockingWriteCloser)(nil)
+	c.cfg.Start = func(c *Conn) error {
+		spawns.Add(1)
+		stdin := newBlockingWriteCloser()
+		stdinMu.Lock()
+		lastStdin = stdin
+		stdinMu.Unlock()
+		stdout, _ := io.Pipe() // reader side never yields: readLoop parks in ReadMessage
+		c.Attach(nil, stdin, stdout)
+		c.MarkReady()
+		return nil
+	}
+	if err := c.StartSupervised(); err != nil {
+		t.Fatalf("initial spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c, spawns, func() *blockingWriteCloser {
+		stdinMu.Lock()
+		defer stdinMu.Unlock()
+		return lastStdin
+	}
+}
+
+// waitForFenceAndRestart asserts the wedged worker was fenced (its stdin was
+// closed by the retirement path) and that the supervisor recycled it into a
+// fresh ready epoch.
+func waitForFenceAndRestart(t *testing.T, c *Conn, spawns *atomic.Int32, stdin func() *blockingWriteCloser, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		sin := stdin()
+		if sin == nil {
+			t.Fatal("fixture never attached a stdin pipe")
+		}
+		select {
+		case <-sin.closed:
+			goto fenced
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("wedged write was never fenced: stdin stayed open")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+fenced:
+	for spawns.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("fenced worker was not recycled (spawns=%d state=%v)", spawns.Load(), c.sup.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for c.sup.State() != supervisor.StateReady {
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement worker not ready (spawns=%d state=%v)", spawns.Load(), c.sup.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestSendRequest_WritePhaseHonorsRequestTimeout pins the write-phase
+// deadline: SendRequest's per-request timer historically started only after
+// the frame write returned, so a child that stopped draining stdin pinned
+// the writer forever (and the read loop's activity refresh kept the §G5
+// watchdog quiet). The write phase itself must now be bounded by
+// RequestTimeout, and the wedged worker must be fenced and recycled.
+func TestSendRequest_WritePhaseHonorsRequestTimeout(t *testing.T) {
+	c, spawns, stdin := wedgedWriteFixture(t)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.SendRequest(context.Background(), "textDocument/hover",
+			map[string]any{"textDocument": map[string]string{"uri": "file:///workspace/a.cpp"}})
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("write against a stdin that is never drained must fail")
+		}
+		if !ierrors.IsKind(err, ierrors.ErrTimeout) {
+			t.Errorf("write-phase error = %v, want a timeout-class error", err)
+		}
+	case <-time.After(20 * c.cfg.RequestTimeout):
+		t.Fatal("SendRequest never returned while the child refused to drain stdin: the write phase is still unbounded")
+	}
+	waitForFenceAndRestart(t, c, spawns, stdin, 20*c.cfg.RequestTimeout)
+}
+
+// TestNotify_WritePhaseHonorsRequestTimeout pins the same bound for the
+// notification write path (didChange/didSave/didClose all share it): a
+// notification must not be able to block its caller forever either.
+func TestNotify_WritePhaseHonorsRequestTimeout(t *testing.T) {
+	c, spawns, stdin := wedgedWriteFixture(t)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.Notify("textDocument/didSave",
+			map[string]any{"textDocument": map[string]string{"uri": "file:///workspace/a.cpp"}})
+	}()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("notification write against a stdin that is never drained must fail")
+		}
+	case <-time.After(20 * c.cfg.RequestTimeout):
+		t.Fatal("Notify never returned while the child refused to drain stdin: the write phase is still unbounded")
+	}
+	waitForFenceAndRestart(t, c, spawns, stdin, 20*c.cfg.RequestTimeout)
 }

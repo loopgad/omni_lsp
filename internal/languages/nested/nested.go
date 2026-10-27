@@ -629,14 +629,23 @@ func (c *Conn) writeMessageDuringClose(msg *jsonrpc.Message, duringClose bool) e
 	if err != nil {
 		return err
 	}
+	if duringClose {
+		return c.writeFrameAtClose(data)
+	}
+	return c.writeFrameBounded(data)
+}
+
+// writeFrameAtClose performs the framing write for the shutdown handshake
+// (shutdown request, exit notification). The close orchestration bounds it
+// from the outside — the shutdown grace timer forces termination, whose pipe
+// close releases both a blocked Fprintf and the write turn it holds — so
+// this path keeps the plain, uncancellable write turn. Unlike the regular
+// path it must proceed while the connection is already marked closed.
+func (c *Conn) writeFrameAtClose(data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
 	c.mu.Lock()
-	if c.closed.Load() && !duringClose {
-		c.mu.Unlock()
-		return fmt.Errorf("%s backend closed", c.cfg.Name)
-	}
 	if c.stdin == nil {
 		c.mu.Unlock()
 		return errors.New(errors.ErrBackendUnavailable, c.cfg.Name, "backend is not started")
@@ -644,8 +653,69 @@ func (c *Conn) writeMessageDuringClose(msg *jsonrpc.Message, duringClose bool) e
 	stdin := c.stdin
 	c.mu.Unlock()
 
-	_, err = fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
+	_, err := fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
 	return err
+}
+
+// writeFrameBounded performs the regular request/notification framing write
+// with the request timeout applied to BOTH the wait for the write turn and
+// the write itself. The per-request deadline in SendRequest starts only
+// after the write returns, so without this bound a child that kept emitting
+// output while never draining stdin pinned the writer forever (and the read
+// loop's per-message lastActivity refresh kept the §G5 watchdog quiet). On
+// deadline the exact child epoch is retired — the fenced-write discipline of
+// writeMessageWithContext: closing the captured pipes releases the blocked
+// Fprintf, the writer goroutine is always joined before the write turn is
+// released so it can never touch a replacement child's stream, and the
+// supervisor restarts the worker.
+func (c *Conn) writeFrameBounded(data []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.RequestTimeout)
+	defer cancel()
+	if err := c.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return fmt.Errorf("%s backend closed", c.cfg.Name)
+	}
+	if c.stdin == nil {
+		c.mu.Unlock()
+		return errors.New(errors.ErrBackendUnavailable, c.cfg.Name, "backend is not started")
+	}
+	stdin, stdout, cmd := c.stdin, c.stdout, c.cmd
+	epoch := c.readerEpoch.Load()
+	c.mu.Unlock()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
+		writeDone <- err
+	}()
+
+	select {
+	case writeErr := <-writeDone:
+		return writeErr
+	case <-ctx.Done():
+		select {
+		case writeErr := <-writeDone:
+			// The frame landed while the deadline fired: nothing is torn.
+			return writeErr
+		default:
+		}
+		retireErr := c.retireProcessEpoch(epoch, stdin, stdout, cmd,
+			fmt.Errorf("%s write exceeded %s while the worker was not draining stdin",
+				c.cfg.Name, c.cfg.RequestTimeout))
+		writeErr := <-writeDone
+		return errors.New(errors.ErrTimeout, c.cfg.Name, fmt.Sprintf(
+			"write did not complete within %s (write outcome: %v; worker retirement: %v)",
+			c.cfg.RequestTimeout, writeErr, retireErr))
+	}
 }
 
 func (c *Conn) notifyWithContext(ctx context.Context, method string, params interface{}, beforeWrite func()) error {
