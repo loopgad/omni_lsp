@@ -605,8 +605,26 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 			}
 			if err := verifyStdioWorkersAlive(alive); err != nil {
 				stopWorkers()
-				soakFailed(&evidence, "soak/workers", err.Error())
-				t.Fatal(err)
+				message := drainWorkerErrorResults(results, err.Error())
+				soakFailed(&evidence, "soak/workers", message)
+				t.Fatal(message)
+			}
+			// The backend-restart trigger is evaluated before the minute-row
+			// block: the block couples a multi-minute full-corpus reindex to
+			// every row (x9-1-status-10m-r2-20261027T1619Z: 257s per reindex),
+			// so a trigger placed after it fires one reindex late — on that 10m
+			// run the first eligible tick landed at active 572s, 28s before the
+			// duration condition expired, and the candidate restart never
+			// started (soak/restart not_verified, gate fail-closed). Triggering
+			// before the block gives the restart goroutine the coupled reindex
+			// windows as probe runway.
+			if !backendRestartStarted && active >= duration/3 {
+				backendRestartStarted = true
+				backendRestartPending = backendRestartDone
+				go func() {
+					oldPID, newPID, restartErr := restartControlledRustBackend(session, job, os.Getpid(), int(candidatePID.Load()), rustAnalyzerPath, rustURI, rustText)
+					backendRestartDone <- controlledBackendRestartResult{oldPID: oldPID, newPID: newPID, err: restartErr}
+				}()
 			}
 			statusSampleStart := time.Now()
 			statusSample, statusErr := readStdioStatus(session)
@@ -742,13 +760,19 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				recordMaintenancePause("periodic-reindex", reindexStarted)
 				lastCommittedIndexGeneration = generation
 			}
-			if !backendRestartStarted && active >= duration/3 {
-				backendRestartStarted = true
-				backendRestartPending = backendRestartDone
-				go func() {
-					oldPID, newPID, restartErr := restartControlledRustBackend(session, job, os.Getpid(), int(candidatePID.Load()), rustAnalyzerPath, rustURI, rustText)
-					backendRestartDone <- controlledBackendRestartResult{oldPID: oldPID, newPID: newPID, err: restartErr}
-				}()
+			// A restart result that landed while this tick's reindex ran would
+			// otherwise wait for the next iteration's priority drain — an
+			// iteration top the duration condition may never reach, because
+			// active already advanced past it inside the reindex (same starved
+			// run). Consume it here so the candidate restart can still start
+			// within this tick.
+			if backendRestartPending != nil {
+				select {
+				case restartedBackend := <-backendRestartPending:
+					backendRestartPending = nil
+					handleBackendRestart(restartedBackend)
+				default:
+				}
 			}
 			if !restarted && backendRestarted && active >= duration/2 {
 				monitor.beginMaintenance()
@@ -826,7 +850,7 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 				session.Notify(t, "textDocument/didOpen", map[string]any{"textDocument": map[string]any{
 					"uri": rustURI, "languageId": "rust", "version": 1, "text": rustText,
 				}})
-				if err := waitForStdioSnapshot(session, beforeRustReopen, 30*time.Second); err != nil {
+				if err := waitForStdioSnapshot(session, beforeRustReopen, soakSnapshotReopenBudget); err != nil {
 					soakFailed(&evidence, "soak/restart-rust-open", err.Error())
 					t.Fatal(err)
 				}
@@ -860,7 +884,11 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 		case worker := <-workerDone:
 			if workerCtx.Err() == nil {
 				stopWorkers()
-				message := fmt.Sprintf("semantic worker %d exited before the soak was stopped", worker)
+				// The worker sent its error result to the buffered results
+				// channel before the done notification, and the main select
+				// may not have consumed it yet; surface it or the root cause
+				// is lost behind the exit report.
+				message := drainWorkerErrorResults(results, fmt.Sprintf("semantic worker %d exited before the soak was stopped", worker))
 				soakFailed(&evidence, "soak/workers", message)
 				t.Fatal(message)
 			}
@@ -1836,7 +1864,7 @@ func startStdioWorkers(ctx context.Context, session *lspdriver.Session, queries 
 			defer aliveState.Store(false)
 			defer func() { done <- index }()
 			for ctx.Err() == nil {
-				requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				requestCtx, cancel := context.WithTimeout(ctx, stdioWorkerRequestBudget())
 				requestStarted := time.Now()
 				raw, err := session.RequestContext(requestCtx, query.method, query.params)
 				elapsed := time.Since(requestStarted)
@@ -1883,6 +1911,28 @@ func verifyStdioWorkersAlive(alive []*atomic.Bool) error {
 		}
 	}
 	return nil
+}
+
+// drainWorkerErrorResults appends every queued worker error to a failure
+// message. A worker that dies mid-run sends its error result to the buffered
+// results channel before its done notification and liveness flag update; a
+// failure path that reports the death without draining the queue reports the
+// symptom but not the cause (x9-1-status-10m-r3-20261027T1702Z failed with
+// "semantic worker 5 is not alive" and the underlying query error was never
+// surfaced). Call only from a path that is about to t.Fatal: queued success
+// results are dropped, which is fine once the run is ending.
+func drainWorkerErrorResults(results <-chan stdioWorkerResult, message string) string {
+	for {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				message = fmt.Sprintf("%s; worker %d %s failed: %v", message, result.worker, result.method, result.err)
+			}
+			continue
+		default:
+		}
+		return message
+	}
 }
 
 func collectStdioTelemetry(session *lspdriver.Session, job *processTreeBudget, candidatePID int, alive []*atomic.Bool, requests, edits uint64, active time.Duration, now time.Time, candidateHash, workerHash string) (stdioTelemetry, error) {

@@ -36,6 +36,19 @@ const (
 	// diagnostic runs (see stdioRequestBudget). It is not a soak-gate
 	// precondition: strict gate semantics do not depend on it.
 	stdioRequestBudgetEnv = "OMNILSP_SOAK_REQUEST_BUDGET"
+
+	// soakRestartIndexQueryCount is the number of full-corpus
+	// textDocument/references requests the candidate-restart block performs
+	// outside its explicit waits: verifyPersistentStdioIndex re-verifies the
+	// restored generation and assertStdioQuerySet re-runs the worker query
+	// set. Each is one request governed by stdioRequestBudget (measured
+	// 13-27s against the 4096-file corpus), so the restart budget counts them
+	// at their governing per-request ceiling instead of a bare constant —
+	// x9-1-status-10m-r5-20261027T1741Z rejected a 6m55s block against the
+	// previous 355s formula that ignored them, while the earlier passing run
+	// only dodged the check because its block outlived the duration
+	// condition and was never recorded.
+	soakRestartIndexQueryCount = 2
 )
 
 // processTreeMember and processTreeSample are the platform-independent shapes
@@ -618,14 +631,22 @@ func minuteWindowGapContinuous(wallGap, activeGap, maintenancePause time.Duratio
 
 // soakMaintenanceBudget bounds the known main-loop pauses. The reindex budget
 // is the request budget it runs under; the restart budget is the rust
-// cold-start allowance plus the phase's own explicit waits. Each pause is
-// checked at record time, so a recorded pause can never be unbounded.
+// cold-start allowance, the phase's explicit snapshot/lifecycle waits, and
+// its two full-corpus references requests at their governing per-request
+// budget. Each pause is checked at record time, so a recorded pause can never
+// be unbounded.
 func soakMaintenanceBudget(kind string) time.Duration {
 	switch kind {
 	case "periodic-reindex":
 		return stdioRequestBudget() + 2*soakPollPeriod
 	case "candidate-restart":
-		return stdioColdStartAllowance(90*time.Second) + soakSnapshotOpenBudget + soakSnapshotReopenBudget + soakProgressLifecycleBudget + 2*soakPollPeriod
+		return stdioColdStartAllowance(90*time.Second) +
+			soakSnapshotOpenBudget +
+			soakSnapshotReopenBudget + // cancel-query document snapshot reopen
+			soakSnapshotReopenBudget + // rust document snapshot reopen
+			soakProgressLifecycleBudget +
+			time.Duration(soakRestartIndexQueryCount)*stdioRequestBudget() +
+			2*soakPollPeriod
 	default:
 		return 0
 	}
@@ -636,6 +657,17 @@ func soakMaintenanceBudget(kind string) time.Duration {
 // re-indexes under the eight-worker load; identity is re-sampled after the
 // probe, so a longer budget cannot hide a backend restart.
 func soakRustStabilityProbeBudget() time.Duration {
+	return stdioRequestBudget()
+}
+
+// stdioWorkerRequestBudget is the per-request deadline the eight query
+// workers apply. It derives from stdioRequestBudget like every other request
+// path: the references worker's full-corpus query measured 13-27s against the
+// previous bare 30s constant (x9-1-status-10m-r4-20261027T1718Z died with
+// "context deadline exceeded" after the first sample already needed 26.9s of
+// that 30s), so a fixed deadline both flaked the gate and ignored the
+// diagnostic widening every other caller honors.
+func stdioWorkerRequestBudget() time.Duration {
 	return stdioRequestBudget()
 }
 

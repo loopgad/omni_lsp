@@ -226,7 +226,8 @@ func TestSoakMaintenanceBudgetsAreDerived(t *testing.T) {
 	if got, want := soakMaintenanceBudget("periodic-reindex"), 30*time.Second+2*soakPollPeriod; got != want {
 		t.Fatalf("periodic reindex budget = %s, want %s", got, want)
 	}
-	if got, want := soakMaintenanceBudget("candidate-restart"), stdioColdStartAllowance(90*time.Second)+soakSnapshotOpenBudget+soakSnapshotReopenBudget+soakProgressLifecycleBudget+2*soakPollPeriod; got != want {
+	wantRestart := stdioColdStartAllowance(90*time.Second) + soakSnapshotOpenBudget + 2*soakSnapshotReopenBudget + soakProgressLifecycleBudget + time.Duration(soakRestartIndexQueryCount)*stdioRequestBudget() + 2*soakPollPeriod
+	if got, want := soakMaintenanceBudget("candidate-restart"), wantRestart; got != want {
 		t.Fatalf("candidate restart budget = %s, want %s", got, want)
 	}
 	if got := soakMaintenanceBudget("unknown"); got != 0 {
@@ -236,7 +237,8 @@ func TestSoakMaintenanceBudgetsAreDerived(t *testing.T) {
 	if got, want := soakMaintenanceBudget("periodic-reindex"), 90*time.Second+2*soakPollPeriod; got != want {
 		t.Fatalf("widened periodic reindex budget = %s, want %s", got, want)
 	}
-	if got, want := soakMaintenanceBudget("candidate-restart"), stdioColdStartAllowance(90*time.Second)+soakSnapshotOpenBudget+soakSnapshotReopenBudget+soakProgressLifecycleBudget+2*soakPollPeriod; got != want {
+	wantRestart = stdioColdStartAllowance(90*time.Second) + soakSnapshotOpenBudget + 2*soakSnapshotReopenBudget + soakProgressLifecycleBudget + time.Duration(soakRestartIndexQueryCount)*stdioRequestBudget() + 2*soakPollPeriod
+	if got, want := soakMaintenanceBudget("candidate-restart"), wantRestart; got != want {
 		t.Fatalf("widened candidate restart budget = %s, want %s", got, want)
 	}
 }
@@ -249,6 +251,17 @@ func TestSoakRustStabilityProbeBudgetIsRequestBudget(t *testing.T) {
 	t.Setenv(stdioRequestBudgetEnv, "45s")
 	if got, want := soakRustStabilityProbeBudget(), 45*time.Second; got != want {
 		t.Fatalf("widened stability probe budget = %s, want %s", got, want)
+	}
+}
+
+func TestSoakWorkerRequestBudgetIsRequestBudget(t *testing.T) {
+	t.Setenv(stdioRequestBudgetEnv, "")
+	if got, want := stdioWorkerRequestBudget(), 30*time.Second; got != want {
+		t.Fatalf("default worker request budget = %s, want %s", got, want)
+	}
+	t.Setenv(stdioRequestBudgetEnv, "45s")
+	if got, want := stdioWorkerRequestBudget(), 45*time.Second; got != want {
+		t.Fatalf("widened worker request budget = %s, want %s", got, want)
 	}
 }
 
