@@ -2218,3 +2218,56 @@ func TestNotify_WritePhaseHonorsRequestTimeout(t *testing.T) {
 	}
 	waitForFenceAndRestart(t, c, spawns, stdin, 20*c.cfg.RequestTimeout)
 }
+
+// TestG5_WatchdogRearmsAfterSupervisedRestart pins the re-arm requirement:
+// the G5 watchdog must cover EVERY ready epoch, not just the first one.
+// Before the re-arm existed, the initial epoch's watchdog returned after its
+// first HandleHungWorker and the supervisor-restart path (StateBackoff →
+// Start → Attach → MarkReady) never armed a replacement, so any later hang
+// could only ride out per-request timeouts one by one instead of going
+// through terminate → epoch increment → policy restart.
+func TestG5_WatchdogRearmsAfterSupervisedRestart(t *testing.T) {
+	sup := fastSup()
+	sup.HungGrace = 60 * time.Millisecond
+	spawns := &atomic.Int32{}
+	c := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir(), Sup: sup, RequestTimeout: 120 * time.Millisecond})
+	c.cfg.Start = func(c *Conn) error { return fakeStart(c, spawns) }
+	if err := c.StartSupervised(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// First hang on the initial epoch: must be detected and recycled.
+	ch1 := c.RegisterPending(9100)
+	waitForPendingFailure(t, ch1, "first hang")
+	deadline := time.Now().Add(3 * time.Second)
+	for spawns.Load() < 2 || c.sup.State() != supervisor.StateReady {
+		if time.Now().After(deadline) {
+			t.Fatalf("worker not recycled after first hang (spawns=%d state=%v)", spawns.Load(), c.sup.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Second hang on the replacement epoch: must ALSO be detected instead of
+	// parking forever.
+	ch2 := c.RegisterPending(9200)
+	waitForPendingFailure(t, ch2, "second hang after supervised restart")
+}
+
+func waitForPendingFailure(t *testing.T, ch <-chan *jsonrpc.Message, label string) {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case resp := <-ch:
+			if resp == nil || resp.Error == nil {
+				t.Fatalf("%s produced %+v, want an error response", label, resp)
+			}
+			return
+		case <-deadline.C:
+			t.Fatalf("%s never failed: the hung-worker watchdog did not cover this epoch", label)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}

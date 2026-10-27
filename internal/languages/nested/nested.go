@@ -204,6 +204,11 @@ type Conn struct {
 	buildCtxID   identity.BuildContextID
 
 	sup *supervisor.Supervisor
+
+	// hungGrace is the §G5 silence threshold computed once at StartSupervised
+	// from the supervisor policy and the per-request budget. Zero on
+	// unsupervised connections (startWatchdog falls back to its default).
+	hungGrace time.Duration
 }
 
 type processWaitState struct {
@@ -253,6 +258,13 @@ func (c *Conn) StartSupervised() error {
 	c.sup = sup
 	c.mu.Unlock()
 	c.wireSupervisor(sup)
+	// The watchdog must never fire on a request still inside its legitimate
+	// window: a project-wide analysis can legitimately run for many seconds.
+	// Align the silence threshold with the per-request timeout so only a
+	// backend that is silent BEYOND its own deadlines gets recycled. The
+	// threshold is captured before the first Start because MarkReady — the
+	// (re)arming point — runs inside the Start factory.
+	c.hungGrace = maxDuration(supCfg.HungGrace, c.cfg.RequestTimeout)
 	sup.Start()
 	if sup.State() == supervisor.StateDisabled {
 		return fmt.Errorf("%s start blocked by workspace trust (OMNILSP_TRUST=%s)",
@@ -268,11 +280,6 @@ func (c *Conn) StartSupervised() error {
 		return errors.New(errors.ErrBackendUnavailable, c.cfg.Name, "backend closed during start")
 	}
 	c.lastActivity.Store(time.Now().UnixNano())
-	// The watchdog must never fire on a request still inside its legitimate
-	// window: a project-wide analysis can legitimately run for many seconds.
-	// Align the silence threshold with the per-request timeout so only a
-	// backend that is silent BEYOND its own deadlines gets recycled.
-	c.startWatchdog(maxDuration(supCfg.HungGrace, c.cfg.RequestTimeout))
 	return nil
 }
 
@@ -352,10 +359,13 @@ func (c *Conn) Attach(cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser)
 }
 
 // MarkReady promotes the supervisor into Ready after a successful handshake.
+// Each promotion — initial start or supervised restart — also (re)arms the
+// §G5 hung-worker watchdog for the fresh reader epoch, so every ready epoch
+// of the process lifecycle is covered, not just the first one.
 func (c *Conn) MarkReady() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed.Load() || c.sup == nil || c.exitHandled {
+		c.mu.Unlock()
 		return
 	}
 	readerEpoch := c.readerEpoch.Load()
@@ -364,7 +374,16 @@ func (c *Conn) MarkReady() {
 	// the exact pipe generation whose initialize handshake just succeeded.
 	c.readyReaderEpoch = readerEpoch
 	c.readyBackendEpoch = backendEpoch
+	firstReadyForEpoch := !c.ready
 	c.ready = true
+	grace := c.hungGrace
+	c.mu.Unlock()
+	// Attach sets ready=false, so the first MarkReady after each Attach arms
+	// exactly one watchdog per epoch; duplicate promotions of an already
+	// ready epoch never stack watchdogs.
+	if firstReadyForEpoch {
+		c.startWatchdog(grace)
+	}
 }
 
 // SupervisorMessage exposes the supervisor's human-facing lifecycle state
@@ -994,19 +1013,28 @@ func (c *Conn) hasPending() bool {
 	return len(c.pending) > 0
 }
 
-// startWatchdog launches the G5 hung-worker detector. Every tick it checks:
-// pending requests present AND no traffic for HungGrace ⇒ wedged process.
-// HandleHungWorker fails the parked requests immediately and kills the
-// process; the read-loop exit then drives the normal restart cycle.
+// startWatchdog launches the G5 hung-worker detector for one reader epoch.
+// Every tick it checks: pending requests present AND no traffic for HungGrace
+// ⇒ wedged process. HandleHungWorker fails the parked requests immediately
+// and kills the process; the read-loop exit then drives the normal restart
+// cycle, and the replacement epoch's MarkReady arms the next watchdog. The
+// goroutine terminates when its epoch is replaced, when the connection
+// closes, or when it fires — never leaking across epochs (F15).
 func (c *Conn) startWatchdog(grace time.Duration) {
 	if grace <= 0 {
 		grace = 5 * time.Second
 	}
+	epoch := c.readerEpoch.Load()
 	go func() {
 		ticker := time.NewTicker(grace / 2)
 		defer ticker.Stop()
-		for range ticker.C {
-			if c.closed.Load() {
+		for {
+			select {
+			case <-ticker.C:
+			case <-c.closeDone:
+				return
+			}
+			if c.closed.Load() || c.readerEpoch.Load() != epoch {
 				return
 			}
 			if !c.hasPending() {
@@ -1017,13 +1045,17 @@ func (c *Conn) startWatchdog(grace time.Duration) {
 				continue
 			}
 			sup := c.sup
+			if sup == nil {
+				continue // unsupervised connection: nothing drives the restart
+			}
 			go func() {
 				sup.HandleHungWorker(
 					func() { c.failPending(c.cfg.Name + " worker hung; requests failed") },
 					c.killProcess,
 				)
 			}()
-			return // process death routes through HandleProcessExit → restart
+			return // process death routes through HandleProcessExit → restart;
+			// the replacement epoch's MarkReady re-arms the next watchdog.
 		}
 	}()
 }
