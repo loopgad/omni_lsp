@@ -288,16 +288,19 @@ func TestScheduler_ShutdownDrainsMixedPriorityQueue(t *testing.T) {
 	}
 }
 
-// TestScheduler_BoostNeverDropsRequests locks the anti-vanishing fix: when
-// queues refuse re-queueing (here: post-Shutdown closed state), the stale
-// request's Result receives an immediate rejection instead of silence.
-func TestScheduler_BoostNeverDropsRequests(t *testing.T) {
+// TestScheduler_BoostAfterShutdownIsNoOp replaces the pre-fix pin
+// (TestScheduler_BoostNeverDropsRequests), which asserted that a post-
+// Shutdown aging pass terminates an extracted stale request with a
+// rejection. That pin captured the pseudo-rejection path the audit flags
+// (F3): with the aging fence, a pass can no longer overlap the closed state
+// at all, so post-shutdown boostStaleRequests is a no-op — it must not panic
+// on the closed lanes and must not write a rejection behind the drain's
+// back. The parked request's terminal outcome belongs to the draining worker
+// (covered by the Shutdown drain tests in this file), never to aging.
+func TestScheduler_BoostAfterShutdownIsNoOp(t *testing.T) {
 	s := New(DefaultConfig())
-	if s.config.PriorityAgingMs <= 0 {
-		s.config.PriorityAgingMs = 10
-	}
 	req := &Request{
-		RequestID:  "boost-drop",
+		RequestID:  "boost-after-shutdown",
 		Priority:   PriorityMaintenance,
 		CostClass:  DefaultCostClass,               // as Submit would resolve it; aging runs per §F8 class lane
 		EnqueuedAt: time.Now().Add(-1 * time.Hour), // definitely stale
@@ -312,17 +315,73 @@ func TestScheduler_BoostNeverDropsRequests(t *testing.T) {
 	if !s.trySend(req.CostClass, int(req.Priority), req) {
 		t.Fatal("setup: could not enqueue request")
 	}
-	s.Shutdown() // closed=true → every trySend now refuses
+	s.Shutdown() // closed=true, lanes closed
 
-	// Post-shutdown aging pass: the popped stale request can go nowhere.
-	s.boostStaleRequests()
+	// Post-shutdown aging pass: fenced no-op.
+	s.boostStaleRequests(context.Background())
+
+	select {
+	case res := <-req.Result:
+		t.Errorf("post-shutdown aging touched the parked request: %+v", res)
+	default:
+	}
+}
+
+// TestScheduler_DrainScanFencesInFlightAgingPass pins the fence mechanism
+// deterministically (audit finding 2): a request that an aging pass holds
+// between lanes while the worker performs its final draining scan must not
+// be stranded. The worker must wait for the pending pass and pick the
+// re-queued request up, delivering a terminal result.
+func TestScheduler_DrainScanFencesInFlightAgingPass(t *testing.T) {
+	s := New(Config{MaxConcurrent: 1, MaxQueueSize: 4, PriorityAgingMs: 5000})
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Start(ctx)
+
+	req := &Request{
+		RequestID:  "fence-drain",
+		Priority:   PriorityMaintenance,
+		CostClass:  DefaultCostClass,
+		EnqueuedAt: time.Now(),
+		Result:     make(chan Result, 1), // trySend parking skips Submit's channel setup
+		Execute: func(ctx context.Context, snap *snapshot.Snapshot) (any, error) {
+			return nil, nil
+		},
+	}
+	// Park without notify so the worker stays idle until cancellation.
+	if !s.trySend(req.CostClass, int(req.Priority), req) {
+		t.Fatal("setup: could not enqueue request")
+	}
+
+	// Simulate an aging pass in flight: registered, holding the fence, and
+	// holding the extracted request between lanes.
+	s.agingPending.Add(1)
+	s.agingMu.Lock()
+	extracted := <-s.queues[DefaultCostClass][int(PriorityMaintenance)]
+	if extracted != req {
+		t.Fatal("setup: extracted the wrong request")
+	}
+
+	cancel() // the worker must not finish its drain while the pass is pending
+
+	// Give the worker time to (wrongly, pre-fix) finish its drain and exit.
+	time.Sleep(50 * time.Millisecond)
+
+	// Complete the simulated pass: closed is still false, so the requeue
+	// succeeds — the request is back in a lane after the fence is released.
+	if !s.trySend(req.CostClass, int(req.Priority), req) {
+		s.agingMu.Unlock()
+		s.agingPending.Add(-1)
+		t.Fatal("setup: could not requeue the extracted request")
+	}
+	s.agingMu.Unlock()
+	s.agingPending.Add(-1)
 
 	select {
 	case res := <-req.Result:
 		if res.Err == nil {
-			t.Error("request terminated with neither value nor error")
+			t.Error("re-queued request completed without a cancellation error")
 		}
-	default:
-		t.Error("stale request has no terminal outcome after boostStaleRequests")
+	case <-time.After(time.Second):
+		t.Fatal("request re-queued by a pending aging pass was stranded: the draining worker exited without it")
 	}
 }

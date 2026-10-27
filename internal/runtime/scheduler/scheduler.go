@@ -19,18 +19,26 @@ package scheduler
 //  2. Priority aging prevents starvation per F7.
 //  3. Shutdown drains queued work but cancels in-flight Execute: s.cancel()
 //     runs before the queues close, so anything already executing sees a done
-//     context immediately. Queued requests still run -- pickRequest treats the
-//     cancellation as a drain signal and keeps scanning the queues.
+//     context immediately. Queued requests do not run after cancellation: a
+//     draining worker that dequeues one rolls it back with ctx.Err()
+//     (runRequest). The drain guarantee is that every admitted request still
+//     receives exactly one terminal Result — the aging fence (agingMu /
+//     agingPending) keeps priority-aging passes from holding a request
+//     between lanes while the last draining worker scans, which would
+//     otherwise strand it with no terminal outcome at all.
 //
 // F2 Locking policy:
 //   - Protected: queues[NumCostClasses][9], config, closed, inFlight, stats
 //   - No nested locks; atomic ops for inFlight/stats counters
 //   - No blocking I/O under lock
 //   - Goroutines owned by Start/Shutdown lifecycle
+//   - Lock order: agingMu before queueMu (Shutdown and the aging pass both
+//     take agingMu first; trySend only ever takes queueMu).
 
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -408,6 +416,17 @@ type Scheduler struct {
 	// correctly flags any send that overlaps the close window.
 	queueMu sync.RWMutex
 
+	// agingMu is the priority-aging fence (audit 复证圈 1, findings 1/2/3/5):
+	// boostStaleRequests holds it for an entire scan so a request can never
+	// sit in limbo between lanes while Shutdown closes the queues or the
+	// last draining worker scans. Shutdown takes the same fence before it
+	// cancels and closes, and pickRequest's final drain scan takes it so an
+	// empty scan is a stable empty. agingPending counts passes waiting on or
+	// holding the fence; a draining worker that scans empty while a pass is
+	// pending yields and rescans instead of exiting.
+	agingMu      sync.Mutex
+	agingPending atomic.Int64
+
 	// F11/J6: single-flight joining for coalescable read-only requests.
 	tracker *InFlightTracker
 
@@ -685,6 +704,25 @@ func (s *Scheduler) pickRequest(ctx context.Context) *Request {
 			return req
 		}
 		if draining {
+			// Final drain scan under the aging fence: with the fence held, a
+			// priority-aging pass can neither hold a request between lanes
+			// during this scan nor re-queue one after it. A pass that started
+			// before cancellation either completed (its requeues are visible
+			// to this scan) or is still pending, in which case the worker
+			// yields and rescans instead of exiting on a false empty. Any
+			// pass that runs later refuses at its fence entry (cancelled
+			// context or closed), so an empty fenced scan is a stable empty.
+			s.agingMu.Lock()
+			if req := s.pickClassAware(); req != nil {
+				s.agingMu.Unlock()
+				return req
+			}
+			pending := s.agingPending.Load()
+			s.agingMu.Unlock()
+			if pending != 0 {
+				runtime.Gosched()
+				continue
+			}
 			return nil
 		}
 		// Prefer an already-canceled context before waiting. If cancellation
@@ -748,15 +786,57 @@ func (s *Scheduler) agingLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.boostStaleRequests()
+			s.boostStaleRequests(ctx)
 		}
 	}
 }
 
-// boostStaleRequests lifts requests that have been queued longer than PriorityAgingMs.
-// Aging moves requests between priorities within their own §F8 class lane —
-// boosting changes §F3 order, never §F8 cost.
-func (s *Scheduler) boostStaleRequests() {
+// requeueAged puts an aging-extracted request back into its §F8 class lane:
+// first choice, then the lane it came from, then any sibling priority lane
+// with room. An aging pass extracts at most one request per lane, so the
+// origin lane has room unless a concurrent Submit refilled it; the sibling
+// fallback (F3 audit fix) keeps a saturated destination from turning an
+// admitted request into a pseudo-rejection. Returns the priority the request
+// landed in, or -1 when every lane of the class is full.
+func (s *Scheduler) requeueAged(c CostClass, first, origin int, req *Request) int {
+	if s.trySend(c, first, req) {
+		return first
+	}
+	if origin != first && s.trySend(c, origin, req) {
+		return origin
+	}
+	for pq := 0; pq < len(s.queues[resolveClass(c)]); pq++ {
+		if pq != first && pq != origin && s.trySend(c, pq, req) {
+			return pq
+		}
+	}
+	return -1
+}
+
+// boostStaleRequests lifts requests that have been queued longer than
+// PriorityAgingMs. Aging moves requests between priorities within their own
+// §F8 class lane — boosting changes §F3 order, never §F8 cost.
+//
+// The pass holds the aging fence (agingMu) for its entire duration and is
+// registered in agingPending before taking it: Shutdown waits on the fence
+// before it cancels and closes the queues, and a draining worker's final
+// scan holds it too, so an extracted request can never be in lane limbo
+// across a close or a last scan (audit findings 1/2/5 — the panic on a
+// drained closed lane — and finding 2 — stranded admitted requests).
+func (s *Scheduler) boostStaleRequests(ctx context.Context) {
+	s.agingPending.Add(1)
+	s.agingMu.Lock()
+	defer func() {
+		s.agingMu.Unlock()
+		s.agingPending.Add(-1)
+	}()
+	// Refuse to scan once shutdown started or the session context is gone:
+	// from that point the drain owns every queued request, and a pass past
+	// this point would extract requests from lanes that are closing under it
+	// and turn them into pseudo-rejections (F3) or stragglers (F2).
+	if s.closed.Load() || ctx.Err() != nil {
+		return
+	}
 	boosted := false
 	for pq := PriorityMaintenance; pq > PriorityCompletion; pq-- {
 		for c := CostTiny; c <= CostVeryLarge; c++ {
@@ -765,22 +845,31 @@ func (s *Scheduler) boostStaleRequests() {
 				continue
 			}
 			destPq := pq - 1
-			// Drain one stale request and re-queue at higher priority.
+			// Drain one stale request and re-queue at higher priority. The
+			// receive must be the binary form: a lane closed mid-scan that a
+			// draining worker just emptied reports the zero value with
+			// ok=false, and receiving that as a bare *Request nil-
+			// dereferenced at the EnqueuedAt read below, panicking the
+			// agingLoop goroutine and the process with it.
 			select {
-			case req := <-src:
+			case req, ok := <-src:
+				if !ok || req == nil {
+					continue
+				}
 				if time.Since(req.EnqueuedAt) <= time.Duration(s.config.PriorityAgingMs) {
 					// Not stale yet, put back; never drop silently.
-					if !s.trySend(c, int(pq), req) {
-						s.rejectDropped(req, "scheduler: dropped during priority aging")
+					if s.requeueAged(c, int(pq), int(pq), req) < 0 {
+						s.rejectDropped(req, "scheduler: priority aging could not return the request; every lane of its class is full")
 					}
 					continue
 				}
-				if s.trySend(c, int(destPq), req) {
+				if s.requeueAged(c, int(destPq), int(pq), req) >= 0 {
 					boosted = true
-				} else if !s.trySend(c, int(pq), req) {
-					// Destination full AND origin refused: fail fast instead of
-					// vanishing (historical double-default silent drop).
-					s.rejectDropped(req, "scheduler: queues saturated during priority aging")
+				} else {
+					// Destination full AND no sibling lane had room: fail
+					// fast instead of vanishing (historical double-default
+					// silent drop).
+					s.rejectDropped(req, "scheduler: priority aging boost failed; every lane of its class is full")
 				}
 			default:
 			}
@@ -808,6 +897,16 @@ func (s *Scheduler) rejectDropped(req *Request, msg string) {
 
 // Shutdown gracefully stops the scheduler.
 func (s *Scheduler) Shutdown() {
+	// Aging fence first: a priority-aging pass must never overlap the
+	// cancel+close window. A pass holding an extracted request at that
+	// moment would either pseudo-reject it (trySend refuses closed lanes) or
+	// re-queue it after the last draining worker scan — a stranded admitted
+	// request with no terminal result. Taking the same fence the pass holds
+	// makes Shutdown wait for any in-flight pass and block later ones; every
+	// later pass refuses at its own entry check below.
+	s.agingMu.Lock()
+	defer s.agingMu.Unlock()
+
 	// Linearize shutdown with queue sends: a sender holding RLock must finish
 	// its closed check and send before closed becomes visible or workers are
 	// cancelled. Later senders acquire RLock after this and reject on closed.
