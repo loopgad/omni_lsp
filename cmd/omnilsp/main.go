@@ -110,6 +110,24 @@ func usage() {
 	fmt.Println("  version  Show version information")
 }
 
+// startSessionRecorder opens the §P9 session recorder around inner and binds
+// the semantic-response observer, so recording covers whichever transport the
+// session runs on (§P9: "wraps whichever transport was selected"). Returns nil
+// when recording is disabled (empty path). The caller owns closing the
+// recorder when its session ends.
+func startSessionRecorder(srv *server.Server, cfg config.Config, inner transport.Transport, recordPath string) *replay.RecorderTransport {
+	if recordPath == "" {
+		return nil
+	}
+	rec, err := replay.NewRecorder(inner, recordPath, sessionMeta(cfg, srv), srv.SnapshotRevision)
+	if err != nil {
+		fatal("record: %v", err)
+	}
+	srv.SetSemanticResponseObserver(indexedSemanticResponseBinder(srv, rec))
+	info("recording session to %s", recordPath)
+	return rec
+}
+
 // cmdServe wires configuration layers into a running server.
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -119,7 +137,7 @@ func cmdServe(args []string) {
 	httpAddr := fs.String("http-addr", "", "also serve the read-only HTTP API on this loopback address (e.g. 127.0.0.1:9100)")
 	debugAddr := fs.String("debug", "", "serve net/http/pprof on this loopback address (§P6, e.g. 127.0.0.1:6060)")
 	workspace := fs.String("workspace", "", "workspace root (defaults to cwd)")
-	recordPath := fs.String("record", "", "record the session to this .jsonl file (§P9)")
+	recordPath := fs.String("record", "", "record the session to this .jsonl file (§P9; stdio and tcp transports; not supported by mcp)")
 	_ = fs.Parse(args)
 
 	// goal.md W1: an explicitly named config file that does not exist is an
@@ -203,6 +221,13 @@ func cmdServe(args []string) {
 	case "mcp":
 		// §C14/X6: MCP tools projection over stdio, stateless per the
 		// pinned 2026-07-28 revision.
+		if *recordPath != "" {
+			// §P9 recording wraps an LSP transport; the MCP projection reads
+			// os.Stdin and writes os.Stdout directly and offers none to wrap.
+			// Say so instead of silently dropping the flag (the recording file
+			// would otherwise simply never appear).
+			warn("--record is not supported with --transport mcp: §P9 session recording wraps an LSP transport and the MCP projection does not use one; no recording will be written")
+		}
 		srv.InitializeWorkspace(cfg.WorkspaceDir)
 		info("serving MCP %s over stdio", mcpserver.ProtocolRevision)
 		if err := mcpserver.Serve(ctx, os.Stdin, os.Stdout, mcpCore{srv: srv}); err != nil && ctx.Err() == nil {
@@ -243,8 +268,21 @@ func cmdServe(args []string) {
 			registerBackends(sessionSrv, cfg)
 			sharedCore.srv.Store(sessionSrv)
 			tr = transport.NewTCPTransport(conn)
+			// §P9 session recording wraps whichever transport was selected.
+			// Each TCP connection is one session (v1: one at a time), so the
+			// recorder wraps the per-connection transport and the recording
+			// file is recreated per session. It must be closed here, not with
+			// a defer — a defer inside this loop would only run at cmdServe
+			// exit and hold every recording open.
+			var rec *replay.RecorderTransport
+			if rec = startSessionRecorder(sessionSrv, cfg, tr, *recordPath); rec != nil {
+				tr = rec
+			}
 			if rerr := sessionSrv.Run(ctx, tr); rerr != nil && ctx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "omnilsp: session %d ended: %v\n", session, rerr)
+			}
+			if rec != nil {
+				_ = rec.Close()
 			}
 			fmt.Fprintln(os.Stderr, "omnilsp: client disconnected; waiting for reconnect")
 		}
@@ -252,16 +290,12 @@ func cmdServe(args []string) {
 		tr = transport.NewStdioTransportFromOS()
 	}
 
-	// §P9 session recording wraps whichever transport was selected.
-	if *recordPath != "" {
-		rec, rerr := replay.NewRecorder(tr, *recordPath, sessionMeta(cfg, srv), srv.SnapshotRevision)
-		if rerr != nil {
-			fatal("record: %v", rerr)
-		}
+	// §P9 session recording wraps whichever transport was selected. This path
+	// serves the stdio transport; the tcp branch wraps its own per-session
+	// transport above, and the mcp branch warns that recording is unsupported.
+	if rec := startSessionRecorder(srv, cfg, tr, *recordPath); rec != nil {
 		defer rec.Close()
-		srv.SetSemanticResponseObserver(indexedSemanticResponseBinder(srv, rec))
 		tr = rec
-		info("recording session to %s", *recordPath)
 	}
 
 	if err := srv.Run(ctx, tr); err != nil && ctx.Err() == nil {
