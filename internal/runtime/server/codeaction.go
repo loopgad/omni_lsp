@@ -8,6 +8,7 @@ import (
 
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
+	"github.com/omnilsp/omni/internal/protocol/lsp"
 )
 
 // §I19 code actions: three kinds with distinct safety classes.
@@ -55,13 +56,13 @@ func (s *Server) handleCodeAction(ctx context.Context, msg *jsonrpc.Message) (js
 		if !diagInRange(it, params.Range.Start.Line, params.Range.End.Line) {
 			continue
 		}
-		switch fix := quickfixFor(it, params.TextDocument.URI); {
+		switch fix := quickfixFor(it); {
 		case fix != nil:
 			out = append(out, map[string]any{
 				"title":       fix.Title,
 				"kind":        "quickfix",
 				"diagnostics": []map[string]any{projectDiagnostics([]languages.Diagnostic{it})[0]},
-				"edit":        fix.Edit,
+				"edit":        s.codeActionWorkspaceEdit(ctx, params.TextDocument.URI, fix.Edit),
 			})
 		default:
 			out = append(out, map[string]any{
@@ -83,15 +84,17 @@ func diagInRange(it languages.Diagnostic, startLine, endLine uint32) bool {
 }
 
 // quickfix is a mutating edit proposal (S3 rules govern its application).
+// Edit is a single TextEdit; codeActionWorkspaceEdit wraps it into the
+// WorkspaceEdit shape CodeAction.edit requires on the wire.
 type quickfix struct {
 	Title string
-	Edit  map[string]any
+	Edit  lsp.TextEdit
 }
 
 // quickfixFor maps known diagnostic codes to concrete fixes. Only codes whose
 // fix is provably safe at syntax tier get an edit; everything else falls back
 // to an explanation-only action (never a fake one-click repair).
-func quickfixFor(it languages.Diagnostic, uri string) *quickfix {
+func quickfixFor(it languages.Diagnostic) *quickfix {
 	switch it.Code {
 	case "unused-import", "imported-and-not-used":
 		// Removing the content of a line that carries only the offending
@@ -100,16 +103,51 @@ func quickfixFor(it languages.Diagnostic, uri string) *quickfix {
 		// is an edit proposal — S3 gates still govern application.
 		return &quickfix{
 			Title: "Remove unused import",
-			Edit: map[string]any{
-				"type":         "edit",
-				"range":        map[string]any{"start": map[string]any{"line": it.StartLine, "character": it.StartChar}, "end": map[string]any{"line": it.EndLine, "character": it.EndChar}},
-				"textDocument": map[string]any{"uri": uri},
-				"newText":      "",
+			Edit: lsp.TextEdit{
+				Range: lsp.Range{
+					Start: lsp.Position{Line: it.StartLine, Character: it.StartChar},
+					End:   lsp.Position{Line: it.EndLine, Character: it.EndChar},
+				},
+				NewText: "",
 			},
 		}
 	default:
 		return nil
 	}
+}
+
+// codeActionWorkspaceEdit projects one quickfix TextEdit as CodeAction.edit:
+// a WorkspaceEdit (LSP 3.17) in the version-aware documentChanges form when
+// the client negotiated §C9, the legacy changes form otherwise. CodeAction.edit
+// used to carry a custom {"type":"edit","range":…,"textDocument":…} object,
+// which is not a WorkspaceEdit — no conforming client could apply it.
+func (s *Server) codeActionWorkspaceEdit(ctx context.Context, uri string, edit lsp.TextEdit) lsp.WorkspaceEdit {
+	if s.wantsDocumentChanges() {
+		return lsp.WorkspaceEdit{DocumentChanges: []lsp.TextDocumentEdit{{
+			TextDocument: lsp.OptionalVersionedTextDocumentIdentifier{
+				URI:     lsp.DocumentURI(uri),
+				Version: quickfixDocumentVersion(ctx, s, uri),
+			},
+			Edits: []lsp.TextEdit{edit},
+		}}}
+	}
+	return lsp.WorkspaceEdit{Changes: lsp.TextEditMap{lsp.DocumentURI(uri): []lsp.TextEdit{edit}}}
+}
+
+// quickfixDocumentVersion reports the document version the fix was computed
+// against (LSP 3.17 documentChanges): the captured snapshot when the request
+// carries one, the live VFS otherwise, 0 for a document tracked by neither —
+// the same precedence the rename path applies to its TextDocumentEdits.
+func quickfixDocumentVersion(ctx context.Context, s *Server, uri string) int {
+	if captured := snapshotFromCtx(ctx); captured != nil {
+		if doc := captured.Document(uri); doc != nil {
+			return int(doc.Version)
+		}
+	}
+	if state := s.vfs.Get(uri); state != nil {
+		return int(state.Version)
+	}
+	return 0
 }
 
 // handlePrepareRename serves textDocument/prepareRename (§I10 step one):

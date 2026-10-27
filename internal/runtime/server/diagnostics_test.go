@@ -925,16 +925,37 @@ func TestI19_UnusedImportQuickfixRemovesLineContent(t *testing.T) {
 	if action["title"] != "Remove unused import" || action["kind"] != "quickfix" {
 		t.Fatalf("action identity = %+v", action)
 	}
+	// CodeAction.edit MUST be a WorkspaceEdit (LSP 3.17 §textDocument/codeAction):
+	// the retired custom shape {"type":"edit","range":…,"textDocument":…} is not
+	// one, and no conforming client could apply it. Unnegotiated clients get the
+	// legacy changes form.
 	edit, ok := action["edit"].(map[string]any)
 	if !ok {
 		t.Fatalf("action has no edit: %+v", action)
 	}
-	if edit["newText"] != "" {
-		t.Fatalf("quickfix newText = %v, want empty deletion", edit["newText"])
+	for _, retired := range []string{"type", "textDocument"} {
+		if _, bad := edit[retired]; bad {
+			t.Fatalf("quickfix edit carries retired custom key %q: %+v", retired, edit)
+		}
 	}
-	rng, ok := edit["range"].(map[string]any)
+	changes, ok := edit["changes"].(map[string]any)
 	if !ok {
-		t.Fatalf("edit has no range: %+v", edit)
+		t.Fatalf("quickfix edit = %+v, want WorkspaceEdit changes form", edit)
+	}
+	perDoc, ok := changes[uri].([]any)
+	if !ok || len(perDoc) != 1 {
+		t.Fatalf("changes[%s] = %v, want exactly one TextEdit", uri, changes[uri])
+	}
+	textEdit, ok := perDoc[0].(map[string]any)
+	if !ok {
+		t.Fatalf("changes entry = %v, want a TextEdit object", perDoc[0])
+	}
+	if textEdit["newText"] != "" {
+		t.Fatalf("quickfix newText = %v, want empty deletion", textEdit["newText"])
+	}
+	rng, ok := textEdit["range"].(map[string]any)
+	if !ok {
+		t.Fatalf("edit has no range: %+v", textEdit)
 	}
 	start, okStart := rng["start"].(map[string]any)
 	end, okEnd := rng["end"].(map[string]any)
@@ -944,6 +965,69 @@ func TestI19_UnusedImportQuickfixRemovesLineContent(t *testing.T) {
 	if start["line"] != float64(0) || start["character"] != float64(0) ||
 		end["line"] != float64(0) || end["character"] != float64(12) {
 		t.Fatalf("quickfix range = %v-%v, want 0:0-0:12 (whole import line)", start, end)
+	}
+}
+
+// TestI19_QuickfixEditUsesDocumentChangesWhenNegotiated pins the §C9 branch of
+// the CodeAction.edit WorkspaceEdit: a client that negotiated documentChanges
+// gets the version-aware form only, carrying the document's own version.
+func TestI19_QuickfixEditUsesDocumentChangesWhenNegotiated(t *testing.T) {
+	const uri = "file:///w/main.go"
+	s := New(DefaultConfig())
+	s.RegisterBackend("go", &unusedImportDiagBackend{diagBackend: diagBackend{mockBackend: mockBackend{langID: "go", exts: []string{".go"}}}})
+	s.vfs.Open(uri, "go", 1, []byte("import \"fmt\"\n"), 0)
+	s.publishSnapshot()
+	s.clientWantsDocumentChanges.Store(true)
+
+	resp := s.Dispatcher().Dispatch(context.Background(), jsonrpc.NewRequest(
+		jsonrpc.RequestID{Num: 7}, "textDocument/codeAction",
+		json.RawMessage(`{"textDocument":{"uri":"`+uri+`"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"context":{}}`)))
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("codeAction failed: %+v", resp)
+	}
+	var env struct {
+		Result json.RawMessage `json:"result"`
+	}
+	raw, _ := json.Marshal(resp)
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	var actions []map[string]any
+	if err := json.Unmarshal(env.Result, &actions); err != nil {
+		t.Fatalf("decode actions: %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("actions = %+v, want exactly one quickfix", actions)
+	}
+	edit, ok := actions[0]["edit"].(map[string]any)
+	if !ok {
+		t.Fatalf("action has no edit: %+v", actions[0])
+	}
+	if _, legacy := edit["changes"]; legacy {
+		t.Fatalf("negotiated client got legacy changes form: %+v", edit)
+	}
+	docs, ok := edit["documentChanges"].([]any)
+	if !ok || len(docs) != 1 {
+		t.Fatalf("quickfix edit = %+v, want one documentChanges entry", edit)
+	}
+	doc, ok := docs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("documentChanges entry = %v, want a TextDocumentEdit", docs[0])
+	}
+	ident, ok := doc["textDocument"].(map[string]any)
+	if !ok || ident["uri"] != uri {
+		t.Fatalf("textDocument identifier = %v, want uri %s", doc["textDocument"], uri)
+	}
+	if ident["version"] != float64(1) {
+		t.Fatalf("textDocument version = %v, want 1 (the VFS version the fix was computed against)", ident["version"])
+	}
+	edits, ok := doc["edits"].([]any)
+	if !ok || len(edits) != 1 {
+		t.Fatalf("edits = %v, want exactly one TextEdit", doc["edits"])
+	}
+	textEdit, ok := edits[0].(map[string]any)
+	if !ok || textEdit["newText"] != "" {
+		t.Fatalf("TextEdit = %v, want an empty deletion", edits[0])
 	}
 }
 

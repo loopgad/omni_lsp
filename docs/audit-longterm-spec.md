@@ -815,7 +815,7 @@ quickfix。本轮按此标准清点，并先修复了一个可达性缺陷。
 
 | 诊断来源 | 机械修复 | 当前 codeAction |
 |---|---|---|
-| Go unused import（server 原生分类） | 整行内容删除（保留换行，留空行；仅在证明安全时给范围） | 真实 quickfix |
+| Go unused import（server 原生分类） | 整行内容删除（保留换行，留空行；仅在证明安全时给范围） | 真实 quickfix（CodeAction.edit 为 LSP 3.17 WorkspaceEdit：未协商 §C9 的客户端收 `changes` 形状，协商过的客户端收版本化 `documentChanges` 形状） |
 | Go 解析/类型错误（go/packages 透传） | 未证明可机械推导 | explanation-only |
 | ccls / rust-analyzer / pyright / TypeScript 诊断 | 后端各自可能有 fix，但 server 不转发 backend codeAction | explanation-only（携带 source/code 数据） |
 
@@ -823,6 +823,15 @@ quickfix。本轮按此标准清点，并先修复了一个可达性缺陷。
 不调用任何后端的 `textDocument/codeAction`。因此即使嵌套后端自带修复建议，
 当前也不会出现在响应里。未实现的机械修复候选（缺 import、未使用变量等）
 在语法层无法证明安全，维持 explanation-only，避免假一键修复。
+
+**edit 形状勘误（2026-10-28 批 2 审计修复）**：本清单此前把 unused-import 行
+记为「真实 quickfix」，但当时 `CodeAction.edit` 携带的是自定义形状
+`{"type":"edit","range":…,"textDocument":…,"newText":""}`，不是 LSP 3.17
+规定的 WorkspaceEdit（`changes`/`documentChanges` 二者皆无），合规客户端
+无法应用。本轮已改为按 §C9 协商投影为 `documentChanges`（否则 `changes`
+形状），上表已同步；钉住旧形状的
+`TestI19_UnusedImportQuickfixRemovesLineContent` 断言改为 WorkspaceEdit
+形状，并新增 `TestI19_QuickfixEditUsesDocumentChangesWhenNegotiated`。
 
 ### 3. soak 连续性与 X9-1 插桩
 
