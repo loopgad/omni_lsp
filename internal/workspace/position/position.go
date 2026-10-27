@@ -418,6 +418,62 @@ func (idx *Index) OffsetOfLineChar(content []byte, line, character uint32) (uint
 	return lineStart + off, nil
 }
 
+// OffsetOfLineCharInline converts an LSP position to a byte offset without
+// materializing an Index: the line is located by one byte scan and the column
+// resolves within that line in O(line length) via columnToOffset. NewIndex, by
+// contrast, allocates 4 bytes of column map per content byte and scans the
+// whole document on every call — overhead the hot paths (per-range didChange,
+// per-occurrence reference result loops) were paying for conversions that
+// cannot amortize a build. Offsets, errors, and error text match
+// OffsetOfLineCharEncoding exactly; TestOffsetOfLineCharInlineMatchesIndexPath
+// pins that equivalence position by position.
+func OffsetOfLineCharInline(content []byte, line, character uint32, enc Encoding) (uint32, error) {
+	start, end, err := lineSpan(content, line)
+	if err != nil {
+		return 0, err
+	}
+	off, err := columnToOffset(content[start:end], character, enc)
+	if err != nil {
+		return 0, err
+	}
+	return start + off, nil
+}
+
+// lineSpan returns the [start, end) byte range of line's content, end
+// excluding the terminator — the same slice Index.OffsetOfLineChar resolves
+// columns against. Line boundaries follow the NewIndex rules: LF, CR, and CRLF
+// each end a line, and a line start is the offset just after a terminator.
+// Multi-byte UTF-8 sequences never contain 0x0A or 0x0D bytes, so byte-wise
+// scanning is encoding-safe. The out-of-range error text matches
+// Index.LineStart so the two paths are indistinguishable to callers.
+func lineSpan(content []byte, line uint32) (uint32, uint32, error) {
+	start := uint32(0)
+	// terminators counts line boundaries consumed so far; len(Index.lines)
+	// for the same content is terminators+1, which is exactly the total the
+	// error message must report.
+	terminators := uint32(0)
+	for terminators < line {
+		i := start
+		for i < uint32(len(content)) && content[i] != '\n' && content[i] != '\r' {
+			i++
+		}
+		if i >= uint32(len(content)) {
+			return 0, 0, fmt.Errorf("line %d out of range (total %d lines)", line, terminators+1)
+		}
+		i++
+		if content[i-1] == '\r' && i < uint32(len(content)) && content[i] == '\n' {
+			i++
+		}
+		start = i
+		terminators++
+	}
+	i := start
+	for i < uint32(len(content)) && content[i] != '\n' && content[i] != '\r' {
+		i++
+	}
+	return start, i, nil
+}
+
 func columnToOffset(lineContent []byte, col uint32, enc Encoding) (uint32, error) {
 	var width uint32
 	for i := 0; i < len(lineContent); {

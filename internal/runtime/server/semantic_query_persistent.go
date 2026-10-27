@@ -235,7 +235,20 @@ func (s *Server) persistentSemanticLocations(
 	if !ok {
 		return zero, false
 	}
-	queryOffset, err := position.OffsetOfLineCharEncoding(queryContent, line, column, position.Encoding(encoding))
+	// One index build per content, not per occurrence: both loops below touch
+	// every occurrence of the query file, and NewIndex rescans the whole
+	// document (plus a 4-bytes-per-byte column map) on every call — a 4096
+	// use-site references query paid tens of thousands of full scans (§S19
+	// bounded-memory/scaling). Persisted record positions are UTF-16 (the
+	// persistedOccurrenceOffsets contract); the negotiated index serves the
+	// incoming cursor and is the same build when the session negotiated
+	// UTF-16.
+	queryRecordIndex := position.NewIndex(queryContent, position.UTF16)
+	queryNegotiatedIndex := queryRecordIndex
+	if position.Encoding(encoding) != position.UTF16 {
+		queryNegotiatedIndex = position.NewIndex(queryContent, position.Encoding(encoding))
+	}
+	queryOffset, err := queryNegotiatedIndex.OffsetOfLineChar(queryContent, line, column)
 	if err != nil {
 		return zero, false
 	}
@@ -267,11 +280,15 @@ func (s *Server) persistentSemanticLocations(
 			if string(occurrence.SourceHash) != string(queryFile.SHA256) {
 				return zero, false
 			}
-			start, end, valid := persistedOccurrenceOffsets(queryContent, occurrence.Range)
-			if !valid {
+			startOffset, err := queryRecordIndex.OffsetOfLineChar(queryContent, occurrence.Range.StartLine, occurrence.Range.StartChar)
+			if err != nil {
 				return zero, false
 			}
-			if queryOffset < start || queryOffset >= end {
+			endOffset, err := queryRecordIndex.OffsetOfLineChar(queryContent, occurrence.Range.EndLine, occurrence.Range.EndChar)
+			if err != nil || endOffset <= startOffset {
+				return zero, false
+			}
+			if queryOffset < startOffset || queryOffset >= endOffset {
 				continue
 			}
 			if !knownOccurrenceRole(occurrence.Role) {
@@ -356,6 +373,8 @@ func (s *Server) persistentSemanticLocations(
 	seenLocations := make(map[languages.Location]struct{})
 	var currentURI string
 	var currentContent []byte
+	var currentRecordIndex *position.Index
+	var currentNegotiatedIndex *position.Index
 	for _, occurrence := range resultOccurrences {
 		if occurrence.URI != currentURI {
 			file := diskView.byURI[occurrence.URI]
@@ -368,16 +387,32 @@ func (s *Server) persistentSemanticLocations(
 					return zero, false
 				}
 			}
+			// Build each index once per content here, at the URI switch, and
+			// reuse it for every occurrence of this file: per-occurrence
+			// NewIndex calls made a 4096-reference result loop rescan the
+			// whole document six times per use site. Record positions are
+			// UTF-16; the negotiated index is only a second build when the
+			// session negotiated a different encoding.
+			currentRecordIndex = position.NewIndex(currentContent, position.UTF16)
+			currentNegotiatedIndex = currentRecordIndex
+			if position.Encoding(encoding) != position.UTF16 {
+				currentNegotiatedIndex = position.NewIndex(currentContent, position.Encoding(encoding))
+			}
 			currentURI = occurrence.URI
 		}
-		if _, _, valid := persistedOccurrenceOffsets(currentContent, occurrence.Range); !valid {
+		startOffset, err := currentRecordIndex.OffsetOfLineChar(currentContent, occurrence.Range.StartLine, occurrence.Range.StartChar)
+		if err != nil {
 			return zero, false
 		}
-		start, ok := persistedPositionInEncoding(currentContent, occurrence.Range.StartLine, occurrence.Range.StartChar, position.Encoding(encoding))
+		endOffset, err := currentRecordIndex.OffsetOfLineChar(currentContent, occurrence.Range.EndLine, occurrence.Range.EndChar)
+		if err != nil || endOffset <= startOffset {
+			return zero, false
+		}
+		start, ok := persistedPositionFromOffset(currentNegotiatedIndex, currentContent, startOffset)
 		if !ok {
 			return zero, false
 		}
-		end, ok := persistedPositionInEncoding(currentContent, occurrence.Range.EndLine, occurrence.Range.EndChar, position.Encoding(encoding))
+		end, ok := persistedPositionFromOffset(currentNegotiatedIndex, currentContent, endOffset)
 		if !ok {
 			return zero, false
 		}
@@ -643,6 +678,17 @@ func persistedPositionInEncoding(content []byte, line, character uint32, encodin
 		return position.Pos{}, false
 	}
 	converted, err := position.NewIndex(content, encoding).OffsetToPosition(content, offset)
+	if err != nil {
+		return position.Pos{}, false
+	}
+	return converted, true
+}
+
+// persistedPositionFromOffset converts a byte offset already resolved from a
+// persisted record into the negotiated-encoding position using an index the
+// caller built once per content, instead of building NewIndex per call.
+func persistedPositionFromOffset(idx *position.Index, content []byte, offset uint32) (position.Pos, bool) {
+	converted, err := idx.OffsetToPosition(content, offset)
 	if err != nil {
 		return position.Pos{}, false
 	}

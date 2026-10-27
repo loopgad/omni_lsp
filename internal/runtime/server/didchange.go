@@ -40,16 +40,20 @@ func applyContentChanges(content []byte, changes []lsp.TextDocumentContentChange
 }
 
 // applyRangeEdit splices newText into content at the given LSP range. The
-// range characters are counted in enc, so the index must be built for the same
-// encoding the client negotiated -- building it for any other encoding turns a
+// range characters are counted in enc, so the conversion must resolve columns
+// in the same encoding the client negotiated -- any other encoding turns a
 // character's column into a different byte offset on any line with non-ASCII.
+// The endpoints resolve inline (line scan + O(line length) column walk) instead
+// of building a per-call position.Index: ranged didChange is the §S18 hot path
+// and NewIndex would rescan the whole document and allocate a 4-bytes-per-byte
+// column map on every edit. Offsets and errors are identical to the Index path
+// (pinned by TestOffsetOfLineCharInlineMatchesIndexPath).
 func applyRangeEdit(content []byte, r lsp.Range, newText string, enc position.Encoding) ([]byte, error) {
-	idx := position.NewIndex(content, enc)
-	start, err := idx.OffsetOfLineChar(content, r.Start.Line, r.Start.Character)
+	start, err := position.OffsetOfLineCharInline(content, r.Start.Line, r.Start.Character, enc)
 	if err != nil {
 		return nil, fmt.Errorf("range start: %w", err)
 	}
-	end, err := idx.OffsetOfLineChar(content, r.End.Line, r.End.Character)
+	end, err := position.OffsetOfLineCharInline(content, r.End.Line, r.End.Character, enc)
 	if err != nil {
 		return nil, fmt.Errorf("range end: %w", err)
 	}
