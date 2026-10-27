@@ -493,7 +493,12 @@ try {
 }
 
 $previousReviewEvidenceDirectory = $EvidenceDirectory
-$reviewEvidenceParent = Join-Path $repoRoot 'test/acceptance/evidence'
+# The review contract fixture lives in the process temp location like every
+# other contract fixture in this script. test/acceptance/evidence is an
+# ACL-locked directory (docs/acceptance.md "per-run evidence" ACL): creating
+# fixtures there is denied on locked-down machines and structurally broke the
+# first Fast check. The fixture is deleted in the finally block below.
+$reviewEvidenceParent = [IO.Path]::GetTempPath()
 $reviewContractRoot = Join-Path $reviewEvidenceParent ('pre-soak-review-contract-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Force -Path $reviewContractRoot | Out-Null
