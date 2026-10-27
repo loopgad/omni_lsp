@@ -9,7 +9,7 @@
 //
 // Owned mutable state:
 //
-//	files map (protected by mu), diskFiles map, revision counter (atomic).
+//	files map (protected by mu), revision counter (atomic).
 //
 // Concurrency model:
 //
@@ -64,20 +64,15 @@ var ErrDuplicateOpen = errors.New("vfs: conflicting duplicate open")
 //  2. Editor overlay (SourceEditor) always takes precedence over disk.
 //  3. Closing a file drops the entry; disk content is not restored.
 type VFS struct {
-	mu    sync.RWMutex
-	files map[string]*FileState
-	// diskFiles retains the last known disk content per file. It is written on
-	// Open(SourceDisk) and Save and never read, and Close does not remove it, so
-	// it grows with every file the process has ever opened.
-	diskFiles map[string][]byte
-	revision  atomic.Uint64
+	mu       sync.RWMutex
+	files    map[string]*FileState
+	revision atomic.Uint64
 }
 
 // New creates a new empty VFS.
 func New() *VFS {
 	return &VFS{
-		files:     make(map[string]*FileState),
-		diskFiles: make(map[string][]byte),
+		files: make(map[string]*FileState),
 	}
 }
 
@@ -118,9 +113,6 @@ func (v *VFS) openLocked(key, uriText, langID string, version int64, content []b
 		Source:     source,
 		Dirty:      source == SourceEditor,
 	}
-	if source == SourceDisk {
-		v.diskFiles[key] = content
-	}
 	v.revision.Add(1)
 }
 
@@ -156,7 +148,6 @@ func (v *VFS) Save(uri string) {
 	if f, ok := v.files[key]; ok {
 		f.Dirty = false
 		f.Source = SourceDisk
-		v.diskFiles[key] = f.Content
 	}
 	v.revision.Add(1)
 }

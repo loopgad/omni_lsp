@@ -1,7 +1,9 @@
 package vfs
 
 import (
+	"bytes"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -257,4 +259,79 @@ func TestAdvanceRevisionInvalidatesWithoutTouchingDocuments(t *testing.T) {
 	if files := v.OpenFiles(); len(files) != 1 || files[0] != uri {
 		t.Errorf("OpenFiles() = %v, want just %q", files, uri)
 	}
+}
+
+// TestNoClosedDocumentContentRetention pins the §S16 "no monotonic memory
+// leak" condition on the VFS side: once a document is closed, its content must
+// no longer be reachable from any VFS internal state. The historical defect
+// was a write-only disk-content map retained on Open(SourceDisk)/Save and
+// never dropped by Close, so didSave permanently pinned the full text of every
+// document the process had ever saved. The guard deliberately does not name a
+// field: it sweeps every value reachable from the VFS struct, so any future
+// retention-bearing state is caught too.
+func TestNoClosedDocumentContentRetention(t *testing.T) {
+	const marker = "package leak-probe // content that must die with Close"
+	v := New()
+	uri := "file:///w/leak.go"
+	v.Open(uri, "go", 1, []byte(marker), SourceDisk)
+	v.Save(uri) // didSave hot path — the historical retention point
+	v.Close(uri)
+
+	if v.Get(uri) != nil {
+		t.Fatal("file should be closed")
+	}
+	if findReachableBytes(reflect.ValueOf(*v), []byte(marker), 0) {
+		t.Fatal("closed document content still reachable from VFS internal state (monotonic retention)")
+	}
+}
+
+// findReachableBytes reports whether target appears among the byte/string
+// values reachable from rv (structs, maps, slices, pointers). Depth-limited so
+// a stray walk into runtime-owned nested state cannot run away.
+func findReachableBytes(rv reflect.Value, target []byte, depth int) bool {
+	if depth > 8 || !rv.IsValid() {
+		return false
+	}
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return false
+		}
+		return findReachableBytes(rv.Elem(), target, depth+1)
+	case reflect.Struct:
+		for i := 0; i < rv.NumField(); i++ {
+			if findReachableBytes(rv.Field(i), target, depth+1) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for _, k := range rv.MapKeys() {
+			if findReachableBytes(k, target, depth+1) || findReachableBytes(rv.MapIndex(k), target, depth+1) {
+				return true
+			}
+		}
+	case reflect.Slice:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return bytes.Equal(rv.Bytes(), target)
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if findReachableBytes(rv.Index(i), target, depth+1) {
+				return true
+			}
+		}
+	case reflect.Array:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			buf := make([]byte, rv.Len())
+			reflect.Copy(reflect.ValueOf(buf), rv)
+			return bytes.Equal(buf, target)
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if findReachableBytes(rv.Index(i), target, depth+1) {
+				return true
+			}
+		}
+	case reflect.String:
+		return bytes.Contains([]byte(rv.String()), target)
+	}
+	return false
 }
