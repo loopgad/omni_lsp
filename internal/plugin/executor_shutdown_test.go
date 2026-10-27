@@ -1,10 +1,8 @@
 package plugin
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"testing"
 	"time"
 )
@@ -92,9 +90,8 @@ func TestShutdownExit_NormalLifecycle(t *testing.T) {
 
 	m := newValidManifest([]byte("x"))
 	m.Capabilities = []Capability{CapDiagnosticsEmit}
-	m.Entrypoint = os.Args[0]
 	exits := make(chan error, 1)
-	p, err := Launch(context.Background(), m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err })
+	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err })
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}

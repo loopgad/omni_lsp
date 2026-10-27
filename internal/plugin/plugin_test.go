@@ -193,7 +193,7 @@ func TestExecutor_LaunchHandshake(t *testing.T) {
 	m.Capabilities = []Capability{CapNetworkAccess}
 
 	t.Run("能力门_未授权不出进程", func(t *testing.T) {
-		p, err := Launch(ctx, m, DefaultGrants(), nil)
+		p, err := Launch(ctx, t.TempDir(), m, DefaultGrants(), nil)
 		if !errors.Is(err, ErrCapabilityDenied) {
 			t.Fatalf("期望 ErrCapabilityDenied，实际 %v", err)
 		}
@@ -205,7 +205,7 @@ func TestExecutor_LaunchHandshake(t *testing.T) {
 	t.Run("完整性门_api版本不匹配不出进程", func(t *testing.T) {
 		bad := m
 		bad.APIVersion = "omnilsp.plugin.v2"
-		p, err := Launch(ctx, bad, NewGrant(CapNetworkAccess), nil)
+		p, err := Launch(ctx, t.TempDir(), bad, NewGrant(CapNetworkAccess), nil)
 		if err == nil || errors.Is(err, ErrCapabilityDenied) {
 			t.Fatalf("完整性门应先行拒绝: %v", err)
 		}

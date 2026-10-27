@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -92,14 +93,19 @@ type helloFrame struct {
 // Launch 启动进程外插件并完成握手。前置门（顺序固定）：
 //  1. manifest 完整性（Validate）；
 //  2. 能力门——manifest 声明的每项能力必须在 grant 中放行，
-//     任一被拒即返回 ErrCapabilityDenied，不产生子进程。
+//     任一被拒即返回 ErrCapabilityDenied，不产生子进程；
+//  3. 信任链执行时刻复核——entrypoint 必须是 dir 下的裸文件名，且启动前对
+//     dir/<entrypoint> 重算 sha256 与 manifest.Checksum 比对（N14/§O3）。
+//     校验体与执行体由此钉在同一个文件上：先前的 Verify 结果不顶替本次
+//     复核（校验与 exec 之间二进制可能已被调包），裸文件名绝不经 PATH
+//     解析——PATH 上的同名影子二进制不得顶替已通过 checksum 的那一个。
 //
 // 协议完整版已落地：id 关联多路复用（Call 任意并发，按响应 id 配对）、
 // Content-Length 头分帧（附加头容忍、帧边界精确消费、单帧大小上限）、
 // 宿主→插件通知广播（Notify）、优雅停机（Shutdown/Exit 三态状态机，
 // LSP shutdown/exit 语义）、以及按方法→能力映射下沉到 Call 级别的能力门
 // （methodCapability + manifest 声明快照，见 Call）。
-func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*Process, error) {
+func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error)) (*Process, error) {
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("plugin: launch 前置完整性校验: %w", err)
 	}
@@ -108,8 +114,24 @@ func Launch(ctx context.Context, m Manifest, grant Grant, onExit func(error)) (*
 			return nil, err // 能力门在 spawn 之前生效（§O2）
 		}
 	}
+	if dir == "" {
+		return nil, fmt.Errorf("plugin: launch 缺少插件目录来源")
+	}
+	if err := safeEntrypoint(m.Entrypoint); err != nil {
+		return nil, err
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("plugin: 解析插件目录: %w", err)
+	}
+	exe := filepath.Join(absDir, m.Entrypoint)
+	if err := verifyChecksum(exe, m.Checksum); err != nil {
+		return nil, err
+	}
 
-	cmd := exec.CommandContext(ctx, m.Entrypoint)
+	// 绝对路径启动：exec.Command 对含路径分隔符的名字不再走 LookPath，
+	// PATH 解析（及其影子命中）从执行路径上整体移除。
+	cmd := exec.CommandContext(ctx, exe)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("plugin: stdin 管道: %w", err)

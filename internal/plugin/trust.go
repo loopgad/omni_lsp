@@ -41,29 +41,45 @@ func Verify(dir string) (Manifest, error) {
 	if err := m.Validate(); err != nil {
 		return m, err
 	}
-	// ponytail: entrypoint 仅允许裸文件名（与 plugin.json 同级），
-	// 覆盖穿越/绝对路径/盘符三类敌意样本；支持子目录需加相对路径遍历校验。
-	ep := m.Entrypoint
-	if ep != filepath.Base(ep) || strings.Contains(ep, "..") ||
-		filepath.IsAbs(ep) || strings.ContainsRune(ep, ':') {
-		return m, fmt.Errorf("plugin: 敌意 entrypoint 被拒绝: %q", ep)
+	if err := safeEntrypoint(m.Entrypoint); err != nil {
+		return m, err
 	}
-	p := filepath.Join(dir, ep)
+	p := filepath.Join(dir, m.Entrypoint)
 	if _, err := os.Stat(p); err != nil {
 		return m, fmt.Errorf("plugin: entrypoint 缺失: %w", err)
 	}
-	f, err := os.Open(p)
+	if err := verifyChecksum(p, m.Checksum); err != nil {
+		return m, err
+	}
+	return m, nil
+}
+
+// safeEntrypoint 强制 entrypoint 为与 plugin.json 同级的裸文件名，覆盖
+// 穿越/绝对路径/盘符三类敌意样本（ponytail：支持子目录需加相对路径遍历
+// 校验）。Verify 与 Launch 共用——一旦目录来源进入执行路径，形态检查
+// 必须在启动时刻同样生效，否则 Join(dir, ep) 可被带分隔符的 ep 引出目录。
+func safeEntrypoint(ep string) error {
+	if ep != filepath.Base(ep) || strings.Contains(ep, "..") ||
+		filepath.IsAbs(ep) || strings.ContainsRune(ep, ':') {
+		return fmt.Errorf("plugin: 敌意 entrypoint 被拒绝: %q", ep)
+	}
+	return nil
+}
+
+// verifyChecksum 计算 path 处文件的 sha256 并与 manifest 声明值比对（N14）。
+func verifyChecksum(path, declared string) error {
+	f, err := os.Open(path)
 	if err != nil {
-		return m, fmt.Errorf("plugin: 打开 entrypoint: %w", err)
+		return fmt.Errorf("plugin: 打开 entrypoint: %w", err)
 	}
 	defer f.Close()
 	sum := sha256.New()
 	if _, err := io.Copy(sum, f); err != nil {
-		return Manifest{}, fmt.Errorf("plugin: 计算 sha256: %w", err)
+		return fmt.Errorf("plugin: 计算 sha256: %w", err)
 	}
 	actual := "sha256:" + hex.EncodeToString(sum.Sum(nil))
-	if actual != m.Checksum {
-		return m, fmt.Errorf("%w: 声明 %s 实际 %s", ErrChecksumMismatch, m.Checksum, actual)
+	if actual != declared {
+		return fmt.Errorf("%w: 声明 %s 实际 %s", ErrChecksumMismatch, declared, actual)
 	}
-	return m, nil
+	return nil
 }

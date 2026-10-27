@@ -2,10 +2,14 @@ package plugin
 
 import (
 	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +24,21 @@ func TestMain(m *testing.M) {
 		return
 	}
 	os.Exit(m.Run())
+}
+
+// launchTestBinary 以测试二进制自身作为插件入口发起 Launch（§N14 目录来源
+// 语义下的标准测试姿势）：目录来源取其所在目录，entrypoint 取裸文件名，
+// checksum 按文件实算——Launch 启动前的 sha256 复核因此拿到真实匹配的清单。
+func launchTestBinary(t *testing.T, m Manifest, g Grant, onExit func(error)) (*Process, error) {
+	t.Helper()
+	m.Entrypoint = filepath.Base(os.Args[0])
+	raw, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		return nil, fmt.Errorf("读取测试二进制: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	m.Checksum = "sha256:" + hex.EncodeToString(sum[:])
+	return Launch(context.Background(), filepath.Dir(os.Args[0]), m, g, onExit)
 }
 
 // helperMain 按 GO_PLUGIN_MODE 脚本化插件的线级行为：

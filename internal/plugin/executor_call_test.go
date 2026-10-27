@@ -1,10 +1,8 @@
 package plugin
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +11,7 @@ import (
 // spawnHelper launches the test binary itself as a fake plugin subprocess.
 func spawnHelper(t *testing.T, mode string, m Manifest, g Grant) *Process {
 	t.Helper()
-	m.Entrypoint = os.Args[0]
-	p, err := Launch(context.Background(), m, g, nil)
+	p, err := launchTestBinary(t, m, g, nil)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -229,8 +226,7 @@ func TestOnExit_OnceAndCrashQuarantine(t *testing.T) {
 
 	exits := make(chan error, 4)
 	// OnExit wired at spawn time (the only race-free moment).
-	m.Entrypoint = os.Args[0]
-	p, err := Launch(context.Background(), m, NewGrant(m.Capabilities...), func(err error) { exits <- err })
+	p, err := launchTestBinary(t, m, NewGrant(m.Capabilities...), func(err error) { exits <- err })
 	if err != nil {
 		t.Fatalf("launch with OnExit: %v", err)
 	}
