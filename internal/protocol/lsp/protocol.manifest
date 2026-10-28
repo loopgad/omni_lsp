@@ -61,6 +61,7 @@ const SymbolTypeParameter
 const SymbolVariable
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error)
 func (s *Server) InitializeWorkspace(root string)
+func (s *Server) backendGates() backendGates
 func (s *Server) disableIndex(err error)
 func (s *Server) dispatchSemanticRequest(ctx context.Context, msg *jsonrpc.Message, uri string, line uint32, column uint32, project func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error)) (json.RawMessage, error)
 func (s *Server) handleCancelRequest(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
@@ -93,7 +94,6 @@ func (s *Server) handleRename(ctx context.Context, msg *jsonrpc.Message) (json.R
 func (s *Server) handleSemanticTokens(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleShutdown(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
 func (s *Server) handleWorkspaceSymbol(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error)
-func (s *Server) hasSemanticTokensEmitter() bool
 func (s *Server) indexState() (*indexService, *trust.Policy, string)
 func (s *Server) initIndex(rootURI string)
 func (s *Server) invalidateExternalSources()
@@ -105,7 +105,7 @@ func (s *Server) workspaceRoot() string
 func (s *Server) workspaceSymbolsFromBackend(ctx context.Context, be languages.Backend, query string) ([]languages.WorkspaceSymbol, error)
 func assuranceString(a identity.Assurance) string
 func backendBuildContext(be languages.Backend) identity.BuildContextID
-func buildCapabilities(positionEncoding string, semanticTokens bool) ServerCapabilities
+func buildCapabilities(positionEncoding string, gates backendGates) ServerCapabilities
 func canonicalDocumentURI(raw string) string
 func completenessName(c identity.Completeness) string
 func completionRangeToLSP(r languages.Range) lsp.Range
@@ -212,6 +212,7 @@ type WorkspaceEdit struct{Changes TextEditMap json:"changes,omitempty", Document
 type WorkspaceFolder struct{URI string json:"uri", Name string json:"name"}
 type WorkspaceSymbol struct{Name string json:"name", Kind SymbolKind json:"kind", Location Location json:"location"}
 type WorkspaceSymbolParams struct{Query string json:"query"}
+type backendGates struct{semanticTokens bool, signatureHelp bool, formatting bool, inlayHints bool, declaration bool}
 type buildContextProvider interface{BuildContextID}
 type fileRecord struct{Path string json:"path", Size int64 json:"size", SHA256 string json:"sha256"}
 type indexService struct{root string, workspaceID identity.WorkspaceID, dir string, store *persistent.FileStore, budget int64, buildMu sync.Mutex, statsMu sync.RWMutex, last IndexRebuildStats}
