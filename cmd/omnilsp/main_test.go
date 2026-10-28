@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	ierrors "github.com/omnilsp/omni/internal/errors"
 )
 
 // TestMain lets exit-code assertions re-run this test binary as a probe:
@@ -30,12 +32,54 @@ func TestMain(m *testing.M) {
 		os.Args = []string{"omnilsp", "serve", "--config",
 			filepath.Join(os.TempDir(), fmt.Sprintf("omnilsp-absent-config-%d.json", os.Getpid()))}
 		main()
-	case "fatal-keeps-exit-one":
-		// Pre-existing fatal() call site (invalid transport via env layer):
-		// its contract stays exit 1, guarding against a global exit-code
-		// regression when new exit paths are introduced.
+	case "config-parse-invalid":
+		// An existing but unparseable config file is invalid config (W1
+		// category 2) exactly like a missing explicit config. It used to
+		// fall through fatal() into the W1-undefined exit 1 — the audited
+		// same-category inconsistency (missing file 2 vs parse failure 1).
+		dir, mkErr := os.MkdirTemp("", "omnilsp-bad-config-")
+		if mkErr != nil {
+			fmt.Fprintf(os.Stderr, "probe setup: %v\n", mkErr)
+			os.Exit(1)
+		}
+		path := filepath.Join(dir, "omnilsp.json")
+		if wErr := os.WriteFile(path, []byte("{not json"), 0o644); wErr != nil {
+			fmt.Fprintf(os.Stderr, "probe setup: %v\n", wErr)
+			os.Exit(1)
+		}
+		os.Args = []string{"omnilsp", "serve", "--config", path}
+		main()
+	case "config-invalid-transport":
+		// Pre-existing fatal() call site (invalid transport via env layer).
+		// Semantics cut-over (audit batch 1): transport validation is the
+		// config layer, so this now exits W1 category 2 like every other
+		// invalid-config path — the former "keeps exit 1" pin froze the
+		// very inconsistency the W1 mapping removes.
 		os.Setenv("OMNILSP_TRANSPORT", "ws")
 		os.Args = []string{"omnilsp", "serve"}
+		main()
+	case "index-trust-denied":
+		// index's trust gate refuses the export before any server work.
+		// The refusal wraps errors.ErrUntrustedOperation, so W1 category 6
+		// (permission/trust error) is the only code automation may observe;
+		// it used to collapse into the W1-undefined exit 1.
+		ws, mkErr := os.MkdirTemp("", "omnilsp-trust-ws-")
+		if mkErr != nil {
+			fmt.Fprintf(os.Stderr, "probe setup: %v\n", mkErr)
+			os.Exit(1)
+		}
+		out := filepath.Join(os.TempDir(), fmt.Sprintf("omnilsp-trust-export-%d.scip", os.Getpid()))
+		os.Setenv("OMNILSP_TRUST", "untrusted")
+		os.Args = []string{"omnilsp", "index", "export", "--format", "scip",
+			"--scope", "probe", "--output", out, "--workspace", ws}
+		main()
+	case "record-unwritable":
+		// --record under a directory that cannot exist: replay.NewRecorder's
+		// os.Create fails with a plain filesystem error carrying no W1 kind.
+		// This pins the documented residual of the W1 mapping: unclassifiable
+		// failures keep exit 1 instead of guessing a category.
+		os.Args = []string{"omnilsp", "serve", "--record",
+			filepath.Join(os.TempDir(), fmt.Sprintf("omnilsp-no-such-dir-%d", os.Getpid()), "session.jsonl")}
 		main()
 	case "tcp-record":
 		// Child server for TestServeTCPRecordCreatesSessionFile: the blocking
@@ -128,10 +172,47 @@ type exitProbe struct {
 	wantStderr string
 }
 
-// TestCLIExitCodes drives the re-executed test binary through three exit
-// categories: the W1 invalid-CLI code (2), the explicit --config-missing
-// serve path (2), and one pre-existing fatal() call site that must keep
-// exiting 1 so a global exit-code change cannot slip through unnoticed.
+// TestW1ExitCodeMapping locks the error→W1 category table at the unit level
+// (goal.md §W1): trust/permission → 6, build-context → 3, backend → 4,
+// protocol → 7, internal → 8. Wrapped chains must classify transitively,
+// and errors outside the internal/errors taxonomy keep the documented
+// residual exit 1 rather than guessing a category.
+func TestW1ExitCodeMapping(t *testing.T) {
+	kindErr := func(kind ierrors.ErrorKind) error {
+		return ierrors.New(kind, "op", "ctx")
+	}
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"trust refusal maps to 6", kindErr(ierrors.ErrUntrustedOperation), 6},
+		{"permission maps to 6", kindErr(ierrors.ErrPermission), 6},
+		{"wrapped trust refusal classifies transitively", fmt.Errorf("index export blocked by workspace trust: %w",
+			ierrors.New(ierrors.ErrUntrustedOperation, "trust.gate", "untrusted")), 6},
+		{"build context maps to 3", kindErr(ierrors.ErrBuildContext), 3},
+		{"backend unavailable maps to 4", kindErr(ierrors.ErrBackendUnavailable), 4},
+		{"backend crashed maps to 4", kindErr(ierrors.ErrBackendCrashed), 4},
+		{"protocol maps to 7", kindErr(ierrors.ErrProtocol), 7},
+		{"internal maps to 8", kindErr(ierrors.ErrInternal), 8},
+		{"plain error keeps residual 1", errors.New("boom"), 1},
+		{"flag usage error keeps residual 1", errors.New("index: --scope is required"), 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := w1ExitCode(tc.err); got != tc.want {
+				t.Fatalf("w1ExitCode(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCLIExitCodes drives the re-executed test binary through the W1 exit
+// categories the CLI actually produces: the invalid-CLI code (2) for unknown
+// commands, missing configs, unparseable configs and invalid transport, the
+// permission/trust code (6) for index's workspace-trust refusal, and the
+// documented W1-undefined residual (1) for a failure that carries no taxonomy
+// kind at all.
 func TestCLIExitCodes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("exit probes re-exec the test binary; skipped in -short")
@@ -150,8 +231,20 @@ func TestCLIExitCodes(t *testing.T) {
 			wantStderr: "config: file not found",
 		},
 		{
-			name: "existing fatal path keeps exit 1", mode: "fatal-keeps-exit-one", wantCode: 1,
+			name: "config parse failure exits 2", mode: "config-parse-invalid", wantCode: 2,
+			wantStderr: "config: parse",
+		},
+		{
+			name: "invalid transport via env exits 2 (config category)", mode: "config-invalid-transport", wantCode: 2,
 			wantStderr: `config: unsupported transport "ws"`,
+		},
+		{
+			name: "index trust refusal exits 6", mode: "index-trust-denied", wantCode: 6,
+			wantStderr: "blocked by workspace trust",
+		},
+		{
+			name: "unclassifiable record failure keeps exit 1", mode: "record-unwritable", wantCode: 1,
+			wantStderr: "record:",
 		},
 	} {
 		probe := probe

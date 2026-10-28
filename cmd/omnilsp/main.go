@@ -26,6 +26,7 @@ import (
 	"sync"
 	"syscall"
 
+	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/index/model"
 	mcpserver "github.com/omnilsp/omni/internal/protocol/mcp"
 	"github.com/omnilsp/omni/internal/security"
@@ -57,32 +58,32 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "doctor":
 		if err := cmdDoctor(os.Args[2:]); err != nil {
-			os.Exit(1)
+			os.Exit(w1ExitCode(err))
 		}
 	case "verify":
 		if err := cmdVerify(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "verify: %v\n", err)
-			os.Exit(1)
+			os.Exit(w1ExitCode(err))
 		}
 	case "replay":
 		if err := cmdReplay(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "replay: %v\n", err)
-			os.Exit(1)
+			os.Exit(w1ExitCode(err))
 		}
 	case "repro":
 		if err := cmdRepro(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "repro: %v\n", err)
-			os.Exit(1)
+			os.Exit(w1ExitCode(err))
 		}
 	case "plugins":
 		if err := cmdPlugins(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "plugins: %v\n", err)
-			os.Exit(1)
+			os.Exit(w1ExitCode(err))
 		}
 	case "index":
 		if err := cmdIndex(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "index: %s\n", security.RedactString(err.Error()))
-			os.Exit(1)
+			os.Exit(w1ExitCode(err))
 		}
 	case "version", "--version", "-v":
 		fmt.Println("omnilsp v" + version)
@@ -152,7 +153,9 @@ func cmdServe(args []string) {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fatal("config: %v", err)
+		// Config layer, same W1 category as the missing-explicit-file exit
+		// above: parse/read failures are invalid config, not internal faults.
+		fatalCode(2, "config: %v", err)
 	}
 	// CLI layer wins over everything (spec: Default < Env < File < CLI).
 	if *transportName != "" {
@@ -169,7 +172,9 @@ func cmdServe(args []string) {
 		cfg.WorkspaceDir = wd
 	}
 	if err := cfg.Validate(); err != nil {
-		fatal("%v", err)
+		// Validation failures are all "config: ..." rejections of the
+		// layered config value — W1 category 2 (invalid CLI/config).
+		fatalCode(2, "%v", err)
 	}
 
 	srv := server.New(serverConfigFrom(cfg))
@@ -180,7 +185,7 @@ func cmdServe(args []string) {
 	// enforced by ValidateAddr (N8 v1); mutating endpoints do not exist.
 	if *httpAddr != "" {
 		if verr := httpserver.ValidateAddr(*httpAddr); verr != nil {
-			fatal("http-addr: %v", verr)
+			fatalCode(2, "http-addr: %v", verr)
 		}
 		sharedCore.srv.Store(srv)
 		opts := httpserver.Options{Addr: *httpAddr}
@@ -205,7 +210,7 @@ func cmdServe(args []string) {
 	// convention; exposes runtime profiling, never workspace content.
 	if *debugAddr != "" {
 		if verr := httpserver.ValidateAddr(*debugAddr); verr != nil {
-			fatal("debug: %v", verr)
+			fatalCode(2, "debug: %v", verr)
 		}
 		go func() {
 			info("pprof debug server on http://%s/debug/pprof", *debugAddr)
@@ -231,7 +236,7 @@ func cmdServe(args []string) {
 		srv.InitializeWorkspace(cfg.WorkspaceDir)
 		info("serving MCP %s over stdio", mcpserver.ProtocolRevision)
 		if err := mcpserver.Serve(ctx, os.Stdin, os.Stdout, mcpCore{srv: srv}); err != nil && ctx.Err() == nil {
-			fatal("mcp server error: %v", err)
+			fatalErr(err, "mcp server error: %v", err)
 		}
 		return
 	case "tcp":
@@ -243,7 +248,7 @@ func cmdServe(args []string) {
 		// auth — it must never bind a non-loopback address. This is the same
 		// fail-closed gate the HTTP and debug endpoints already pass.
 		if verr := httpserver.ValidateAddr(listenAddr); verr != nil {
-			fatal("tcp-addr: %v", verr)
+			fatalCode(2, "tcp-addr: %v", verr)
 		}
 		ln, lerr := net.Listen("tcp", listenAddr)
 		if lerr != nil {
@@ -283,7 +288,7 @@ func cmdServe(args []string) {
 	}
 
 	if err := srv.Run(ctx, tr); err != nil && ctx.Err() == nil {
-		fatal("server error: %v", err)
+		fatalErr(err, "server error: %v", err)
 	}
 }
 
@@ -502,17 +507,58 @@ func rustSemanticIndexToolConfig() (rustanalyzer.RustIndexToolConfig, error) {
 	}, nil
 }
 
-func fatal(f string, args ...any) {
-	// §N11: even fatal diagnostics pass the credential redactor.
-	fmt.Fprint(os.Stderr, "omnilsp: "+security.RedactString(fmt.Sprintf(f, args...))+"\n")
-	os.Exit(1)
+// w1ExitCode maps an error onto the goal.md §W1 CLI exit-code categories
+// (goal.md §W1: 0 success, 2 invalid CLI/config, 3 workspace/build-context
+// error, 4 backend unavailable, 5 semantic result unavailable, 6
+// permission/trust error, 7 protocol/remote error, 8 internal error).
+// Classification rides the internal/errors taxonomy, so wrapped refusals
+// (e.g. index's trust gate wrapping ErrUntrustedOperation) classify
+// transitively. Errors carrying no recognizable kind — flag/usage text,
+// raw filesystem and net errors — keep exit 1, the W1-undefined residual:
+// W1 predates most of the error taxonomy, category 5 has no CLI producer
+// yet, and an unmapped failure stays on the historical default rather than
+// guessing a category. Category 2 is assigned at the config/CLI call sites
+// that know their layer statically (fatalCode), not inferred from the error.
+func w1ExitCode(err error) int {
+	switch {
+	case ierrors.IsKind(err, ierrors.ErrUntrustedOperation), ierrors.IsKind(err, ierrors.ErrPermission):
+		return 6 // W1: permission/trust error
+	case ierrors.IsKind(err, ierrors.ErrBuildContext):
+		return 3 // W1: workspace/build-context error
+	case ierrors.IsKind(err, ierrors.ErrBackendUnavailable), ierrors.IsKind(err, ierrors.ErrBackendCrashed):
+		return 4 // W1: backend unavailable
+	case ierrors.IsKind(err, ierrors.ErrProtocol):
+		return 7 // W1: protocol/remote error
+	case ierrors.IsKind(err, ierrors.ErrInternal):
+		return 8 // W1: internal error
+	default:
+		return 1
+	}
 }
 
-// fatalCode is the exit-code-aware variant of fatal for call sites whose
-// exit category differs from the shared default (goal.md W1). The shared
-// fatal() above keeps its hardcoded os.Exit(1) contract; only explicit
-// callers pick a different code.
+func fatal(f string, args ...any) {
+	// Unclassified fatal: the W1-undefined residual exit. Call sites holding
+	// an error value use fatalErr so the §W1 category mapping applies; call
+	// sites that know their category statically use fatalCode.
+	exitFatal(1, f, args...)
+}
+
+// fatalErr renders a fatal diagnostic and exits with the goal.md §W1
+// category of err (see w1ExitCode). Raw errors outside the taxonomy resolve
+// to the residual exit 1.
+func fatalErr(err error, f string, args ...any) {
+	exitFatal(w1ExitCode(err), f, args...)
+}
+
+// fatalCode is the exit-code-aware variant of fatal for call sites whose W1
+// category is known statically from the failing layer (config/CLI validation
+// → 2) regardless of the underlying error's taxonomy kind.
 func fatalCode(code int, f string, args ...any) {
+	exitFatal(code, f, args...)
+}
+
+func exitFatal(code int, f string, args ...any) {
+	// §N11: even fatal diagnostics pass the credential redactor.
 	fmt.Fprint(os.Stderr, "omnilsp: "+security.RedactString(fmt.Sprintf(f, args...))+"\n")
 	os.Exit(code)
 }
