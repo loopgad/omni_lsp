@@ -477,6 +477,21 @@ func (s *Server) handleDidChange(ctx context.Context, msg *jsonrpc.Message) (jso
 			WithWorkspace(string(s.workspaceID))
 	}
 
+	// Audit circle 2, finding 2: a didChange for a document that was never
+	// opened would create VFS state (and republish the snapshot) — at the
+	// open-document budget's edge that creation is refused fail-closed, same
+	// as an over-budget didOpen. Changes to already-open documents are never
+	// capped: the budget bounds distinct documents, not edits. didChange runs
+	// inline on the single read-loop writer, so the check-and-update pair has
+	// no concurrent client-surface opener to race.
+	if s.vfs.Get(uri) == nil && s.vfs.OpenCount() >= s.vfs.MaxOpenDocuments() {
+		s.syncRejects.Add(1)
+		s.metrics.SyncRejects.Inc(1)
+		return nil, errors.New(errors.ErrOverloaded, "didChange",
+			fmt.Sprintf("open-document budget exhausted; refusing implicit open of %s", uri)).
+			WithWorkspace(string(s.workspaceID))
+	}
+
 	content := s.vfs.Content(uri)
 	if content == nil {
 		content = []byte{}

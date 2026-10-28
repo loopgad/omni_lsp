@@ -58,28 +58,70 @@ type FileState struct {
 // language, version, or content. The original open state remains intact.
 var ErrDuplicateOpen = errors.New("vfs: conflicting duplicate open")
 
+// ErrTooManyOpenDocuments reports that a client-facing open was refused
+// because the session's open-document budget is exhausted. The open is
+// fail-closed: no partial state is created (audit circle 2, finding 2 —
+// every open also republishes the full snapshot, so an open flood is O(N^2)
+// CPU and unbounded memory without a cap).
+var ErrTooManyOpenDocuments = errors.New("vfs: too many open documents")
+
+// DefaultMaxOpenDocuments bounds the client-opened documents of one session.
+// It applies only to the client-facing editor surface (SourceEditor through
+// TryOpen and the didChange creation guard); server-internal sources
+// (virtual/remote) are exempt because no client input controls their count.
+const DefaultMaxOpenDocuments = 512
+
 // VFS is a thread-safe virtual file system that maintains file state.
 // Invariants:
 //  1. All reads and writes are atomic per file.
 //  2. Editor overlay (SourceEditor) always takes precedence over disk.
 //  3. Closing a file drops the entry; disk content is not restored.
 type VFS struct {
-	mu       sync.RWMutex
-	files    map[string]*FileState
-	revision atomic.Uint64
+	mu               sync.RWMutex
+	files            map[string]*FileState
+	revision         atomic.Uint64
+	maxOpenDocuments int
 }
 
 // New creates a new empty VFS.
 func New() *VFS {
 	return &VFS{
-		files: make(map[string]*FileState),
+		files:            make(map[string]*FileState),
+		maxOpenDocuments: DefaultMaxOpenDocuments,
 	}
+}
+
+// SetMaxOpenDocuments lowers or raises the client-open-document budget. A
+// non-positive n is ignored (the default stands). Must be called before the
+// session serves traffic.
+func (v *VFS) SetMaxOpenDocuments(n int) {
+	if n > 0 {
+		v.maxOpenDocuments = n
+	}
+}
+
+// MaxOpenDocuments returns the active client-open-document budget.
+func (v *VFS) MaxOpenDocuments() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.maxOpenDocuments
+}
+
+// OpenCount returns the number of documents currently held in the VFS.
+func (v *VFS) OpenCount() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return len(v.files)
 }
 
 // Open opens or updates a file with the given content. The content is
 // cloned at this write boundary once; from here on the bytes are immutable
 // VFS property (callers may freely reuse/mutate their slice). This is what
 // lets snapshot publication share content slices without copying.
+//
+// Open is the embedder-facing write; the client-facing didOpen/didChange
+// surface is capped (see TryOpen) — Open deliberately carries no error
+// return, so it is not the flood gate.
 func (v *VFS) Open(uri, langID string, version int64, content []byte, source FileSource) {
 	key := canonicalURI(uri)
 	v.mu.Lock()
@@ -89,6 +131,8 @@ func (v *VFS) Open(uri, langID string, version int64, content []byte, source Fil
 
 // TryOpen opens a file, or accepts an idempotent reopen when language,
 // version, and content match. A conflict leaves the existing state intact.
+// A NEW client-facing (SourceEditor) open beyond the session's document
+// budget is refused with ErrTooManyOpenDocuments.
 func (v *VFS) TryOpen(uriText, langID string, version int64, content []byte, source FileSource) error {
 	key := canonicalURI(uriText)
 	v.mu.Lock()
@@ -98,6 +142,9 @@ func (v *VFS) TryOpen(uriText, langID string, version int64, content []byte, sou
 			return ErrDuplicateOpen
 		}
 		return nil
+	}
+	if source == SourceEditor && len(v.files) >= v.maxOpenDocuments {
+		return ErrTooManyOpenDocuments
 	}
 	v.openLocked(key, uriText, langID, version, content, source)
 	return nil
