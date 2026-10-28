@@ -117,3 +117,26 @@ func TestF9_TimedOutNotificationStaysSilent(t *testing.T) {
 		t.Fatalf("timed-out notification produced %d wire responses, want silence: %+v", len(resps), resps)
 	}
 }
+
+// TestF9_LargeDefaultCoversColdWorkspaceExportEnvelope pins the §F9 Large
+// default against workspace-scale work the server itself performs on a cold
+// session: the first full-corpus textDocument/references request pays the
+// one-shot snapshot-overlay facts export over the whole dirty overlay, which
+// the x9-1 acceptance startup measured at minutes (the 3e22f85 base run
+// completed soak/initial-queries only after a 13m12s startup; b56a775's
+// 120s default answered RequestCancelled while the dispatcher was still
+// exporting, failing soak/initial-queries on every subsequent run). The
+// default must cover the same 300s per-request envelope the acceptance
+// harness budgets for cold phases (OMNILSP_SOAK_REQUEST_BUDGET=300s, Y1-10)
+// while staying below the VeryLarge reindex ceiling so the §F8 ladder keeps
+// its ordering.
+func TestF9_LargeDefaultCoversColdWorkspaceExportEnvelope(t *testing.T) {
+	cfg := DefaultConfig()
+	large := cfg.RequestDeadlines[scheduler.CostLarge]
+	if large < 300*time.Second {
+		t.Fatalf("CostLarge default deadline = %s, want at least the 300s cold-workspace export envelope", large)
+	}
+	if large >= cfg.RequestDeadlines[scheduler.CostVeryLarge] {
+		t.Fatalf("CostLarge default %s must stay tighter than the VeryLarge ceiling %s (§F8 ladder ordering)", large, cfg.RequestDeadlines[scheduler.CostVeryLarge])
+	}
+}

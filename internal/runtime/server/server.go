@@ -220,13 +220,23 @@ type evidenceRecord struct {
 // the §F9 path (scheduler cancels the work → drainResult answers the typed
 // RequestCancelled response; nothing partial is published). The values scale
 // with the §F8 ladder (more work ⇒ more wall clock) and sit above the soak
-// harness's 30s default request budget and its 300s acceptance reindex
-// budget, so under normal operation they only fire on work that is stuck.
+// harness's 30s default request budget, so under normal operation they only
+// fire on work that is stuck.
+//
+// CostLarge is sized to the acceptance harness's 300s cold-phase envelope
+// (OMNILSP_SOAK_REQUEST_BUDGET=300s, Y1-10), not to warm-query latencies:
+// the first full-corpus textDocument/references request on a cold session
+// pays a one-shot snapshot-overlay facts export measured at 199.3s on the
+// acceptance host (x9-1-notimeout-20261029T0126Z phase trace, dispatch
+// succeeded), and the previous 120s default answered RequestCancelled while
+// that export was still running — failing the soak's startup on every run.
+// It stays below the VeryLarge ceiling so the ladder keeps its ordering
+// (TestF9_LargeDefaultCoversColdWorkspaceExportEnvelope pins both bounds).
 var defaultRequestDeadlines = map[scheduler.CostClass]time.Duration{
 	scheduler.CostTiny:      30 * time.Second,
 	scheduler.CostSmall:     60 * time.Second,
 	scheduler.CostMedium:    90 * time.Second,
-	scheduler.CostLarge:     120 * time.Second,
+	scheduler.CostLarge:     300 * time.Second,
 	scheduler.CostVeryLarge: 600 * time.Second,
 }
 
