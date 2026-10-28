@@ -27,9 +27,13 @@ type fileBuild struct {
 	// walk costs O(files under root) and used to run on EVERY WriteSegment,
 	// making an export O(segments × store files). The first budgeted
 	// segment walks once; later segments of the same build add their
-	// already-staged bytes on top of the cached total.
+	// already-staged bytes on top of the cached total. A walk error is
+	// cached just the same: the build cannot verify the budget until the
+	// filesystem cooperates, so every later segment is refused without
+	// paying a walk per segment.
 	budgetWalked    bool
 	budgetUsedBytes int64
+	budgetWalkErr   error
 }
 
 type buildState uint8
@@ -40,21 +44,33 @@ const (
 	buildAborted
 )
 
+// budgetWalkFS is the directory-tree reader behind the §L17 budget walk. It
+// is a variable for tests only: there is no portable way to make ReadDir or
+// Lstat fail on a live directory across Windows ACLs and POSIX permission
+// bits, so the fail-closed guard injects the error here.
+var budgetWalkFS = filepath.Walk
+
 // walkLiveBytes counts live store content for the §L17 budget, at most once
 // per build (caller holds b.mu). The quarantine directory holds forensic
 // copies of corrupt segments that no write can shrink; counting it would let
 // every corruption event permanently shrink publishable capacity until index
 // publication blocks outright. Quarantine is bounded separately by
 // recycleQuarantine (recovery.go).
-func (b *fileBuild) walkLiveBytes() int64 {
+//
+// The walk is fail-closed (§L17 "refuse, never fill the disk"): an entry the
+// filesystem refuses to report (ACL, AV interference) leaves the used total
+// unknown, so the first walk error is returned and the caller must refuse the
+// write instead of trusting an undercount. The returned error is cached with
+// the count — the next open retries via a fresh build.
+func (b *fileBuild) walkLiveBytes() (int64, error) {
 	if b.budgetWalked {
-		return b.budgetUsedBytes
+		return b.budgetUsedBytes, b.budgetWalkErr
 	}
 	quarantine := b.store.quarantineDir()
 	var used int64
-	_ = filepath.Walk(b.store.root, func(p string, fi os.FileInfo, err error) error {
+	walkErr := budgetWalkFS(b.store.root, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if fi.IsDir() {
 			if p == quarantine {
@@ -66,8 +82,9 @@ func (b *fileBuild) walkLiveBytes() int64 {
 		return nil
 	})
 	b.budgetUsedBytes = used
+	b.budgetWalkErr = walkErr
 	b.budgetWalked = true
-	return used
+	return used, walkErr
 }
 
 // WriteSegment encodes, fsyncs and records one immutable segment. Budget is
@@ -99,8 +116,15 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 	for _, seg := range b.segments {
 		staged += seg.Len
 	}
-	used := b.walkLiveBytes() + staged
-	if used+int64(len(payload))+int64(segHeaderSz)+16 > budget {
+	used, walkErr := b.walkLiveBytes()
+	if walkErr != nil {
+		// Fail-closed (§L17): with part of the store unaccounted for, the
+		// budget cannot be verified, so the write is refused under the same
+		// sentinel the over-budget path uses. Callers surface it like any
+		// other budget refusal instead of filling the disk blindly.
+		return "", fmt.Errorf("%w: budget walk over %s failed: %w", ErrDiskBudgetExceeded, b.store.root, walkErr)
+	}
+	if used+staged+int64(len(payload))+int64(segHeaderSz)+16 > budget {
 		return "", ErrDiskBudgetExceeded
 	}
 	return b.writeSegmentUnchecked(payload)
