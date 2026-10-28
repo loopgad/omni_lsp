@@ -312,6 +312,50 @@ func TestCancellationAfterCommitDecisionReturnsCommittedOutcome(t *testing.T) {
 	}
 }
 
+// TestWriteSegmentRespondsToCancelledBuildContext pins the batch-4 audit
+// finding: WriteSegment used to poll the cross-process writer lock under
+// context.Background(), so an already-cancelled extraction could block
+// indefinitely in the 10ms retry loop behind a busy lock. The build's own
+// context (bound when BeginBuild created the session) must gate the lock
+// acquisition — the same responsiveness Commit already had from its per-call
+// context.
+func TestWriteSegmentRespondsToCancelledBuildContext(t *testing.T) {
+	s := newStore(t)
+	buildCtx, cancelBuild := context.WithCancel(context.Background())
+	build, err := s.BeginBuild(buildCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold the cross-process writer lock the way another process would.
+	holder, err := acquireWriterLock(context.Background(), s.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.release()
+	cancelBuild()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := build.WriteSegment([]byte("payload"))
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("WriteSegment returned %v on a cancelled build context, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		holder.release()
+		<-errCh // the background poller acquires once the lock frees; drain before cleanup
+		t.Fatal("WriteSegment was still polling the writer lock 5s after its build context was cancelled")
+	}
+}
+
+// TestCommitReadsStoreStateOnlyUnderStoreMutex lives in
+// commit_store_state_test.go: it guards the batch-4 finding that
+// commitWithWriterLock assembled its next recovery history from unsynchronized
+// store reads (see that file for the race-detector guard).
+
 func TestGenerationLeasePinsSegmentsDuringCompaction(t *testing.T) {
 	s := newStore(t)
 	oldID := publishOne(t, s, "reader-pinned")

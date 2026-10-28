@@ -15,8 +15,14 @@ import (
 // fileBuild stages the next generation; nothing it writes is discoverable
 // through the manifest until Commit's atomic pointer swap (TXN-002).
 type fileBuild struct {
-	mu       sync.Mutex
-	store    *FileStore
+	mu    sync.Mutex
+	store *FileStore
+	// ctx is the caller's build context, bound when BeginBuild created the
+	// session. WriteSegment's cross-process writer-lock acquisition and its
+	// §L17 budget walk respond to it, so a cancelled extraction cannot block
+	// indefinitely behind a busy lock (Commit keeps taking its own per-call
+	// context, which governs publication instead).
+	ctx      context.Context
 	genID    uint64
 	stageDir string
 	segments []SegmentRef
@@ -72,6 +78,11 @@ func (b *fileBuild) walkLiveBytes() (int64, error) {
 		if err != nil {
 			return err
 		}
+		// Respond to build cancellation: abort the walk instead of scanning
+		// the whole store for an extraction nobody is waiting on anymore.
+		if ctxErr := b.ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if fi.IsDir() {
 			if p == quarantine {
 				return filepath.SkipDir
@@ -95,10 +106,13 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 	if b.state != buildOpen {
 		return "", b.closedError()
 	}
+	if err := b.ctx.Err(); err != nil {
+		return "", err
+	}
 	b.store.mu.Lock()
 	budget := b.store.cfg.DiskBudgetBytes
 	b.store.mu.Unlock()
-	writerLock, err := acquireWriterLock(context.Background(), b.store.root)
+	writerLock, err := acquireWriterLock(b.ctx, b.store.root)
 	if err != nil {
 		return "", err
 	}
@@ -118,6 +132,12 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 	}
 	used, walkErr := b.walkLiveBytes()
 	if walkErr != nil {
+		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
+			// The walk aborted because the build itself was cancelled:
+			// surface the cancellation instead of disguising it as a budget
+			// refusal.
+			return "", walkErr
+		}
 		// Fail-closed (§L17): with part of the store unaccounted for, the
 		// budget cannot be verified, so the write is refused under the same
 		// sentinel the over-budget path uses. Callers surface it like any

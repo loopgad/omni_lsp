@@ -322,7 +322,7 @@ func (s *FileStore) beginBuildWithWriterLock(ctx context.Context, writerLock *wr
 		return nil, fmt.Errorf("persistent: reserve generation %d: %w", genID, err)
 	}
 	s.nextGenID = genID
-	return &fileBuild{store: s, genID: genID, stageDir: stage}, nil
+	return &fileBuild{store: s, ctx: ctx, genID: genID, stageDir: stage}, nil
 }
 
 func (s *FileStore) quarantineSegsLocked(segs []SegmentID) error {
