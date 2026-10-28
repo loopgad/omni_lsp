@@ -187,8 +187,12 @@ incomplete wherever SCIP cannot prove completeness; this imported generation
 does not satisfy complete-query or rename-safety gates by itself. Output files
 are created without overwriting an existing path. Both `--input` and `--output`
 must resolve outside the workspace because all workspace files participate in
-the disk identity digest. LSIF remains available only through the existing
-conversion adapter, not this local command.
+the disk identity digest. LSIF is served natively by this command as well:
+`index import --format lsif` and `index export --format lsif` call the server's
+native LSIF import/export through the same trusted-workspace, empty-index, and
+freshness guards as the SCIP path — no SCIP conversion detour — and an
+`--allow-lossy` LSIF export counts each loss in the LSIF
+`metaData.toolInfo.args`.
 
 The performance test must keep at least 1,000 raw request samples per
 operation and language. Its strict S18 targets are:
