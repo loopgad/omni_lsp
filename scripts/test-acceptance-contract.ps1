@@ -366,6 +366,41 @@ try {
     }
 }
 
+# --- Fast source-stability naming contract -----------------------------------
+# The pre-producers identity check executes AFTER build-candidate, the four
+# cross-builds, build-soak-test and the fuzz loop, and BEFORE the first
+# acceptance producer (the candidate binary's own verify baseline). Its id and
+# the requirement-matrix row must state exactly that position: the old
+# 'source-stability-before-build' id promised a pre-build execution point the
+# Fast phase never had, which misled frozen-evidence reviewers (audit
+# 2026-10-29, 验收面). Anchoring the call's byte offset between the last fuzz
+# step and the first producer keeps name and position from drifting apart
+# again; a missing anchor fails loudly instead of silently passing.
+$stabilityScript = Get-Content -LiteralPath $acceptancePath -Raw
+if ($stabilityScript.Contains('source-stability-before-build')) {
+    throw "acceptance.ps1 still uses the stale id 'source-stability-before-build'; the check runs before the acceptance producers, not before the build."
+}
+$stabilityCallId = "Test-FastSourceTreeIdentity 'source-stability-before-acceptance-producers'"
+$lastBuildAnchor = "Invoke-Step 'build-candidate'"
+$lastFuzzAnchor = "name = 'fuzz-uri-parse'"
+$firstProducerAnchor = "quick-score-baseline.log"
+foreach ($anchor in @($stabilityCallId, $lastBuildAnchor, $lastFuzzAnchor, $firstProducerAnchor)) {
+    if (-not $stabilityScript.Contains($anchor)) {
+        throw "acceptance.ps1 lost the source-stability naming anchor '$anchor'; the naming contract cannot be verified."
+    }
+}
+$stabilityCallIndex = $stabilityScript.IndexOf($stabilityCallId, [StringComparison]::Ordinal)
+if (-not ($stabilityScript.IndexOf($lastBuildAnchor, [StringComparison]::Ordinal) -lt $stabilityCallIndex -and
+        $stabilityScript.IndexOf($lastFuzzAnchor, [StringComparison]::Ordinal) -lt $stabilityCallIndex -and
+        $stabilityCallIndex -lt $stabilityScript.IndexOf($firstProducerAnchor, [StringComparison]::Ordinal))) {
+    throw "The pre-producers source-stability check must run after build-candidate and the fuzz loop, and before the first acceptance producer (the candidate verify baseline)."
+}
+$stabilityMatrixRow = "@{ id = 'source-stability-before-acceptance-producers'; goal = 'candidate identity'; impl = 'Workspace content hash is unchanged before the acceptance producers run'"
+if (-not $stabilityScript.Contains($stabilityMatrixRow)) {
+    throw "The requirement matrix must carry the renamed pre-producers identity check with a description matching its execution point."
+}
+Write-Output 'Fast source-stability naming contract passed.'
+
 $contractEvidencePath = Join-Path ([IO.Path]::GetTempPath()) ('omnilsp-evidence-check-status-' + [guid]::NewGuid().ToString('N') + '.json')
 try {
     [ordered]@{

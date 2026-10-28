@@ -2500,7 +2500,7 @@ function Write-RequirementMatrix {
         @{ id = 'acceptance-report-contract'; goal = 'evidence validation'; impl = 'PowerShell acceptance report validator contract tests' },
         @{ id = 'tool-version-lock'; goal = 'environment'; impl = 'Locked Go, language servers, clients, Node, and editor versions' },
         @{ id = 'local-language-server-wrappers'; goal = 'environment'; impl = 'Project-local fixed-version Pyright and TypeScript server launchers' },
-        @{ id = 'source-stability-before-build'; goal = 'candidate identity'; impl = 'Workspace content hash is unchanged before candidate build' },
+        @{ id = 'source-stability-before-acceptance-producers'; goal = 'candidate identity'; impl = 'Workspace content hash is unchanged before the acceptance producers run' },
         @{ id = 'source-stability-after-tests'; goal = 'candidate identity'; impl = 'Workspace content hash is unchanged through all Fast checks' },
         @{ id = 'unit'; goal = 'Fast gate'; impl = 'Go packages and acceptance support code' },
         @{ id = 'race'; goal = 'Fast gate'; impl = 'Go race detector across ./...' },
@@ -3044,7 +3044,7 @@ switch ($Phase) {
         )) {
             $checks.Add((Invoke-Step $fuzz.name $go @('test', "-fuzz=$($fuzz.func)", '-fuzztime=10s', $fuzz.target)))
         }
-        $checks.Add((Test-FastSourceTreeIdentity 'source-stability-before-build'))
+        $checks.Add((Test-FastSourceTreeIdentity 'source-stability-before-acceptance-producers'))
         if (($checks | Where-Object { $_.status -eq 'failed' }).Count -gt 0) {
             $summaryPath = Write-Summary 'failed' $checks $errors
             Write-RequirementMatrix
