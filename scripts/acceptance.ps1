@@ -1077,6 +1077,24 @@ function Assert-S19ReturnedLocationScale($Check, $Sample, [int] $ExpectedReturne
     }
 }
 
+function Get-S19NoStarvationBudgetMs($Reference800Sample) {
+    # Derive the S19 no-starvation interactive response budget from this run's
+    # own measured uncanceled 800-reference P50 (2026-10-25 ruling 5, same
+    # method as the perf cancellation budget): twice the P50, rounded up to
+    # whole milliseconds. The factor is a noise margin, not a performance
+    # threshold; a completion/hover starved behind the outstanding
+    # 3200-reference walk costs at least 4x the 800-reference measurement and
+    # cannot fit inside two of them. Accepts either the sample's p50_ns/check
+    # observed shape or the SampleSet p50 shape (Assert-S19ReturnedLocationScale
+    # already pinned both to the raw samples). Returns $null when the run has
+    # no measurable 800-reference baseline; callers must fail closed.
+    if ($null -eq $Reference800Sample) { return $null }
+    $p50 = $Reference800Sample.PSObject.Properties['p50_ns']
+    if (-not $p50) { $p50 = $Reference800Sample.PSObject.Properties['p50'] }
+    if (-not $p50 -or ($p50.Value -isnot [long] -and $p50.Value -isnot [double]) -or [double]$p50.Value -le 0) { return $null }
+    return [long][Math]::Ceiling((2 * [double]$p50.Value) / 1000000)
+}
+
 function Assert-S19ProcessTreeResourceEvidence($Check) {
     if ($null -eq $Check -or [string]$Check.status -cne 'passed' -or
         -not ([string]$Check.id).EndsWith('/S19/process-tree-resources', [StringComparison]::Ordinal) -or
@@ -1638,6 +1656,12 @@ function Assert-StructuredReportIdentity(
         $cancellation = $actualIds["$ExpectedRunId/S19/active-cancellation"].observed
         $progress = $actualIds["$ExpectedRunId/S19/progress"].observed
         $fairness = $actualIds["$ExpectedRunId/S19/no-starvation"].observed
+        # The no-starvation response budget is derived, not a wall-clock
+        # constant: it must equal twice this run's measured references@800 P50
+        # rounded up to whole milliseconds — the same derivation the generator
+        # side applies — and the observed completion/hover latencies are judged
+        # against that derived budget below (a $null basis fails the gate).
+        $expectedBudgetMs = Get-S19NoStarvationBudgetMs $sampleById["$ExpectedRunId/S19/references@800"]
         if (-not $cancellation.attempted -or -not $cancellation.progress_began -or
             $cancellation.progress_token -cne 'omnilsp-s19-cancel' -or
             [string]::IsNullOrWhiteSpace([string]$cancellation.server_terminal) -or
@@ -1652,9 +1676,9 @@ function Assert-StructuredReportIdentity(
             $fairness.reference_result_count -ne $fairness.expected_reference_result_count -or $fairness.reference_result_count -ne 3200 -or
             $fairness.reference_terminal_result_count -ne 3200 -or
             $fairness.completion_status -cne 'pass' -or $fairness.hover_status -cne 'pass' -or
-            $fairness.budget_ms -isnot [long] -or $fairness.budget_ms -ne 2000 -or
-            $fairness.completion_ns -isnot [long] -or $fairness.completion_ns -lt 0 -or $fairness.completion_ns -gt 2000000000 -or
-            $fairness.hover_ns -isnot [long] -or $fairness.hover_ns -lt 0 -or $fairness.hover_ns -gt 2000000000 -or
+            $fairness.budget_ms -isnot [long] -or $fairness.budget_ms -ne $expectedBudgetMs -or
+            $fairness.completion_ns -isnot [long] -or $fairness.completion_ns -lt 0 -or $fairness.completion_ns -gt ([double]$fairness.budget_ms * 1000000) -or
+            $fairness.hover_ns -isnot [long] -or $fairness.hover_ns -lt 0 -or $fairness.hover_ns -gt ([double]$fairness.budget_ms * 1000000) -or
             -not (Test-S19ConcurrentRequestIdentity $fairness) -or
             $fairness.reference_begin_event_index -isnot [long] -or $fairness.reference_begin_event_index -lt 0 -or
             $fairness.reference_end_event_index -isnot [long] -or $fairness.reference_end_event_index -lt 0 -or

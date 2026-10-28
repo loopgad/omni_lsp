@@ -58,6 +58,28 @@ var e2eS18PolicyFlag = flag.String("S18Policy", "strict", "S18 release policy: s
 
 var e2eS19ReturnedLocationScales = [...]int{200, 800, 3200}
 
+// e2eS19NoStarvationBudgetReferenceTotal names the S19 scale whose measured
+// cost derives the no-starvation interactive-response budget.
+const e2eS19NoStarvationBudgetReferenceTotal = 800
+
+// e2eNoStarvationBudgetMillis derives the no-starvation completion/hover
+// response budget from this run's own measurement instead of a wall-clock
+// constant (2026-10-25 ruling 5, same method as the perf cancellation budget):
+// twice the measured uncanceled 800-reference P50, rounded up to whole
+// milliseconds. The factor is a noise margin, not a performance threshold: a
+// completion or hover starved behind the outstanding 3200-reference walk costs
+// at least 4x the 800-reference measurement and cannot fit inside two of them.
+// ok is false when the run has no measured 800-reference baseline; the caller
+// must then report the interactive checks as not_verified instead of judging
+// them against a fabricated budget. scripts/acceptance.ps1 recomputes the same
+// derivation from the report's references@800 evidence, pinning both sides.
+func e2eNoStarvationBudgetMillis(scale e2eReferenceScale) (int64, bool) {
+	if scale.ReturnedLocationTotalIncludingDeclaration != e2eS19NoStarvationBudgetReferenceTotal || scale.P50NS <= 0 {
+		return 0, false
+	}
+	return (2*scale.P50NS + int64(time.Millisecond) - 1) / int64(time.Millisecond), true
+}
+
 var errE2ENotVerified = errors.New("not verified")
 
 // e2eFailureKind is deliberately independent of the human-readable error
@@ -2857,7 +2879,7 @@ func runE2ES19(t *testing.T, binary string) e2eS19Report {
 		Status:       "running",
 		Cancellation: e2eCancellationOutcome{Status: "not_verified"},
 		Progress:     e2eProgressOutcome{Status: "not_verified"},
-		NoStarvation: e2eNoStarvationOutcome{BudgetMillis: 2000, CompletionStatus: "not_verified", HoverStatus: "not_verified", Status: "not_verified"},
+		NoStarvation: e2eNoStarvationOutcome{CompletionStatus: "not_verified", HoverStatus: "not_verified", Status: "not_verified"},
 	}
 	workspace := t.TempDir()
 	content, tokenPositions, corpusErr := buildE2ES19Corpus()
@@ -2957,6 +2979,23 @@ func runE2ES19(t *testing.T, binary string) e2eS19Report {
 		}
 		result.Scaling = append(result.Scaling, scale)
 		result.Resources = append(result.Resources, e2eProcessTreeResources(os.Getpid(), fmt.Sprintf("returned-locations-%d", locationTotal)))
+	}
+
+	// Derive the no-starvation interactive budget from this round's own
+	// 800-reference measurement (2026-10-25 ruling 5; scripts/acceptance.ps1
+	// recomputes the same derivation from the report evidence). Without a
+	// measured baseline the completion/hover checks cannot be judged and stay
+	// not_verified instead of being graded against a fabricated budget.
+	noStarvationBudgetDerived := false
+	for _, scale := range result.Scaling {
+		if millis, ok := e2eNoStarvationBudgetMillis(scale); ok {
+			result.NoStarvation.BudgetMillis = millis
+			noStarvationBudgetDerived = true
+			break
+		}
+	}
+	if !noStarvationBudgetDerived {
+		result.NotVerified = append(result.NotVerified, "no-starvation response budget not derived: the 800-reference scale has no measured samples")
 	}
 
 	// Active cancellation: use the progress begin as evidence the server has
@@ -3089,10 +3128,12 @@ func runE2ES19(t *testing.T, binary string) e2eS19Report {
 	if completionCheckErr == nil {
 		completionCheckErr = validateE2ECompletionFor(completionRaw, "marker")
 	}
-	if completionCheckErr == nil && result.NoStarvation.CompletionNS <= result.NoStarvation.BudgetMillis*int64(time.Millisecond) {
+	if completionCheckErr == nil && noStarvationBudgetDerived && result.NoStarvation.CompletionNS <= result.NoStarvation.BudgetMillis*int64(time.Millisecond) {
 		result.NoStarvation.CompletionStatus = "pass"
 	} else if completionCheckErr != nil {
 		result.NoStarvation.CompletionStatus = e2eErrorStatus(completionCheckErr)
+	} else if !noStarvationBudgetDerived {
+		result.NoStarvation.CompletionStatus = "not_verified"
 	} else {
 		result.NoStarvation.CompletionStatus = "failed"
 	}
@@ -3102,10 +3143,12 @@ func runE2ES19(t *testing.T, binary string) e2eS19Report {
 	if hoverCheckErr == nil {
 		hoverCheckErr = validateE2EHoverFor(hoverRaw, "marker")
 	}
-	if hoverCheckErr == nil && result.NoStarvation.HoverNS <= result.NoStarvation.BudgetMillis*int64(time.Millisecond) {
+	if hoverCheckErr == nil && noStarvationBudgetDerived && result.NoStarvation.HoverNS <= result.NoStarvation.BudgetMillis*int64(time.Millisecond) {
 		result.NoStarvation.HoverStatus = "pass"
 	} else if hoverCheckErr != nil {
 		result.NoStarvation.HoverStatus = e2eErrorStatus(hoverCheckErr)
+	} else if !noStarvationBudgetDerived {
+		result.NoStarvation.HoverStatus = "not_verified"
 	} else {
 		result.NoStarvation.HoverStatus = "failed"
 	}
@@ -3229,7 +3272,7 @@ func runE2ES19(t *testing.T, binary string) e2eS19Report {
 		result.NotVerified = append(result.NotVerified, "high-priority completion/hover unsupported or unavailable while a reference query was active")
 	} else {
 		result.NoStarvation.Status = "failed"
-		result.Errors = append(result.Errors, "P0 completion or P1 hover failed semantic validation or exceeded the 2s response budget")
+		result.Errors = append(result.Errors, "P0 completion or P1 hover failed semantic validation or exceeded the derived response budget")
 	}
 	result.Resources = append(result.Resources, e2eProcessTreeResources(os.Getpid(), "completed"))
 
@@ -5946,6 +5989,38 @@ func e2eFloatSamples(samples []int64) []float64 {
 	return out
 }
 
+// TestE2ENoStarvationBudgetDerivation pins the batch-4 audit finding: the S19
+// no-starvation completion/hover budget used to be a bare 2000ms constant on
+// the generator side (runE2ES19 and the report-writer fixture) and in
+// scripts/acceptance.ps1. Per the 2026-10-25 ruling 5 — the same method as the
+// perf cancellation budget — it must derive from this run's own measured
+// uncanceled 800-reference request: twice the P50, rounded up to whole
+// milliseconds. A starved interactive request queued behind the outstanding
+// 3200-reference walk costs at least 4x the 800-reference measurement and
+// cannot fit inside two of them, so the factor stays a noise margin.
+func TestE2ENoStarvationBudgetDerivation(t *testing.T) {
+	scale := e2eReferenceScale{
+		ReturnedLocationTotalIncludingDeclaration:          e2eS19NoStarvationBudgetReferenceTotal,
+		ExpectedReturnedLocationCountIncludingDeclaration:  e2eS19NoStarvationBudgetReferenceTotal,
+		ObservedReturnedLocationCountsIncludingDeclaration: []int{800, 800, 800},
+		SamplesNS: []int64{1000000, 1500000, 2000000}, P50NS: 1500000, P95NS: 2000000, P99NS: 2000000,
+		Status: "pass",
+	}
+	if millis, ok := e2eNoStarvationBudgetMillis(scale); !ok || millis != 3 {
+		t.Fatalf("budget from a 1.5ms 800-reference P50 = %dms (ok=%v), want 3ms", millis, ok)
+	}
+	scale.P50NS = 1500001 // 2*P50 = 3000002ns rounds up to 4 whole milliseconds
+	if millis, ok := e2eNoStarvationBudgetMillis(scale); !ok || millis != 4 {
+		t.Fatalf("budget from a 1.500001ms P50 = %dms (ok=%v), want the 4ms ceiling", millis, ok)
+	}
+	if millis, ok := e2eNoStarvationBudgetMillis(e2eReferenceScale{ReturnedLocationTotalIncludingDeclaration: e2eS19NoStarvationBudgetReferenceTotal}); ok || millis != 0 {
+		t.Fatalf("an unmeasured 800-reference scale yielded %dms (ok=%v); no measurement, no budget", millis, ok)
+	}
+	if _, ok := e2eNoStarvationBudgetMillis(e2eReferenceScale{P50NS: 5, SamplesNS: []int64{5}}); ok {
+		t.Fatal("a scale other than the 800-reference baseline must not yield a budget")
+	}
+}
+
 func TestE2EPerformanceReportWriterUsesSharedSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "performance.json")
 	t.Setenv(performanceOutEnv, path)
@@ -5971,6 +6046,31 @@ func TestE2EPerformanceReportWriterUsesSharedSchema(t *testing.T) {
 	hoverEvidence, err := e2eBuildS18SemanticEvidence(fixture, hoverOperation, fixture.queryToken, candidateHover, upstreamHover, hoverDiffErr)
 	if err != nil {
 		t.Fatalf("build normalized S18 hover evidence: %v", err)
+	}
+	// The fixture carries its own 800-reference evidence so the no-starvation
+	// budget comes from the shared derivation helper instead of a bare
+	// millisecond constant: the writer contract pins that budget_ms travels
+	// from measured evidence, exactly as runE2ES19 produces it.
+	s19FixtureScales := []e2eReferenceScale{
+		{
+			ReturnedLocationTotalIncludingDeclaration: 200, ExpectedReturnedLocationCountIncludingDeclaration: 200,
+			ObservedReturnedLocationCountsIncludingDeclaration: []int{200, 200, 200}, SamplesNS: []int64{100, 110, 120},
+			P50NS: 110, P95NS: 120, P99NS: 120,
+			Status: "pass",
+		},
+		{
+			ReturnedLocationTotalIncludingDeclaration: e2eS19NoStarvationBudgetReferenceTotal, ExpectedReturnedLocationCountIncludingDeclaration: e2eS19NoStarvationBudgetReferenceTotal,
+			ObservedReturnedLocationCountsIncludingDeclaration: []int{800, 800, 800}, SamplesNS: []int64{1000000, 1500000, 2000000},
+			P50NS: 1500000, P95NS: 2000000, P99NS: 2000000,
+			Status: "pass",
+		},
+	}
+	var fixtureNoStarvationBudgetMillis int64
+	for _, scale := range s19FixtureScales {
+		if millis, ok := e2eNoStarvationBudgetMillis(scale); ok {
+			fixtureNoStarvationBudgetMillis = millis
+			break
+		}
 	}
 	input := e2ePerformanceReport{
 		RunID: runID, CreatedUTC: time.Now().UTC(), CandidateBin: "candidate", CandidateSHA: "sha256:candidate", GitRevision: "revision",
@@ -6008,11 +6108,7 @@ func TestE2EPerformanceReportWriterUsesSharedSchema(t *testing.T) {
 		}},
 		S19: e2eS19Report{
 			Status: "partial",
-			Scaling: []e2eReferenceScale{{
-				ReturnedLocationTotalIncludingDeclaration: 200, ExpectedReturnedLocationCountIncludingDeclaration: 200,
-				ObservedReturnedLocationCountsIncludingDeclaration: []int{200, 200, 200}, SamplesNS: []int64{100, 110, 120},
-				Status: "pass",
-			}},
+			Scaling: s19FixtureScales,
 			Cancellation: e2eCancellationOutcome{
 				Status: "pass", Attempted: true, RequestID: 5, ProgressToken: "omnilsp-s19-cancel", ProgressBegan: true,
 				CallerOutcome: "caller received RequestCancelled", ServerTerminal: "server returned RequestCancelled",
@@ -6025,7 +6121,7 @@ func TestE2EPerformanceReportWriterUsesSharedSchema(t *testing.T) {
 				ReferenceBeginIndex: 20, CompletionResponseIndex: 30, HoverResponseIndex: 40, ReferenceEndIndex: 50, ReferenceResponseIndex: 60,
 				ReferenceTerminal: "completed successfully", ReferenceTerminalSuccess: true, ReferenceTerminalResultCount: 3200,
 				ReferenceResultCount: 3200, ExpectedReferenceResultCount: 3200, ReferenceCompletedNaturally: true,
-				CompletionStatus: "pass", HoverStatus: "pass", BudgetMillis: 2000,
+				CompletionStatus: "pass", HoverStatus: "pass", BudgetMillis: fixtureNoStarvationBudgetMillis,
 			},
 		},
 	}
@@ -6171,6 +6267,12 @@ func TestE2EPerformanceReportWriterUsesSharedSchema(t *testing.T) {
 		if _, ok := fairness.Observed[key]; !ok {
 			t.Errorf("S19 no-starvation evidence is missing Observed.%s", key)
 		}
+	}
+	// budget_ms must travel from the fixture's own measured references@800
+	// evidence through the shared derivation (2x the 1.5ms P50, ceiling to
+	// whole milliseconds = 3ms), never from a bare wall-clock constant.
+	if fairness.Observed["budget_ms"] != float64(fixtureNoStarvationBudgetMillis) || fixtureNoStarvationBudgetMillis != 3 {
+		t.Fatalf("shared report lost the derived no-starvation budget: budget_ms=%v, derivation produced %dms, want 3ms", fairness.Observed["budget_ms"], fixtureNoStarvationBudgetMillis)
 	}
 	if len(document.Samples[0].Raw) != 1 {
 		t.Errorf("shared report did not preserve raw latency samples: %+v", document.Samples[0])
