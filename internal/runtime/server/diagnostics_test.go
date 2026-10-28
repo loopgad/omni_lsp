@@ -248,9 +248,9 @@ func TestC11_DiagnosticCacheTracksBackendWorkspaceGeneration(t *testing.T) {
 	s.vfs.Open(uri, "python", 1, []byte("value = 1\n"), vfs.SourceEditor)
 	s.publishSnapshot()
 
-	first, err := s.diag.compute(context.Background(), uri)
-	if err != nil || first == nil {
-		t.Fatalf("first diagnostics = %v, %v", first, err)
+	firstKey, firstItems, err := s.diag.compute(context.Background(), uri)
+	if err != nil || firstItems == nil {
+		t.Fatalf("first diagnostics = %v (key %v), %v", firstItems, firstKey, err)
 	}
 	if got := be.calls.Load(); got != 1 {
 		t.Fatalf("first backend calls = %d, want 1", got)
@@ -259,9 +259,9 @@ func TestC11_DiagnosticCacheTracksBackendWorkspaceGeneration(t *testing.T) {
 	// A same-parent-revision update to another URI can change the child
 	// workspace generation without changing this file's cache inputs.
 	be.generation.Add(1)
-	second, err := s.diag.compute(context.Background(), uri)
-	if err != nil || second == nil {
-		t.Fatalf("second diagnostics = %v, %v", second, err)
+	secondKey, secondItems, err := s.diag.compute(context.Background(), uri)
+	if err != nil || secondItems == nil {
+		t.Fatalf("second diagnostics = %v (key %v), %v", secondItems, secondKey, err)
 	}
 	if got := be.calls.Load(); got != 2 {
 		t.Fatalf("backend calls after workspace generation advanced = %d, want cache miss and 2", got)
@@ -307,7 +307,7 @@ func TestC11_GoDiagnosticsUseWorkspaceLeaseAcrossRetry(t *testing.T) {
 	s.vfs.Open(typesURI, "go", 1, unsavedTypes, vfs.SourceEditor)
 	s.publishSnapshot()
 
-	items, err := s.diag.compute(context.Background(), mainURI)
+	_, items, err := s.diag.compute(context.Background(), mainURI)
 	if err != nil {
 		t.Fatalf("compute Go diagnostics: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestC11_DiagnosticsUseSemanticBackendForLanguageVariants(t *testing.T) {
 		if got := s.findWorkspaceBackendFor(doc.uri); got != semanticBackend {
 			t.Errorf("diagnostic backend for %s = %T, want semantic backend %T", doc.uri, got, semanticBackend)
 		}
-		if _, err := s.diag.compute(context.Background(), doc.uri); err != nil {
+		if _, _, err := s.diag.compute(context.Background(), doc.uri); err != nil {
 			t.Errorf("diagnostics for %s: %v", doc.uri, err)
 		}
 	}
@@ -390,7 +390,7 @@ func TestC11_DiagnosticsDoNotFallBackForUnknownLanguage(t *testing.T) {
 	if got := s.findWorkspaceBackendFor(uri); got != nil {
 		t.Fatalf("unknown document resolved to arbitrary backend %T", got)
 	}
-	if _, err := s.diag.compute(context.Background(), uri); err == nil {
+	if _, _, err := s.diag.compute(context.Background(), uri); err == nil {
 		t.Fatal("diagnostics unexpectedly succeeded for unknown language")
 	}
 	if got := goBackend.calls.Load() + tsBackend.calls.Load(); got != 0 {

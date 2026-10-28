@@ -219,7 +219,7 @@ func (d *diagCoordinator) Close() {
 // computeAndPush runs diagnostics and emits publishDiagnostics.
 func (d *diagCoordinator) computeAndPush(ctx context.Context, uri string) {
 	uri = canonicalDocumentURI(uri)
-	items, err := d.compute(ctx, uri)
+	key, items, err := d.compute(ctx, uri)
 	if err != nil || ctx.Err() != nil {
 		if err != nil && ctx.Err() == nil {
 			d.server.recordEvidence(ctx, "textDocument/publishDiagnostics", uri, identity.ResultUnavailable, identity.CompletenessUnknown, nil, []string{err.Error()})
@@ -230,17 +230,32 @@ func (d *diagCoordinator) computeAndPush(ctx context.Context, uri string) {
 	if be == nil {
 		return
 	}
-	if currentKey := d.currentKey(uri, be); currentKey != (diagKey{}) {
-		d.mu.Lock()
-		cached, ok := d.cache[uri]
-		d.mu.Unlock()
-		if !ok || cached.key != currentKey {
-			return
-		}
-	}
+	d.publishComputed(uri, key, items, be)
+}
+
+// publishComputed emits publishDiagnostics for a freshly computed (key, items)
+// pair — but only while that pair is still the coordinator's current
+// generation for uri. Both guards compare against the key this compute run
+// actually produced, closing the stale-publish window where a paused older
+// run reaches the emit point after a newer run has overwritten the cache: the
+// previous code compared only cache-entry-vs-current-input and never
+// cache-entry-vs-this-run, so the old run's items could go out on the wire
+// under the new run's version. The checks run before the payload is built and
+// again immediately before the wire write (marshal is the slow part between
+// them).
+func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []languages.Diagnostic, be languages.Backend) {
 	d.mu.Lock()
-	cached := d.cache[uri]
+	cached, ok := d.cache[uri]
 	d.mu.Unlock()
+	if !ok || cached.key != key {
+		// The cache no longer holds this run's entry: a newer generation has
+		// overwritten it (or didClose/FIFO eviction removed it). version and
+		// items could no longer be bound to one generation — never publish.
+		return
+	}
+	if cur := d.currentKey(uri, be); cur != key {
+		return
+	}
 	version := cached.version
 	wire := projectDiagnostics(items)
 	displayURI := uri
@@ -255,7 +270,13 @@ func (d *diagCoordinator) computeAndPush(ctx context.Context, uri string) {
 	if merr != nil {
 		return
 	}
-	if currentKey := d.currentKey(uri, be); currentKey != cached.key {
+	d.mu.Lock()
+	cached, ok = d.cache[uri]
+	d.mu.Unlock()
+	if !ok || cached.key != key {
+		return
+	}
+	if cur := d.currentKey(uri, be); cur != key {
 		return
 	}
 	d.server.notifyClient("textDocument/publishDiagnostics", json.RawMessage(payload))
@@ -277,15 +298,18 @@ func (d *diagCoordinator) currentKey(uri string, be languages.Backend) diagKey {
 	return computeDiagKey(uri, rev, src, string(backendBuildContext(be)), backendEpoch(be), backendWorkspaceGeneration(be), diagnosticsGeneration)
 }
 
-// compute resolves diagnostics through the bounded §C11 cache.
-func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []languages.Diagnostic, resultErr error) {
+// compute resolves diagnostics through the bounded §C11 cache. It returns the
+// key actually bound to the returned items — the cache entry key on a hit, the
+// committed resultKey otherwise — so the push path can validate at emit time
+// that what it is about to publish is still this run's generation.
+func (d *diagCoordinator) compute(ctx context.Context, uri string) (pushKey diagKey, result []languages.Diagnostic, resultErr error) {
 	uri = canonicalDocumentURI(uri)
 	if d.server.vfs.Get(uri) == nil {
-		return nil, errDiagnosticDocumentClosed
+		return diagKey{}, nil, errDiagnosticDocumentClosed
 	}
 	be := d.server.findWorkspaceBackendFor(uri)
 	if be == nil {
-		return nil, fmt.Errorf("no backend for %s", uri)
+		return diagKey{}, nil, fmt.Errorf("no backend for %s", uri)
 	}
 	captured := snapshotFromCtx(ctx)
 	if captured == nil && d.server.snapMgr != nil {
@@ -297,7 +321,7 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 		snapRev = captured.ID().Revision
 		doc := captured.Document(uri)
 		if doc == nil {
-			return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "requested document is absent from the captured workspace snapshot")
+			return diagKey{}, nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "requested document is absent from the captured workspace snapshot")
 		}
 		src = doc.Content
 	} else {
@@ -308,7 +332,7 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 	}
 	leaseCtx, finishSnapshot, err := d.server.beginBackendWorkspaceSnapshot(ctx, be, captured)
 	if err != nil {
-		return nil, err
+		return diagKey{}, nil, err
 	}
 	defer func() {
 		if finishSnapshot != nil {
@@ -329,7 +353,7 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 	d.mu.Lock()
 	if en, ok := d.cache[uri]; ok && en.key == key {
 		d.mu.Unlock()
-		return en.items, nil
+		return en.key, en.items, nil
 	}
 	d.mu.Unlock()
 
@@ -337,12 +361,12 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 	// captured workspace context. Nested refresh can update its diagnostic
 	// version inside this lease without changing the source generation.
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return diagKey{}, nil, err
 	}
 
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return diagKey{}, nil, err
 		}
 		var items []languages.Diagnostic
 		if encoded, ok := be.(languages.EncodedDiagnosticsProvider); ok {
@@ -351,29 +375,29 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 			items, err = be.Diagnostics(leaseCtx, uri, src)
 		}
 		if err != nil {
-			return nil, err
+			return diagKey{}, nil, err
 		}
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return diagKey{}, nil, ctx.Err()
 		}
 		if d.server.vfs.Get(uri) == nil {
-			return nil, errDiagnosticDocumentClosed
+			return diagKey{}, nil, errDiagnosticDocumentClosed
 		}
 		if string(backendBuildContext(be)) != buildContext || backendEpoch(be) != epoch {
-			return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "backend context changed while diagnostics were computed")
+			return diagKey{}, nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "backend context changed while diagnostics were computed")
 		}
 		if backendWorkspaceGeneration(be) != workspaceGeneration {
-			return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "child workspace changed while diagnostics were computed")
+			return diagKey{}, nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "child workspace changed while diagnostics were computed")
 		}
 
 		d.mu.Lock()
 		if ctx.Err() != nil {
 			d.mu.Unlock()
-			return nil, ctx.Err()
+			return diagKey{}, nil, ctx.Err()
 		}
 		if d.server.vfs.Get(uri) == nil {
 			d.mu.Unlock()
-			return nil, errDiagnosticDocumentClosed
+			return diagKey{}, nil, errDiagnosticDocumentClosed
 		}
 		if d.updates[uri] != diagnosticsGeneration {
 			// A child report can replace the data after Diagnostics has copied
@@ -382,7 +406,7 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 			diagnosticsGeneration = d.updates[uri]
 			d.mu.Unlock()
 			if attempt+1 == diagRetryLimit {
-				return nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "child diagnostics kept changing while this report was computed")
+				return diagKey{}, nil, ierrors.New(ierrors.ErrContentModified, "server.diagnostics", "child diagnostics kept changing while this report was computed")
 			}
 			continue
 		}
@@ -405,7 +429,7 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (result []lan
 		resultKey := computeDiagKey(uri, snapRev, src, buildContext, epoch, workspaceGeneration, diagnosticsGeneration)
 		d.cache[uri] = diagEntry{key: resultKey, items: items, version: version}
 		d.mu.Unlock()
-		return items, nil
+		return resultKey, items, nil
 	}
 }
 
@@ -437,7 +461,10 @@ func (d *diagCoordinator) computePull(parent context.Context, uri string) ([]lan
 		d.mu.Unlock()
 	}()
 
-	items, err := d.compute(ctx, uri)
+	// The pull path answers from the same compute run but has no generation
+	// identity of its own to publish; the returned key binding is irrelevant
+	// here (cache revalidation happens per request).
+	_, items, err := d.compute(ctx, uri)
 	if err != nil {
 		if errors.Is(err, context.Canceled) && d.server.vfs.Get(uri) == nil {
 			return nil, errDiagnosticDocumentClosed
