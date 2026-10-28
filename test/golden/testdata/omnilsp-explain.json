@@ -13,20 +13,16 @@
             "\""
           ]
         },
-        "declarationProvider": true,
         "definitionProvider": true,
         "diagnosticProvider": {
           "interFileDependencies": true,
           "workspaceDiagnostics": false
         },
-        "documentFormattingProvider": true,
         "documentSymbolProvider": true,
         "hoverProvider": true,
-        "inlayHintProvider": true,
         "positionEncoding": "utf-16",
         "referencesProvider": true,
         "renameProvider": true,
-        "signatureHelpProvider": {},
         "textDocumentSync": {
           "change": "<n>",
           "openClose": true,
