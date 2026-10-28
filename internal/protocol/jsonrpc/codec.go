@@ -15,6 +15,15 @@ const (
 	// DefaultMaxMessageSize is the default inbound message cap per goal.md §C1
 	// (64 MiB). It is configurable per-Codec via the MaxMessageSize field.
 	DefaultMaxMessageSize = 64 * 1024 * 1024
+
+	// DefaultMaxBatchElements is the default per-frame batch element cap per
+	// goal.md §C1 (no unbounded allocation from attacker-controlled shape).
+	// It is configurable per-Codec via the MaxBatchElements field. LSP 3.17
+	// deprecates batches, so the cap is generous for the legitimate shapes
+	// that remain. The cap also bounds the per-frame error-reply budget: an
+	// invalid element owes at most one reply, so replies per frame can never
+	// exceed the element cap.
+	DefaultMaxBatchElements = 1024
 )
 
 // Codec handles encoding and decoding of JSON-RPC messages over a stream.
@@ -23,6 +32,12 @@ type Codec struct {
 	// MaxMessageSize caps the accepted Content-Length for inbound messages.
 	// Values <=0 select DefaultMaxMessageSize.
 	MaxMessageSize int
+
+	// MaxBatchElements caps the element count of one batch frame. A batch
+	// over the cap is rejected whole as a ParseError (the per-stream fatal
+	// class) instead of being amplified per element. Values <=0 select
+	// DefaultMaxBatchElements.
+	MaxBatchElements int
 }
 
 // NewCodec creates a new codec with the default message size limit.
@@ -35,6 +50,13 @@ func (c *Codec) maxMessageSize() int {
 		return c.MaxMessageSize
 	}
 	return DefaultMaxMessageSize
+}
+
+func (c *Codec) maxBatchElements() int {
+	if c.MaxBatchElements > 0 {
+		return c.MaxBatchElements
+	}
+	return DefaultMaxBatchElements
 }
 
 // ReadMessage reads a single JSON-RPC message from the reader.

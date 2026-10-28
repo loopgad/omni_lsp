@@ -56,8 +56,14 @@ type BatchElement struct {
 // fault too and lands there, not in element isolation.
 //
 // The body size cap (MaxMessageSize) bounds a batch's total size exactly as
-// it bounds a single message; element count is not separately capped, and
-// delivery backpressure is the transport's existing policy (F6).
+// it bounds a single message, and the element count is separately capped
+// (MaxBatchElements): a batch over the cap is rejected whole as a ParseError
+// — the per-stream fatal class — instead of being amplified per element
+// (audit circle 2, finding 1: a dense 1MiB batch used to cost 621x its size
+// in cumulative allocations and owed one reply per invalid element). The
+// element cap doubles as the per-frame reply budget: replies per frame can
+// never exceed it. Delivery backpressure remains the transport's existing
+// policy (F6).
 func (c *Codec) ReadFrame(r io.Reader) (*Frame, error) {
 	body, err := c.readBody(r)
 	if err != nil {
@@ -66,7 +72,7 @@ func (c *Codec) ReadFrame(r io.Reader) (*Frame, error) {
 	// Tolerate leading whitespace before the array opener, exactly as the
 	// single-message path tolerates it before an object.
 	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 && trimmed[0] == '[' {
-		return decodeBatchFrame(trimmed)
+		return decodeBatchFrame(trimmed, c.maxBatchElements())
 	}
 	var msg Message
 	if err := json.Unmarshal(body, &msg); err != nil {
@@ -81,13 +87,30 @@ func (c *Codec) ReadFrame(r io.Reader) (*Frame, error) {
 // decodeBatchFrame splits an array body and decodes each element in
 // isolation. The array itself must parse: a body that opens with '[' but is
 // not valid JSON is an unparseable frame (ParseError) — the ruling's
-// per-stream fatal class — not a batch with bad elements.
-func decodeBatchFrame(body []byte) (*Frame, error) {
+// per-stream fatal class — not a batch with bad elements. So is an array
+// with more than maxElements elements: fail closed at the pre-count, before
+// json.Unmarshal materializes every element and before any per-element
+// decode or reply work.
+func decodeBatchFrame(body []byte, maxElements int) (*Frame, error) {
+	if countTopLevelArrayElements(body) > maxElements {
+		return nil, &CodecError{
+			Code: ParseError,
+			Message: fmt.Sprintf("parse error: batch frame exceeds the element cap (%d elements max)",
+				maxElements),
+		}
+	}
 	var raws []json.RawMessage
 	if err := json.Unmarshal(body, &raws); err != nil {
 		return nil, &CodecError{
 			Code:    ParseError,
 			Message: fmt.Sprintf("parse error: %v", err),
+		}
+	}
+	if len(raws) > maxElements {
+		return nil, &CodecError{
+			Code: ParseError,
+			Message: fmt.Sprintf("parse error: batch frame exceeds the element cap: %d elements (max %d)",
+				len(raws), maxElements),
 		}
 	}
 	f := &Frame{Elements: make([]BatchElement, 0, len(raws))}
@@ -102,6 +125,43 @@ func decodeBatchFrame(body []byte) (*Frame, error) {
 		f.Elements = append(f.Elements, el)
 	}
 	return f, nil
+}
+
+// countTopLevelArrayElements is an allocation-free conservative pre-count of
+// the elements in an array body: string-, escape- and depth-aware, so it is
+// exact for well-formed JSON and an upper bound for malformed text (which
+// the real unmarshal rejects as ParseError afterwards anyway). It exists so
+// an oversize batch is refused before json.Unmarshal materializes every
+// element (§C1: the count check itself must not amplify the frame).
+func countTopLevelArrayElements(body []byte) int {
+	count := 1 // the first element; commas at depth 1 add the rest
+	depth := 0
+	inString := false
+	escaped := false
+	for _, b := range body {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch {
+		case inString:
+			switch b {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+		case b == '"':
+			inString = true
+		case b == '[' || b == '{':
+			depth++
+		case b == ']' || b == '}':
+			depth--
+		case b == ',' && depth == 1:
+			count++
+		}
+	}
+	return count
 }
 
 // batchElementReply builds the §6 single error response for one invalid

@@ -12,6 +12,12 @@ import (
 
 // FuzzJSONRPC exercises JSON-RPC framing and message decoding
 // with adversarial payloads. Invariant: never panic.
+//
+// Audit circle 2, finding 4: the corpus and the driver now also cover the
+// batch framing surface (ReadFrame/decodeBatchFrame) — valid frameworks with
+// hostile element shapes, dense invalid-element batches, and the element-cap
+// boundary — which is where the unbounded per-element amplification used to
+// live.
 func FuzzJSONRPC(f *testing.F) {
 	for _, seed := range []string{
 		`{"jsonrpc":"2.0","id":1,"method":"test","params":null}`,
@@ -19,6 +25,12 @@ func FuzzJSONRPC(f *testing.F) {
 		`{"jsonrpc":"2.0","method":"initialized"}`,
 		`{"jsonrpc":"2.0","id":1,"result":null}`,
 		`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`,
+		`[1,2,3]`,
+		`[]`,
+		`[{"jsonrpc":"2.0","id":1,"method":"batch/a"},1,{"id":5,"method":123},[1],"str",null]`,
+		`[{"a":` + strings.Repeat(`{"b":`, 64) + `1`,
+		`["` + strings.Repeat(`,`, 32) + `"]`,
+		"[" + strings.TrimSuffix(strings.Repeat(`1,`, DefaultMaxBatchElements+1), `,`) + `]`,
 	} {
 		f.Add([]byte(seed))
 	}
@@ -48,17 +60,42 @@ func FuzzJSONRPC(f *testing.F) {
 			}
 		}
 
+		// Batch framing surface: drive the fuzz body through ReadFrame as a
+		// framed batch, including whatever element shapes it carries.
+		for i := 0; i < 2; i++ {
+			fr, err := c.ReadFrame(strings.NewReader(frame(string(data))))
+			if err != nil {
+				break
+			}
+			if fr == nil {
+				break
+			}
+			if fr.Msg != nil {
+				_, _ = json.Marshal(fr.Msg)
+			}
+			for _, el := range fr.Elements {
+				if el.Msg != nil {
+					_, _ = json.Marshal(el.Msg)
+				}
+				if el.Reply != nil {
+					_, _ = json.Marshal(el.Reply)
+				}
+			}
+		}
+
 		adversarial := []string{
 			"Content-Length: " + string(data[:min(len(data), 80)]) + "\r\n\r\n",
 			"Content-Length: -1\r\n\r\n",
 			"Content-Length: 99999999\r\n\r\nvery short body",
 			"\x00\x00\x00\x00\r\n\r\n",
 			strings.Repeat(`{"a":`, 500) + "\r\n\r\n",
+			"[" + strings.Repeat(`1,`, min(len(data)+1, DefaultMaxBatchElements*2)) + "1]\r\n\r\n",
 		}
 		for _, v := range adversarial {
 			var b bytes.Buffer
 			_, _ = b.WriteString(v)
 			_, _ = c.ReadMessage(&b)
+			_, _ = c.ReadFrame(&b)
 		}
 	})
 }
