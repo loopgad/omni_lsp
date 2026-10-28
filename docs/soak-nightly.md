@@ -70,7 +70,8 @@ Remove-Item Env:OMNILSP_RUN_ID, Env:OMNILSP_BIN, Env:SOAK_JSONL, `
 
 The per-request stdio budget is harness plumbing, not a §S16 value. Every
 `requestStdio` call waits at most 30s by default (`stdioRequestBudget` in
-`test/soak/stdio_soak_test.go`, pinned by `TestSoak_RequestBudgetDefaultIs30s`).
+`test/soak/stdio_gates.go`, pinned by `TestSoak_RequestBudgetDefaultIs30s` in
+`test/soak/stdio_soak_helpers_test.go`).
 `OMNILSP_SOAK_REQUEST_BUDGET` accepts a positive Go duration to widen that
 wait for a diagnostic run; `scripts/acceptance.ps1` sets `300s` for its own
 soak stages and cleans the variable afterwards. Since 2026-10-25 `300s` is
