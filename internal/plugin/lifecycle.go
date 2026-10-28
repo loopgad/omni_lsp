@@ -121,7 +121,8 @@ func (m *Manager) Install(d Discovery) error {
 	return nil
 }
 
-// Enable 仅允许 Verified → Enabled，并按 manifest.capabilities 建立授权表。
+// Enable 允许 Verified/Failed → Enabled（Failed 是上次运行崩溃后的可重启态，
+// 与 Disable 的 switch 保持同一覆盖面），并按 manifest.capabilities 建立授权表。
 // 隔离态或连续崩溃达阈值时返回 ErrQuarantined。成功启用会清零连续崩溃计数。
 func (m *Manager) Enable(id string) (Grant, error) {
 	m.mu.Lock()
@@ -129,8 +130,8 @@ func (m *Manager) Enable(id string) (Grant, error) {
 	if m.states[id] == StateQuarantined || m.crashes[id] >= MaxConsecutivePluginCrashes {
 		return Grant{}, ErrQuarantined
 	}
-	if m.states[id] != StateVerified {
-		return Grant{}, fmt.Errorf("plugin: %s 处于 %v，仅 verified 可启用", id, m.states[id])
+	if m.states[id] != StateVerified && m.states[id] != StateFailed {
+		return Grant{}, fmt.Errorf("plugin: %s 处于 %v，仅 verified/failed 可启用", id, m.states[id])
 	}
 	if m.TrustGate != nil {
 		if err := m.TrustGate(id); err != nil {
@@ -172,15 +173,42 @@ func (m *Manager) MarkRunning(id string) error {
 	return nil
 }
 
-// RecordCrash 累计连续崩溃；达 MaxConsecutivePluginCrashes 即转入 Quarantined，
-// 之后 Enable 一律返回 ErrQuarantined（§O4 崩溃循环遏制）。
+// RecordCrash 累计连续崩溃：未达阈值迁移 StateFailed（上次运行失败），
+// 达 MaxConsecutivePluginCrashes 即转入 Quarantined，之后 Enable 一律返回
+// ErrQuarantined（§O4 崩溃循环遏制）。未知 id 只计数，不经 RecordCrash 入表。
 func (m *Manager) RecordCrash(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.crashes[id]++
+	if _, known := m.states[id]; !known {
+		return
+	}
 	if m.crashes[id] >= MaxConsecutivePluginCrashes {
 		m.states[id] = StateQuarantined
+		return
 	}
+	m.states[id] = StateFailed
+}
+
+// Remove 把插件迁入 StateRemoved 终态并清空授权与连续崩溃计数（§O4）。
+// Running 中的插件宿主仍持有子进程，必须先 Disable；removed 后不可再启用；
+// 重复 Remove 幂等；states 表以 Install 为唯一入表点，零值 StateDiscovered
+// 即未知 id，报错而不落终态。
+func (m *Manager) Remove(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch m.states[id] {
+	case StateRemoved:
+		return nil
+	case StateRunning:
+		return fmt.Errorf("plugin: %s 仍在运行，须先禁用再移除", id)
+	case StateDiscovered:
+		return fmt.Errorf("plugin: 未知插件 %q", id)
+	}
+	delete(m.grants, id)
+	delete(m.crashes, id)
+	m.states[id] = StateRemoved
+	return nil
 }
 
 // State 返回插件当前生命周期状态；未知 id 返回错误。
