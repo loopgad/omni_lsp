@@ -142,21 +142,17 @@ func TestRunStartsPollerAfterInitializeAndStopsOnExit(t *testing.T) {
 	if poller == nil || !poller.HasBaseline() {
 		t.Fatal("poller did not establish a complete baseline")
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The write moves mtime, the poller change signal since the audit
+	// circle 2 finding 5 cut line (the previous same-mtime restore relied
+	// on content-hash semantics the stat short-circuit deliberately dropped).
 	if err := os.WriteFile(path, []byte("package other\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 		t.Fatal(err)
 	}
 	for s.vfs.Revision() == before && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if s.vfs.Revision() == before {
-		t.Fatal("external same-size same-time change never invalidated snapshot")
+		t.Fatal("external change never invalidated snapshot")
 	}
 	if got := string(s.vfs.Content(workspaceuri.FromPath(path).String())); got != "package unsaved\n" {
 		t.Fatalf("poller overwrote editor buffer: %q", got)

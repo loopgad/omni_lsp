@@ -114,14 +114,17 @@ func TestWatcherSkipsRepositoryArtifactsButIncludesDependencies(t *testing.T) {
 	}
 }
 
-func TestWatcherDetectsSameSizeSameMtimeContentChange(t *testing.T) {
+// TestWatcherDetectsSameSizeContentChangeWithMovedMtime replaces the old
+// TestWatcherDetectsSameSizeSameMtimeContentChange pin (audit circle 2,
+// finding 5 cut line): the poller's change signal is now the (mtime,size)
+// stat signature — it reuses the previous digest without re-reading when the
+// signature is unchanged, so a content edit that preserves BOTH mtime and
+// size is invisible, while the editor/atomic-replace shape (same-size bytes,
+// moved mtime) is still detected exactly once as Modified.
+func TestWatcherDetectsSameSizeContentChangeWithMovedMtime(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "same.txt")
 	if err := os.WriteFile(path, []byte("one"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
 		t.Fatal(err)
 	}
 	p := New(root, time.Hour, nil)
@@ -130,11 +133,16 @@ func TestWatcherDetectsSameSizeSameMtimeContentChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte("two"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); !has(evs, "same.txt", Modified) {
-		t.Fatalf("same-size, same-mtime content change was missed: %+v", evs)
+		t.Fatalf("same-size content change with a moved mtime was missed: %+v", evs)
+	}
+	// The second scan is quiet: the fingerprint settled.
+	if evs := p.Scan(); len(evs) != 0 {
+		t.Fatalf("settled tree produced events: %+v", evs)
 	}
 }
 

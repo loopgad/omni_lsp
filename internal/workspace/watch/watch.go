@@ -165,6 +165,11 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 	out := make(map[string]finger, 256)
 	var scanErr error
 	var totalBytes int64
+	// Snapshot of the previous baseline for the (mtime,size) re-hash
+	// short-circuit; maps are replaced, never mutated, once published.
+	p.mu.Lock()
+	prev := p.prints
+	p.mu.Unlock()
 	recordError := func(err error) {
 		if scanErr == nil {
 			scanErr = err
@@ -202,7 +207,24 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 			recordError(fmt.Errorf("watch: stat %q: %w", path, ierr))
 			return nil
 		}
-		var digest [32]byte
+		key := path
+		if !filepath.IsAbs(key) {
+			// New accepts a relative root (SetExcludedRoots anchors it
+			// only when called), and WalkDir then yields relative paths.
+			// Events feed the server's file-URI conversion directly, so
+			// the fingerprint key — and every event derived from it —
+			// must be absolute: a relative key parses as a UNC host and
+			// loses the per-file invalidation for the real file (audit
+			// finding 6).
+			if abs, absErr := filepath.Abs(key); absErr == nil {
+				key = abs
+			}
+		}
+		// Size limits are evaluated for EVERY regular file from its stat,
+		// including files whose fingerprint will be reused below: the tree
+		// budget bounds the tree as a whole (baseline preservation for an
+		// oversized tree is pinned by TestSizeLimitsReportIncompleteAnd-
+		// PreserveBaseline), not merely the bytes this pass happens to read.
 		if info.Mode().IsRegular() {
 			if info.Size() < 0 || info.Size() > p.maxFileBytes {
 				recordError(fmt.Errorf("watch: file size %d exceeds limit %d at %q", info.Size(), p.maxFileBytes, path))
@@ -212,6 +234,25 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 				recordError(fmt.Errorf("watch: workspace exceeds %d bytes", p.maxTreeBytes))
 				return nil
 			}
+			totalBytes += info.Size()
+		}
+		// (mtime,size) short-circuit (audit circle 2, finding 5): reuse the
+		// previous digest whenever the stat signature is unchanged, so a
+		// quiet tree costs a stat pass instead of a full read+hash every
+		// interval. Contract cut line: the stat signature IS the change
+		// signal — a content edit that preserves BOTH mtime and size is
+		// invisible to the poller, the same tradeoff every stat-based
+		// poller makes (editors and atomic replaces move mtime). prev is
+		// only ever replaced (never mutated) under scanMu, which this walk
+		// already holds.
+		if prev != nil {
+			if old, ok := prev[key]; ok && old.mtime == info.ModTime().UnixNano() && old.size == info.Size() {
+				out[key] = old
+				return nil
+			}
+		}
+		var digest [32]byte
+		if info.Mode().IsRegular() {
 			file, openErr := openReadShared(path)
 			if openErr != nil {
 				recordError(fmt.Errorf("watch: open %q: %w", path, openErr))
@@ -230,22 +271,8 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 				return nil
 			}
 			copy(digest[:], hasher.Sum(nil))
-			totalBytes += readBytes
 		}
-			key := path
-			if !filepath.IsAbs(key) {
-				// New accepts a relative root (SetExcludedRoots anchors it
-				// only when called), and WalkDir then yields relative paths.
-				// Events feed the server's file-URI conversion directly, so
-				// the fingerprint key — and every event derived from it —
-				// must be absolute: a relative key parses as a UNC host and
-				// loses the per-file invalidation for the real file (audit
-				// finding 6).
-				if abs, absErr := filepath.Abs(key); absErr == nil {
-					key = abs
-				}
-			}
-			out[key] = finger{mtime: info.ModTime().UnixNano(), size: info.Size(), digest: digest}
+		out[key] = finger{mtime: info.ModTime().UnixNano(), size: info.Size(), digest: digest}
 		return nil
 	})
 	if walkErr != nil {
