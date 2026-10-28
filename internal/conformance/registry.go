@@ -74,7 +74,7 @@ var Registry = struct{ Checks []Check }{
 			Status: StatusAuto,
 			Probe: &Probe{Groups: []ProbeGroup{
 				{Pkg: "internal/runtime/server", Tests: []string{"TestS13_HalfFrameDisconnect"}},
-				{Pkg: "internal/runtime/scheduler", Tests: []string{"TestS4CancelRace", "TestScheduler_ShutdownNoPanicOnConcurrentSubmit", "TestScheduler_BoostNeverDropsRequests"}},
+				{Pkg: "internal/runtime/scheduler", Tests: []string{"TestS4CancelRace", "TestScheduler_ShutdownNoPanicOnConcurrentSubmit", "TestScheduler_BoostAfterShutdownIsNoOp"}},
 			}}},
 		{ID: "Y1-10", Domain: "core", Category: "Y1", Clause: "§S16", Weight: 1,
 			Text:   "Soak has no monotonic resource leak (accelerated gate green; the real-stdio RC opt-in gate remains release evidence — its 30s preflight attempts still miss the fixed 30s initial-query budget on the current host)",
