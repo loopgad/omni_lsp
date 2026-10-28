@@ -890,3 +890,39 @@ offset debt on file in `freeze-record.txt`):
   （sha256 `c66fa11e…`）与 soak 测试（sha256 `3ebcee73…`），30s/10m/1h
   顺序执行。`test/acceptance/evidence` 子目录创建被 ACL 拒绝，故本地证据
   目录为 `out/soak-local/`；正式链结果待报告落盘后补记。
+
+## Evidence record — 2026-10-29 记账轮（WS-D14 promote 分数核验：实算 == baseline，已同步不动账）
+
+- 性质：registry WS-D14 已于 0bfac71 升 AUTO，且该提交已随「promote 三件套」
+  完成入账（registry + `test/conformance/testdata/baseline.json` WORKSPACE
+  0.5→1 + `docs/conformance.md` 投影再生）。本轮按任务书核验 promote 后的
+  FastProbeReport 实算分与 baseline 的关系，判定是否还需要补一笔入账。
+- 预测（读码先于运行）：core 权重表只含
+  Y0/Y3/Y1/Y2/Y4/Y5/PERF（internal/conformance/report.go:14-22），WORKSPACE
+  不带 core 权重——score() 对 core 域按 `coreWeights[cat]` 计权（report.go:225-231），
+  缺失键为 0，故 WS-D14 PARTIAL→AUTO 只抬 WORKSPACE 类目分、不抬 coreScore；
+  0bfac71 提交信息所述「coreScore 不变因 WORKSPACE 无 core 权重」与代码一致。
+  预测：实算分与 baseline 逐位相等（已同步，无需动账）。
+- 实算（真跑 AUTO 探针，本轮实跑）：`go run ./cmd/omnilsp verify --probe --json`
+  → exit 0，mode=fast-probe，coreScore=**98.45959595959597**，125 checks。
+  （上一轮记录为 124 checks：0bfac71 之后 registry.go 另有 4 个提交触碰
+  ——3e22f85 / d4b3635 / a63e00f / 05e76df——增量与之一致；本轮各分数与
+  baseline 逐项精确相等，增量检查未改变任何已入账分数。）JSON 存
+  `out/wsd14-bank/verify-probe.json`。
+- 机器断言（node 脚本，TOL 1e-9，coreScore + baseline 全部 15 个类目逐项
+  比对，输出 `out/wsd14-bank/compare.txt`）：coreScore diff=0、15 类目全部
+  diff=0 精确相等（含 WORKSPACE=1，与 0bfac71 的入账一致）；RAISE 0 项、
+  REGRESS/MISSING 0 项——既无未入账提升，也无退化。
+- 判定：**已同步，不动账**。提升已在 0bfac71 入账（baseline WORKSPACE
+  0.5→1，testdata/baseline.json:10），coreScore 98.45959595959597 因
+  WORKSPACE 无 core 权重本就不随该 promote 变动；本轮 baseline.json 逐位
+  零改动，无需 OMNISP_UPDATE_CONFORMANCE。
+- 确认门禁（本轮实跑）：
+  - `go test -count=1 -timeout 900s ./test/conformance/` → ok 126.724s
+    （TestGenerateDocs + TestConformanceNoRegression，真探针 fast 模式），
+    日志 `out/wsd14-bank/test-conformance.log`；
+  - `go run ./cmd/omnilsp verify --min 90` → exit 0，floor 90.0%: PASS，
+    core [gated] 98.5%、core 域 WORKSPACE 100.0%（fast AST 模式）。输出中另
+    一处 WORKSPACE 0.0% 属 post-x9 deferred 域（DEF-NOTEBOOK 等延迟项，
+    日志 :24-69 块），与 core 域无关。日志 `out/wsd14-bank/verify-min90.log`。
+- 提交：仅本记录（docs/acceptance.md）一笔；baseline.json 无 diff 不入提交。
