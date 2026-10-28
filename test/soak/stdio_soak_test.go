@@ -1079,6 +1079,17 @@ func TestSoak_RealStdioMixedWorkload(t *testing.T) {
 	t.Logf("completed %s with %d requests, %d edits; peak private bytes=%d", active, completed.Load(), edits.Load(), peakPrivate)
 }
 
+// TestSoakRealStdioProcessBudgetPinsWorkerCount ties the untagged
+// soakInitialQueryCount to the workload's worker count: soakProcessBudget
+// counts the initial query sequence at one request per worker, so the two
+// constants must not drift apart (the process-budget derivation lives in the
+// untagged stdio_gates.go and cannot see soakWorkers directly).
+func TestSoakRealStdioProcessBudgetPinsWorkerCount(t *testing.T) {
+	if soakInitialQueryCount != soakWorkers {
+		t.Fatalf("soakInitialQueryCount = %d, want soakWorkers = %d", soakInitialQueryCount, soakWorkers)
+	}
+}
+
 func stdioSoakRepoRoot(t *testing.T) string {
 	t.Helper()
 	_, source, _, ok := runtime.Caller(0)

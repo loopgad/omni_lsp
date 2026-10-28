@@ -2797,7 +2797,25 @@ function Invoke-Soak([string] $Duration, [string] $RunIdForSoak) {
     # diagnosis; initial-queries passed only at 300s there), NOT a §S16
     # value. From 2026-10-25 on, 300s is the standard harness budget.
     $env:OMNILSP_SOAK_REQUEST_BUDGET = '300s'
-    $result = Invoke-Step "soak-$Duration" $testExe @('-test.run=^TestSoak_RealStdioMixedWorkload$', '-test.count=1', '-test.timeout=90m')
+    # The soak -test.timeout is derived, never a bare literal (16th-round
+    # rule): the frozen test binary computes the stage's legal worst-case wall
+    # clock (active cadence + maintenance budgets + startup/finalization;
+    # single source of truth in Go next to soakMaintenanceBudget) and the
+    # budget helper below reports it. The 90m literal this replaced predated
+    # the 300s request budget and sat below the legal worst case — 60 legal
+    # periodic reindexes alone can consume ~5.2h — so the continuous 1h gate
+    # was structurally unreachable, and a timeout kill calls os.Exit without
+    # running the deferred final report (no final report voids the stage).
+    $env:OMNILSP_SOAK_PROCESS_BUDGET_HELPER = '1'
+    $budgetStep = Invoke-Step "soak-$Duration-process-budget" $testExe @('-test.run=^TestSoakRealStdioProcessBudgetHelper$', '-test.count=1')
+    Remove-Item Env:OMNILSP_SOAK_PROCESS_BUDGET_HELPER -ErrorAction SilentlyContinue
+    if ($budgetStep.status -ne 'passed') { throw "soak process budget helper failed; see $($budgetStep.log)" }
+    $budgetText = Get-Content -LiteralPath (Join-Path $EvidenceDirectory $budgetStep.log) -Raw
+    $budgetMatch = [regex]::Match($budgetText, 'soak-process-budget-seconds=(\d+)')
+    if (-not $budgetMatch.Success) { throw "soak process budget helper printed no process budget; see $($budgetStep.log)" }
+    $soakProcessTimeout = $budgetMatch.Groups[1].Value + 's'
+    Write-Output "Soak $Duration derived process budget: $soakProcessTimeout"
+    $result = Invoke-Step "soak-$Duration" $testExe @('-test.run=^TestSoak_RealStdioMixedWorkload$', '-test.count=1', "-test.timeout=$soakProcessTimeout")
     Remove-Item Env:SOAK_DURATION, Env:SOAK_JSONL, Env:OMNILSP_ACCEPTANCE_REPORT, Env:OMNILSP_BIN, Env:OMNILSP_RUN_ID, Env:OMNILSP_SOAK_GATE, Env:OMNILSP_SOAK_REQUEST_BUDGET, Env:OMNILSP_S18_COMPLETION_PHASE_TRACE, Env:OMNILSP_S18_COMPLETION_PHASE_TRACE_LIMIT, Env:OMNILSP_S18_COMPLETION_PHASE_TRACE_STATUS_EVERY -ErrorAction SilentlyContinue
     if ($phaseTraceRequested) {
         $traceInfo = Get-Item -LiteralPath $phaseTracePath -ErrorAction SilentlyContinue

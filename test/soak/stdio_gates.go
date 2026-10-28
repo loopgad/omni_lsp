@@ -49,6 +49,14 @@ const (
 	// only dodged the check because its block outlived the duration
 	// condition and was never recorded.
 	soakRestartIndexQueryCount = 2
+
+	// soakInitialQueryCount is the number of initial full-corpus queries
+	// assertStdioQuerySet runs before the main loop (one per worker). It
+	// mirrors soakWorkers (stdio_soak_test.go, soak tag) as an untagged
+	// constant because soakProcessBudget must compile and be guarded in the
+	// default suite; TestSoakRealStdioProcessBudgetPinsWorkerCount ties the
+	// two together under the soak tag.
+	soakInitialQueryCount = 8
 )
 
 // processTreeMember and processTreeSample are the platform-independent shapes
@@ -650,6 +658,51 @@ func soakMaintenanceBudget(kind string) time.Duration {
 	default:
 		return 0
 	}
+}
+
+// soakProcessBudget is the wall-clock upper bound one real-stdio soak stage
+// can legally consume before its own gates fail it: the active cadence, one
+// periodic reindex per minute row, the single candidate restart, and the
+// request sequences that run outside the loop's recorded maintenance windows
+// (startup and finalization, see soakStageOverheadBudget).
+//
+// acceptance.ps1 derives the stage's -test.timeout from this via
+// TestSoakRealStdioProcessBudgetHelper. The bare 90m literal it replaced
+// predated the 300s request budget and sat below the legal worst case — 60
+// periodic reindexes alone can consume 60 × (requestBudget + 2×soakPollPeriod)
+// ≈ 5.2h — so the continuous 1h gate was structurally unreachable on slow
+// hosts, and a timeout kill calls os.Exit without running the deferred final
+// report (no final report voids the continuous stage).
+func soakProcessBudget(duration time.Duration) time.Duration {
+	ticks := duration/time.Minute + 1 // one reindex per minute row, plus the trailing partial tick
+	return duration +
+		ticks*soakMaintenanceBudget("periodic-reindex") +
+		soakMaintenanceBudget("candidate-restart") +
+		soakStageOverheadBudget()
+}
+
+// soakStageOverheadBudget bounds the request sequences outside the loop's
+// recorded maintenance windows. Every duration comes from an existing budget;
+// the multipliers are structural counts of those sequences, the same style as
+// soakRestartIndexQueryCount:
+//   - startup: two cold full-corpus reindex triples (the soak/reindex gate and
+//     the pre-loop cold rebuild, each indexStats → reindex-with-retry →
+//     indexStats), the two startup reindex cancellations, the
+//     soakInitialQueryCount initial queries, the cold rust hover, and the two
+//     fixed document-snapshot waits;
+//   - finalization: the fresh-generation validation, the final cross-file
+//     references check, and the final close, each request-budgeted.
+func soakStageOverheadBudget() time.Duration {
+	const (
+		startupReindexTriples = 2
+		startupCancelAcks     = 2
+		startupSnapshotWaits  = 2
+		finalizeRequests      = 3
+	)
+	return time.Duration(3*startupReindexTriples)*soakMaintenanceBudget("periodic-reindex") +
+		time.Duration(startupCancelAcks+finalizeRequests+soakInitialQueryCount)*stdioRequestBudget() +
+		stdioColdStartAllowance(90*time.Second) +
+		time.Duration(startupSnapshotWaits)*soakSnapshotReopenBudget
 }
 
 // soakRustStabilityProbeBudget uses the same per-request stdio budget as every
