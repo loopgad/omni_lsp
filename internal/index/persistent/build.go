@@ -22,6 +22,14 @@ type fileBuild struct {
 	segments []SegmentRef
 	state    buildState
 	result   error
+
+	// §L17 budget-walk cache (audit circle 2, finding 6): the live-store
+	// walk costs O(files under root) and used to run on EVERY WriteSegment,
+	// making an export O(segments × store files). The first budgeted
+	// segment walks once; later segments of the same build add their
+	// already-staged bytes on top of the cached total.
+	budgetWalked    bool
+	budgetUsedBytes int64
 }
 
 type buildState uint8
@@ -32,28 +40,16 @@ const (
 	buildAborted
 )
 
-// WriteSegment encodes, fsyncs and records one immutable segment. Budget is
-// enforced before touching disk (§L17).
-func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.state != buildOpen {
-		return "", b.closedError()
+// walkLiveBytes counts live store content for the §L17 budget, at most once
+// per build (caller holds b.mu). The quarantine directory holds forensic
+// copies of corrupt segments that no write can shrink; counting it would let
+// every corruption event permanently shrink publishable capacity until index
+// publication blocks outright. Quarantine is bounded separately by
+// recycleQuarantine (recovery.go).
+func (b *fileBuild) walkLiveBytes() int64 {
+	if b.budgetWalked {
+		return b.budgetUsedBytes
 	}
-	writerLock, err := acquireWriterLock(context.Background(), b.store.root)
-	if err != nil {
-		return "", err
-	}
-	defer writerLock.release()
-	b.store.mu.Lock()
-	budget := b.store.cfg.DiskBudgetBytes
-	b.store.mu.Unlock()
-
-	// §L17 budget walk counts only live store content. The quarantine
-	// directory holds forensic copies of corrupt segments that no write can
-	// shrink; counting it here would let every corruption event permanently
-	// shrink publishable capacity until index publication blocks outright.
-	// Quarantine is bounded separately by recycleQuarantine (recovery.go).
 	quarantine := b.store.quarantineDir()
 	var used int64
 	_ = filepath.Walk(b.store.root, func(p string, fi os.FileInfo, err error) error {
@@ -69,9 +65,50 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 		used += fi.Size()
 		return nil
 	})
-	if budget > 0 && used+int64(len(payload))+int64(segHeaderSz)+16 > budget {
+	b.budgetUsedBytes = used
+	b.budgetWalked = true
+	return used
+}
+
+// WriteSegment encodes, fsyncs and records one immutable segment. Budget is
+// enforced before touching disk (§L17).
+func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != buildOpen {
+		return "", b.closedError()
+	}
+	b.store.mu.Lock()
+	budget := b.store.cfg.DiskBudgetBytes
+	b.store.mu.Unlock()
+	writerLock, err := acquireWriterLock(context.Background(), b.store.root)
+	if err != nil {
+		return "", err
+	}
+	defer writerLock.release()
+	if budget <= 0 {
+		// Unlimited budget: the walk and check have nothing to compare
+		// against, so skip them entirely.
+		return b.writeSegmentUnchecked(payload)
+	}
+
+	// Live-store total (walked once per build) plus everything this build
+	// has already staged — the staged segments are part of the store's
+	// eventual footprint but predate the cached walk.
+	var staged int64
+	for _, seg := range b.segments {
+		staged += seg.Len
+	}
+	used := b.walkLiveBytes() + staged
+	if used+int64(len(payload))+int64(segHeaderSz)+16 > budget {
 		return "", ErrDiskBudgetExceeded
 	}
+	return b.writeSegmentUnchecked(payload)
+}
+
+// writeSegmentUnchecked performs the durable write; budget enforcement and
+// build-state checks are the caller's duty (b.mu held).
+func (b *fileBuild) writeSegmentUnchecked(payload []byte) (SegmentID, error) {
 
 	var rnd [4]byte
 	_, _ = rand.Read(rnd[:])
