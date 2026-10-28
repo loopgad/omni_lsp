@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/internal/security"
+	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 )
 
 const maxPendingSourceChanges = 4096
@@ -40,12 +42,50 @@ func (s *Server) sourceState(backend languages.Backend, create bool) *sourceSync
 	return state
 }
 
+// containExternalChanges executes the §N7 boundary on the external-change
+// funnel (audit circle 2, finding 3): every change URI must resolve inside
+// the session's workspace root before anything is queued for the child
+// backends — this is the production caller the containment gate had been
+// missing. A root-less session (no workspace root configured) has no domain
+// to enforce and keeps prior behavior; the lifecycle gate already blocks
+// external-change traffic until initialize.
+//
+// Fail-closed: one rejected URI refuses the whole batch, and the error text
+// names only the client-supplied URI — never the resolved filesystem layout
+// (N7's no-path-leak rule).
+func (s *Server) containExternalChanges(changes []languages.SourceChange) error {
+	root := s.workspaceRoot()
+	if root == "" {
+		return nil
+	}
+	for _, change := range changes {
+		parsed, err := workspaceuri.Parse(change.URI)
+		if err != nil || !parsed.IsFile() {
+			return fmt.Errorf("external change URI %q failed workspace containment", change.URI)
+		}
+		path := parsed.PathOr()
+		if path == "" {
+			// A cross-host authority (file://evil-host/share/x) has no local
+			// path on this platform — there is nothing inside the root it
+			// could name, so refuse.
+			return fmt.Errorf("external change URI %q failed workspace containment", change.URI)
+		}
+		if _, err := security.ResolveInWorkspace(root, path); err != nil {
+			return fmt.Errorf("external change URI %q failed workspace containment", change.URI)
+		}
+	}
+	return nil
+}
+
 // The document writer only invalidates and queues bounded events. Child I/O
 // runs on the next semantic/diagnostic read, outside mutationMu, so a slow
 // child cannot prevent the main reader from accepting shutdown or cancellation.
 func (s *Server) applyExternalSourceChanges(ctx context.Context, changes []languages.SourceChange) error {
 	changes, err := languages.NormalizeSourceChanges(changes)
 	if err != nil || len(changes) == 0 {
+		return err
+	}
+	if err := s.containExternalChanges(changes); err != nil {
 		return err
 	}
 	bytes := 0
