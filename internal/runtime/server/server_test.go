@@ -567,7 +567,7 @@ func TestI21_LegendMatchesEmittedTypes(t *testing.T) {
 	if n != int(languages.TokComment)+1 {
 		t.Fatalf("legend has %d entries but emitter enum tops at %d", n, languages.TokComment)
 	}
-	caps := buildCapabilities("utf-16", true)
+	caps := buildCapabilities("utf-16", backendGates{semanticTokens: true})
 	st := caps.SemanticTokensProvider
 	if st == nil {
 		t.Fatal("semanticTokensProvider not declared")

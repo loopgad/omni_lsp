@@ -1268,13 +1268,14 @@ func TestI10_PrepareRenameGate(t *testing.T) {
 // is advertised in capabilities AND served through the optional
 // DeclarationProvider capability (ADR-0009 D2 — core interface stays frozen).
 func TestT2_DeclarationServedAndDeclared(t *testing.T) {
-	caps := buildCapabilities("utf-16", true)
-	if !caps.DeclarationProvider {
-		t.Fatal("declarationProvider not declared")
-	}
 	s := New(DefaultConfig())
 	be := &mockBackend{langID: "go", exts: []string{".go"}}
 	s.RegisterBackend("go", be)
+	// 声明位从真实注册的后端投影：mockBackend 实现了可选 DeclarationProvider。
+	caps := buildCapabilities("utf-16", s.backendGates())
+	if !caps.DeclarationProvider {
+		t.Fatal("declarationProvider not declared")
+	}
 	s.vfs.Open("file:///x.go", "go", 1, []byte("package main\n"), vfs.SourceEditor)
 	msg := jsonrpc.NewRequest(jsonrpc.RequestID{Str: "d1", IsStr: true},
 		"textDocument/declaration", json.RawMessage(`{"textDocument":{"uri":"file:///x.go"},"position":{"line":0,"character":0}}`))
@@ -1342,7 +1343,15 @@ func TestC12_ResultMetaAndQueryTrace(t *testing.T) {
 // makes clients send requests that fail; a served-but-undeclared one is dead.
 func TestC3_CapabilitiesDeclaredEqualsServed(t *testing.T) {
 	s := New(DefaultConfig())
-	caps := buildCapabilities("utf-16", true)
+	// 钉住「声明位 ⇒ handler 已注册」：给满 gate 位，四个可选能力的
+	// handler 无论声明与否都保持注册（§C3 对应面）。
+	caps := buildCapabilities("utf-16", backendGates{
+		semanticTokens: true,
+		signatureHelp:  true,
+		formatting:     true,
+		inlayHints:     true,
+		declaration:    true,
+	})
 	if caps.HoverProvider {
 		if !s.dispatcher.HasHandler("textDocument/hover") {
 			t.Error("hoverProvider declared but no handler")

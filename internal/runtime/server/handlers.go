@@ -207,18 +207,46 @@ type buildContextProvider interface {
 // the served path share one method set, they cannot drift apart.
 type SemanticTokensEmitter = languages.EncodedSemanticTokensProvider
 
-// hasSemanticTokensEmitter reports whether any registered backend really
-// emits semantic tokens (§I21): the declaration gate for
-// semanticTokensProvider at initialize time.
-func (s *Server) hasSemanticTokensEmitter() bool {
+// backendGates carries the initialize-time declaration gates, one bit per
+// optional backend capability. Every bit is true only when at least one
+// registered backend really implements the matching optional interface in
+// internal/languages — the same "bit and served path share one method set"
+// discipline as SemanticTokensEmitter above, so they cannot drift apart.
+// Backends without a capability answer errNotSupported; declaring the bit for
+// them would make conforming clients send requests that can only fail (§C3:
+// declared-but-unserved is a lie).
+type backendGates struct {
+	semanticTokens bool
+	signatureHelp  bool
+	formatting     bool
+	inlayHints     bool
+	declaration    bool
+}
+
+// backendGates projects the registered backends onto the optional-capability
+// declaration bits at initialize time.
+func (s *Server) backendGates() backendGates {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	var g backendGates
 	for _, be := range s.languages {
 		if _, ok := be.(SemanticTokensEmitter); ok {
-			return true
+			g.semanticTokens = true
+		}
+		if _, ok := be.(languages.SignatureHelper); ok {
+			g.signatureHelp = true
+		}
+		if _, ok := be.(languages.Formatter); ok {
+			g.formatting = true
+		}
+		if _, ok := be.(languages.InlayHintProvider); ok {
+			g.inlayHints = true
+		}
+		if _, ok := be.(languages.DeclarationProvider); ok {
+			g.declaration = true
 		}
 	}
-	return false
+	return g
 }
 
 func backendBuildContext(be languages.Backend) identity.BuildContextID {
@@ -295,7 +323,7 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 	s.mu.RLock()
 	negotiated = s.positionEncoding
 	s.mu.RUnlock()
-	result := InitializeResult{Capabilities: buildCapabilities(negotiated, s.hasSemanticTokensEmitter())}
+	result := InitializeResult{Capabilities: buildCapabilities(negotiated, s.backendGates())}
 	data, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("marshal initialize result: %w", err)
@@ -306,13 +334,17 @@ func (s *Server) handleInitialize(ctx context.Context, msg *jsonrpc.Message) (js
 // buildCapabilities assembles the advertised capability set (§C3). Every
 // entry here must have a registered handler behind it and vice versa — a
 // served-but-undeclared feature is unreachable, a declared-but-unserved one
-// is a lie. One deliberate exception: semanticTokensProvider is declared only
-// when a registered backend really emits tokens (hasSemanticTokensEmitter);
-// the handler stays registered either way, so a client that calls it anyway
-// gets the backend's own answer instead of a method-not-found lie.
+// is a lie. Optional backend capabilities follow the semanticTokens 方案B
+// discipline: semanticTokensProvider, signatureHelpProvider,
+// documentFormattingProvider, inlayHintProvider and declarationProvider are
+// declared only when a registered backend really implements the matching
+// optional interface (backendGates); the handlers stay registered either way,
+// so a client that calls them anyway gets the backend's own answer
+// (errNotSupported) instead of a method-not-found lie.
 // TestI21_LegendMatchesEmittedTypes pins the tokens shape; the conditional
-// declaration is pinned by semantic_tokens_capability_test.go.
-func buildCapabilities(positionEncoding string, semanticTokens bool) ServerCapabilities {
+// declarations are pinned by semantic_tokens_capability_test.go and
+// optional_capabilities_gate_test.go.
+func buildCapabilities(positionEncoding string, gates backendGates) ServerCapabilities {
 	caps := ServerCapabilities{
 		PositionEncoding: positionEncoding,
 		TextDocumentSync: &TextDocumentSyncOptions{
@@ -320,21 +352,17 @@ func buildCapabilities(positionEncoding string, semanticTokens bool) ServerCapab
 			Change:    2,
 			Save:      &SaveOptions{IncludeText: true},
 		},
-		HoverProvider:              true,
-		CompletionProvider:         &CompletionOptions{TriggerCharacters: []string{".", ":", ">", "\""}},
-		DefinitionProvider:         true,
-		DeclarationProvider:        true,
-		ReferencesProvider:         true,
-		DocumentSymbolProvider:     true,
-		RenameProvider:             true, // prepareRename served (I10); plain bool keeps the typed struct honest
-		WorkspaceSymbolProvider:    true,
-		SignatureHelpProvider:      &SignatureHelpOptions{},
-		CodeActionProvider:         true,
-		DiagnosticProvider:         &DiagnosticProviderOptions{InterFileDependencies: true}, // pull + push (C11)
-		DocumentFormattingProvider: true,
-		InlayHintProvider:          true,
+		HoverProvider:           true,
+		CompletionProvider:      &CompletionOptions{TriggerCharacters: []string{".", ":", ">", "\""}},
+		DefinitionProvider:      true,
+		ReferencesProvider:      true,
+		DocumentSymbolProvider:  true,
+		RenameProvider:          true, // prepareRename served (I10); plain bool keeps the typed struct honest
+		WorkspaceSymbolProvider: true,
+		CodeActionProvider:      true,
+		DiagnosticProvider:      &DiagnosticProviderOptions{InterFileDependencies: true}, // pull + push (C11)
 	}
-	if semanticTokens {
+	if gates.semanticTokens {
 		caps.SemanticTokensProvider = &SemanticTokensOptions{
 			Legend: SemanticTokensLegend{
 				// §I21: legend indexes are the contract with backend emitters —
@@ -347,6 +375,18 @@ func buildCapabilities(positionEncoding string, semanticTokens bool) ServerCapab
 			// make clients request semanticTokens/delta and get
 			// method-not-found (§C3 honesty).
 		}
+	}
+	if gates.signatureHelp {
+		caps.SignatureHelpProvider = &SignatureHelpOptions{}
+	}
+	if gates.formatting {
+		caps.DocumentFormattingProvider = true
+	}
+	if gates.inlayHints {
+		caps.InlayHintProvider = true
+	}
+	if gates.declaration {
+		caps.DeclarationProvider = true
 	}
 	return caps
 }
