@@ -307,9 +307,14 @@ func (b *fileBuild) commitWithWriterLock(ctx context.Context) (retErr error) {
 	}
 	// Save the current generation in recovery history before atomically
 	// replacing the manifest, so recovery retains a fallback after publication.
-	nextHistory := append([]*Generation(nil), b.store.history...)
-	if b.store.current != nil {
-		nextHistory = append([]*Generation{b.store.current}, nextHistory...)
+	// Assemble the next history from the snapshots taken under store.mu at the
+	// top of this function (previous = committed current, oldHistory = committed
+	// history) instead of re-reading store fields without the mutex: the writer
+	// lock may exclude other processes, but in-process store access must not
+	// lean on that implicit convention.
+	nextHistory := append([]*Generation(nil), oldHistory...)
+	if previous != nil {
+		nextHistory = append([]*Generation{previous}, nextHistory...)
 	}
 	var retired []*Generation
 	if len(nextHistory) > b.store.cfg.KeepGenerations {
