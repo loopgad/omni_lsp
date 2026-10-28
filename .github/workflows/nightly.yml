@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
       - name: Sustained soak (55m accelerated nightly form; regression signal only, not RC evidence — see docs/soak-nightly.md)
         run: go test -tags soak -timeout 70m -count=1 ./test/soak/
         env:
@@ -46,9 +46,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
-      # Full conformance verification: AUTO probes + GATE commands executed
-      # (race suite, golden scenarios, soak smoke, SBOM, build matrix).
+          go-version-file: go.mod
+      # Full conformance verification: verify --full runs the AUTO probe
+      # groups batched with -race, then the two GATE commands the registry
+      # carries — Y1-10 soak (300s ./test/soak/) and X8-1 build-multiplatform
+      # (build matrix + sha256 + SBOM). The race suite and golden scenarios
+      # are Fast/acceptance evidence, not verify --full GATE entries.
       - name: Conformance verify --full
         run: go run ./cmd/omnilsp verify --full --min 90
 
@@ -59,7 +62,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
       - name: Multi-platform build matrix + sha256 + SBOM (X8-1)
         run: bash scripts/build-multiplatform.sh "$(date -u +%Y%m%d)-nightly" dist-nightly
       - uses: actions/upload-artifact@v4
