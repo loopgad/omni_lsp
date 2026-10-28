@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // encodeSegment frames a payload: magic | schemaVer | genID | len | crc32.
@@ -62,10 +63,18 @@ func (s *FileStore) recover() error {
 	mb, err := os.ReadFile(s.manifestPath())
 	if err == nil {
 		var gen Generation
-		if jerr := json.Unmarshal(mb, &gen); jerr == nil && validGeneration(&gen) {
+		jerr := json.Unmarshal(mb, &gen)
+		switch {
+		case jerr == nil && validGeneration(&gen):
 			s.current = &gen
-		} else {
-			_ = os.Remove(s.manifestPath())
+		case jerr != nil:
+			if qerr := s.quarantineCorruptManifest("undecodable"); qerr != nil {
+				return qerr
+			}
+		default:
+			if qerr := s.quarantineCorruptManifest("invalid-generation"); qerr != nil {
+				return qerr
+			}
 		}
 	}
 
@@ -122,6 +131,31 @@ func (s *FileStore) recover() error {
 	}
 	if staged, err := stagingHighWater(s.root); err == nil && staged > s.nextGenID {
 		s.nextGenID = staged
+	}
+	return nil
+}
+
+// quarantineCorruptManifest moves an undecodable or invalid manifest.json
+// into the quarantine directory under a manifest-corrupt-<reason>-<timestamp>
+// name, so a failed publish pointer leaves forensic residue (§L8: integrity
+// failures are quarantined for diagnostics — the same treatment corrupt
+// segments get) instead of vanishing with a silent remove. The evidence files
+// are deliberately not recycled by recycleQuarantine (it only prunes
+// seg-*.bin): one small file per corruption event, bounded by how often
+// corruption happens.
+//
+// When the move is blocked (file occupying the quarantine path, AV lock,
+// sharing violation) the error is propagated: recover then fails and the next
+// open retries, instead of the store silently continuing with the only
+// diagnostic destroyed. Caller holds the writer lock (recover contract).
+func (s *FileStore) quarantineCorruptManifest(reason string) error {
+	if err := os.MkdirAll(s.quarantineDir(), 0o755); err != nil {
+		return fmt.Errorf("persistent: quarantine corrupt manifest: %w", err)
+	}
+	name := fmt.Sprintf("manifest-corrupt-%s-%s.json", reason, time.Now().UTC().Format("20060102T150405.000000000"))
+	dst := filepath.Join(s.quarantineDir(), name)
+	if err := os.Rename(s.manifestPath(), dst); err != nil {
+		return fmt.Errorf("persistent: quarantine corrupt manifest: %w", err)
 	}
 	return nil
 }
