@@ -23,6 +23,15 @@
   （本轮实测 `grep -c "Status: Status" internal/conformance/registry.go` =
   124，按 Status 字段逐一计数）。PARTIAL 七条：WS-D14、Y2-5、X5-4、
   DEF-EDITORS、DEF-IDXWIRE、X8-2、X9-1；GATE 两条：Y1-10、X8-1。
+  **勘误注（2026-10-29）**：上条快照已过时两处，本日实测
+  `grep -c "Status: StatusAuto" internal/conformance/registry.go` = 89、
+  `StatusPartial` = 6、`StatusDeferred` = 28、`StatusGate` = 2、
+  `Status: Status` 合计 = 125——① WS-D14 随 0bfac71（2026-10-27，
+  「test: promote WS-D14 to AUTO on file-operation transition evidence」）
+  升 AUTO，计数更正为 **AUTO 89 / PARTIAL 6**；PARTIAL 收口台账相应收缩为
+  六条，WS-D14 已移出（见下）。② DEFERRED 随 d4b3635（2026-10-28，Y1-11
+  改述为实探范围并新增 DEF-BUDWIRE 缓期行）由 27 增至 28，registry 总数
+  由 124 变 125。后续审计轮以上述实测值为准，勿再按 88/7/27/124 判读。
 - **域分数（本轮实测 `go run ./cmd/omnilsp verify --json`）**：core
   0.9845959595959597、x5 **0.9285714285714286**（= 6.5/7：INDEX 100%——
   X5-1/X5-6/X5-7 全 AUTO，INTEROP/QUERY/CACHE 满，GRAPH 50%——X5-4
@@ -41,15 +50,18 @@
     5da1c6d 实现元素隔离；§7.6 2s 墙钟——改为 2× 同轮实测 800-ref 请求
     （2026-10-26 复验 933.14µs），不再使用裸常量。详见文末
     「2026-10-26 补缺验证」。
-  - **PARTIAL 收口台账（7）**：X5-4（graph 死码删除后 probe-less，恒 0.5，
-    待 X10 接线方有回 AUTO 通道）、WS-D14、Y2-5、DEF-EDITORS、DEF-IDXWIRE、
+  - **PARTIAL 收口台账（6；勘误注 2026-10-29：原 7 条中的 WS-D14 随
+    0bfac71 升 AUTO 移出本台账，原七条列表保留于上方 registry 计数条原文）**：
+    X5-4（graph 死码删除后 probe-less，恒 0.5，
+    待 X10 接线方有回 AUTO 通道）、Y2-5、DEF-EDITORS、DEF-IDXWIRE、
     X8-2（客户端矩阵 not_verified 半边）、X9-1（1h 连续档证据仍缺席；
     gate-20261025T1404Z-soak 红于 586.42s 监控器饥饿，监控器已独立
     goroutine 化；后续 10m 诊断红于冷启动首行断层，loopStart + 有界维护窗
     修复已落地、尚无绿色 10m/1h 复跑）。
   - **GATE（2）**：Y1-10（soak 长跑闸门）、X8-1（multiplatform 发布门禁）。
-  - **DEFERRED（27）**：结构性缓期、probe-less 不计分（含 DEF-S21CORPUS
-    的机器依赖候选证据）。
+  - **DEFERRED（27；勘误注 2026-10-29：现 28——d4b3635 新增 DEF-BUDWIRE，
+    见上方 registry 计数条勘误）**：结构性缓期、probe-less 不计分（含
+    DEF-S21CORPUS 的机器依赖候选证据）。
   - **跨文档在案**：第八轮决策包 §2.2③「把 lock 跟随候选冻结写进
     docs/acceptance.md 操作规程」grep 无命中（本轮实测），仍未执行，登记
     缓期——见决策包 §2.2 终审销案注。
