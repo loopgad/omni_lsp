@@ -239,7 +239,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| X9-1 | Sustained soak + differential mismatch triage pipeline | T7/S6 release duty | — | PARTIAL→x9 |
+| X9-1 | Sustained soak + differential mismatch triage pipeline | T7/S6 release duty | `TestSoakContinuityMonitorProgressingWorkloadDoesNotStall`, `TestSoakContinuityMonitorSuppressesProgressStallDuringMaintenance`, `TestSoakContinuityMonitorFatalOnSuspendResume`, `TestSoakContinuityMonitorDetectsSampleGap`, `TestSoakTimeoutIsDerivedNotLiteral`, `TestStdioSoakDurationGateUsesOnlyConfiguredStages`, `TestMinuteWindowGapContinuityThresholds`, `TestSoakMaintenanceBudgetsAreDerived`, `TestRustAnalyzerLockedSCIPDifferential` | AUTO |
 | X9-2 | Protocol reproducibility check (manifest fingerprint via the documented `go run scripts/gen-protocol.go -check` operator entry; metamodel-driven codegen stays post-X9+) | C17/U4 reproducibility | `TestProtocolGenCheckProbe` | AUTO |
 
 ## Deferred domain POST-X8 (independent denominator)

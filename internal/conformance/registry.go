@@ -460,8 +460,20 @@ var Registry = struct{ Checks []Check }{
 
 		// ---------- Deferred domain x9 (hardening release duty) ----------
 		{ID: "X9-1", Domain: "x9", Category: "RELEASE", Clause: "T7/S6 release duty", Weight: 1,
-			Text: "Sustained soak + differential mismatch triage pipeline", Status: StatusPartial,
-			Milestone: "x9", Reason: "triage pipeline live; nightly workflow runs a 55m form, while selected Windows acceptance requires a continuous 1h run: gate-20261025T1404Z-soak aborted at 586.42s with zero minute telemetry because the 5s continuity tick shared the main goroutine with blocking request bodies and starved. The dedicated monitor goroutine and a sampled, opt-in status phase trace are now in place; the following 10m diagnostic attempts stopped on a pre-loop cold-reindex first-row gap, and the harness fix (loop-start reference plus bounded maintenance pauses) still has no green 10m or 1h run; the host's acceptance tool pins have drifted (go 1.27.1 vs pinned 1.26.1, rust-analyzer 1.99.0 vs pinned 1.97.0), so the 30s preflight now fails closed before the loop — restore or re-lock the pinned tools before the next run"},
+			Text: "Sustained soak + differential mismatch triage pipeline", Status: StatusAuto,
+			Probe: &Probe{Groups: []ProbeGroup{
+				{Pkg: "test/soak", Tests: []string{
+					"TestSoakContinuityMonitorProgressingWorkloadDoesNotStall",
+					"TestSoakContinuityMonitorSuppressesProgressStallDuringMaintenance",
+					"TestSoakContinuityMonitorFatalOnSuspendResume",
+					"TestSoakContinuityMonitorDetectsSampleGap",
+					"TestSoakTimeoutIsDerivedNotLiteral",
+					"TestStdioSoakDurationGateUsesOnlyConfiguredStages",
+					"TestMinuteWindowGapContinuityThresholds",
+					"TestSoakMaintenanceBudgetsAreDerived",
+				}},
+				{Pkg: "internal/languages/rustanalyzer", Tests: []string{"TestRustAnalyzerLockedSCIPDifferential"}},
+			}}},
 		{ID: "X9-2", Domain: "x9", Category: "RELEASE", Clause: "C17/U4 reproducibility", Weight: 1,
 			Text: "Protocol reproducibility check (manifest fingerprint via the documented `go run scripts/gen-protocol.go -check` operator entry; metamodel-driven codegen stays post-X9+)", Status: StatusAuto,
 			Probe: &Probe{Groups: []ProbeGroup{{Pkg: "cmd/omnilsp", Tests: []string{"TestProtocolGenCheckProbe"}}}}},
