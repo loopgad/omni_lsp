@@ -981,6 +981,16 @@ func (c *Conn) SendRequest(ctx context.Context, method string, params interface{
 			c.requestTiming.record(method, timingURI, finished.Sub(timingStarted), writeDuration, finished.Sub(waitStarted), parentRequestID, outcome)
 		}
 		if resp.Error != nil {
+			if resp.Error.Code == jsonrpc.ContentModified {
+				// Round-17 product-domain wire normalization: a child refusing
+				// with the LSP-standard ContentModified code keeps its semantic
+				// as the typed kind, so the dispatcher answers -32801 instead
+				// of relaying InternalError -32603. The "<name>: <child
+				// message>" text is preserved so message-based consumers (the
+				// acceptance drivers' dual predicate) keep matching.
+				return nil, errors.New(errors.ErrContentModified, "nested.request",
+					fmt.Sprintf("%s: %s", c.cfg.Name, resp.Error.Message)).WithRecoverable(true)
+			}
 			return nil, fmt.Errorf("%s: %s", c.cfg.Name, resp.Error.Message)
 		}
 		return resp.Result, nil
