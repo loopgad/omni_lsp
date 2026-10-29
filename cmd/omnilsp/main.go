@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/index/model"
@@ -380,11 +381,25 @@ type nestedEntry struct {
 func registerNested(srv *server.Server, enabled func(string) bool, workDir string, entries ...nestedEntry) {
 	// Concurrent spawn+initialize: three toolchain bridges start in parallel
 	// instead of serially, cutting time-to-ready by the slowest (not the sum).
+	// Semantic-index pinning (rustup probing, tool identity hashing, TS/Py
+	// provider construction) runs inside each spawn goroutine too, so the
+	// pinning chain costs the slowest bridge rather than their sum on the TCP
+	// accept loop; every subprocess on this path carries a deadline
+	// (runProbe/toolchainPinTimeout), so a hung toolchain degrades through the
+	// warn path instead of blocking accept indefinitely (audit batch 1).
 	// Registration happens after all factories settle, keeping map writes on
 	// one goroutine.
 	type settled struct {
 		e  nestedEntry
 		be languages.Backend
+		// semanticLang/provider/planner carry the pinning product built during
+		// spawn. provider nil means the language has no semantic provider or
+		// pinning failed (already warned); registration still happens after
+		// settle, in results order.
+		semanticLang string
+		provider     languages.SemanticIndexProvider
+		planner      languages.SemanticIndexRequestBuilder
+		providerNote string
 	}
 	results := make(chan settled, len(entries))
 	var wg sync.WaitGroup
@@ -400,7 +415,44 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 				warn("%s backend unavailable (%s not found): %v", e.langID, e.binary, err)
 				return
 			}
-			results <- settled{e: e, be: be}
+			st := settled{e: e, be: be}
+			switch backend := be.(type) {
+			case *rustanalyzer.Backend:
+				toolConfig, configErr := rustSemanticIndexToolConfig()
+				if configErr != nil {
+					warn("Rust semantic index unavailable: %v", configErr)
+				} else {
+					st.semanticLang = "rust"
+					st.provider = backend
+					st.planner = rustanalyzer.NewSemanticIndexRequestBuilder(backend, toolConfig)
+					st.providerNote = "Rust semantic index provider registered with pinned tool identities"
+				}
+			case *typescript.Backend:
+				pinCtx, cancel := context.WithTimeout(context.Background(), toolchainPinTimeout)
+				provider, providerErr := typescript.NewPinnedSemanticIndexProvider(pinCtx, backend)
+				cancel()
+				if providerErr != nil {
+					warn("TypeScript/JavaScript semantic index unavailable: %v", providerErr)
+				} else {
+					st.semanticLang = "typescript"
+					st.provider = provider
+					st.planner = provider
+					st.providerNote = "TypeScript/JavaScript semantic index provider registered with pinned Node, compiler, and candidate identities"
+				}
+			case *pyright.Backend:
+				pinCtx, cancel := context.WithTimeout(context.Background(), toolchainPinTimeout)
+				provider, providerErr := pyright.NewRuntimeSemanticIndexProvider(pinCtx, backend)
+				cancel()
+				if providerErr != nil {
+					warn("Python semantic index unavailable: %v", providerErr)
+				} else {
+					st.semanticLang = "python"
+					st.provider = provider
+					st.planner = provider
+					st.providerNote = "Python semantic index provider registered with pinned analyzer identities"
+				}
+			}
+			results <- st
 		}(e)
 	}
 	wg.Wait()
@@ -410,46 +462,57 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 		if st.be.LanguageID() != st.e.short {
 			srv.RegisterBackend(st.e.short, st.be) // short alias, e.g. "py" → python
 		}
-		if backend, ok := st.be.(*rustanalyzer.Backend); ok {
-			toolConfig, configErr := rustSemanticIndexToolConfig()
-			if configErr != nil {
-				warn("Rust semantic index unavailable: %v", configErr)
-			} else {
-				planner := rustanalyzer.NewSemanticIndexRequestBuilder(backend, toolConfig)
-				srv.RegisterSemanticIndexProvider("rust", backend, planner)
-				info("Rust semantic index provider registered with pinned tool identities")
-			}
-		}
-		if backend, ok := st.be.(*typescript.Backend); ok {
-			provider, providerErr := typescript.NewPinnedSemanticIndexProvider(context.Background(), backend)
-			if providerErr != nil {
-				warn("TypeScript/JavaScript semantic index unavailable: %v", providerErr)
-			} else {
-				srv.RegisterSemanticIndexProvider("typescript", provider, provider)
-				info("TypeScript/JavaScript semantic index provider registered with pinned Node, compiler, and candidate identities")
-			}
-		}
-		if backend, ok := st.be.(*pyright.Backend); ok {
-			provider, providerErr := pyright.NewRuntimeSemanticIndexProvider(context.Background(), backend)
-			if providerErr != nil {
-				warn("Python semantic index unavailable: %v", providerErr)
-			} else {
-				srv.RegisterSemanticIndexProvider("python", provider, provider)
-				info("Python semantic index provider registered with pinned analyzer identities")
-			}
+		if st.provider != nil {
+			srv.RegisterSemanticIndexProvider(st.semanticLang, st.provider, st.planner)
+			info("%s", st.providerNote)
 		}
 		info("%s backend registered (%s bridge)", st.e.langID, st.e.binary)
 	}
 }
 
+const (
+	// toolchainProbeTimeout bounds ONE toolchain subprocess probe; rustPinBudget
+	// bounds the whole pinning chain (probes plus identity hashing). Both run
+	// on the TCP accept-loop critical path (registerBackends per session), so
+	// a hung rustup/rustc or a huge binary hash must degrade the semantic
+	// index through the warn path instead of stalling accept indefinitely
+	// (audit batch 1: the old exec calls had no context and no timeout).
+	toolchainProbeTimeout = 30 * time.Second
+	rustPinBudget         = 2 * time.Minute
+	// toolchainPinTimeout bounds TS/Py pinned-provider construction the same
+	// way (probe + identity hashing inside those constructors).
+	toolchainPinTimeout = 2 * time.Minute
+)
+
+// runProbe executes name/args under a hard deadline: a hung toolchain is
+// killed and surfaces as a context error (the same warn-and-degrade path as a
+// missing toolchain), never as an unbounded wait.
+func runProbe(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, name, args...).Output()
+	if err != nil {
+		if perr := probeCtx.Err(); perr != nil {
+			return out, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), perr)
+		}
+		return out, err
+	}
+	return out, nil
+}
+
 func rustSemanticIndexToolConfig() (rustanalyzer.RustIndexToolConfig, error) {
+	// One bounded context for the whole pinning chain; every subprocess probe
+	// additionally carries its own deadline. A missing or hung toolchain is
+	// the same warn-and-degrade path as any other backend gap — never a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), rustPinBudget)
+	defer cancel()
 	rustupPath, err := exec.LookPath("rustup")
 	if err != nil {
 		return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("rustup toolchain resolver not found: %w", err)
 	}
 	toolchainPaths := make(map[string]string, 3)
 	for _, name := range []string{"cargo", "rustc", "rust-analyzer"} {
-		output, runErr := exec.Command(rustupPath, "which", name).Output()
+		output, runErr := runProbe(ctx, toolchainProbeTimeout, rustupPath, "which", name)
 		if runErr != nil {
 			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("rustup which %s: %w", name, runErr)
 		}
@@ -462,11 +525,11 @@ func rustSemanticIndexToolConfig() (rustanalyzer.RustIndexToolConfig, error) {
 	tools := make([]model.ToolIdentity, 0, 3)
 	versions := make(map[string]string, 2)
 	for _, name := range []string{"cargo", "rustc", "rust-analyzer"} {
-		path, digest, identityErr := nested.ExecutableIdentity(toolchainPaths[name])
+		path, digest, identityErr := nested.ExecutableIdentityContext(ctx, toolchainPaths[name])
 		if identityErr != nil {
 			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("identify pinned %s: %w", name, identityErr)
 		}
-		output, versionErr := exec.Command(path, "--version").Output()
+		output, versionErr := runProbe(ctx, toolchainProbeTimeout, path, "--version")
 		if versionErr != nil || strings.TrimSpace(string(output)) == "" {
 			return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("probe pinned %s version: %w", name, versionErr)
 		}
@@ -476,12 +539,12 @@ func rustSemanticIndexToolConfig() (rustanalyzer.RustIndexToolConfig, error) {
 			tools = append(tools, model.ToolIdentity{Name: name, Path: path, Version: version, SHA256: digest})
 		}
 	}
-	sysrootOutput, err := exec.Command(toolchainPaths["rustc"], "--print", "sysroot").Output()
+	sysrootOutput, err := runProbe(ctx, toolchainProbeTimeout, toolchainPaths["rustc"], "--print", "sysroot")
 	if err != nil {
 		return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("find pinned Rust sysroot: %w", err)
 	}
 	procMacroPath := filepath.Join(strings.TrimSpace(string(sysrootOutput)), "libexec", "rust-analyzer-proc-macro-srv.exe")
-	procMacroPath, procMacroDigest, err := nested.ExecutableIdentity(procMacroPath)
+	procMacroPath, procMacroDigest, err := nested.ExecutableIdentityContext(ctx, procMacroPath)
 	if err != nil {
 		return rustanalyzer.RustIndexToolConfig{}, fmt.Errorf("identify pinned Rust proc-macro server: %w", err)
 	}
