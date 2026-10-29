@@ -42,6 +42,7 @@ import (
 	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
+	"github.com/omnilsp/omni/internal/plugin"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/runtime/scheduler"
 	"github.com/omnilsp/omni/internal/semantic/query"
@@ -154,6 +155,19 @@ type Server struct {
 	// declared workspace.workspaceEdit.documentChanges at initialize. Set
 	// once during handleInitialize, read-only afterwards.
 	clientWantsDocumentChanges atomic.Bool
+
+	// plugin lane (§O0-O5): mounted only when Config.PluginsDir is set.
+	// pluginMu guards the registry maps; counters are atomic.
+	pluginMu     sync.Mutex
+	pluginMgr    *plugin.Manager
+	pluginGrants map[string]plugin.Grant // id → Enable 授权表（emit 能力门的授予半边）
+	pluginProcs  map[string]*plugin.Process
+	pluginOnce   sync.Once // ClosePlugins 幂等
+
+	// plugin counters (§P3 低基数可观测性：拒绝与丢弃可见，不静默)。
+	pluginNotifies     atomic.Int64 // 收到的插件通知总数
+	pluginUnknown      atomic.Int64 // 非 diagnostics/emit 的通知数（暂存车道外）
+	pluginEmitRejected atomic.Int64 // 能力门/解析门拒绝的 emit 数（default deny 实证）
 }
 
 // wantsDocumentChanges reports whether the client negotiated the version-aware
@@ -289,6 +303,13 @@ type Config struct {
 	// NotifySourceChanges in the regular flush). Zero derives
 	// min(defaultExternalSyncWindow, RequestDeadlines[CostTiny]).
 	ExternalSyncWindow time.Duration
+	// PluginsDir enables the process-out-of-plugin lane (goal.md §O0-O5): the
+	// server mounts every verified plugin found under this directory at New
+	// time (Discover → Install → Enable → Launch) and routes its
+	// diagnostics/emit notifications through the capability gate into the
+	// diagnostics coordinator. Zero value disables the lane entirely — no
+	// discovery, no subprocess, no behavior change (X10: default off).
+	PluginsDir string
 }
 
 // DefaultConfig returns default server configuration.
@@ -362,7 +383,164 @@ func New(cfg Config) *Server {
 	s.positionEncoding = "utf-16" // LSP baseline default until negotiated
 	s.scheduler = scheduler.New(cfg.Scheduler)
 	s.registerHandlers()
+	if cfg.PluginsDir != "" {
+		s.mountPlugins(cfg.PluginsDir)
+	}
 	return s
+}
+
+// pluginEmitParams 是插件 diagnostics/emit 通知的 params 形状（插件协议 v1）。
+// 插件不可携带 source 字段：来源标记由宿主强制生成（来源治理）。
+type pluginEmitParams struct {
+	URI         string           `json:"uri"`
+	Diagnostics []pluginEmitDiag `json:"diagnostics"`
+}
+
+type pluginEmitDiag struct {
+	StartLine uint32 `json:"startLine"`
+	StartChar uint32 `json:"startChar"`
+	EndLine   uint32 `json:"endLine"`
+	EndChar   uint32 `json:"endChar"`
+	Severity  int    `json:"severity"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+}
+
+// mountPlugins 是进程内插件装配点（§O0-O5 落差1）：PluginsDir 非空时执行
+// Discover → Install → Enable → Launch。单插件失败不中断整体（与 Discover
+// 同哲学）：VerifyErr 目录被 Install 拒绝（信任链失败不 spawn）、Enable 失败
+// （含工作区信任门与崩溃隔离态）与 Launch 失败只记账不重试。Launch 失败
+// 不计入 RecordCrash——executor 的 §O4 语义把握手期失败排除在崩溃循环之外。
+func (s *Server) mountPlugins(dir string) {
+	mgr := plugin.NewManager()
+	// 工作区信任门（§N1/N3）：Enable 前咨询 plugin.load。装配发生在 New
+	// （早于 LSP initialize），此刻信任策略通常尚未建立——闭包延迟读取，
+	// nil 即放行；OMNILSP_TRUST 显式收紧后的装配期拒绝由后续 Enable 路径
+	// （崩溃重启、手动启用）补足。该时序限制登记于交付说明。
+	mgr.TrustGate = func(id string) error {
+		if _, policy, _ := s.indexState(); policy != nil {
+			return policy.Gate(trust.CapPluginLoad)
+		}
+		return nil
+	}
+
+	s.pluginMu.Lock()
+	if s.pluginMgr != nil { // 幂等：每个 Server 实例至多装配一次
+		s.pluginMu.Unlock()
+		return
+	}
+	s.pluginMgr = mgr
+	s.pluginGrants = make(map[string]plugin.Grant)
+	s.pluginProcs = make(map[string]*plugin.Process)
+	s.pluginMu.Unlock()
+
+	for _, d := range mgr.Discover(dir) {
+		id := d.Manifest.ID
+		if err := mgr.Install(d); err != nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 未通过信任链，拒绝装配: %v\n", id, err)
+			continue
+		}
+		grant, err := mgr.Enable(id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 启用被拒: %v\n", id, err)
+			continue
+		}
+		proc, err := plugin.Launch(context.Background(), d.Dir, d.Manifest, grant, func(werr error) {
+			s.pluginOnExit(id, werr)
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 失败: %v\n", id, err)
+			_ = mgr.Disable(id) // 死进程不持有 Enabled 态授权
+			continue
+		}
+		mgr.MarkRunning(id)
+		// 订阅接线在 Launch 返回后立即执行：注册窗口内到达的通知按有界
+		// 有损语义丢弃并计数（Process.DroppedNotifies），不静默、不阻塞。
+		pluginID := id
+		proc.SetNotifySink(func(method string, params json.RawMessage) {
+			s.onPluginNotify(pluginID, method, params)
+		})
+		s.pluginMu.Lock()
+		s.pluginGrants[id] = grant
+		s.pluginProcs[id] = proc
+		s.pluginMu.Unlock()
+	}
+}
+
+// onPluginNotify 是插件→宿主通知的宿主半边（pump 线程调用）：统计、能力门
+// （Grant.Check——default deny 的 emit 实证点）、解析，最后把诊断集带宿主
+// 强制来源标记汇入 diagnostics 协调器（去抖路径，不直连推送）。
+func (s *Server) onPluginNotify(pluginID, method string, params json.RawMessage) {
+	s.pluginNotifies.Add(1)
+	if method != "diagnostics/emit" {
+		s.pluginUnknown.Add(1) // 车道外方法：可见丢弃（最小切片只放行单能力）
+		return
+	}
+	s.pluginMu.Lock()
+	grant, ok := s.pluginGrants[pluginID]
+	s.pluginMu.Unlock()
+	if !ok {
+		s.pluginEmitRejected.Add(1)
+		return
+	}
+	// 能力门（§O2）：无 diagnostics.emit 授予的 emit 在此拒绝——default deny。
+	if err := grant.Check(plugin.CapDiagnosticsEmit); err != nil {
+		s.pluginEmitRejected.Add(1)
+		return
+	}
+	var ep pluginEmitParams
+	if err := json.Unmarshal(params, &ep); err != nil || ep.URI == "" {
+		s.pluginEmitRejected.Add(1)
+		return
+	}
+	items := make([]languages.Diagnostic, 0, len(ep.Diagnostics))
+	for _, dg := range ep.Diagnostics {
+		items = append(items, languages.Diagnostic{
+			StartLine: dg.StartLine, StartChar: dg.StartChar,
+			EndLine: dg.EndLine, EndChar: dg.EndChar,
+			Severity: dg.Severity, Code: dg.Code, Message: dg.Message,
+			// 来源治理：宿主强制覆盖——插件无法伪装宿主或后端来源。
+			Source: "plugin:" + pluginID,
+		})
+	}
+	s.diag.injectPluginDiagnostics(pluginID, ep.URI, items)
+}
+
+// pluginOnExit 接入 Manager.RecordCrash（§O4 崩溃循环遏制）：进程异常退出
+// （err 非 nil）计一次连续崩溃，达 MaxConsecutivePluginCrashes 即隔离；
+// 干净退出（shutdown→exit 握手完成，err==nil）不计——那不是崩溃。
+func (s *Server) pluginOnExit(id string, err error) {
+	s.pluginMu.Lock()
+	delete(s.pluginProcs, id)
+	mgr := s.pluginMgr
+	s.pluginMu.Unlock()
+	if mgr == nil || err == nil {
+		return
+	}
+	mgr.RecordCrash(id)
+}
+
+// ClosePlugins 优雅关闭全部插件进程（Run 收尾与宿主退出路径共用）：按 LSP
+// 语义 shutdown → exit。已死进程的 Shutdown 失败直接跳过（Exit 对 lcActive
+// 会拒绝发送，不合规退出拦截照常生效）。幂等。
+func (s *Server) ClosePlugins() {
+	s.pluginOnce.Do(s.closePlugins)
+}
+
+func (s *Server) closePlugins() {
+	s.pluginMu.Lock()
+	procs := s.pluginProcs
+	s.pluginProcs = make(map[string]*plugin.Process)
+	s.pluginMu.Unlock()
+	for id, p := range procs {
+		if err := p.Shutdown(); err != nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s shutdown: %v\n", id, err)
+			continue
+		}
+		if err := p.Exit(); err != nil {
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s exit: %v\n", id, err)
+		}
+	}
 }
 
 // RegisterBackend registers a language backend for the given language ID.
@@ -446,6 +624,7 @@ func (s *Server) Run(ctx context.Context, t transport.Transport) (runErr error) 
 			watcher.CloseAndWait()
 		}
 		s.scheduler.Shutdown()
+		s.ClosePlugins()
 		runErr = stderrors.Join(runErr, s.closeBackends())
 		s.mu.RLock()
 		runErr = stderrors.Join(runErr, s.shutdownErr)

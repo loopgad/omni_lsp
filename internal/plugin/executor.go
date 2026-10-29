@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,15 +46,27 @@ var ErrExited = errors.New("plugin: 进程已 exit")
 // callTimeout 是单次 Call 读取响应行的上限。
 const callTimeout = 5 * time.Second
 
+// pluginNotifyBuffer 是插件→宿主通知投递通道的容量（有界）。readLoop 以
+// 非阻塞 select 投递：慢消费者不允许拖死唯一的响应读取循环——通道满即丢弃
+// 该帧并计入 DroppedNotifies（丢弃可见，绝不静默，也绝不阻塞）。
+const pluginNotifyBuffer = 64
+
+// pluginNotifyEvent 是一条插件→宿主通知（无 id、带 method + params）。
+type pluginNotifyEvent struct {
+	method string
+	params json.RawMessage
+}
+
 // Process 是一个进程外插件子进程的句柄（协议完整版）。
 //
 // 并发模型：Call 可任意并发——每个请求分配自增 id，readLoop 按响应 id 路由到
 // pending 表中对应的等待者（多路复用）；所有对 stdin 的写入（Call 请求与
 // Notify 通知）由 writeMu 串行化，帧与帧之间不会交错。插件→宿主的帧若带
-// method 而无 id（插件侧通知），当前由 readLoop 丢弃——宿主侧订阅 API 待
-// 有真实消费者再开放。OnExit 在 Launch 参数中传入（spawn 前接线），由唯一
-// 的 Wait goroutine 在进程退出时调用恰好一次——事后赋值与 Wait goroutine
-// 的读取构成数据竞争。
+// method 而无 id（插件侧通知），readLoop 解析后经有界通道投递给宿主订阅
+// 回调（SetNotifySink）；无订阅者或通道满时按有界有损语义丢弃并计入
+// DroppedNotifies——慢消费者拖不死 readLoop。OnExit 在 Launch 参数中传入
+// （spawn 前接线），由唯一的 Wait goroutine 在进程退出时调用恰好一次——
+// 事后赋值与 Wait goroutine 的读取构成数据竞争。
 type Process struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -73,6 +86,17 @@ type Process struct {
 	// 宿主用它接入 Manager.RecordCrash 实现崩溃循环遏制。
 	// 只能在 Launch 时设置（spawn 前接线，见 Launch 文档）。
 	OnExit func(err error)
+
+	// notifyCh 是插件→宿主通知的有界投递通道：readLoop 是唯一发送者
+	// （退出时 close），pumpNotifies 是唯一消费者。满即丢弃并计数——
+	// 慢消费者最多拖慢 pump 自己，永远拖不到 readLoop。
+	notifyCh        chan pluginNotifyEvent
+	droppedNotifies atomic.Uint64
+	// sink 是宿主订阅回调（SetNotifySink 注册，sinkMu 保护：可在 Launch
+	// 前后任意时刻并发注册/替换）。nil 表示无订阅者——通知照投递进通道、
+	// 由 pump 计数丢弃，保持「丢弃可见不静默」的同一语义。
+	sinkMu sync.Mutex
+	sink   func(method string, params json.RawMessage)
 }
 
 type response struct {
@@ -146,13 +170,14 @@ func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 	}
 
 	p := &Process{
-		cmd:     cmd,
-		stdin:   stdin,
-		stdout:  bufio.NewReader(stdout),
-		grant:   grant,
-		pending: make(map[int]chan response),
-		caps:    make(map[Capability]bool, len(m.Capabilities)),
-		OnExit:  onExit,
+		cmd:      cmd,
+		stdin:    stdin,
+		stdout:   bufio.NewReader(stdout),
+		grant:    grant,
+		pending:  make(map[int]chan response),
+		caps:     make(map[Capability]bool, len(m.Capabilities)),
+		OnExit:   onExit,
+		notifyCh: make(chan pluginNotifyEvent, pluginNotifyBuffer),
 	}
 	for _, c := range m.Capabilities {
 		if c != "" { // 防御：空能力不进声明表（Validate 已拒，双保险）
@@ -181,6 +206,7 @@ func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 	// the caller never received — a launch failure counted as a plugin crash
 	// against MaxConsecutivePluginCrashes (§O4).
 	go p.readLoop()
+	go p.pumpNotifies()
 	go func() {
 		werr := cmd.Wait()
 		p.onExitOnce.Do(func() {
@@ -270,10 +296,13 @@ type rpcError struct {
 }
 
 // readLoop 是唯一的响应读取者：按 Content-Length 帧边界逐帧读取，把响应按
-// id 路由进 pending 表（多路复用的宿主半边）。致命错误（EOF/管道损坏）才会
-// 中止循环并唤醒全部等待者；单帧负载损坏只丢弃该帧——多路复用通道上其余
-// 并发请求必须照常获得响应，不能被一帧垃圾连坐。
+// id 路由进 pending 表（多路复用的宿主半边）；无 id、带 method 的帧是
+// 插件→宿主通知，解析后经有界通道投递宿主订阅回调（SetNotifySink）——
+// 通道满或无订阅者即丢弃并计数，readLoop 永不因通知投递而阻塞。致命错误
+// （EOF/管道损坏）才会中止循环并唤醒全部等待者；单帧负载损坏只丢弃该帧——
+// 多路复用通道上其余并发请求必须照常获得响应，不能被一帧垃圾连坐。
 func (p *Process) readLoop() {
+	defer close(p.notifyCh) // 唯一发送者退出时关闭：pump 排空余量后结束
 	for {
 		line, err := readFrame(p.stdout)
 		if err != nil {
@@ -287,7 +316,9 @@ func (p *Process) readLoop() {
 		}
 
 		var frame struct {
-			ID     int             `json:"id"`
+			ID     *int            `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
 			Result json.RawMessage `json:"result"`
 			Error  *rpcError       `json:"error"`
 		}
@@ -296,10 +327,23 @@ func (p *Process) readLoop() {
 			continue
 		}
 
+		if frame.ID == nil {
+			// 插件→宿主通知（无 id、带 method）：有界投递，满即丢弃计数。
+			if frame.Method != "" {
+				ev := pluginNotifyEvent{method: frame.Method, params: frame.Params}
+				select {
+				case p.notifyCh <- ev:
+				default:
+					p.droppedNotifies.Add(1)
+				}
+			}
+			continue
+		}
+
 		p.mu.Lock()
-		ch, ok := p.pending[frame.ID]
+		ch, ok := p.pending[*frame.ID]
 		if ok {
-			delete(p.pending, frame.ID)
+			delete(p.pending, *frame.ID)
 		}
 		p.mu.Unlock()
 		if !ok {
@@ -310,6 +354,36 @@ func (p *Process) readLoop() {
 			continue
 		}
 		ch <- response{result: frame.Result}
+	}
+}
+
+// SetNotifySink 注册插件→宿主通知的宿主半边（订阅回调）：readLoop 解析出
+// 无 id、带 method 的通知帧后，经 pluginNotifyBuffer 容量的有界通道异步送达
+// fn。并发安全——可在 Launch 前后任意时刻调用；注册窗口与通道饱和期到达的
+// 通知按有界有损语义丢弃并计入 DroppedNotifies（丢弃可见，绝不静默）。
+// 传 nil 恢复「无订阅者」默认态。
+func (p *Process) SetNotifySink(fn func(method string, params json.RawMessage)) {
+	p.sinkMu.Lock()
+	p.sink = fn
+	p.sinkMu.Unlock()
+}
+
+// DroppedNotifies 返回因无订阅者或通道饱和而被丢弃的插件通知数。
+func (p *Process) DroppedNotifies() uint64 { return p.droppedNotifies.Load() }
+
+// pumpNotifies 是通知投递的唯一消费者：从有界通道逐条取出，送达当前注册的
+// 宿主回调。readLoop 退出（进程终止）时关闭通道，本循环排空余量后结束。
+// 回调阻塞只拖慢 pump 自身——readLoop 的非阻塞投递永不等待这里。
+func (p *Process) pumpNotifies() {
+	for ev := range p.notifyCh {
+		p.sinkMu.Lock()
+		fn := p.sink
+		p.sinkMu.Unlock()
+		if fn == nil {
+			p.droppedNotifies.Add(1)
+			continue
+		}
+		fn(ev.method, ev.params)
 	}
 }
 

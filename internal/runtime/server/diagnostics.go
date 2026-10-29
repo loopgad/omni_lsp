@@ -75,6 +75,19 @@ type diagCoordinator struct {
 	pullRuns map[string]map[*diagRun]struct{}
 	server   *Server
 	closed   bool
+
+	// plugin lane (§O0-O5 diagnostics.emit)：插件诊断与后端计算共用同一
+	// 治理面——有界 FIFO 表、diagDebounce 去抖、宿主强制来源标记。键为
+	// uri → pluginID → 该插件对该 uri 的最新 emit 集。
+	pluginItems  map[string]map[string]pluginDiagSet
+	pluginOrder  []string
+	pluginTimers map[string]*time.Timer
+}
+
+// pluginDiagSet 是一个插件对单一 uri 的最新 emit 集（injectPluginDiagnostics
+// 覆盖写：同插件同 uri 新 emit 顶替旧集，与 LSP 全量报告语义一致）。
+type pluginDiagSet struct {
+	items []languages.Diagnostic
 }
 
 type diagRun struct {
@@ -83,12 +96,14 @@ type diagRun struct {
 
 func newDiagCoordinator(s *Server) *diagCoordinator {
 	return &diagCoordinator{
-		cache:    make(map[string]diagEntry),
-		updates:  make(map[string]uint64),
-		timers:   make(map[string]*time.Timer),
-		runs:     make(map[string]*diagRun),
-		pullRuns: make(map[string]map[*diagRun]struct{}),
-		server:   s,
+		cache:        make(map[string]diagEntry),
+		updates:      make(map[string]uint64),
+		timers:       make(map[string]*time.Timer),
+		runs:         make(map[string]*diagRun),
+		pullRuns:     make(map[string]map[*diagRun]struct{}),
+		server:       s,
+		pluginItems:  make(map[string]map[string]pluginDiagSet),
+		pluginTimers: make(map[string]*time.Timer),
 	}
 }
 
@@ -101,6 +116,90 @@ func (d *diagCoordinator) request(uri string) {
 // nested server publishes a newer complete set for the current document.
 func (d *diagCoordinator) diagnosticsUpdated(uri string) {
 	d.schedule(uri, true)
+}
+
+// injectPluginDiagnostics 接收一次插件 diagnostics.emit（调用前已过 Grant
+// 能力门，§O2）：入插件诊断表（FIFO 有界，与后端缓存同限）并按 diagDebounce
+// 去抖后推送——插件 emit 不直连 notifyClient（diagnostics.go:282 路径的
+// 勘察警告），而是走协调器自己的去抖与来源治理面。
+func (d *diagCoordinator) injectPluginDiagnostics(pluginID, uri string, items []languages.Diagnostic) {
+	uri = canonicalDocumentURI(uri)
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	if _, seen := d.pluginItems[uri]; !seen {
+		d.pluginOrder = append(d.pluginOrder, uri)
+		for len(d.pluginOrder) > diagCacheLimit { // FIFO eviction，与后端缓存同限
+			old := d.pluginOrder[0]
+			d.pluginOrder = d.pluginOrder[1:]
+			delete(d.pluginItems, old)
+		}
+	}
+	if d.pluginItems[uri] == nil {
+		d.pluginItems[uri] = make(map[string]pluginDiagSet)
+	}
+	d.pluginItems[uri][pluginID] = pluginDiagSet{items: items}
+	d.mu.Unlock()
+	d.schedulePluginPush(uri)
+}
+
+// schedulePluginPush 以 diagDebounce 去抖一次插件诊断推送（重复 emit 重置
+// 计时器——与后端 push 路径同一节奏）。
+func (d *diagCoordinator) schedulePluginPush(uri string) {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	if t := d.pluginTimers[uri]; t != nil {
+		t.Stop()
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(diagDebounce, func() {
+		d.mu.Lock()
+		if d.pluginTimers[uri] != timer || d.closed {
+			d.mu.Unlock()
+			return
+		}
+		delete(d.pluginTimers, uri)
+		sets, ok := d.pluginItems[uri]
+		d.mu.Unlock()
+		if ok {
+			d.publishPluginDiagnostics(uri, sets)
+		}
+	})
+	d.pluginTimers[uri] = timer
+	d.mu.Unlock()
+}
+
+// publishPluginDiagnostics 合并该 uri 下全部插件的最新 emit 集（按插件 ID
+// 确定性排序）后经 notifyClient 推送。每条诊断的 Source 已在注入时被宿主
+// 强制为 "plugin:<id>"——线协议上来源可见、可治理。与后端 publishDiagnostics
+// 的重叠语义（LSP 全量替换）是插件车道的已知限制，见交付说明。
+func (d *diagCoordinator) publishPluginDiagnostics(uri string, sets map[string]pluginDiagSet) {
+	ids := make([]string, 0, len(sets))
+	for id := range sets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var items []languages.Diagnostic
+	for _, id := range ids {
+		items = append(items, sets[id].items...)
+	}
+	displayURI := uri
+	if file := d.server.vfs.Get(uri); file != nil {
+		displayURI = file.URI
+	}
+	payload, err := json.Marshal(map[string]any{
+		"uri":         displayURI,
+		"diagnostics": projectDiagnostics(items),
+	})
+	if err != nil {
+		return
+	}
+	d.server.notifyClient("textDocument/publishDiagnostics", json.RawMessage(payload))
 }
 
 func (d *diagCoordinator) schedule(uri string, childUpdate bool) {
@@ -181,6 +280,11 @@ func (d *diagCoordinator) didCloseDocument(uri string, closeDocument func()) {
 		delete(d.pullRuns[uri], run)
 	}
 	delete(d.pullRuns, uri)
+	if timer := d.pluginTimers[uri]; timer != nil {
+		timer.Stop()
+		delete(d.pluginTimers, uri)
+	}
+	delete(d.pluginItems, uri)
 	if closeDocument != nil {
 		closeDocument()
 	}
@@ -214,6 +318,12 @@ func (d *diagCoordinator) Close() {
 		}
 	}
 	d.pullRuns = map[string]map[*diagRun]struct{}{}
+	for _, t := range d.pluginTimers {
+		t.Stop()
+	}
+	d.pluginTimers = map[string]*time.Timer{}
+	d.pluginItems = map[string]map[string]pluginDiagSet{}
+	d.pluginOrder = nil
 }
 
 // computeAndPush runs diagnostics and emits publishDiagnostics.

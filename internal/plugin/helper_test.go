@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,11 @@ func launchTestBinary(t *testing.T, m Manifest, g Grant, onExit func(error)) (*P
 //     （验证单帧损坏不中止连接、不殃及并发请求）；
 //   - collect-notify: 记录 hello 之后所有无 id 的通知帧，收到
 //     broadcast/audit 请求时把它们原样回传（验证 Notify 广播）；
+//   - emit-notify    : 收到第一个请求时先向宿主发一条无 id 通知帧
+//     （GO_PLUGIN_NOTIFY_METHOD，默认 diagnostics/emit），再回 pong
+//     （验证宿主 readLoop 的 method 解析与订阅回调投递）；
+//   - notify-flood   : 收到第一个请求时连续发 GO_PLUGIN_FLOOD 条通知帧，
+//     之后才回 pong（验证有界投递：慢消费者下 readLoop 不死、丢弃计数）。
 //   - graceful-shutdown: plugin/shutdown 请求以 null 应答并记录；
 //     plugin/exit 通知只记录不退出（供宿主事后审计）；其余请求回显
 //     （验证 shutdown 后响应仍可用、不合规 exit 零发送）；
@@ -82,6 +88,7 @@ func helperMain() {
 	}
 	var collected []json.RawMessage
 	var sawShutdown, sawExit bool
+	var emitted bool
 	for {
 		line, err := readHelperFrame(reader)
 		if err != nil {
@@ -180,6 +187,36 @@ func helperMain() {
 		switch mode {
 		case "echo-hello":
 			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", id, helloParams)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+		case "emit-notify":
+			if !emitted {
+				emitted = true
+				method := os.Getenv("GO_PLUGIN_NOTIFY_METHOD")
+				if method == "" {
+					method = "diagnostics/emit"
+				}
+				params := os.Getenv("GO_PLUGIN_NOTIFY_PARAMS")
+				if params == "" {
+					params = `{"uri":"file:///p/main.go"}`
+				}
+				note := fmt.Sprintf(`{"jsonrpc":"2.0","method":%q,"params":%s}`, method, params)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(note), note)
+			}
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
+		case "notify-flood":
+			if !emitted {
+				emitted = true
+				n, _ := strconv.Atoi(os.Getenv("GO_PLUGIN_FLOOD"))
+				if n < 1 {
+					n = 1
+				}
+				for i := 0; i < n; i++ {
+					note := fmt.Sprintf(`{"jsonrpc":"2.0","method":"diagnostics/emit","params":{"seq":%d}}`, i)
+					fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(note), note)
+				}
+			}
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "rpc-error":
 			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":42,\"message\":\"nope\"}}", id)

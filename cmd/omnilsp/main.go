@@ -102,7 +102,7 @@ func usage() {
 	fmt.Println("Commands: serve | doctor | verify | replay | index | version")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  serve    Start the LSP server (--config, --transport stdio|tcp, --addr, --workspace)")
+	fmt.Println("  serve    Start the LSP server (--config, --transport stdio|tcp, --addr, --workspace, --plugins)")
 	fmt.Println("  doctor   Probe the environment (PASS/WARN/FAIL/SKIP)")
 	fmt.Println("  replay   Replay a recorded session file")
 	fmt.Println("  index    Import or export a verified persistent semantic scope")
@@ -139,6 +139,9 @@ func cmdServe(args []string) {
 	debugAddr := fs.String("debug", "", "serve net/http/pprof on this loopback address (§P6, e.g. 127.0.0.1:6060)")
 	workspace := fs.String("workspace", "", "workspace root (defaults to cwd)")
 	recordPath := fs.String("record", "", "record the session to this .jsonl file (§P9; stdio and tcp transports; not supported by mcp)")
+	// §O0-O5 插件车道：缺省空 = 禁用（零行为变化）。指向含插件子目录的根时，
+	// serve 在 server.New 时装配 Discover → Enable → Launch（DEF-PLUGMOUNT）。
+	pluginsDir := fs.String("plugins", "", "plugin root directory (mount verified plugins at startup; default: disabled)")
 	_ = fs.Parse(args)
 
 	// goal.md W1: an explicitly named config file that does not exist is an
@@ -177,7 +180,7 @@ func cmdServe(args []string) {
 		fatalCode(2, "%v", err)
 	}
 
-	srv := server.New(serverConfigFrom(cfg))
+	srv := server.New(serveConfig(cfg, *pluginsDir))
 
 	registerBackends(srv, cfg)
 
@@ -269,7 +272,7 @@ func cmdServe(args []string) {
 				fmt.Fprintf(os.Stderr, "omnilsp: tcp accept: %v\n", aerr)
 				continue
 			}
-			sessionSrv := server.New(serverConfigFrom(cfg))
+			sessionSrv := server.New(serveConfig(cfg, *pluginsDir))
 			registerBackends(sessionSrv, cfg)
 			sharedCore.srv.Store(sessionSrv)
 			runTCPSession(ctx, session, conn, sessionSrv, cfg, *recordPath)

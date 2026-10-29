@@ -24,3 +24,13 @@ func serverConfigFrom(cfg config.Config) server.Config {
 	result.WatchInterval = defaultWatchInterval
 	return result
 }
+
+// serveConfig 是 serverConfigFrom 的 serve 路径包装：把 --plugins flag 映射为
+// server.Config.PluginsDir（DEF-PLUGMOUNT）。空串（缺省）保持字段零值——插件
+// 车道整体禁用，装配层零行为（X10：默认关）。replay 离线回放不经此包装，
+// 不装配插件：回放必须逐字节重放录制会话，插件子进程是录制之外的外部源。
+func serveConfig(cfg config.Config, pluginsDir string) server.Config {
+	result := serverConfigFrom(cfg)
+	result.PluginsDir = pluginsDir
+	return result
+}
