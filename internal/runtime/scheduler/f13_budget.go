@@ -81,6 +81,20 @@ func (bm *BudgetManager) ReleaseUsage(cat BudgetCategory, bytes int64) {
 	}
 }
 
+// ReplaceUsage 在同一次持锁内把 cat 的记账重置（rebase）为 bytes：扣旧值与
+// 记新值原子完成（复证圈 1 审计发现 6）。旧实现的
+// UsageSnapshot→ReleaseUsage→RecordUsage 三步读-改-写分离存在 TOCTOU 窗口——
+// 任何第二类 CatDynamicIndex 记账方与 refresh 并发即产生用量漂移：并发方的
+// 贡献被按过期快照值的释放一并抹掉，或 ReleaseUsage 的下限守卫误跳过使旧
+// 用量重复计入（§F13 压力档误判）。
+func (bm *BudgetManager) ReplaceUsage(cat BudgetCategory, bytes int64) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	old := bm.usage[cat]
+	bm.usage[cat] = bytes
+	bm.totalUsed += bytes - old
+}
+
 func (bm *BudgetManager) Pressure() float64 {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()

@@ -202,14 +202,26 @@ func newIndexBudgetLadder(diskBudget int64) *scheduler.BudgetManager {
 // clears to zero. Refresh failures announce on stderr and leave the previous
 // usage in place (fail-open); the persistent store's own budget-first
 // WriteSegment check remains the authoritative hard stop on every path.
+//
+// 有界等待（复证圈 1 审计发现 9）：无 deadline 的调用（initialize 握手路径
+// 传 context.Background()）在 writer.lock 被另一进程占用时无限等待——10ms
+// 轮询仅响应 ctx.Done()，Background 永不 Done，错误路径设计为 fail-open 却
+// 没有防「不返回」。对无 deadline 的 ctx 包一层 indexLadderRefreshTimeout，
+// 超时走既有 fail-open 分支（保留上次用量）。带 deadline 的调用方（请求 ctx）
+// 不受影响。
 func (idx *indexService) refreshBudgetLadder(ctx context.Context) {
 	if idx.ladder == nil {
 		return
 	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		bounded, cancel := context.WithTimeout(ctx, indexLadderRefreshTimeout)
+		defer cancel()
+		ctx = bounded
+	}
 	lease, err := idx.store.OpenSnapshotLease(ctx)
 	if err != nil {
 		if errors.Is(err, persistent.ErrNoGeneration) {
-			idx.ladder.ReleaseUsage(scheduler.CatDynamicIndex, idx.ladder.UsageSnapshot()[scheduler.CatDynamicIndex])
+			idx.ladder.ReplaceUsage(scheduler.CatDynamicIndex, 0)
 			return
 		}
 		fmt.Fprintf(os.Stderr, "omnilsp: index budget ladder refresh failed (gate stays fail-open): %v\n", err)
@@ -220,8 +232,10 @@ func (idx *indexService) refreshBudgetLadder(ctx context.Context) {
 	for _, seg := range lease.Snapshot().Segments {
 		live += seg.Len
 	}
-	idx.ladder.ReleaseUsage(scheduler.CatDynamicIndex, idx.ladder.UsageSnapshot()[scheduler.CatDynamicIndex])
-	idx.ladder.RecordUsage(scheduler.CatDynamicIndex, live)
+	// ReplaceUsage 一次持锁完成「扣旧值→记新值」（复证圈 1 审计发现 6）：
+	// 消除 UsageSnapshot→ReleaseUsage→RecordUsage 三步读-改-写分离的 TOCTOU
+	// 窗口——并发记账方与 refresh 交错即产生用量漂移。
+	idx.ladder.ReplaceUsage(scheduler.CatDynamicIndex, live)
 }
 
 // indexBudgetRefusal shapes a §F13 ladder refusal as a visible reindex
