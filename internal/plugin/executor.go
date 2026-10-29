@@ -451,11 +451,34 @@ func (p *Process) notifyPendingLocked(err error) {
 // 前置门保证：声明 ⊆ grant）；映射外的方法（plugin/hello、plugin/shutdown、
 // 审计等协议管线）不设能力门——默认 deny 约束能力本身，不约束无能力语义的
 // 协议方法。宿主侧固定映射：方法名由协议定义，不由 manifest 自由扩展。
+//
+// 登记纪律（审计批 3，§O2）：映射外放行是结构上的 fail-open（被
+// TestCall_MethodCapabilityGate 的「映射外_无能力门」钉为协议管线的预期），
+// 因此登记靠机制强制而非靠自觉——双向完备性守卫
+// TestMethodCapabilityCompleteness 要求 AllCapabilities 的每一项能力要么是
+// 本表某个条目的值（有方法触达面），要么显式列入 envOnlyCapabilities
+// （环境型）。新增能力或方法触达面而漏登记，go test ./internal/plugin/
+// 直接红灯，而不是零检查直发。
 var methodCapability = map[string]Capability{
 	"index/query":      CapIndexQuery,
 	"index/write":      CapIndexWrite,
 	"diagnostics/emit": CapDiagnosticsEmit,
 	"code_action/emit": CapCodeActionEmit,
+}
+
+// envOnlyCapabilities 是「环境型」能力的显式花名册——methodCapability 的
+// 完备性另一半（§O2「Default is deny」）：它们约束插件进程自身的运行行为
+// （读文档、读工作区、联网、起进程、写文件系统），在插件协议 v1 中没有
+// 宿主→插件的请求方法面，因此不经 Call 级门约束；其 deny 默认由授予半边
+// 承担（Launch 前置门：声明 ⊆ grant）。向 AllCapabilities 新增能力时必须
+// 二选一登记：methodCapability（有方法触达）或本表（环境型），两头都不沾
+// 即由 TestMethodCapabilityCompleteness 在包级测试中拒绝。
+var envOnlyCapabilities = []Capability{
+	CapDocumentRead,
+	CapWorkspaceRead,
+	CapNetworkAccess,
+	CapProcessExecute,
+	CapFilesystemWrite,
 }
 
 // Call 发送一次 JSON-RPC 请求并按 id 等待对应响应，可任意并发（多路复用），
