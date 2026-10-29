@@ -88,7 +88,7 @@ func TestP0_SyncBypassesSaturatedScheduler(t *testing.T) {
 	started := make(chan struct{}, workers)
 	for i := 0; i < workers; i++ {
 		if res := s.scheduler.Submit(&scheduler.Request{
-			Priority:   scheduler.PriorityHover,
+			Priority: scheduler.PriorityHover,
 			// The class must be stated explicitly: §F8 resolves an unset
 			// CostClass to DefaultCostClass (Medium), whose ¾ cap can never
 			// occupy all `workers` slots — the saturation this F1 test

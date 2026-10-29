@@ -60,9 +60,9 @@ func runAgingShutdownRound(t *testing.T, round int) {
 	reqs := make([]*Request, total)
 	for i := range reqs {
 		reqs[i] = &Request{
-			RequestID: identity.RequestID(fmt.Sprintf("aging-stress-%d-%d", round, i)),
-			Priority:  PriorityMaintenance,
-			CostClass: CostLarge,
+			RequestID:  identity.RequestID(fmt.Sprintf("aging-stress-%d-%d", round, i)),
+			Priority:   PriorityMaintenance,
+			CostClass:  CostLarge,
 			EnqueuedAt: time.Now(), // not stale: aging extracts and puts back in place
 			Execute: func(ctx context.Context, snap *snapshot.Snapshot) (any, error) {
 				return nil, nil
