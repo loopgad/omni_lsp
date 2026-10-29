@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/security"
@@ -152,7 +151,7 @@ func (s *Server) flushExternalSourceChanges(ctx context.Context, backend languag
 		if !ok {
 			return fence
 		}
-		bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
+		bounded, cancel := context.WithTimeout(ctx, s.externalSyncWindow())
 		err := recoverer.RecoverSourceChanges(bounded)
 		cancel()
 		if err != nil {
@@ -180,7 +179,7 @@ func (s *Server) flushExternalSourceChanges(ctx context.Context, backend languag
 	if len(changes) == 0 {
 		return nil
 	}
-	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
+	bounded, cancel := context.WithTimeout(ctx, s.externalSyncWindow())
 	err := backend.(languages.SourceChangeSynchronizer).NotifySourceChanges(bounded, changes)
 	cancel()
 	epoch = backendEpoch(backend)

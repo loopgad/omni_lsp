@@ -240,6 +240,26 @@ var defaultRequestDeadlines = map[scheduler.CostClass]time.Duration{
 	scheduler.CostVeryLarge: 600 * time.Second,
 }
 
+// Shutdown-drain and external-sync windows derive from these named budgets
+// instead of bare integer literals at their call sites (round-16 ruling 5;
+// guarded by TestNoBareSecondLiteralsInServerProductionFiles).
+// defaultDrainWindow bounds how long the shutdown paths wait for in-flight
+// responses to reach the wire (drainInflight); defaultExternalSyncWindow
+// bounds one external source-change synchronization round trip
+// (RecoverSourceChanges after an overflow fence, NotifySourceChanges in
+// the regular flush). Magnitude evidence: TestDrainInflightWaitsForResponse
+// Write observes a blocked response write within 20ms, and confirms 1s is
+// ample to finish the write once unblocked (lifecycle_test.go); a backend
+// subprocess round trip measures in single-digit milliseconds on the
+// acceptance host, so 2s leaves a thousand-fold margin while staying well
+// below the §F8 CostTiny default (30s). Both windows cap at the CostTiny
+// request deadline when one is configured — see drainWindow and
+// externalSyncWindow.
+const (
+	defaultDrainWindow        = 2 * time.Second
+	defaultExternalSyncWindow = 2 * time.Second
+)
+
 // Config holds server configuration.
 type Config struct {
 	Scheduler            scheduler.Config
@@ -258,6 +278,17 @@ type Config struct {
 	// the client receives the typed RequestCancelled response. A zero or
 	// missing entry means the class runs without a server-imposed deadline.
 	RequestDeadlines map[scheduler.CostClass]time.Duration
+	// ShutdownDrainWindow bounds how long the shutdown paths wait for
+	// in-flight responses to reach the wire (drainInflight; handleShutdown
+	// and Run's three transport-exit paths). Zero derives the window from
+	// named budgets — min(defaultDrainWindow, RequestDeadlines[CostTiny]) —
+	// the same zero-value-means-derived convention WatchInterval follows.
+	ShutdownDrainWindow time.Duration
+	// ExternalSyncWindow bounds one external source-change synchronization
+	// round trip (RecoverSourceChanges after an overflow fence,
+	// NotifySourceChanges in the regular flush). Zero derives
+	// min(defaultExternalSyncWindow, RequestDeadlines[CostTiny]).
+	ExternalSyncWindow time.Duration
 }
 
 // DefaultConfig returns default server configuration.
@@ -277,6 +308,36 @@ func DefaultConfig() Config {
 // means the class runs without a server-imposed deadline.
 func (s *Server) requestDeadline(class scheduler.CostClass) time.Duration {
 	return s.config.RequestDeadlines[class]
+}
+
+// drainWindow returns the wall-clock budget for the shutdown drain paths: an
+// explicit Config.ShutdownDrainWindow wins; otherwise the window derives from
+// named budgets — min(defaultDrainWindow, the §F9 CostTiny deadline). A zero
+// CostTiny deadline means "no server-imposed deadline" (requestDeadline), so
+// the unbounded case falls back to defaultDrainWindow rather than zeroing the
+// drain.
+func (s *Server) drainWindow() time.Duration {
+	if v := s.config.ShutdownDrainWindow; v > 0 {
+		return v
+	}
+	if d := s.requestDeadline(scheduler.CostTiny); d > 0 {
+		return min(defaultDrainWindow, d)
+	}
+	return defaultDrainWindow
+}
+
+// externalSyncWindow is drainWindow's twin for external source-change
+// synchronization round trips: an explicit Config.ExternalSyncWindow wins;
+// otherwise min(defaultExternalSyncWindow, the §F9 CostTiny deadline), with
+// the same unbounded-deadline fallback.
+func (s *Server) externalSyncWindow() time.Duration {
+	if v := s.config.ExternalSyncWindow; v > 0 {
+		return v
+	}
+	if d := s.requestDeadline(scheduler.CostTiny); d > 0 {
+		return min(defaultExternalSyncWindow, d)
+	}
+	return defaultExternalSyncWindow
 }
 
 // New creates a new LSP server.
@@ -416,15 +477,15 @@ func (s *Server) Run(ctx context.Context, t transport.Transport) (runErr error) 
 			// successful completion of the lifecycle handshake, not a transport
 			// fault. Unexpected read failures still surface below.
 			if s.State() == StateExited {
-				return s.drainInflight(2 * time.Second)
+				return s.drainInflight(s.drainWindow())
 			}
 			// Clean EOF is a normal stream end (peer closed after finishing,
 			// replay drain); any other error is a transport fault that must
 			// surface — a truncated frame must never masquerade as done (S13).
 			if stderrors.Is(err, io.EOF) {
-				return s.drainInflight(2 * time.Second)
+				return s.drainInflight(s.drainWindow())
 			}
-			return stderrors.Join(err, s.drainInflight(2*time.Second))
+			return stderrors.Join(err, s.drainInflight(s.drainWindow()))
 		}
 
 		if msg == nil {

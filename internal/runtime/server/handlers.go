@@ -415,7 +415,7 @@ func (s *Server) handleShutdown(ctx context.Context, msg *jsonrpc.Message) (json
 			request.Cancel()
 		}
 		s.mu.RUnlock()
-		err := stderrors.Join(s.drainInflight(2*time.Second), s.closeBackends())
+		err := stderrors.Join(s.drainInflight(s.drainWindow()), s.closeBackends())
 		s.mu.Lock()
 		s.shutdownErr = err
 		s.mu.Unlock()
