@@ -40,6 +40,10 @@ type BudgetManager struct {
 	thresholds BudgetThresholds
 	totalUsed  int64
 	totalLimit int64
+	// totalBudget is an explicit §F13 total budget set via SetTotalBudget.
+	// Zero (the zero value) keeps the historical behavior: the ladder runs
+	// against totalLimit, the sum of the per-category limits.
+	totalBudget int64
 }
 
 func NewBudgetManager(thresholds BudgetThresholds) *BudgetManager {
@@ -80,10 +84,37 @@ func (bm *BudgetManager) ReleaseUsage(cat BudgetCategory, bytes int64) {
 func (bm *BudgetManager) Pressure() float64 {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
-	if bm.totalLimit == 0 {
+	budget := bm.ladderBudget()
+	if budget == 0 {
 		return 0
 	}
-	return float64(bm.totalUsed) / float64(bm.totalLimit)
+	return float64(bm.totalUsed) / float64(budget)
+}
+
+// ladderBudget returns the total the pressure ladder runs against: the
+// explicit SetTotalBudget value when one was set, otherwise the sum of the
+// per-category limits (caller holds bm.mu).
+func (bm *BudgetManager) ladderBudget() int64 {
+	if bm.totalBudget > 0 {
+		return bm.totalBudget
+	}
+	return bm.totalLimit
+}
+
+// SetTotalBudget pins the §F13 total budget explicitly, overriding the sum
+// of per-category limits as the ladder's denominator. Category limits keep
+// bounding their own categories (CategoryPressure is unchanged); only the
+// total pressure, State and CanAllocate read this budget. Zero restores the
+// sum-of-limits denominator. This is the hook the server's index-budget
+// wiring uses to run the goal.md §F13 ladder against a configured memory
+// budget instead of the constructor's 1 GiB-per-category defaults.
+func (bm *BudgetManager) SetTotalBudget(bytes int64) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	bm.totalBudget = bytes
 }
 
 func (bm *BudgetManager) CategoryPressure(cat BudgetCategory) float64 {
@@ -132,10 +163,11 @@ func (bm *BudgetManager) State() string {
 func (bm *BudgetManager) CanAllocate(n int64) bool {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
-	if bm.totalLimit == 0 {
+	budget := bm.ladderBudget()
+	if budget == 0 {
 		return true
 	}
-	return float64(bm.totalUsed+n)/float64(bm.totalLimit) < bm.thresholds.High
+	return float64(bm.totalUsed+n)/float64(budget) < bm.thresholds.High
 }
 
 func (bm *BudgetManager) SetLimit(cat BudgetCategory, bytes int64) {

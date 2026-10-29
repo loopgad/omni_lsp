@@ -201,3 +201,60 @@ func TestBudgetManagerMultipleCategories(t *testing.T) {
 		t.Errorf("query pressure = %f", bm.CategoryPressure(CatQueryCache))
 	}
 }
+
+// TestBudgetManagerTotalBudgetDrivesLadder pins the DEF-BUDWIRE hook: an
+// explicit SetTotalBudget overrides the sum-of-category-limits denominator
+// for Pressure, State and CanAllocate, while per-category limits keep
+// bounding CategoryPressure. This is what lets the server's index wiring run
+// the §F13 ladder against a configured memory budget instead of the
+// constructor's 1 GiB-per-category defaults (which could never bind).
+func TestBudgetManagerTotalBudgetDrivesLadder(t *testing.T) {
+	bm := NewBudgetManager(DefaultBudgetThresholds())
+	bm.SetTotalBudget(1000)
+	bm.RecordUsage(CatSnapshots, 800)
+	if p := bm.Pressure(); p < 0.79 || p > 0.81 {
+		t.Errorf("pressure against explicit total = %f, want 0.8", p)
+	}
+	// 800/1000 = 80% -> throttle band on the §F13 ladder.
+	if got := bm.State(); got != "throttle" {
+		t.Errorf("state at 80%% of explicit total = %q, want throttle", got)
+	}
+	// CanAllocate refuses any allocation landing at or above High (90%).
+	if bm.CanAllocate(100) {
+		t.Error("CanAllocate(100) would land at 90%% of the total; want refusal")
+	}
+	if !bm.CanAllocate(99) {
+		t.Error("CanAllocate(99) stays below 90%% of the total; want admission")
+	}
+	// Category limits still bound their own categories: CatSnapshots keeps
+	// its 1 GiB constructor default, so category pressure is ~0.
+	if p := bm.CategoryPressure(CatSnapshots); p > 0.001 {
+		t.Errorf("category pressure = %f, want ~0 (explicit total must not touch it)", p)
+	}
+
+	// Zero restores the historical denominator: the sum of category limits.
+	bm.SetTotalBudget(0)
+	if p := bm.Pressure(); p >= 0.001 {
+		t.Errorf("pressure after clearing the total = %f, want ~0 (sum of 1 GiB limits)", p)
+	}
+	if !bm.CanAllocate(1 << 20) {
+		t.Error("CanAllocate against 1 GiB-sum limits must admit 1 MiB")
+	}
+}
+
+// TestBudgetManagerTotalBudgetDefaultUnchanged pins that managers built
+// without SetTotalBudget keep the sum-of-limits semantics the existing
+// ladder tests (TestBudgetManagerPressureLadder) depend on.
+func TestBudgetManagerTotalBudgetDefaultUnchanged(t *testing.T) {
+	bm := NewBudgetManager(DefaultBudgetThresholds())
+	for cat := CatDocumentText; cat <= CatRPCBuffers; cat++ {
+		bm.SetLimit(cat, 1000)
+	}
+	bm.RecordUsage(CatSnapshots, 900)
+	if p := bm.Pressure(); p < 0.1115 || p > 0.1135 {
+		t.Errorf("pressure = %f, want 900/8000 = 0.1125? got wrong denominator", p)
+	}
+	if got := bm.State(); got != "normal" {
+		t.Errorf("state = %q, want normal (900/8000 = 11.25%%)", got)
+	}
+}

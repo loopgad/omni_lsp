@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/omnilsp/omni/internal/index/persistent"
 	"github.com/omnilsp/omni/internal/index/semantic"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
+	"github.com/omnilsp/omni/internal/runtime/scheduler"
 	"github.com/omnilsp/omni/internal/trust"
 	"github.com/omnilsp/omni/internal/workspace/uri"
 )
@@ -31,6 +33,13 @@ import (
 const inventoryVersion = "file-inventory-v2"
 const maxIndexDepth = 16
 const maxIndexFileSize = 1 << 20
+
+// indexBudgetLadderEnv opts the persistent index into the goal.md §F13
+// memory-budget ladder (DEF-BUDWIRE wiring). The value is the ladder's total
+// budget in bytes. Unset or invalid keeps the ladder nil: the index path
+// behaves byte-for-byte as before the wiring (X10: default behavior must not
+// change local core).
+const indexBudgetLadderEnv = "OMNILSP_INDEX_MEMORY_BUDGET_BYTES"
 
 type fileRecord struct {
 	Path   string `json:"path"`
@@ -76,9 +85,13 @@ type indexService struct {
 	dir         string
 	store       *persistent.FileStore
 	budget      int64
-	buildMu     sync.Mutex
-	statsMu     sync.RWMutex
-	last        IndexRebuildStats
+	// ladder is the goal.md §F13 BudgetManager over the index write path,
+	// constructed only when indexBudgetLadderEnv opts in. Nil elsewhere:
+	// every ladder touch must be nil-guarded (default = no-op, X10).
+	ladder  *scheduler.BudgetManager
+	buildMu sync.Mutex
+	statsMu sync.RWMutex
+	last    IndexRebuildStats
 }
 
 func projectSemanticCoverage(coverage []model.Coverage) []semanticCoverageStat {
@@ -139,11 +152,84 @@ func (s *Server) initIndex(rootURI string) {
 		s.disableIndex(err)
 		return
 	}
+	ladder := newIndexBudgetLadder(s.config.IndexDiskBudgetBytes)
 	s.mu.Lock()
-	s.idx = &indexService{root: root, workspaceID: workspaceID, dir: dir, store: store, budget: s.config.IndexDiskBudgetBytes}
+	s.idx = &indexService{root: root, workspaceID: workspaceID, dir: dir, store: store, budget: s.config.IndexDiskBudgetBytes, ladder: ladder}
 	s.idxReason = ""
 	s.trust = policy
 	s.mu.Unlock()
+	if ladder != nil {
+		// Seed the ladder with the index already on disk so a restarted
+		// process gates at the real pressure instead of zero. Best-effort:
+		// a failed seed leaves usage at zero (fail-open) while the
+		// persistent store's WriteSegment budget stays the authoritative
+		// hard stop.
+		s.idx.refreshBudgetLadder(context.Background())
+	}
+}
+
+// newIndexBudgetLadder builds the §F13 ladder for the index service when
+// indexBudgetLadderEnv names a positive total budget in bytes; nil otherwise
+// (default off — X10 red line). The persistent-index category is fed the
+// configured disk budget, so CategoryPressure reads against the same ceiling
+// the persistent store's WriteSegment enforces; the explicit total budget
+// drives the pressure ladder itself. Invalid values announce on stderr and
+// keep the ladder off instead of guessing (the positiveIntFromEnv
+// convention).
+func newIndexBudgetLadder(diskBudget int64) *scheduler.BudgetManager {
+	text := strings.TrimSpace(os.Getenv(indexBudgetLadderEnv))
+	if text == "" {
+		return nil
+	}
+	total, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || total <= 0 {
+		fmt.Fprintf(os.Stderr, "omnilsp: ignoring invalid %s=%q (want a positive integer); the index budget ladder stays off\n", indexBudgetLadderEnv, text)
+		return nil
+	}
+	ladder := scheduler.NewBudgetManager(scheduler.DefaultBudgetThresholds())
+	ladder.SetLimit(scheduler.CatDynamicIndex, diskBudget)
+	ladder.SetTotalBudget(total)
+	return ladder
+}
+
+// refreshBudgetLadder resets the ladder's accounting to the committed
+// generation's segment bytes — real byte accounting on the actual allocation
+// point (DEF-BUDWIRE), not accumulation: retired generations shrink the
+// recorded usage along with the store. With no generation on disk the usage
+// clears to zero. Refresh failures announce on stderr and leave the previous
+// usage in place (fail-open); the persistent store's own budget-first
+// WriteSegment check remains the authoritative hard stop on every path.
+func (idx *indexService) refreshBudgetLadder(ctx context.Context) {
+	if idx.ladder == nil {
+		return
+	}
+	lease, err := idx.store.OpenSnapshotLease(ctx)
+	if err != nil {
+		if errors.Is(err, persistent.ErrNoGeneration) {
+			idx.ladder.ReleaseUsage(scheduler.CatDynamicIndex, idx.ladder.UsageSnapshot()[scheduler.CatDynamicIndex])
+			return
+		}
+		fmt.Fprintf(os.Stderr, "omnilsp: index budget ladder refresh failed (gate stays fail-open): %v\n", err)
+		return
+	}
+	defer lease.Close()
+	var live int64
+	for _, seg := range lease.Snapshot().Segments {
+		live += seg.Len
+	}
+	idx.ladder.ReleaseUsage(scheduler.CatDynamicIndex, idx.ladder.UsageSnapshot()[scheduler.CatDynamicIndex])
+	idx.ladder.RecordUsage(scheduler.CatDynamicIndex, live)
+}
+
+// indexBudgetRefusal shapes a §F13 ladder refusal as a visible reindex
+// failure: the request errors, the rebuild stats carry the same message and
+// nothing is published (rejection must not be silent).
+func indexBudgetRefusal(message string) *jsonrpc.ResponseError {
+	return &jsonrpc.ResponseError{
+		Code:    jsonrpc.RequestFailed,
+		Message: "reindex rejected: " + message,
+		Data:    json.RawMessage(`{"kind":"budget_exceeded"}`),
+	}
 }
 
 // InitializeWorkspace configures workspace identity and persistent-index state
@@ -295,11 +381,22 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		idx.statsMu.Unlock()
 	}()
 	if len(s.semanticIndexBindings()) > 0 {
+		// The semantic path streams an unknown number of segments through the
+		// sink, so its ladder gate is the §F13 pressure check itself: a live
+		// index already in the reject band (>= High, 90%) refuses the
+		// expensive rebuild up front instead of after extraction. The
+		// persistent store's WriteSegment budget stays the byte-level
+		// authority on what actually lands on disk.
+		if idx.ladder != nil && !idx.ladder.CanAllocate(0) {
+			last.Error = fmt.Sprintf("F13 memory budget ladder in the reject band (pressure %.1f%%)", idx.ladder.Pressure()*100)
+			return nil, indexBudgetRefusal(last.Error)
+		}
 		result, semanticErr := s.reindexSemantic(ctx, idx, revision, &last)
 		if semanticErr != nil {
 			last.Error = semanticErr.Error()
 			return nil, reindexResponseError(semanticErr)
 		}
+		idx.refreshBudgetLadder(ctx)
 		return result, nil
 	}
 	records, err := idx.inventory(ctx, &last)
@@ -314,6 +411,16 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 	if err != nil {
 		last.Error = err.Error()
 		return nil, reindexResponseError(err)
+	}
+	// The legacy path knows the exact bytes it is about to stage, so the
+	// ladder gate accounts them: a payload that would land the index at or
+	// above the reject band is refused before any build starts (§F13 >= 90%).
+	// This links the ladder to the write path without re-implementing the
+	// persistent layer's budget-first check, which stays authoritative at
+	// 100% of the disk budget.
+	if idx.ladder != nil && !idx.ladder.CanAllocate(int64(len(data))) {
+		last.Error = fmt.Sprintf("F13 memory budget ladder refuses a %d-byte index segment (pressure %.1f%%)", len(data), idx.ladder.Pressure()*100)
+		return nil, indexBudgetRefusal(last.Error)
 	}
 	sourceHash := inventorySourceHash(idx.workspaceID, inventoryHash)
 	build, err := idx.store.BeginBuild(ctx)
@@ -358,6 +465,7 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		return nil, reindexResponseError(err)
 	}
 	committed = true
+	idx.refreshBudgetLadder(ctx)
 	return json.Marshal(map[string]any{"generation": generation, "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
 }
 

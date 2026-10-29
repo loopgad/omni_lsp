@@ -13,6 +13,7 @@ import (
 
 	"github.com/omnilsp/omni/internal/index/persistent"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
+	"github.com/omnilsp/omni/internal/runtime/scheduler"
 	"github.com/omnilsp/omni/internal/workspace/snapshot"
 	"github.com/omnilsp/omni/internal/workspace/uri"
 )
@@ -561,6 +562,90 @@ func (c *cancelAfterContext) Err() error {
 		return context.Canceled
 	}
 	return nil
+}
+
+// The F13 index-budget ladder tests pin the DEF-BUDWIRE wiring: with
+// OMNILSP_INDEX_MEMORY_BUDGET_BYTES set, the persistent-index write path
+// consults scheduler.NewBudgetManager — pressure at or above the High band
+// (90%) refuses the expensive reindex with a visible ResponseError instead
+// of silently proceeding to the persistent layer's own 100% hard stop.
+// Without the variable the ladder is never constructed (X10 red line:
+// default behavior unchanged), and the reindex path behaves byte-for-byte
+// as before the wiring.
+func TestF13_IndexBudgetLadderRefusesOverBudgetReindex(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	t.Setenv("OMNILSP_INDEX_MEMORY_BUDGET_BYTES", "1")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "source.go"), []byte("package p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := initializedIndexServer(t, root)
+	if s.idx.ladder == nil {
+		t.Fatalf("ladder must be constructed when OMNILSP_INDEX_MEMORY_BUDGET_BYTES is set")
+	}
+	resp := indexRequest(s, context.Background(), "omnilsp/reindex")
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("reindex under a 1-byte F13 ladder must be refused, got %+v", resp)
+	}
+	if !strings.Contains(resp.Error.Message, "budget") {
+		t.Fatalf("refusal must name the budget ladder, got %q", resp.Error.Message)
+	}
+	// The refusal is real, not silent: nothing was published and the failure
+	// is visible in the rebuild stats.
+	stats := indexStats(t, s)
+	if stats.Generation != 0 {
+		t.Fatalf("refused reindex must not publish a generation, got %+v", stats)
+	}
+	if stats.LastRebuild.Error == "" {
+		t.Fatalf("refused reindex must surface its error in LastRebuild, got %+v", stats)
+	}
+}
+
+func TestF13_IndexBudgetLadderIdleByDefault(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "source.go"), []byte("package p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := initializedIndexServer(t, root)
+	if s.idx.ladder != nil {
+		t.Fatalf("default config must not construct the F13 ladder (X10: default no-op)")
+	}
+	resp := indexRequest(s, context.Background(), "omnilsp/reindex")
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("reindex without the ladder env must behave exactly as before the wiring: %+v", resp)
+	}
+	stats := indexStats(t, s)
+	if !stats.Enabled || stats.Generation != 1 || stats.LastRebuild.Files != 1 {
+		t.Fatalf("default-path stats changed by the wiring: %+v", stats)
+	}
+}
+
+// TestF13_IndexBudgetLadderRecordsLiveUsage pins the accounting half of the
+// wiring: with an ample ladder the reindex succeeds and the manager's
+// CatDynamicIndex usage equals real live index bytes (refreshed from the
+// committed generation, so retired generations shrink it too).
+func TestF13_IndexBudgetLadderRecordsLiveUsage(t *testing.T) {
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	t.Setenv("OMNILSP_INDEX_MEMORY_BUDGET_BYTES", "1048576")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "source.go"), []byte("package p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := initializedIndexServer(t, root)
+	if s.idx.ladder == nil {
+		t.Fatalf("ladder must be constructed when OMNILSP_INDEX_MEMORY_BUDGET_BYTES is set")
+	}
+	for generation := uint64(1); generation <= 2; generation++ {
+		resp := indexRequest(s, context.Background(), "omnilsp/reindex")
+		if resp == nil || resp.Error != nil {
+			t.Fatalf("reindex %d under an ample ladder must succeed: %+v", generation, resp)
+		}
+		usage := s.idx.ladder.UsageSnapshot()[scheduler.CatDynamicIndex]
+		if usage <= 0 {
+			t.Fatalf("generation %d: ladder must record live index bytes, got %d", generation, usage)
+		}
+	}
 }
 
 func TestC12_ReindexCancel(t *testing.T) {

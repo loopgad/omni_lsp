@@ -60,6 +60,7 @@ const SymbolStruct
 const SymbolTypeParameter
 const SymbolVariable
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error)
+func (idx *indexService) refreshBudgetLadder(ctx context.Context)
 func (s *Server) InitializeWorkspace(root string)
 func (s *Server) backendGates() backendGates
 func (s *Server) disableIndex(err error)
@@ -114,10 +115,12 @@ func documentSymbolSelectionEnd(symbol languages.DocumentSymbol, encoding int) l
 func encodingWidth(value string, encoding int) uint32
 func externalChangeURIValid(raw string) bool
 func firstInventoryChange(before []fileRecord, after []fileRecord) string
+func indexBudgetRefusal(message string) *jsonrpc.ResponseError
 func inventoryPayload(records []fileRecord) ([]byte, string, error)
 func inventorySourceHash(workspaceID identity.WorkspaceID, inventoryHash string) string
 func marshalWorkspaceSymbols(symbols []languages.WorkspaceSymbol, encoding int) (json.RawMessage, error)
 func negotiatePositionEncoding(proposals []string) string
+func newIndexBudgetLadder(diskBudget int64) *scheduler.BudgetManager
 func projectChildren(children []languages.DocumentSymbol, encoding int) []lsp.DocumentSymbol
 func projectCompletionTextEdit(edit *languages.CompletionTextEdit) (any, error)
 func projectLocations(locs []languages.Location) []lsp.Location
@@ -215,5 +218,5 @@ type WorkspaceSymbolParams struct{Query string json:"query"}
 type backendGates struct{semanticTokens bool, signatureHelp bool, formatting bool, inlayHints bool, declaration bool}
 type buildContextProvider interface{BuildContextID}
 type fileRecord struct{Path string json:"path", Size int64 json:"size", SHA256 string json:"sha256"}
-type indexService struct{root string, workspaceID identity.WorkspaceID, dir string, store *persistent.FileStore, budget int64, buildMu sync.Mutex, statsMu sync.RWMutex, last IndexRebuildStats}
+type indexService struct{root string, workspaceID identity.WorkspaceID, dir string, store *persistent.FileStore, budget int64, ladder *scheduler.BudgetManager, buildMu sync.Mutex, statsMu sync.RWMutex, last IndexRebuildStats}
 type semanticCoverageStat struct{ScopeID string json:"scopeId", Fact model.FactKind json:"fact", State model.Completeness json:"state", Reason string json:"reason,omitempty"}
