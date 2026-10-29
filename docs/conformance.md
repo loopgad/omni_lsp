@@ -331,7 +331,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| DEF-PLUGMOUNT | plugin-declared capabilities gate runtime API mount points | O2 capability-to-API mounting | — | DEFERRED→post-X9 |
+| DEF-PLUGMOUNT | plugin-declared capabilities gate runtime API mount points | O2 capability-to-API mounting | `TestPluginsMount_TrustChainFailureNeverSpawns`, `TestPluginsMount_ZeroValueIsNoOp`, `TestEmit_DefaultDenyWithoutGrant`, `TestEmit_EndToEndWithDebounce` | AUTO |
 
 ### SECURITY
 
