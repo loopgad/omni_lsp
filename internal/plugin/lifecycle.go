@@ -63,15 +63,17 @@ type Discovery struct {
 //
 // 并发模型：全部公开方法经 mu 串行化；注册表以 manifest.ID 为键
 // （仅 Verified 之后的元数据才入表，N14）。
+//
+// 工作区信任断言（§N1/N3 plugin.load）不属于 Manager：审计批 2 把它从
+// Enable 上的可选回调（nil 即放行——生产赋值点只在装配期读过一次尚未建立
+// 的策略）下沉为 Launch 的必经前置（executor.Launch 的 trust 参数，nil 即拒）。
+// Enable 只做状态机与授权表。
 type Manager struct {
 	mu        sync.Mutex
 	states    map[string]State
 	manifests map[string]Manifest
 	grants    map[string]Grant
 	crashes   map[string]int
-	// TrustGate, when non-nil, is consulted before Enable (§N1/N3: plugin.load
-	// is refused in Untrusted workspaces). Nil means allow.
-	TrustGate func(id string) error
 }
 
 // NewManager 创建空管理器。
@@ -134,11 +136,6 @@ func (m *Manager) Enable(id string) (Grant, error) {
 	}
 	if m.states[id] != StateVerified && m.states[id] != StateFailed {
 		return Grant{}, fmt.Errorf("plugin: %s 处于 %v，仅 verified/failed 可启用", id, m.states[id])
-	}
-	if m.TrustGate != nil {
-		if err := m.TrustGate(id); err != nil {
-			return Grant{}, fmt.Errorf("plugin: %s 被工作区信任策略拒绝: %w", id, err)
-		}
 	}
 	caps := m.manifests[id].Capabilities
 	g := Grant{caps: make(map[Capability]bool, len(caps))}

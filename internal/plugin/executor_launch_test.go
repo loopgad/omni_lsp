@@ -17,7 +17,7 @@ func TestLaunch_RejectsBeforeSpawn(t *testing.T) {
 	// refuses before the launch-time trust recheck ever reads it.
 	bad := newValidManifest([]byte("#!/bin/demo\n"))
 	bad.ID = ""
-	if _, err := Launch(context.Background(), t.TempDir(), bad, NewGrant(AllCapabilities()...), nil); err == nil {
+	if _, err := Launch(context.Background(), t.TempDir(), bad, NewGrant(AllCapabilities()...), nil, trustAllow); err == nil {
 		t.Fatal("empty id must be rejected by Validate before spawn")
 	}
 
@@ -26,7 +26,7 @@ func TestLaunch_RejectsBeforeSpawn(t *testing.T) {
 	m := newValidManifest([]byte("#!/bin/demo\n"))
 	m.Entrypoint = "whatever-the-gate-rejects-first"
 	m.Capabilities = []Capability{CapNetworkAccess, CapFilesystemWrite}
-	_, err := Launch(context.Background(), t.TempDir(), m, NewGrant(CapNetworkAccess), nil)
+	_, err := Launch(context.Background(), t.TempDir(), m, NewGrant(CapNetworkAccess), nil, trustAllow)
 	if !errors.Is(err, ErrCapabilityDenied) {
 		t.Fatalf("err = %v, want ErrCapabilityDenied", err)
 	}
@@ -65,7 +65,7 @@ func TestLaunch_ExecutesChecksummedEntrypoint(t *testing.T) {
 		t.Setenv("OMNISP_PLUGIN_HELPER", "1")
 		t.Setenv("GO_PLUGIN_MODE", "roundtrip")
 
-		p, err := Launch(ctx, dir, m, NewGrant(CapIndexQuery), nil)
+		p, err := Launch(ctx, dir, m, NewGrant(CapIndexQuery), nil, trustAllow)
 		if err != nil {
 			t.Fatalf("Launch 应执行目录内已校验入口而非 PATH 影子: %v", err)
 		}
@@ -87,9 +87,45 @@ func TestLaunch_ExecutesChecksummedEntrypoint(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(tampered, ep), []byte("tampered payload — not the verified binary\n"), 0o755); err != nil {
 			t.Fatalf("调包 entrypoint: %v", err)
 		}
-		_, err := Launch(ctx, tampered, m, NewGrant(CapIndexQuery), nil)
+		_, err := Launch(ctx, tampered, m, NewGrant(CapIndexQuery), nil, trustAllow)
 		if !errors.Is(err, ErrChecksumMismatch) {
 			t.Fatalf("err = %v, want ErrChecksumMismatch（启动前 sha256 复核）", err)
 		}
 	})
+}
+
+// TestLaunch_TrustAssertionIsRequiredGate pins the audit batch 2 finding:
+// the workspace trust assertion is a MANDATORY pre-spawn gate of Launch —
+// no callback (nil) is a refusal, not an allow, and a refusing callback
+// aborts before any child process exists. This replaces the old optional
+// Manager.TrustGate (nil meant allow) whose only production assignment read
+// the policy during New, before any trust policy could exist.
+func TestLaunch_TrustAssertionIsRequiredGate(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "shutdown-exit")
+
+	m := newValidManifest([]byte("x"))
+	m.Capabilities = []Capability{CapDiagnosticsEmit}
+	g := NewGrant(CapDiagnosticsEmit)
+
+	// nil 信任断言 = 拒绝：必经前置不允许「无策略即放行」。
+	if _, err := launchTestBinary(t, m, g, nil, nil); err == nil {
+		t.Fatal("nil trust 回调必须被拒（必经前置，nil 即拒）")
+	}
+
+	// 断言拒绝 → 原样上抛，不产生子进程。
+	denied := errors.New("workspace untrusted: plugin.load refused")
+	if _, err := launchTestBinary(t, m, g, nil, func() error { return denied }); !errors.Is(err, denied) {
+		t.Fatalf("trust 拒绝必须原样上抛，got %v", err)
+	}
+
+	// 断言放行 → 正常启动并可用。
+	p, err := launchTestBinary(t, m, g, nil, func() error { return nil })
+	if err != nil {
+		t.Fatalf("trust 放行后 Launch: %v", err)
+	}
+	t.Cleanup(func() { _ = p.cmd.Process.Kill() })
+	if _, err := p.Call("probe/alive", nil); err != nil {
+		t.Fatalf("放行后的插件应可用: %v", err)
+	}
 }

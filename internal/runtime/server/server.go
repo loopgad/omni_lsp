@@ -165,7 +165,13 @@ type Server struct {
 	// pluginDiscoverErr 记录装配期目录级发现失败的原因（pluginMu 保护）：
 	// 对齐 disableIndex 的 idxReason 可观测约定——空串表示无目录级失败。
 	pluginDiscoverErr string
-	pluginOnce   sync.Once // ClosePlugins 幂等
+	// pluginPending 是装配期已 Enabled、等待工作区信任策略就绪后 Launch 的
+	// 插件（pluginMu 保护）。审计批 2：装配发生在 New（早于 LSP initialize），
+	// 信任策略此刻通常尚未建立——「闭包延迟读取、nil 即放行」的装配期窗口
+	// 已移除；initIndex 建立策略后由 launchReadyPlugins 消费。策略从未就绪
+	// （索引初始化失败）时插件保持待命、绝不启动（fail-closed）。
+	pluginPending []pluginPendingLaunch
+	pluginOnce    sync.Once // ClosePlugins 幂等
 
 	// plugin counters (§P3 低基数可观测性：拒绝与丢弃可见，不静默)。
 	pluginNotifies     atomic.Int64 // 收到的插件通知总数
@@ -409,23 +415,26 @@ type pluginEmitDiag struct {
 	Message   string `json:"message"`
 }
 
+// pluginPendingLaunch 是一条待 Launch 的装配结果：discovery 提供目录来源与
+// manifest，grant 是 Enable 建立的授权表。
+type pluginPendingLaunch struct {
+	discovery plugin.Discovery
+	grant     plugin.Grant
+}
+
 // mountPlugins 是进程内插件装配点（§O0-O5 落差1）：PluginsDir 非空时执行
-// Discover → Install → Enable → Launch。单插件失败不中断整体（与 Discover
-// 同哲学）：VerifyErr 目录被 Install 拒绝（信任链失败不 spawn）、Enable 失败
-// （含工作区信任门与崩溃隔离态）与 Launch 失败只记账不重试。Launch 失败
-// 不计入 RecordCrash——executor 的 §O4 语义把握手期失败排除在崩溃循环之外。
+// Discover → Install → Enable。单插件失败不中断整体（与 Discover 同哲学）：
+// VerifyErr 目录被 Install 拒绝（信任链失败不 spawn）、Enable 失败（崩溃隔离
+// 态）只记账不重试。
+//
+// Launch 不发生在装配期（审计批 2）：工作区信任策略（trust.Policy）由
+// initialize 的 initIndex 建立，装配期通常尚未就绪——旧实现「闭包延迟读取、
+// nil 即放行、后续 Enable 路径补足」的时序豁免已撤。插件停留 enabled 待命，
+// 由 launchReadyPlugins 在策略就绪后推进 Launch；工作区信任断言（§N1/N3
+// plugin.load）下沉为 Launch 的必经前置（plugin.Launch 的 trust 参数，nil 即拒），
+// 绕过 Enable 直达 Launch 的路径同样过门。
 func (s *Server) mountPlugins(dir string) {
 	mgr := plugin.NewManager()
-	// 工作区信任门（§N1/N3）：Enable 前咨询 plugin.load。装配发生在 New
-	// （早于 LSP initialize），此刻信任策略通常尚未建立——闭包延迟读取，
-	// nil 即放行；OMNILSP_TRUST 显式收紧后的装配期拒绝由后续 Enable 路径
-	// （崩溃重启、手动启用）补足。该时序限制登记于交付说明。
-	mgr.TrustGate = func(id string) error {
-		if _, policy, _ := s.indexState(); policy != nil {
-			return policy.Gate(trust.CapPluginLoad)
-		}
-		return nil
-	}
 
 	s.pluginMu.Lock()
 	if s.pluginMgr != nil { // 幂等：每个 Server 实例至多装配一次
@@ -458,12 +467,40 @@ func (s *Server) mountPlugins(dir string) {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 启用被拒: %v\n", id, err)
 			continue
 		}
-		proc, err := plugin.Launch(context.Background(), d.Dir, d.Manifest, grant, func(werr error) {
+		s.pluginMu.Lock()
+		s.pluginPending = append(s.pluginPending, pluginPendingLaunch{discovery: d, grant: grant})
+		s.pluginMu.Unlock()
+	}
+}
+
+// launchReadyPlugins 把装配期待命的插件推进到 Launch：由 initIndex 在工作区
+// 信任策略建立后调用（index.go）。信任裁决只有一处——plugin.Launch 的必经
+// 前置 trust 回调（现读 trust.Policy 过 plugin.load 门，nil 策略即拒），拒绝
+// 与失败都落 stderr 并 Disable（死插件不持有 Enabled 态授权）；Launch 失败
+// 不计入 RecordCrash——executor 的 §O4 语义把握手期失败排除在崩溃循环之外。
+// 幂等：pending 队列消费即清空，无 Manager 或空队列零动作。
+func (s *Server) launchReadyPlugins() {
+	s.pluginMu.Lock()
+	pending := s.pluginPending
+	s.pluginPending = nil
+	mgr := s.pluginMgr
+	s.pluginMu.Unlock()
+	if mgr == nil || len(pending) == 0 {
+		return
+	}
+	for _, e := range pending {
+		id := e.discovery.Manifest.ID
+		proc, err := plugin.Launch(context.Background(), e.discovery.Dir, e.discovery.Manifest, e.grant, func(werr error) {
 			s.pluginOnExit(id, werr)
+		}, func() error {
+			if _, policy, _ := s.indexState(); policy != nil {
+				return policy.Gate(trust.CapPluginLoad)
+			}
+			return fmt.Errorf("plugin: 工作区信任策略尚未建立")
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 失败: %v\n", id, err)
-			_ = mgr.Disable(id) // 死进程不持有 Enabled 态授权
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 被拒: %v\n", id, err)
+			_ = mgr.Disable(id)
 			continue
 		}
 		mgr.MarkRunning(id)
@@ -474,7 +511,7 @@ func (s *Server) mountPlugins(dir string) {
 			s.onPluginNotify(pluginID, method, params)
 		})
 		s.pluginMu.Lock()
-		s.pluginGrants[id] = grant
+		s.pluginGrants[id] = e.grant
 		s.pluginProcs[id] = proc
 		s.pluginMu.Unlock()
 	}

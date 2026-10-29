@@ -119,9 +119,12 @@ type helloFrame struct {
 
 // Launch 启动进程外插件并完成握手。前置门（顺序固定）：
 //  1. manifest 完整性（Validate）；
-//  2. 能力门——manifest 声明的每项能力必须在 grant 中放行，
+//  2. 工作区信任断言——trust 是必经前置回调（§N1/N3 plugin.load）：nil 即拒，
+//     非 nil 时在 spawn 前调用，返回错误即拒绝。审计批 2 把它从 Enable 上的
+//     可选回调（nil 即放行）下沉至此——直调 Launch 绕过 Enable 也绕不开信任；
+//  3. 能力门——manifest 声明的每项能力必须在 grant 中放行，
 //     任一被拒即返回 ErrCapabilityDenied，不产生子进程；
-//  3. 信任链执行时刻复核——entrypoint 必须是 dir 下的裸文件名，且启动前对
+//  4. 信任链执行时刻复核——entrypoint 必须是 dir 下的裸文件名，且启动前对
 //     dir/<entrypoint> 重算 sha256 与 manifest.Checksum 比对（N14/§O3）。
 //     校验体与执行体由此钉在同一个文件上：先前的 Verify 结果不顶替本次
 //     复核（校验与 exec 之间二进制可能已被调包），裸文件名绝不经 PATH
@@ -132,9 +135,15 @@ type helloFrame struct {
 // 宿主→插件通知广播（Notify）、优雅停机（Shutdown/Exit 三态状态机，
 // LSP shutdown/exit 语义）、以及按方法→能力映射下沉到 Call 级别的能力门
 // （methodCapability + manifest 声明快照，见 Call）。
-func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error)) (*Process, error) {
+func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error), trust func() error) (*Process, error) {
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("plugin: launch 前置完整性校验: %w", err)
+	}
+	if trust == nil {
+		return nil, fmt.Errorf("plugin: launch 缺少工作区信任断言（必经前置，nil 即拒）")
+	}
+	if err := trust(); err != nil {
+		return nil, fmt.Errorf("plugin: launch 被工作区信任策略拒绝: %w", err)
 	}
 	for _, c := range m.Capabilities {
 		if err := grant.Check(c); err != nil {

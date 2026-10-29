@@ -149,18 +149,83 @@ func TestPluginsMount_TrustChainFailureNeverSpawns(t *testing.T) {
 	}
 }
 
+// TestPluginsMount_LaunchDeferredUntilTrustPolicy（审计批 2 守卫）：装配期
+// （New，信任策略尚未建立）绝不 Launch——「nil 即放行」窗口已移除，插件停留
+// 在 enabled 待命；工作区信任策略就绪（initialize → initIndex）后才起飞，
+// 默认本地启动 = trusted → 放行。
+func TestPluginsMount_LaunchDeferredUntilTrustPolicy(t *testing.T) {
+	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "diag-emit")
+	t.Setenv("OMNILSP_TRUST", "trusted")
+
+	root := t.TempDir()
+	writePluginDir(t, root, "deferred", []plugin.Capability{plugin.CapDiagnosticsEmit}, nil)
+
+	s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
+	defer s.ClosePlugins()
+
+	if proc := mountedProc(t, s, "deferred"); proc != nil {
+		t.Fatal("信任策略建立前不得 Launch（装配期放行窗口未移除）")
+	}
+	if st, err := s.pluginMgr.State("deferred"); err != nil || st != plugin.StateEnabled {
+		t.Fatalf("装配后应停留 enabled 待命, got %v (err %v)", st, err)
+	}
+	if n := s.pluginNotifies.Load(); n != 0 {
+		t.Errorf("待命插件不得产生通知，got %d", n)
+	}
+
+	// 策略就绪（initialize 路径）→ 待命插件起飞 → running。
+	s.InitializeWorkspace(t.TempDir())
+	waitUntil(t, func() bool {
+		return mountedProc(t, s, "deferred") != nil
+	}, "信任策略就绪后插件未被 Launch")
+	if st, err := s.pluginMgr.State("deferred"); err != nil || st != plugin.StateRunning {
+		t.Fatalf("策略就绪后状态 = %v (err %v), want running", st, err)
+	}
+}
+
+// TestPluginsMount_UntrustedWorkspaceRefusesLoad（审计批 2 守卫）：OMNILSP_TRUST
+// 显式收紧为 untrusted 时，plugin.load 在 Launch 必经前置被拒——插件不得起飞、
+// 不持有 Enabled 授权（Disable 回 verified）。旧的「装配期 nil 即放行 + 后续
+// Enable 补足」约定不再存在。
+func TestPluginsMount_UntrustedWorkspaceRefusesLoad(t *testing.T) {
+	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "diag-emit")
+	t.Setenv("OMNILSP_TRUST", "untrusted")
+
+	root := t.TempDir()
+	writePluginDir(t, root, "untrusted-plugin", []plugin.Capability{plugin.CapDiagnosticsEmit}, nil)
+
+	s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
+	defer s.ClosePlugins()
+
+	s.InitializeWorkspace(t.TempDir()) // 策略就绪：untrusted → Gate(CapPluginLoad) 拒
+	waitUntil(t, func() bool {
+		st, err := s.pluginMgr.State("untrusted-plugin")
+		return err == nil && st == plugin.StateVerified
+	}, "untrusted 工作区的插件未被信任门拒绝（应 Disable 回 verified）")
+	if proc := mountedProc(t, s, "untrusted-plugin"); proc != nil {
+		t.Fatal("untrusted 工作区不得有插件进程")
+	}
+	if n := s.pluginNotifies.Load(); n != 0 {
+		t.Errorf("被拒插件不得产生通知，got %d", n)
+	}
+}
+
 // TestEmit_DefaultDenyWithoutGrant：manifest 未声明 diagnostics.emit 的插件
 // 敌意 emit（helper 不关心授予什么）——宿主 Grant.Check 必须拒绝：
 // 无推送、拒绝计数 +1（default deny 实证点，server.go onPluginNotify）。
 func TestEmit_DefaultDenyWithoutGrant(t *testing.T) {
 	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
 	t.Setenv("GO_PLUGIN_MODE", "diag-emit")
+	t.Setenv("OMNILSP_TRUST", "trusted")
 
 	root := t.TempDir()
 	writePluginDir(t, root, "no-grant", []plugin.Capability{plugin.CapDocumentRead}, nil)
 
-	s := New(Config{PluginsDir: root})
+	s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
 	defer s.ClosePlugins()
+	s.InitializeWorkspace(t.TempDir()) // 审计批 2：策略就绪后才 Launch
 	rt := attachRecordingTransport(t, s)
 
 	proc := mountedProc(t, s, "no-grant")
@@ -189,12 +254,14 @@ func TestEmit_EndToEndWithDebounce(t *testing.T) {
 	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
 	t.Setenv("GO_PLUGIN_MODE", "diag-emit")
 	t.Setenv("GO_PLUGIN_EMIT_MESSAGE", "e2e-marker")
+	t.Setenv("OMNILSP_TRUST", "trusted")
 
 	root := t.TempDir()
 	writePluginDir(t, root, "diag-e2e", []plugin.Capability{plugin.CapDiagnosticsEmit}, nil)
 
-	s := New(Config{PluginsDir: root})
+	s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
 	defer s.ClosePlugins()
+	s.InitializeWorkspace(t.TempDir()) // 审计批 2：策略就绪后才 Launch
 	rt := attachRecordingTransport(t, s)
 
 	proc := mountedProc(t, s, "diag-e2e")
@@ -243,12 +310,14 @@ func TestEmit_EndToEndWithDebounce(t *testing.T) {
 func TestEmit_CrashDuringEmitContained(t *testing.T) {
 	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
 	t.Setenv("GO_PLUGIN_MODE", "diag-emit-die")
+	t.Setenv("OMNILSP_TRUST", "trusted")
 
 	root := t.TempDir()
 	writePluginDir(t, root, "crasher", []plugin.Capability{plugin.CapDiagnosticsEmit}, nil)
 
-	s := New(Config{PluginsDir: root})
+	s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
 	defer s.ClosePlugins()
+	s.InitializeWorkspace(t.TempDir()) // 审计批 2：策略就绪后才 Launch
 	rt := attachRecordingTransport(t, s)
 
 	proc := mountedProc(t, s, "crasher")

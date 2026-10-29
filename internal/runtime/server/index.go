@@ -166,6 +166,9 @@ func (s *Server) initIndex(rootURI string) {
 		// hard stop.
 		s.idx.refreshBudgetLadder(context.Background())
 	}
+	// 工作区信任策略此刻已建立（审计批 2）：推进装配期延后的插件 Launch
+	// （mountPlugins 只装配到 Enabled，launchReadyPlugins 过 plugin.load 门）。
+	s.launchReadyPlugins()
 }
 
 // newIndexBudgetLadder builds the §F13 ladder for the index service when

@@ -97,7 +97,7 @@ func TestExit_HungPluginIsKilled(t *testing.T) {
 	m := newValidManifest([]byte("x"))
 	m.Capabilities = []Capability{CapDiagnosticsEmit}
 	exits := make(chan error, 1)
-	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err })
+	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err }, trustAllow)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestShutdownExit_NormalLifecycle(t *testing.T) {
 	m := newValidManifest([]byte("x"))
 	m.Capabilities = []Capability{CapDiagnosticsEmit}
 	exits := make(chan error, 1)
-	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err })
+	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err }, trustAllow)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
