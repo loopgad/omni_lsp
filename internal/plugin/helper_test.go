@@ -71,6 +71,11 @@ func launchTestBinary(t *testing.T, m Manifest, g Grant, onExit func(error), tru
 //     （验证 shutdown 后响应仍可用、不合规 exit 零发送）；
 //   - shutdown-exit  : 同 graceful-shutdown，但收到 plugin/exit 通知后
 //     立即干净退出（exit 0）（验证 shutdown→exit 完整生命周期）；
+//   - hold-shutdown-exit: plugin/shutdown 请求不应答（握手挂起——并发
+//     Shutdown/Exit 状态机交错的确定性构造）；plugin/exit 通知后立即
+//     干净退出；其余请求回 pong；
+//   - stop-reading   : 吞掉 plugin/hello 后停止读 stdin（存活但不读——
+//     宿主→插件写帧在管道缓冲填满后必然阻塞，写路径有界性的守卫样本）；
 //   - die       : 立即退出（覆盖宿主的 EOF/进程死亡路径）；
 //   - roundtrip : 默认。回显 {"pong": <原样 params>}，id 与请求一致。
 func helperMain() {
@@ -109,6 +114,14 @@ func helperMain() {
 			_ = json.Unmarshal(line, &hf)
 			helloParams = hf.Params
 			sawHello = true
+			if mode == "stop-reading" {
+				// 吞掉 hello 后停止读 stdin：宿主→插件的后续写帧在管道
+				// 缓冲填满后必然阻塞（守卫样本）。Sleep 循环而非 select{}
+				// ——空 select 会触发运行时死锁检测使子进程提前退出。
+				for {
+					time.Sleep(time.Hour)
+				}
+			}
 			continue
 		}
 
@@ -130,9 +143,9 @@ func helperMain() {
 					collected = append(collected, b)
 				}
 			}
-			if req.Method == "plugin/exit" && (mode == "graceful-shutdown" || mode == "shutdown-exit") {
+			if req.Method == "plugin/exit" && (mode == "graceful-shutdown" || mode == "shutdown-exit" || mode == "hold-shutdown-exit") {
 				sawExit = true
-				if mode == "shutdown-exit" {
+				if mode == "shutdown-exit" || mode == "hold-shutdown-exit" {
 					if err := w.Flush(); err != nil {
 						return
 					}
@@ -276,6 +289,12 @@ func helperMain() {
 				msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
 				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 			}
+		case "hold-shutdown-exit":
+			if req.Method == "plugin/shutdown" {
+				continue // 不应答：shutdown 握手挂起（宿主侧 Call 等待/超时）
+			}
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		default:
 			fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}\n", id, req.Args)
 		}

@@ -43,8 +43,40 @@ var ErrAlreadyShutdown = errors.New("plugin: 已 shutdown")
 // ErrExited 表示插件已 exit，进程生命周期终态之后的请求一律拒绝。
 var ErrExited = errors.New("plugin: 进程已 exit")
 
-// callTimeout 是单次 Call 读取响应行的上限。
-const callTimeout = 5 * time.Second
+// callTimeout 是单次 Call 读取响应行的上限。非常量——测试注入更短窗口
+// （与 exitGracePeriod 同一约定；生产默认值不变）。
+var callTimeout = 5 * time.Second
+
+// writeStuckTimeout 是宿主→插件单帧写入的有界窗口（复证圈 1 审计发现 4）。
+// 旧实现里 Call 的 callTimeout 只约束响应等待（select 在写完成之后才启动），
+// Exit 的 grace timer 只在 Notify 写成功返回后才布防——子进程存活但停止读
+// stdin 时 writeFrame 无界阻塞并持有 writeMu，挂死插件的 kill 界被整体绕过。
+// 非常量——测试注入更短窗口。
+var writeStuckTimeout = 2 * time.Second
+
+// writeBounded 在有界时间内完成一次宿主→插件的 stdin 写帧：写移入独立
+// goroutine（仍经 writeMu 串行化，帧间不交错），超时返回错误。
+//
+// 写阻塞超时后，该 goroutine 仍卡在 writeFrame 上直到进程死亡（kill 使管道
+// 断裂、写以错误收场）才释放 writeMu——因此写超时必须由调用方的 kill 兜底
+// 闭合（Exit 的通知写失败路径、closePlugins 对 Shutdown 失败的有界拆除），
+// 单靠超时本身解除不了 writeMu。
+func (p *Process) writeBounded(payload []byte) error {
+	done := make(chan error, 1) // 容量 1：卡死的 goroutine 在进程死亡后完成发送，不泄漏
+	go func() {
+		p.writeMu.Lock()
+		defer p.writeMu.Unlock()
+		done <- writeFrame(p.stdin, payload)
+	}()
+	timer := time.NewTimer(writeStuckTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("plugin: stdin 写帧 %v 内未完成（插件存活但疑似停止读 stdin）", writeStuckTimeout)
+	}
+}
 
 // pluginNotifyBuffer 是插件→宿主通知投递通道的容量（有界）。readLoop 以
 // 非阻塞 select 投递：慢消费者不允许拖死唯一的响应读取循环——通道满即丢弃
@@ -514,18 +546,24 @@ func (p *Process) Call(method string, params any) (json.RawMessage, error) {
 		"params":  params,
 	})
 	if err != nil {
+		// 复证圈 1 审计发现 8：marshal 失败与写失败/超时两条错误路径对齐——
+		// 旧实现此处直接 return 不删已注册的 pending 表项，每次失败永久占用
+		// 一个自增 id 与一个 entry（直到 readLoop 终止的 notifyPendingLocked
+		// 兜底才释放）。
+		p.mu.Lock()
+		delete(p.pending, id)
+		p.mu.Unlock()
 		return nil, fmt.Errorf("plugin: 序列化请求: %w", err)
 	}
 
-	p.writeMu.Lock()
-	if err := writeFrame(p.stdin, req); err != nil {
-		p.writeMu.Unlock()
+	// 有界写（复证圈 1 审计发现 4）：写阶段纳入超时覆盖，子进程停止读 stdin
+	// 时 Call 以错误返回而非无界挂起。
+	if err := p.writeBounded(req); err != nil {
 		p.mu.Lock()
 		delete(p.pending, id)
 		p.mu.Unlock()
 		return nil, fmt.Errorf("plugin: 写请求: %w", err)
 	}
-	p.writeMu.Unlock()
 
 	select {
 	case r := <-ch:
@@ -564,11 +602,37 @@ func (p *Process) Shutdown() error {
 
 	if _, err := p.Call("plugin/shutdown", nil); err != nil {
 		p.mu.Lock()
-		p.lifecycle = lcActive
+		// 条件迁移回滚（复证圈 1 审计发现 3）：仅当仍处于 lcShutdown 时回滚
+		// lcActive。旧实现无条件写 lcActive——与并发 Exit 交错时把 Exit 已
+		// 置位的 lcExited（可能已发出 plugin/exit 通知）覆写回 lcActive，状态
+		// 机与已发线字节脱钩：后续 Exit 误报 ErrNonCompliantExit、lcExited 的
+		// Call 拒绝门重开。终态 lcExited 一经设立不可回退。
+		if p.lifecycle == lcShutdown {
+			p.lifecycle = lcActive
+		}
 		p.mu.Unlock()
 		return fmt.Errorf("plugin: shutdown 握手: %w", err)
 	}
 	return nil
+}
+
+// Kill 强制终止插件进程并等待收割（有界，复证圈 1 审计发现 7）：有界拆除的
+// 兜底腿。Exit 的挂死处理（grace 超时 kill）覆盖 exit 腿；本方法供宿主拆除
+// 路径（closePlugins 对 shutdown 握手失败的存活进程）显式终止——该路径下
+// Shutdown 超时失败时旧实现只 continue 跳过 Exit（唯一带 kill 的腿），进程
+// 与两根 stdio 管道泄漏为孤儿。进程死亡使 Wait goroutine 以非 nil 错误触发
+// OnExit，§O4 崩溃记账照常闭合。已死进程上的 Kill 返回进程已结束类错误
+// （无害，调用方记日志即可）。
+func (p *Process) Kill() error {
+	if err := p.cmd.Process.Kill(); err != nil {
+		return err
+	}
+	select {
+	case <-p.exited:
+		return nil
+	case <-time.After(exitGracePeriod):
+		return fmt.Errorf("plugin: kill 后 %v 内进程未被收割", exitGracePeriod)
+	}
 }
 
 // exitGracePeriod 是 Exit() 发出 plugin/exit 通知后等待插件自行退出的上限；
@@ -600,6 +664,11 @@ func (p *Process) Exit() error {
 	p.mu.Unlock()
 
 	if err := p.Notify("plugin/exit", nil); err != nil {
+		// 复证圈 1 审计发现 4：写失败统一落入 kill 兜底——有界拆除不依赖写
+		// 成功。EPIPE（进程已死）上 kill 是无害 no-op；写阻塞超时（插件停止
+		// 读 stdin）上 kill 是唯一闭合路径：写超时后内部写 goroutine 仍持
+		// writeMu 卡在 writeFrame，kill 使管道断裂才释放。
+		_ = p.cmd.Process.Kill() // 竞速败给进程自行死亡时 Kill 报错，忽略
 		return fmt.Errorf("plugin: exit 通知: %w", err)
 	}
 	timer := time.NewTimer(exitGracePeriod)
@@ -629,9 +698,10 @@ func (p *Process) Notify(method string, params any) error {
 	if err != nil {
 		return fmt.Errorf("plugin: 序列化通知: %w", err)
 	}
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	if err := writeFrame(p.stdin, notif); err != nil {
+	// 有界写（复证圈 1 审计发现 4）：旧实现无界写并持有 writeMu，Exit 的
+	// grace timer 在 Notify 之后才布防——插件停止读 stdin 时 kill 界被整体
+	// 绕过；写失败（含写超时）由调用方决定 kill 兜底。
+	if err := p.writeBounded(notif); err != nil {
 		return fmt.Errorf("plugin: 写通知: %w", err)
 	}
 	return nil
