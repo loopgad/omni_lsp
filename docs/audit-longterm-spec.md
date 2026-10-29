@@ -32,13 +32,33 @@
   六条，WS-D14 已移出（见下）。② DEFERRED 随 d4b3635（2026-10-28，Y1-11
   改述为实探范围并新增 DEF-BUDWIRE 缓期行）由 27 增至 28，registry 总数
   由 124 变 125。后续审计轮以上述实测值为准，勿再按 88/7/27/124 判读。
+  **勘误注（2026-10-30，档案勘误员）**：X9-1 随 6303aca（2026-10-29，
+  「test: promote X9-1 to AUTO on the standard-budget 1h soak」）升 AUTO，
+  上条勘误的计数随之再度过时。本轮实测（HEAD 8cfdbbb）：`grep -c
+  StatusAuto` = 90、`StatusPartial` = 5、`StatusDeferred` = 28、
+  `StatusGate` = 2，与 `grep -c 'ID: "'` = 125 闭合——现行计数 **AUTO 90 /
+  PARTIAL 5 / DEFERRED 28 / GATE 2，共 125 条**。方法注记：裸模式
+  `grep -c "Status: Status"` 现报 124（DEFERRED 27），漏数 DEF-BUDWIRE 的
+  gofmt 对齐行（registry.go:100 `Status:    StatusDeferred,` 字段间有对齐
+  空格）；复计数须用容忍空白的 `grep -cE "Status:\s+Status"`（实测 = 125）。
+  PARTIAL 收口台账相应收缩为五条：X5-4、Y2-5、DEF-EDITORS、DEF-IDXWIRE、
+  X8-2（grep 实测），X9-1 已移出（见下条勘误注）。
 - **域分数（本轮实测 `go run ./cmd/omnilsp verify --json`）**：core
   0.9845959595959597、x5 **0.9285714285714286**（= 6.5/7：INDEX 100%——
   X5-1/X5-6/X5-7 全 AUTO，INTEROP/QUERY/CACHE 满，GRAPH 50%——X5-4
   probe-less PARTIAL）、x7 1、x8 0.6666666666666666、x9 0.75、post-x9
   0.06896551724137931、post-x8 0。§1 表内 x5 行「85.7%／INDEX 83.3%」是
   ed5226f（2026-10-25 16:17，X5-7 PARTIAL→AUTO）之前的旧值，其余域与
-  verify 输出逐位一致。
+  verify 输出逐位一致。**勘误注（2026-10-30，档案勘误员）**：本条域分数
+  又过时两处——X9-1 升 AUTO 后 x9 0.75→**1.0**（RELEASE 满格：X9-1/X9-2
+  双 AUTO）；d4b3635 新增 DEF-BUDWIRE 后 post-x9 分母 29→30，现值
+  **0.06666666666666667**。本轮档案员实跑 `go run ./cmd/omnilsp verify
+  --min 90 --json`（exit 0、passed=true）实测：core 0.9845959595959597、
+  x5 0.9285714285714286、x7 1、x8 0.6666666666666666、x9 1、
+  post-x9 0.06666666666666667、post-x8 0；coreScore 98.45959595959597
+  逐位不变（x9 为非 core 延迟域，不入 baseline，见 docs/acceptance.md
+  2026-10-29 记账轮）。行内 x9 0.75 与 post-x9 0.0689… 均为升格/增条前
+  旧值；JSON 存 out/ledger-align-20261030/verify-fast-20261030.json。
 - **剩余台账分类**：
   - **已拍板并落地（5，2026-10-25 终局裁决；2026-10-26 工程落地）**：
     §7.2 fast 探针执行——`FastProbeReport` 真跑 AUTO 探针，
@@ -57,7 +77,16 @@
     X8-2（客户端矩阵 not_verified 半边）、X9-1（1h 连续档证据仍缺席；
     gate-20261025T1404Z-soak 红于 586.42s 监控器饥饿，监控器已独立
     goroutine 化；后续 10m 诊断红于冷启动首行断层，loopStart + 有界维护窗
-    修复已落地、尚无绿色 10m/1h 复跑）。
+    修复已落地、尚无绿色 10m/1h 复跑）。**勘误注（2026-10-30，档案
+    勘误员）**：X9-1 已于 6303aca 升 AUTO、移出本台账（现五条，见文首
+    registry 计数条勘误）——1h 标准预算连续档证据已闭环：
+    out/soak-final-1h-20261028T220733Z-e6674d1e/soak-report.json 实测
+    decision=passed、31/31 检查全 passed（本轮档案员读档复核）；
+    registry X9-1 现为 StatusAuto（registry.go:462-476），Milestone x9 与
+    PARTIAL Reason 已随 promote 删除（`git show 6303aca` 实核），探针为
+    8 个 soak form 测试 + TestRustAnalyzerLockedSCIPDifferential。行内
+    「1h 连续档证据仍缺席」「尚无绿色 10m/1h 复跑」自 promote 起失效，
+    原文保留为升格前记录。
   - **GATE（2）**：Y1-10（soak 长跑闸门）、X8-1（multiplatform 发布门禁）。
   - **DEFERRED（27；勘误注 2026-10-29：现 28——d4b3635 新增 DEF-BUDWIRE，
     见上方 registry 计数条勘误）**：结构性缓期、probe-less 不计分（含
@@ -82,9 +111,9 @@ verify 跑的是 CI 出货的同一二进制，所以本地分数与 CI 同源�
 | x5 | 85.7% | INDEX 83.3% / INTEROP 100.0% / GRAPH 50.0%（2026-10-25 记账员落账：X5-2 升 AUTO——server 原生 LSIF API 落地、探针组修剪死码测试后全组 `-count=1` 实跑绿；X5-4 改 probe-less PARTIAL——internal/index/graph 按零生产引用死码整包删除，PARTIAL 恒 0.5 故分数不变。实算 `go run ./cmd/omnilsp verify --json`：x5=0.8571428571428571，与 verify 输出逐位一致）。**终审注（2026-10-25）**：本行分数已过期——X5-7 随 ed5226f（2026-10-25 16:17，X5-7 PARTIAL→AUTO）升格后，行内 85.7%／INDEX 83.3%／实算 x5=0.8571428571428571 均为升格前旧值；终审复跑同命令实测 x5=0.9285714285714286（92.86%，6.5/7）、INDEX=100%（X5-1/X5-6/X5-7 全 AUTO），其余域分数与 verify 输出仍逐位一致。见文首「终审状态」 |
 | x7 | 100.0% | X7-1 探针 TestExecutor_LaunchHandshake 此前实跑报 SKIP 的诚实性缺口已收口（2026-10-25：插件宿主协议完整版落地后 e2e 子测试「真实子进程_握手_调用_广播」实跑 PASS，记账员 `-count=1 -v` 实核非 SKIP） |
 | x8 | 66.7% | CLIENTS 50% / DIST 50% |
-| x9 | 75.0% | RELEASE 75% |
+| x9 | 75.0% | RELEASE 75%。**勘误注（2026-10-30，档案勘误员）**：本行为 X9-1 升 AUTO 前旧值——6303aca（2026-10-29）promote 后 x9=1.0（RELEASE 满，X9-1/X9-2 双 AUTO；本轮档案员 `go run ./cmd/omnilsp verify --min 90 --json` 实跑亲证，JSON 存 out/ledger-align-20261030/verify-fast-20261030.json，详见文首域分数条勘误） |
 
-registry 124 条（2026-10-07 实测 `grep -c "Status: Status" internal/conformance/registry.go`）。`gofmt -l internal cmd test` 只剩 3 个
+registry 124 条（2026-10-07 实测 `grep -c "Status: Status" internal/conformance/registry.go`。**勘误注（2026-10-30，档案勘误员）**：现 125 条——AUTO 90 / PARTIAL 5 / DEFERRED 28 / GATE 2，且裸 grep 现漏数 DEF-BUDWIRE 的 gofmt 对齐行，方法注记见文首 registry 计数条勘误）。`gofmt -l internal cmd test` 只剩 3 个
 `test/acceptance/evidence/**` fixture —— 那是捕获的编辑器证据，不是我们的源码。
 
 ### 分数口径的一个已知弱点 `[已复核]`
@@ -520,6 +549,15 @@ protocol/transport/runtime/server import；`go test ./internal/conformance/
   :2693），reindex 半边至此在 spec 补记。X9-1 仍 PARTIAL：registry X9-1
   Reason 记首个标准预算 1h soak（gate-20261025T1404Z-soak）红于 586.42s
   连续性守卫，1h 连续档证据仍缺席。
+  **勘误注（2026-10-30，档案勘误员）**：上两段的 X9-1 现状判定已终局
+  反转——1h 标准预算连续档终局门绿（out/soak-final-1h-20261028T220733Z-
+  e6674d1e/soak-report.json 实测 decision=passed、31/31 检查全 passed，
+  本轮档案员读档复核），X9-1 随 6303aca（2026-10-29）由 PARTIAL 升
+  AUTO，registry 的 Milestone x9 与 PARTIAL Reason 同步删除（`git show
+  6303aca` 实核）。「X9-1 维持 PARTIAL」「1h 连续档证据仍缺席」自
+  promote 起失效，原文保留为升格前历史记录；前序 10m 首绿与因果链见
+  docs/acceptance.md「2026-10-29 记账轮（X9-1 标准预算 1h soak 终局绿）」
+  节。
 
 ### 5.5 并发 / 事务测试的假信号（`internal/index/persistent`）
 
@@ -714,6 +752,10 @@ D 结构性）标注；凡属语义变更的落地轮须遵守「语义变更先
    X9-1 关账前 X10 不解锁；**机械排序，非拍板项**。本轮不动插件接线。
    **落点**：无实现动作；X10 解锁条件 = X9-1 关账（registry Milestone
    字段即规则，禁止绕过字段手工解锁）。
+   **资格到点注（2026-10-30，档案勘误员）**：X9-1 已于 6303aca 升 AUTO
+   关账，本条机械规则下的 X10 解锁条件满足——资格已到；X10 属 goal.md
+   OPTIONAL 档，范围层级选择待用户拍板、未立项，无实现动作。详见文末
+   「2026-10-30 档案口径对齐」的 X10 资格登记小节。
 7. **codeAction 收口标准（源缺口3）**：服务端原生发出的每一类诊断，凡
    修复可机械推导者必须配真实 quickfix；本轮按此标准评估现状并登记差距，
    不强制本轮实现全部。**落点**：评估与差距登记归阶段 A，实现按差距清单
@@ -884,6 +926,13 @@ quickfix。本轮按此标准清点，并先修复了一个可达性缺陷。
   或 phase trace。证据：out/soak-verify/{soak.log, soak-report.json,
   omnilsp.exe, soak.test.exe}。没有 10m/1h 绿色证据，X9-1 维持 PARTIAL
   （registry Milestone x9）。
+  **勘误注（2026-10-30，档案勘误员）**：本条边界已终局闭合——工具锁于
+  2026-10-26 按用户裁决以本机环境重锁（见下「6. 本机工具链重锁与重启
+  探针预算」），1h 标准预算 soak 于 2026-10-28/29 终局绿
+  （out/soak-final-1h-20261028T220733Z-e6674d1e/soak-report.json 实测
+  decision=passed、31/31 检查全 passed），X9-1 随 6303aca 升 AUTO、
+  Milestone x9 删除。「没有 10m/1h 绿色证据，X9-1 维持 PARTIAL（registry
+  Milestone x9）」自 promote 起失效，原文保留为当时边界。
 - 恢复路径只有两条：把工具链恢复到锁定版本，或按锁重建流程正式换锁；
   本轮不绕过测试内的 pin 检查。
 - 本轮未重跑完整 `go test ./...`（90m 档）与全包 `-race`；已跑的是
@@ -937,3 +986,82 @@ quickfix。本轮按此标准清点，并先修复了一个可达性缺陷。
   不会在一分钟后即截断。
 - 30s 预检与更长档的实测结果见 docs/acceptance.md 的对应证据记录；本节
   不预写结果。
+
+---
+
+## 2026-10-30 档案口径对齐（X9-1 promote 落账、X10 资格登记与 watch 留观销案）
+
+本节由档案勘误员于 2026-10-30 落账（HEAD 8cfdbbb，工作树始于干净）。
+背景：X9-1 已于 2026-10-29 随 6303aca 升 AUTO（终局证据
+out/soak-final-1h-20261028T220733Z-e6674d1e/soak-report.json，本轮读档
+实测 decision=passed、31/31 检查全 passed），正文各处落后口径已按体例
+以「勘误注」逐处追加、历史原文一律保留，落点为：文首 registry 计数条、
+域分数条、PARTIAL 收口台账、§1 表 x9 行、§5.4 X9-1 soak 现状注记、
+§7 裁决6、「2026-10-26 补缺验证」§4。本轮另作两项登记（下述小节）；
+改动仅 docs/audit-longterm-spec.md 与 docs/acceptance.md 两文件。
+
+### 1. X10 解锁资格登记（范围层级待拍板，未立项）
+
+- **规则源**：§7 终局裁决第 6 条（机械规则，非拍板项）——「X10 解锁条件
+  = X9-1 关账（registry Milestone 字段即规则，禁止绕过字段手工解锁）」。
+  X9-1 已于 6303aca 升 AUTO 关账（registry.go:462-476 现为 StatusAuto，
+  Milestone x9 与 PARTIAL Reason 已删，`git show 6303aca` 实核），故
+  **X10 资格已到**。
+- **Milestone 字段的性质**：registry 内无运行时解锁闸——Milestone 仅被
+  docgen.go:82-86 消费作投影后缀（`status→milestone`）、被
+  report.go:150-153 消费作 core 域 DEFERRED 项的域分桶；解锁是台账纪律
+  概念，由本裁决禁止绕字段手工升级执行。
+- **资格面（本轮 grep 实测）**：Milestone "X10" 共 4 条——DEF-BUDWIRE
+  （registry.go:98，F13/F14 生产接线）、DEF-REMOTEIDX（:368，远程索引
+  服务）、DEF-W7UPD（:372，自更新检查）、DEF-COMPACT（:452，压实调度
+  接线，Reason 明言需结构有界压实先行）；Milestone "post-X9" 共 20 条，
+  含 DEF-PLUGMOUNT（:365-367，Reason 明言「server-side plugin API
+  surface itself is X10 scope」）——X9-1 关账后该批 post-X9 条目的资格
+  随之解锁，但其各自 Reason 即其规则，升级仍须按条目自带条件另轮处理。
+- **goal 锚点**：goal.md:5379-5388「X10. Milestone 10 — Advanced scale」
+  整档标 **OPTIONAL**：remote index service、remote semantic workers、
+  distributed indexing、multi-tenant hosted service、advanced
+  cross-language graph、DAP integration。
+- **登记口径**：X10 资格已到，**范围层级选择待用户拍板，未立项**——
+  本轮无任何实现动作，不新增工作项、不动插件接线；拍板前 registry 各
+  条目按自带 Reason/Milestone 维持现状。
+- **诚实边界**：x9 域尚有 DEF-EDITORS（PARTIAL，Milestone x9，
+  registry.go:425-427）在账，其编辑器矩阵证据独立于本登记；X10 资格
+  判定按裁决 6 锚定 X9-1 关账，不依赖 DEF-EDITORS 收口。
+
+### 2. watch 短路留观项静态销案（三路结论，复发再启）
+
+本文档原无该留观项专行，落于本节（留观项来自源侧工作台账，针对 0863010
+「fix(watch): reuse fingerprints on unchanged (mtime,size) instead of
+re-reading every file」引入的 (mtime,size) 短路复用路径）。本轮三路
+静态结论均为档案员读码复核（`[已复核]`——亲自读源码逐行核对；**静态
+读码，非 `-race` 实测**，如实标注）：
+
+1. **深度超限与短路交互干净**：深度超限在目录分支拦截——
+   internal/workspace/watch/watch.go:199-201 `strings.Count(...) >=
+   p.maxDepth` 时 `recordError` + `filepath.SkipDir`，被截断子树到不了
+   文件分支的短路复用（:239-253）；该 error 使 scanErr 非 nil，而
+   Scan 在 :325-330 于基线换图（:332-334 `p.prints = now`）**之前**即
+   `return nil`——失败趟不产事件、不发布指纹图，短路引用的 prev 始终
+   属于上一个成功趟；fingerprint 头注释（:162-163）明言「A partial walk
+   is not a valid basis for diffing or replacing the baseline」。交互
+   干净。
+2. **短路复用无数据竞争**：短路复用（watch.go:239-253）只**读** prev；
+   prev 快照在 p.mu 下读取（:170-172），map 发布后只被整体替换、从不被
+   就地变异（:168-169 注释与 :332-334 的换图点一致），且扫描全程持有
+   scanMu（Scan :305-306，fingerprint 由 :314 在持锁下调用）。无竞争
+   面。**边界**：此为静态推理结论，未跑 `-race` 实测；watch 包测试
+   （含 watch_test.go 与 stat_shortcircuit_test.go）在既有门禁内随套件
+   执行。
+3. **NTFS 粒度契约已被反向钉住**：stat_shortcircuit_test.go:26-59
+   `TestWatcherSkipsRereadForUnchangedStatSignature`——内容漂移但把
+   (mtime,size) 复原到基线签名后，断言必须**零事件**（摘要复用、不
+   重读）：这正是「stat 签名即变更信号、NTFS mtime 粒度内的同签名内容
+   漂移不可见」契约的反向钉死；文件头（:16-20）记录契约切线，并注明旧
+   内容哈希钉 TestWatcherDetectsSameSizeSameMtime-ContentChange 已被
+   watch_test.go 的新契约替换。同文件 :64-85 补正向半边（mtime 移动的
+   同尺寸内容变更必报 Modified）。
+
+**处置**：留观销案——三路静态结论落档，此留观项关闭；若后续轮次在该
+路径复发同类疑点（深度/失败趟交互、短路并发、粒度契约漂移），以本节为
+基准重启留观。

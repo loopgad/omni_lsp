@@ -941,3 +941,78 @@ offset debt on file in `freeze-record.txt`):
 - 确认门禁（本轮实跑）：`go test -count=1 -timeout 900s ./test/conformance/` → ok 140.514s（TestGenerateDocs + TestConformanceNoRegression，真探针 fast 模式，含新 X9-1 探针实跑）；`go test -count=1 ./internal/conformance/` → ok 2.503s；`go test -count=1 -run '^TestF9_LargeDefaultCoversColdWorkspaceExportEnvelope$' ./internal/runtime/server/` → PASS（harness 修复 9419576 在 HEAD 祖先）；`go vet ./internal/conformance/` → OK。gofmt 预存在漂移：registry.go 的 Y1-11/DEF-BUDWIRE 字段对齐在 HEAD 即不齐（`git show HEAD:internal/conformance/registry.go | gofmt -l` 标记 stdin 证实），本域未触碰；本域 X9-1 块为 gofmt 稳定形态。
 - 范围限定（leftOpen）：此绿为 env 契约形态下的同一真实 stdio 终局门绿，不等于完整 wrapper 链（同 RunId 的 Fast 门 + 30s/10m 预检 + 独立 Luna D pre-soak-review.json）绿；该链在本树无前置证据，未运行也无法由本会话生成，若要走 Start1h/Status 发布路径需先补齐。
 
+## Evidence record — 2026-10-30 档案口径对齐轮（X9-1 promote 口径勘误落账 + X10 资格登记 + watch 留观销案）
+
+- 性质：本轮为档案轮（docs-only，零代码改动）——把 X9-1 升 AUTO
+  （6303aca，2026-10-29）之后 docs/audit-longterm-spec.md 各处落后口径
+  对齐账面：逐处追加「勘误注（2026-10-30，档案勘误员）」、历史原文一律
+  不改写；登记 X10 解锁资格（范围层级待用户拍板、未立项）；对 watch
+  (mtime,size) 短路留观项作三路静态销案。改动仅两文件：
+  docs/audit-longterm-spec.md（八处勘误注 + 文末新节「2026-10-30 档案
+  口径对齐」）与 docs/acceptance.md（本节）。
+- 轮号披露：任务书称「追加第十七轮行」；本文件第十七轮已由 be7f710
+  （「docs: record the seventeenth-round engineering landing and tool
+  re-lock」）落档为「2026-10-26 第十七轮」。按「一轮一节」体例本轮以
+  档案轮记账、不重复占用轮号；若源侧台账另有轮次口径，以此披露为准。
+- 勘误落点（逐处注均附证据指针，详见 spec 新节引言）：① 文首 registry
+  计数条与域分数条；② §1 表 x9 行与 §1 正文「registry 124 条」；
+  ③ PARTIAL 收口台账（X9-1 移出、收缩为五条）；④ §5.4 X9-1 soak 现状
+  注记；⑤ §7 裁决6（X10 资格到点注）；⑥「2026-10-26 补缺验证」§4。
+- 关键实测（本轮档案员亲跑/读档，HEAD 8cfdbbb、起始工作树干净）：
+  - registry 计数：`grep -c StatusAuto` = 90、`StatusPartial` = 5、
+    `StatusDeferred` = 28、`StatusGate` = 2、`grep -c 'ID: "'` = 125，
+    四态合计与 ID 数闭合 → **AUTO 90 / PARTIAL 5 / DEFERRED 28 /
+    GATE 2，共 125 条**。方法注记：裸模式 `grep -c "Status: Status"` 报
+    124（DEFERRED 27），漏数 DEF-BUDWIRE 的 gofmt 对齐行
+    （registry.go:100 `Status:    StatusDeferred,`）；容忍空白模式
+    `grep -cE "Status:\s+Status"` = 125。现行 PARTIAL 五条：X5-4、Y2-5、
+    DEF-EDITORS、DEF-IDXWIRE、X8-2。
+  - X9-1 现状：registry.go:462-476 StatusAuto、无 Reason/Milestone，
+    探针 = 8 个 test/soak form 测试 + TestRustAnalyzerLockedSCIPDifferential；
+    `git show 6303aca` 实核 PARTIAL + Milestone x9 + Reason → AUTO。
+  - 1h 终局证据读档复核：out/soak-final-1h-20261028T220733Z-e6674d1e/
+    soak-report.json → decision=passed、checks 31/31 全 passed。
+  - 分数（本轮实跑）：`go run ./cmd/omnilsp verify --min 90 --json` →
+    exit 0、passed=true、coreScore=98.45959595959597（逐位不变）、
+    x9=1（0.75→1.0 亲证）、post-x9=0.06666666666666667（DEF-BUDWIRE
+    入账后分母 29→30）、x5=0.9285714285714286、x7=1、x8=
+    0.6666666666666666；JSON 存 out/ledger-align-20261030/
+    verify-fast-20261030.json（out/ 不入 git）。
+  - X10 资格登记：规则源 = spec §7 裁决6（机械规则：「X10 解锁条件 =
+    X9-1 关账，registry Milestone 字段即规则，禁止绕过字段手工解锁」）；
+    X9-1 已关账 → **资格已到**。Milestone 字段无运行时闸（仅
+    docgen.go:82-86 投影后缀与 report.go:150-153 域分桶消费）。资格面
+    （grep 实测）：Milestone "X10" ×4（DEF-BUDWIRE registry.go:98、
+    DEF-REMOTEIDX :368、DEF-W7UPD :372、DEF-COMPACT :452）、
+    "post-X9" ×20（含 DEF-PLUGMOUNT :365-367，Reason 明言 plugin API
+    surface 为 X10 scope）；goal.md:5379-5388 X10 整档 OPTIONAL
+    （remote index service / remote semantic workers / distributed
+    indexing / multi-tenant hosted service / advanced cross-language
+    graph / DAP integration）。**登记口径：范围层级选择待用户拍板，
+    未立项**——无实现动作、不新增工作项。诚实边界：x9 域尚有
+    DEF-EDITORS（PARTIAL，Milestone x9，registry.go:425-427）在账，
+    X10 资格按裁决6 锚定 X9-1 关账、不依赖该条。
+  - watch 留观销案（三路静态结论，均为本轮读码逐行复核——静态读码，
+    未跑 `-race`，如实标注）：
+    ① 深度超限与短路交互干净：watch.go:199-201 深度超限 recordError +
+    SkipDir（被截子树到不了 :239-253 的短路复用），scanErr 非 nil 时
+    Scan 于 :325-330 在基线换图（:332-334）之前 return nil——失败趟
+    不产事件、不发布指纹图；:162-163 明言局部 walk 不作 diff 基线。
+    ② 短路复用无数据竞争：watch.go:239-253 只读复用 prev；prev 快照
+    p.mu 下读取（:170-172）、map 只替换不变异（:168-169 注释与
+    :332-334 换图点一致），扫描全程持 scanMu（:305-306、:314）。
+    ③ NTFS 粒度契约已反向钉住：stat_shortcircuit_test.go:26-59
+    TestWatcherSkipsRereadForUnchangedStatSignature 断言内容漂移但
+    (mtime,size) 复原基线 ⇒ 零事件（摘要复用、不重读），文件头
+    :16-20 记录契约切线与旧内容哈希钉的替换（0863010 落地；
+    :64-85 补 mtime 移动的正向半边）。处置：留观销案，复发再启。
+- 门禁（诚实归因）：本轮 docs-only、零 Go 改动；档案员提交前实跑
+  `go build ./...` → 通过（包级门禁，第十六轮 docs-only 先例口径）。
+  任务书账面给定的源侧门禁清单——`go vet ./...`、`go test ./... -count=1
+  -timeout 90m`、`verify --min 90`、`go test ./test/conformance/
+  -count=1 -run TestConformanceNoRegression`、`verify --full`、
+  `go test ./... -race -count=1 -timeout 90m`——任务书标注全部 ✔ 已实跑
+  核验，本轮档案员未复跑全量，按账面登记、不冒领。
+- 提交：`git add docs/audit-longterm-spec.md docs/acceptance.md` 后一笔
+  提交（默认身份），不 push。
+
