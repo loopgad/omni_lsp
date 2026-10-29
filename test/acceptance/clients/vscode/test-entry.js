@@ -114,6 +114,49 @@ async function waitUntil(predicate, timeoutMs, description) {
   throw new Error(`timed out waiting for ${description}`);
 }
 
+/* guard:contentModified begin */
+// ContentModified (-32801) is the LSP-standard "semantic inputs changed while
+// you computed; retry with fresher inputs" answer, and real editors never fail
+// a feature on it: vscode-languageclient's handleFailedRequest folds -32801
+// into the default value (editors/vscode/node_modules/vscode-languageclient/
+// lib/common/client.js) so the editor simply re-issues the request. OmniLSP
+// additionally relays the nested rust-analyzer content-modified refusal as
+// InternalError -32603 with a "<name>: content modified" message because the
+// child connection drops the child's error kind
+// (internal/languages/nested/nested.go SendRequest), so the predicate matches
+// the message too. The X8-2 rust cells failed exactly on this: hover issued
+// inside the rust-analyzer warmup window got ContentModified and the driver
+// treated the empty/error result as a hard failure. Typed refusals (-32803,
+// SEM-SAFE-001) and other errors stay fatal.
+function isContentModifiedError(error) {
+  if (error && typeof error === "object" && (error.code === -32801 || error.code === "-32801")) return true;
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return message.includes("content modified");
+}
+
+// retryOnContentModified mirrors the real-editor contract for one-shot
+// semantic commands: a content-modified error is retried a bounded number of
+// times with a short gap while every other error, and the error from the
+// final attempt, propagate unchanged. Retry counts are recorded on the case
+// row so the evidence shows how often the warmup race was hit.
+async function retryOnContentModified(row, stage, action, attempts = 5) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await action();
+    } catch (error) {
+      if (attempt >= attempts || !isContentModifiedError(error)) throw error;
+      row.observed = row.observed || {};
+      row.observed.content_modified_retries = (row.observed.content_modified_retries || 0) + 1;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+}
+
+function semanticCommand(row, stage, command, ...args) {
+  return retryOnContentModified(row, stage, () => commandStep(row, stage, command, ...args));
+}
+/* guard:contentModified end */
+
 function missingTools(testCase) {
   let status = {};
   if (process.env.OMNILSP_CLIENT_TOOL_STATUS) {
@@ -144,9 +187,16 @@ async function waitForHover(document, position, symbol, timeoutMs = 45000) {
   const deadline = Date.now() + timeoutMs;
   let last = [];
   while (Date.now() < deadline) {
-    last = await vscode.commands.executeCommand(
-      "vscode.executeHoverProvider", document.uri, position
-    ) || [];
+    try {
+      last = await vscode.commands.executeCommand(
+        "vscode.executeHoverProvider", document.uri, position
+      ) || [];
+    } catch (error) {
+      // A ContentModified hover refusal mirrors VS Code's own behavior: the
+      // editor folds it into an empty result and re-issues the request.
+      if (!isContentModifiedError(error)) throw error;
+      last = [];
+    }
     if (hoverContainsSymbol(last, symbol)) return last;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -356,7 +406,8 @@ async function runCase(testCase, extension) {
       await commandStep(row, "post-edit hover evidence baseline", "omnilsp.explain"),
       document.uri.toString(), "textDocument/hover"
     );
-    const afterHover = await commandStep(row, "hover after edit", "vscode.executeHoverProvider", document.uri, definitionPosition);
+    const afterHover = await runStep(row, "hover after edit", () =>
+      waitForHover(document, definitionPosition, testCase.symbol));
     if (!hoverContainsSymbol(afterHover, testCase.symbol)) {
       throw new Error(`hover did not describe ${testCase.symbol} after document synchronization`);
     }
@@ -368,7 +419,7 @@ async function runCase(testCase, extension) {
     }
 
     const definitionCursor = evidenceCursor(afterExplain, document.uri.toString(), "textDocument/definition");
-    const definitions = await commandStep(row, "definition", "vscode.executeDefinitionProvider", document.uri, usePosition);
+    const definitions = await semanticCommand(row, "definition", "vscode.executeDefinitionProvider", document.uri, usePosition);
     if (!Array.isArray(definitions) || !definitions.some((location) => locationAt(location, document.uri, definitionPosition))) {
       throw new Error(`definition provider returned no location for ${testCase.symbol}`);
     }
@@ -376,12 +427,12 @@ async function runCase(testCase, extension) {
     assertMethodEvidence(definitionExplain, document.uri.toString(), "textDocument/definition", testCase.backendLanguage, definitionCursor);
 
     const completionPosition = findPosition(originalText, testCase.symbol, 2, 5);
-    const completions = completionItems(await commandStep(row, "completion", "vscode.executeCompletionItemProvider", document.uri, completionPosition));
+    const completions = completionItems(await semanticCommand(row, "completion", "vscode.executeCompletionItemProvider", document.uri, completionPosition));
     if (!completions.some((item) => String(item.label || item.insertText || "").includes(testCase.symbol))) {
       throw new Error(`completion did not offer ${testCase.symbol}`);
     }
     const referencesCursor = evidenceCursor(definitionExplain, document.uri.toString(), "textDocument/references");
-    const references = await commandStep(row, "references", "vscode.executeReferenceProvider", document.uri, usePosition);
+    const references = await semanticCommand(row, "references", "vscode.executeReferenceProvider", document.uri, usePosition);
     if (!Array.isArray(references) || references.length < 2 ||
       !references.some((location) => locationAt(location, document.uri, definitionPosition)) ||
       !references.some((location) => locationAt(location, document.uri, usePosition))) {
@@ -396,7 +447,7 @@ async function runCase(testCase, extension) {
     const diskSourceBeforeRename = fs.readFileSync(filePath);
     const renameCursor = evidenceCursor(referencesExplain, document.uri.toString(), "textDocument/rename");
     try {
-      const proposed = await commandStep(row, "unsafe rename", "vscode.executeDocumentRenameProvider", document.uri, definitionPosition, collisionName);
+      const proposed = await semanticCommand(row, "unsafe rename", "vscode.executeDocumentRenameProvider", document.uri, definitionPosition, collisionName);
       if (proposed instanceof vscode.WorkspaceEdit && hasWorkspaceEdits(proposed)) {
         throw new Error(`unsafe rename returned edits for colliding name ${collisionName}`);
       }

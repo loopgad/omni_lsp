@@ -901,6 +901,173 @@ assert(factory("untitled:Untitled-1") == "untitled:Untitled-1", "non-file URIs m
 	})
 }
 
+// TestDriverContentModifiedRetryGuard pins the harness-side ContentModified
+// contract for the VS Code and Neovim drivers. The X8-2 matrix lost its rust
+// cells non-deterministically because hover issued inside the rust-analyzer
+// warmup window received ContentModified and the drivers treated it as a hard
+// failure, while real editors swallow ContentModified and re-issue the
+// request (vscode-languageclient handleFailedRequest folds -32801 into the
+// default value; a human re-issues hover by moving the cursor). OmniLSP also
+// relays the nested rust-analyzer content-modified refusal as InternalError
+// -32603 "…: content modified" because the child connection drops the child's
+// error kind (internal/languages/nested/nested.go SendRequest), so the
+// predicate must recognize the message shape too. The guard slices the
+// guard-marked block out of each driver source and exercises the predicate
+// plus the bounded retry behavior against the locked node/Neovim binaries,
+// so the editors themselves are never launched.
+func TestDriverContentModifiedRetryGuard(t *testing.T) {
+	root := repoRoot(t)
+	lock, err := readToolLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("vscode", func(t *testing.T) {
+		node, err := verifyLockedBinary(lock, "node")
+		if err != nil {
+			t.Fatalf("locked node is unavailable: %v", err)
+		}
+		const script = `
+const fs = require("fs");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const begin = source.indexOf("/* guard:contentModified begin */");
+const end = source.indexOf("/* guard:contentModified end */");
+if (begin < 0 || end < 0 || end < begin) throw new Error("contentModified guard block missing from test-entry.js");
+eval(source.slice(begin, end));
+const contentModified = { code: -32801, message: "[content_modified] semantic.memo: semantic inputs changed during the request (non-recoverable)" };
+const relayed = { code: -32603, message: "rust-analyzer: content modified" };
+const messageOnly = new Error("rust-analyzer: content modified");
+const renameRefusal = { code: -32803, message: "rename refused: target collides (SEM-SAFE-001)" };
+const plainInternal = { code: -32603, message: "invalid hover params: unexpected token" };
+for (const [got, want, label] of [
+  [isContentModifiedError(contentModified), true, "-32801 must be recognized"],
+  [isContentModifiedError(relayed), true, "-32603 relayed child content-modified must be recognized"],
+  [isContentModifiedError(messageOnly), true, "message-only content-modified must be recognized"],
+  [isContentModifiedError(renameRefusal), false, "typed -32803 refusal must stay fatal"],
+  [isContentModifiedError(plainInternal), false, "internal error without a content-modified message must stay fatal"],
+  [isContentModifiedError(null), false, "null must stay fatal"],
+  [isContentModifiedError(undefined), false, "undefined must stay fatal"],
+]) {
+  if (got !== want) throw new Error(label);
+}
+(async () => {
+  let attempts = 0;
+  const row = {};
+  const result = await retryOnContentModified(row, "probe", async () => {
+    attempts += 1;
+    if (attempts < 3) throw contentModified;
+    return "ok";
+  }, 5);
+  if (result !== "ok") throw new Error("retry did not return the eventual result");
+  if (attempts !== 3) throw new Error("content-modified attempts must be retried until success, got " + attempts);
+  if (!row.observed || row.observed.content_modified_retries !== 2) throw new Error("retry accounting mismatch: " + JSON.stringify(row.observed || row));
+  let fatalAttempts = 0;
+  try {
+    await retryOnContentModified({}, "probe", async () => {
+      fatalAttempts += 1;
+      throw renameRefusal;
+    }, 5);
+    throw new Error("typed refusal must propagate");
+  } catch (error) {
+    if (error !== renameRefusal || fatalAttempts !== 1) throw new Error("fatal error must propagate on the first attempt");
+  }
+  let bounded = 0;
+  try {
+    await retryOnContentModified({}, "probe", async () => {
+      bounded += 1;
+      throw contentModified;
+    }, 3);
+    throw new Error("persistent content-modified must exhaust the bound");
+  } catch (error) {
+    if (error !== contentModified || bounded !== 3) throw new Error("retry bound must cap attempts at the configured limit, got " + bounded);
+  }
+})().then(() => process.exit(0), (error) => { console.error(error && error.stack ? error.stack : error); process.exit(1); });
+`
+		output, err := exec.Command(node, "-e", script, filepath.Join(root, "test", "acceptance", "clients", "vscode", "test-entry.js")).CombinedOutput()
+		if err != nil {
+			t.Fatalf("vscode content-modified guard probe failed: %v: %s", err, strings.TrimSpace(string(output)))
+		}
+	})
+
+	t.Run("neovim", func(t *testing.T) {
+		nvim, err := verifyLockedBinary(lock, "neovim")
+		if err != nil {
+			t.Fatalf("locked Neovim is unavailable: %v", err)
+		}
+		probe := filepath.Join(t.TempDir(), "content_modified_probe.lua")
+		const script = `
+local source_path = vim.env.OMNILSP_PROBE_RUN_LUA
+local file = assert(io.open(source_path, "r"))
+local source = file:read("*a")
+file:close()
+local begin = source:find("-- guard:content_modified begin", 1, true)
+local marker = "-- guard:content_modified end"
+local finish = source:find(marker, 1, true)
+assert(begin and finish and finish > begin, "content_modified guard block missing from run.lua")
+local block = source:sub(begin, finish + #marker)
+local loader = loadstring or load
+local exported = assert(loader(block ..
+  "\nreturn { is_content_modified = is_content_modified, retrying_request = request_sync_retrying_content_modified }"))()
+local is_content_modified = exported.is_content_modified
+local retrying_request = exported.retrying_request
+
+local function expect(got, want, label)
+  assert(got == want, label .. " (got " .. tostring(got) .. ", want " .. tostring(want) .. ")")
+end
+
+expect(is_content_modified({ code = -32801, message = "[content_modified] semantic.memo: semantic inputs changed during the request (non-recoverable)" }), true, "-32801 must be recognized")
+expect(is_content_modified({ code = -32603, message = "rust-analyzer: content modified" }), true, "-32603 relayed child content-modified must be recognized")
+expect(is_content_modified({ code = -32803, message = "rename refused: target collides (SEM-SAFE-001)" }), false, "typed -32803 refusal must stay fatal")
+expect(is_content_modified({ code = -32603, message = "invalid hover params" }), false, "internal error without a content-modified message must stay fatal")
+expect(is_content_modified(nil), false, "nil must stay fatal")
+
+local function fake_client(responses, counter)
+  counter.count = 0
+  return {
+    request_sync = function(_, method, params, timeout, buf)
+      counter.count = counter.count + 1
+      return responses[counter.count]
+    end,
+  }
+end
+
+local counter = {}
+local client = fake_client({
+  { err = { code = -32801, message = "[content_modified] semantic.memo" } },
+  { err = { code = -32603, message = "rust-analyzer: content modified" } },
+  { result = { contents = { value = "fn SoakTarget" } } },
+}, counter)
+local response = retrying_request(client, "textDocument/hover", {}, 30000, 0, 5)
+expect(counter.count, 3, "content-modified attempts must be retried until success")
+expect(response ~= nil and response.err == nil, true, "the eventual success must be returned")
+
+local fatal = { err = { code = -32803, message = "rename refused" } }
+counter = {}
+local fatal_response = retrying_request(fake_client({ fatal }, counter), "textDocument/rename", {}, 30000, 0, 5)
+expect(counter.count, 1, "typed refusals must propagate on the first attempt")
+expect(fatal_response == fatal, true, "the fatal response must be returned untouched")
+
+counter = {}
+local persistent = {}
+for _ = 1, 5 do table.insert(persistent, { err = { code = -32801, message = "content modified" } }) end
+local bounded_response = retrying_request(fake_client(persistent, counter), "textDocument/hover", {}, 30000, 0, 5)
+expect(counter.count, 5, "the attempt bound must cap retries")
+expect(bounded_response ~= nil and bounded_response.err ~= nil, true, "the final content-modified response must be returned")
+`
+		if err := os.WriteFile(probe, []byte(script), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(nvim, "--headless", "-l", probe)
+		command.Env = mergeEnv(os.Environ(), map[string]string{
+			"OMNILSP_PROBE_RUN_LUA": filepath.Join(root, "test", "acceptance", "clients", "neovim", "run.lua"),
+		})
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("neovim content-modified guard probe failed: %v: %s", err, strings.TrimSpace(string(output)))
+		}
+	})
+}
+
 func TestReadClientOutputCapsDiagnostics(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client-output.log")
 	payload := bytes.Repeat([]byte("x"), maxClientOutputBytes+1024)

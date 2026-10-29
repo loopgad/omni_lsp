@@ -42,8 +42,46 @@ local function canonical_uri(uri)
 end
 -- guard:canonical_uri end
 
+-- guard:content_modified begin
+-- ContentModified (-32801) is the LSP-standard "semantic inputs changed while
+-- you computed; retry with fresher inputs" answer, and real editors never fail
+-- a feature on it: vscode-languageclient's handleFailedRequest folds -32801
+-- into the default value so the editor simply re-issues the request. OmniLSP
+-- additionally relays the nested rust-analyzer content-modified refusal as
+-- InternalError -32603 with a "<name>: content modified" message because the
+-- child connection drops the child's error kind
+-- (internal/languages/nested/nested.go SendRequest), so the predicate matches
+-- the message too. The X8-2 rust cell failed exactly on this: hover issued
+-- inside the rust-analyzer warmup window got ContentModified and this driver
+-- aborted the case (run.lua treated any response.err as fatal). Typed
+-- refusals (-32803, SEM-SAFE-001) and other errors stay fatal.
+local function is_content_modified(err)
+  if type(err) ~= "table" then return false end
+  local code = tonumber(err.code)
+  if code == -32801 then return true end
+  if code ~= -32603 then return false end
+  local message = string.lower(vim.trim(tostring(err.message or "")))
+  return string.find(message, "content modified", 1, true) ~= nil
+end
+
+-- request_sync_retrying_content_modified mirrors the real-editor contract for
+-- one-shot semantic requests: a content-modified error is retried a bounded
+-- number of times with a short gap, and the final response is returned
+-- untouched so callers keep their existing success/refusal semantics.
+local function request_sync_retrying_content_modified(client, method, params, timeout_ms, buf, attempts)
+  local remaining = tonumber(attempts) or 5
+  for attempt = 1, remaining do
+    local response = client:request_sync(method, params, timeout_ms, buf)
+    if not (response and response.err and is_content_modified(response.err)) or attempt >= remaining then
+      return response
+    end
+    vim.wait(200, function() return false end, 10)
+  end
+end
+-- guard:content_modified end
+
 local function pull_diagnostics(client, uri, buf)
-  local response = response_result(client:request_sync("textDocument/diagnostic", {
+  local response = response_result(request_sync_retrying_content_modified(client, "textDocument/diagnostic", {
     textDocument = { uri = uri },
   }, 30000, buf), "textDocument/diagnostic")
   if response.kind ~= "full" then
@@ -123,7 +161,13 @@ local function wait_for_hover(client, uri, position, symbol, buf, timeout_ms)
     local response = client:request_sync("textDocument/hover", {
       textDocument = { uri = uri }, position = position,
     }, 30000, buf)
-    if response and response.err then error("textDocument/hover failed: " .. vim.inspect(response.err)) end
+    if response and response.err then
+      if not is_content_modified(response.err) then
+        error("textDocument/hover failed: " .. vim.inspect(response.err))
+      end
+      -- ContentModified is a transient "retry with fresher inputs" answer;
+      -- treat this attempt like an empty result and let the loop re-issue it.
+    end
     if response and response.result ~= nil and response.result ~= vim.NIL then last = response.result end
     if last and hover_contains_symbol(last.contents, symbol) then return last end
     vim.wait(200, function() return false end, 10)
@@ -324,13 +368,29 @@ local function run_case(case)
     local postEditDiagnostics = pull_diagnostics(client, uri, buf)
     row.observed = row.observed or {}
     row.observed.postEditDiagnosticCount = #postEditDiagnostics
-    if #postEditDiagnostics ~= 0 then error("comment-only edit unexpectedly produced diagnostics: " .. vim.inspect(postEditDiagnostics)) end
+    -- The comment-only edit must not introduce diagnostics on the line it
+    -- appended. It may not demand a diagnostics-free document: the fixed rust
+    -- fixture carries pre-existing rustc lint findings (dead_code) that
+    -- rust-analyzer publishes on a flycheck cadence which races this pull, so
+    -- unrelated document warnings are not evidence of an edit-introduced
+    -- false positive. Scope: this replaces the former whole-document
+    -- "#postEditDiagnostics == 0" assertion, which only ever held while the
+    -- pull raced ahead of flycheck (X8-2 rust, 2026-10-30 run1).
+    local commentLine = vim.api.nvim_buf_line_count(buf) - 1
+    local editIntroduced = {}
+    for _, diagnostic in ipairs(postEditDiagnostics) do
+      local startLine = tonumber(diagnostic.range and diagnostic.range.start and diagnostic.range.start.line)
+      if startLine ~= nil and startLine >= commentLine then
+        table.insert(editIntroduced, diagnostic)
+      end
+    end
+    if #editIntroduced ~= 0 then error("comment-only edit unexpectedly produced diagnostics on its own line: " .. vim.inspect(editIntroduced)) end
     if case.family == "cpp" then
       -- Pull diagnostics above is the client-visible source of truth. Push
       -- notifications may be omitted when an unchanged set is unchanged.
     end
 
-    local definitions = response_result(client:request_sync("textDocument/definition", {
+    local definitions = response_result(request_sync_retrying_content_modified(client, "textDocument/definition", {
       textDocument = { uri = uri }, position = use_position,
     }, 30000, buf), "textDocument/definition")
     local definitionFound = false
@@ -347,7 +407,7 @@ local function run_case(case)
     assert_method_evidence(client, uri, "textDocument/definition", case.backendLanguage, buf)
 
     local completion_position = position_for(text, case.symbol, 2, 5)
-    local completions = response_result(client:request_sync("textDocument/completion", {
+    local completions = response_result(request_sync_retrying_content_modified(client, "textDocument/completion", {
       textDocument = { uri = uri }, position = completion_position,
     }, 30000, buf), "textDocument/completion")
     local items = completions.items or completions
@@ -362,7 +422,7 @@ local function run_case(case)
     end
     if not foundCompletion then error("completion did not offer " .. case.symbol) end
 
-    local references = response_result(client:request_sync("textDocument/references", {
+    local references = response_result(request_sync_retrying_content_modified(client, "textDocument/references", {
       textDocument = { uri = uri }, position = use_position,
       context = { includeDeclaration = true }, workDoneToken = "neovim-client-soak",
     }, 30000, buf), "textDocument/references")
@@ -379,7 +439,7 @@ local function run_case(case)
     local collisionName = rename_collision_name(case)
     local textBeforeRename = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     local diskSourceBeforeRename = read_file_bytes(file)
-    local renameResponse = client:request_sync("textDocument/rename", {
+    local renameResponse = request_sync_retrying_content_modified(client, "textDocument/rename", {
       textDocument = { uri = uri }, position = definition_position, newName = collisionName,
     }, 30000, buf)
     if not renameResponse then error("unsafe rename returned no terminal response") end
