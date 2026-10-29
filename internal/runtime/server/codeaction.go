@@ -96,7 +96,7 @@ type quickfix struct {
 // to an explanation-only action (never a fake one-click repair).
 func quickfixFor(it languages.Diagnostic) *quickfix {
 	switch it.Code {
-	case "unused-import", "imported-and-not-used":
+	case "unused-import":
 		// Removing the content of a line that carries only the offending
 		// import is safe: go/types already proved the import unused. The line
 		// terminator stays, so applying the edit leaves a blank line. The edit
