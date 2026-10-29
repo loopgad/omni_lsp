@@ -231,10 +231,40 @@ func writeFrame(w io.Writer, payload []byte) error {
 // 让宿主按声明值无界分配内存（N14 防御纵深，覆盖 manifest 信任链之外的运行期）。
 const maxPluginFrameSize = 4 << 20 // 4 MiB
 
+// maxHeaderLineBytes 是帧头块单行的硬上限：头行扫描逐行缓冲，敌意/损坏插件
+// 的无换行长流不允许在宿主内无界累积内存（N14 运行期防御——4MiB 单帧上限只
+// 约束 Content-Length 声明值，不约束头块扫描本身，见审计批 1 的 64MiB 堆增量
+// 探针）。8 KiB 足以容纳任何规范头（Content-Type 等附加头）；骨架行分隔负载
+// 一并限界——大负载必须走 Content-Length 分帧（上限 maxPluginFrameSize）。
+const maxHeaderLineBytes = 8 << 10 // 8 KiB
+
+// readHeaderLine 以硬上限读一行（含行尾换行）：bufio.ReadSlice 在缓冲区填满
+// 且无换行时返回 ErrBufferFull，逐段累积并在累计超限时拒绝——旧实现的
+// ReadString('\n') 对无换行流无界累积。EOF/管道损坏与旧实现同样上抛，由
+// readLoop 走致命错误路径唤醒全部等待者。
+func readHeaderLine(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(buf)+len(chunk) > maxHeaderLineBytes {
+			return "", fmt.Errorf("plugin: 帧头行超出 %d 字节上限", maxHeaderLineBytes)
+		}
+		buf = append(buf, chunk...)
+		switch err {
+		case nil:
+			return string(buf), nil
+		case bufio.ErrBufferFull:
+			continue
+		default:
+			return "", err
+		}
+	}
+}
+
 func readFrame(r *bufio.Reader) ([]byte, error) {
 	size := -1
 	for {
-		line, err := r.ReadString('\n')
+		line, err := readHeaderLine(r)
 		if err != nil {
 			return nil, err
 		}
@@ -245,16 +275,19 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 			}
 			continue // 帧间杂散空行（骨架路径兼容）
 		}
-		if size >= 0 {
-			return nil, fmt.Errorf("plugin: 帧头块中出现意外行 %q", trimmed)
-		}
 		name, value, isHeader := strings.Cut(trimmed, ":")
 		// 头名只可能由字母/连字符组成；JSON 负载行的首个冒号前必然带
 		// 引号或花括号，据此区分「头块」与骨架的行分隔负载。
 		if !isHeader || !isHeaderName(name) {
+			if size >= 0 {
+				return nil, fmt.Errorf("plugin: 帧头块中出现意外行 %q", trimmed)
+			}
 			return []byte(trimmed), nil
 		}
 		if strings.EqualFold(strings.TrimSpace(name), "content-length") {
+			if size >= 0 {
+				return nil, fmt.Errorf("plugin: 重复的 Content-Length 头")
+			}
 			var n int
 			if _, err := fmt.Sscanf(strings.TrimSpace(value), "%d", &n); err != nil {
 				return nil, fmt.Errorf("plugin: malformed Content-Length header: %w", err)
@@ -266,8 +299,13 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 				return nil, fmt.Errorf("plugin: Content-Length %d 超出单帧上限 %d", n, maxPluginFrameSize)
 			}
 			size = n
+			continue
 		}
-		// 其余头（如 Content-Type）按规范忽略。
+		// 其余头（如 Content-Type）按规范忽略——无论它出现在 Content-Length
+		// 之前还是之后。旧实现把 Content-Length 之后的任何非空行判为 fatal，
+		// 与自身的「附加头容忍」文档矛盾并击穿 LSP 常见的 Content-Length 在前
+		// 头序（审计批 1）；放开仅限附加头，重复 Content-Length 与非头形态行
+		// 仍按帧结构损坏拒绝。
 	}
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(r, buf); err != nil {
