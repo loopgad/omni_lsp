@@ -1016,3 +1016,79 @@ offset debt on file in `freeze-record.txt`):
 - 提交：`git add docs/audit-longterm-spec.md docs/acceptance.md` 后一笔
   提交（默认身份），不 push。
 
+
+## Evidence record — 2026-10-30 第十八轮记账（五车道证据评估：DEF-PLUGMOUNT 升 AUTO + 三条按证据维持）
+
+- 性质：第十八轮记账轮（记账员域）。对第十七轮后五条并发车道（插件切片
+  48a67f7、预算 daeb827、持久层 5d18d5b、七语言 d771735、协议归一 12fc966，
+  收束提交）的证据逐条实跑复核后，对四条 post-X9 台账条目作出 promote/维持
+  结论。改动仅记账员边界内文件：internal/conformance/registry.go、
+  docs/conformance.md（再生投影）、test/conformance/testdata/baseline.json
+  （本轮零 diff）、docs/acceptance.md（本节）。
+- 车道证据实跑复核（本 session 全部实跑，非转抄）：`go test ./internal/plugin/
+  -count=1` ok 2.366s；`go test ./internal/plugin/ -count=1 -race` ok 7.407s；
+  `go test ./internal/runtime/server/ -run 'TestPluginsMount_|TestEmit_'
+  -count=1 -v` 9 测全 PASS（含零值 no-op、信任链拒绝不 spawn、default deny、
+  真实子进程 e2e、崩溃遏制）；`go test ./internal/runtime/server/ -run
+  'TestF13_IndexBudgetLadder' -count=1 -v` 3 测全 PASS；`go test
+  ./internal/runtime/budget/ ./internal/runtime/scheduler/ -count=1` ok/ok；
+  `go test ./internal/index/persistent/ -run 'TestCompact_' -count=1 -v` 4 测
+  全 PASS；`go test ./internal/languages/ccls/ -run 'TestCclsBackend…' -count=1
+  -v` 2 测全 PASS（7.3s）；DEF-IDXWIRE 既有 Probe 三组与 nested 守卫均 ok。
+  代码面核实：能力门在 internal/runtime/server/server.go:537
+  （Grant.Check(plugin.CapDiagnosticsEmit)，default deny）；ladder 生产构造点
+  internal/runtime/server/index.go:192（env 选入、默认关）；`grep` 证实
+  budget.New 零生产调用者、Compact() 零非测试调用者。
+- promote（本轮唯一）：DEF-PLUGMOUNT（post-x9/PLUGIN，O2
+  capability-to-API mounting）DEFERRED→AUTO。判定链：原 Reason 所称「X10
+  scope 的 server 侧插件 API 面」已由 48a67f7 落地——装配链
+  Discover→Install→Enable→Launch 经 --plugins 选入，emit 挂载点被插件清单
+  声明能力门控（default deny 实证点 server.go:537），Text 条件成立。按体例
+  删 Reason 与 Milestone、补 Probe（internal/runtime/server：
+  TestPluginsMount_TrustChainFailureNeverSpawns、TestPluginsMount_ZeroValueIsNoOp、
+  TestEmit_DefaultDenyWithoutGrant、TestEmit_EndToEndWithDebounce，四测本轮
+  实跑绿）。提交 9d24c40（registry.go + docs/conformance.md +
+  baseline.json 三件套一体）。
+- 维持（本轮三条，如实登记）：
+  ① DEF-BUDWIRE 维持 DEFERRED——F13 半边已落地（NewBudgetManager 首个生产
+  构造点 index.go:192，env 选入默认关，reindex 双路径真实 CanAllocate 拒绝门），
+  但 F14 半边（后端缓冲区配额）未接线、budget.New 仍零生产调用者，Text 的
+  live server/backend 双半边要求不满足，仅更新 Reason；
+  ② DEF-COMPACT 维持 DEFERRED——结构半边已落地（compact.go 有界重分区、
+  语义格式逐位保持、透传门，TestCompact_ 四测绿），但 Text 的
+  background-triggered 半边缺位：Compact() 零非测试调用者、无任何服务端调度，
+  现在默认接线即违 X10 红线，仅更新 Reason；
+  ③ DEF-IDXWIRE 维持 PARTIAL——Probe 增补 ccls 组（两个真实 exporter 测试），
+  Reason 按七语言实况更新（go/rust/typescript/python 显式注册在案；cpp 真实
+  exporter 证据本轮补齐；cpp 与 c/javascript 别名键的显式注册被 X10
+  不去稳定红线三重阻止——显式 overlay 将翻转 dirty workspace/symbol 为
+  fail-closed，钉住测试
+  TestHandleWorkspaceSymbolsWithoutExplicitSemanticIndexKeepsLiveBackendWhenDirty
+  在 semantic_overlay_query_test.go:360）。三条随 12fc966/daeb827/5d18d5b/
+  d771735/48a67f7 证据一并提交 dca9671。其余 post-X9 条目零触碰
+  （registry diff 仅上述 4 条目）。
+- 分数核验（先预测后断言，TOL 1e-9）：编辑前实跑
+  `go run ./cmd/omnilsp verify -json`（out/verify-before.json）→ coreScore
+  98.45959595959597、post-x9 0.06666666666666667（加权 2.0/30 items）。
+  预测：PLUGMOUNT 为 post-x9/PLUGIN 类目唯一条目，0→1 后 post-x9 =
+  3.0/30 = 0.1，coreScore 不动。编辑后实跑（out/verify-plugmount.json）→
+  post-x9 = 0.1（与预测 delta 0.0）、coreScore 98.45959595959597（delta
+  0.0）、PLUGIN 类目 0→1；三条维持后再跑（out/verify-ledger.json）→
+  coreScore/post-x9 均零位移（INDEX 0.125、BUDGET 0 不动）。两次断言均在
+  TOL 1e-9 内通过；baseline.json 再生后逐字节零 diff（post-x9 为非 gated
+  延迟域，不入 core baseline，先例 6303aca 一致）。
+- 门禁（本轮实跑）：`go test ./test/conformance/ -count=1` ok 166.889s
+  （TestGenerateDocs + 全 AUTO 真探针）；红线门禁 `go test ./test/conformance/
+  -count=1 -run 'TestConformanceNoRegression' -v` → PASS 163.439s（含新
+  PLUGMOUNT Probe 真实执行）；`go run ./cmd/omnilsp verify --min 90` →
+  core 98.5%、floor 90.0% PASS、exit 0；`go build ./...` 通过；gofmt -l
+  internal/conformance/ 零输出；go vet ./internal/conformance/ 干净；
+  `go test ./internal/conformance/ -count=1` ok 3.448s。未 push、未
+  git add -A、未触碰 ACL 锁定区。
+- leftOpen（随台账保留，非本轮新增缺口）：① F14 后端缓冲区配额接线
+  （internal/languages、internal/plugin 越界）；② compaction 后台调度宿主
+  缺位（默认接线被 X10 阻止，待有调度归属的轮次）；③ cpp/c/javascript 显式
+  语义索引注册被 X10 红线阻止（待行为变更授权轮次）；④ DEF-IDXWIRE 剩余
+  开口（七语言 fact 完整性其余语言端到端、剩余 overlay、完整跨进程 replay）；
+  ⑤ DEFERRED 条目 Reason 不入 docs/conformance.md 投影（投影仅 PARTIAL 带
+  Reason），维护性更新以 registry.go 为准。
