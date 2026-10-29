@@ -79,6 +79,51 @@ func TestExit_BeforeShutdownIsNonCompliant(t *testing.T) {
 	}
 }
 
+// TestExit_HungPluginIsKilled pins the bounded-exit contract (audit batch 2,
+// §O4「Crash loops MUST be contained」): a plugin that receives plugin/exit but
+// never terminates must not hold the host's Manager in StateRunning forever —
+// Exit() waits at most exitGracePeriod, then kills the process. The Wait
+// goroutine then fires OnExit with a non-nil error, so RecordCrash still
+// counts the kill (crash accounting closes for the hung class too), and the
+// process lifecycle reaches its terminal state.
+func TestExit_HungPluginIsKilled(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "graceful-shutdown") // 记录 exit 但永不退出
+
+	old := exitGracePeriod
+	exitGracePeriod = 300 * time.Millisecond
+	t.Cleanup(func() { exitGracePeriod = old })
+
+	m := newValidManifest([]byte("x"))
+	m.Capabilities = []Capability{CapDiagnosticsEmit}
+	exits := make(chan error, 1)
+	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), func(err error) { exits <- err })
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() { _ = p.cmd.Process.Kill() })
+
+	if err := p.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	exitErr := p.Exit()
+	if exitErr == nil {
+		t.Fatal("挂死插件的 Exit 必须报告有界等待超时并强制终止，got nil")
+	}
+	select {
+	case werr := <-exits:
+		if werr == nil {
+			t.Fatal("强制终止后 OnExit 必须以非 nil 错误触发（RecordCrash 记账闭合），got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("kill 后 OnExit 未触发（进程未被收割）")
+	}
+	// 终态：强杀之后一切 Call 被拒。
+	if _, err := p.Call("probe/after-kill", nil); !errors.Is(err, ErrExited) {
+		t.Fatalf("err = %v, want ErrExited", err)
+	}
+}
+
 // TestShutdownExit_NormalLifecycle pins the full compliant lifecycle:
 // Shutdown() round-trips (the child records sawShutdown before it ever sees
 // plugin/exit), Exit() delivers plugin/exit, the child terminates cleanly

@@ -79,6 +79,9 @@ type Process struct {
 	pending    map[int]chan response
 	lifecycle  procLifecycle // shutdown/exit 三态（mu 保护）
 	onExitOnce sync.Once
+	// exited 在进程被收割（Wait 返回）时关闭，先于 OnExit 回调：Exit 的
+	// 有界等待不依赖回调时序，kill 竞速不持任何锁。
+	exited chan struct{}
 	// caps 是 manifest.capabilities 的快照（Launch 后不可变）：Call 级能力门
 	// 的「声明」半边——Launch 已保证声明 ⊆ 授予，故 Call 只需查声明表。
 	caps map[Capability]bool
@@ -178,6 +181,7 @@ func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 		caps:     make(map[Capability]bool, len(m.Capabilities)),
 		OnExit:   onExit,
 		notifyCh: make(chan pluginNotifyEvent, pluginNotifyBuffer),
+		exited:   make(chan struct{}),
 	}
 	for _, c := range m.Capabilities {
 		if c != "" { // 防御：空能力不进声明表（Validate 已拒，双保险）
@@ -209,6 +213,7 @@ func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 	go p.pumpNotifies()
 	go func() {
 		werr := cmd.Wait()
+		close(p.exited) // 先于 OnExit：Exit 的有界等待不依赖回调时序
 		p.onExitOnce.Do(func() {
 			if p.OnExit != nil {
 				p.OnExit(werr)
@@ -534,10 +539,20 @@ func (p *Process) Shutdown() error {
 	return nil
 }
 
+// exitGracePeriod 是 Exit() 发出 plugin/exit 通知后等待插件自行退出的上限；
+// 非常量——测试注入更短窗口（挂死插件的强制终止路径不能让守卫测试等 2s）。
+var exitGracePeriod = 2 * time.Second
+
 // Exit 是优雅停机的终点：发送 plugin/exit 通知，插件收到后自行退出
 // （干净退出经 OnExit 以 nil 上报）。按 LSP 语义 exit 之前必须先 shutdown——
 // lcActive 态直接 Exit 属于不合规退出，宿主拒绝迁移状态、不向管道写任何
 // 字节，返回 ErrNonCompliantExit。lcExited 态重复 Exit 返回 ErrExited。
+//
+// 有界等待（审计批 2）：通知落地后至多等 exitGracePeriod——收到 exit 却挂死
+// 的插件使 Wait goroutine 永不返回 → OnExit 永不触发 → RecordCrash 永不计入
+// → Manager 永久停留 Running，进程与 stdio 管道泄漏。超时即强制终止（kill），
+// Wait goroutine 随之以非 nil 错误触发 OnExit——§O4 崩溃记账对挂死类故障
+// 照常闭合；Exit 本身返回说明性错误（调用方可观测），终态语义不变。
 func (p *Process) Exit() error {
 	p.mu.Lock()
 	cur := p.lifecycle
@@ -555,7 +570,15 @@ func (p *Process) Exit() error {
 	if err := p.Notify("plugin/exit", nil); err != nil {
 		return fmt.Errorf("plugin: exit 通知: %w", err)
 	}
-	return nil
+	timer := time.NewTimer(exitGracePeriod)
+	defer timer.Stop()
+	select {
+	case <-p.exited:
+		return nil
+	case <-timer.C:
+		_ = p.cmd.Process.Kill() // 竞速败给进程自行死亡时 Kill 报错，忽略
+		return fmt.Errorf("plugin: exit 通知后 %v 内未退出，已强制终止", exitGracePeriod)
+	}
 }
 
 // Notify 是宿主→插件的广播通道：发送一条无 id 的 JSON-RPC 通知帧
