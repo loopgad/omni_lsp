@@ -40,6 +40,13 @@ type fileBuild struct {
 	budgetWalked    bool
 	budgetUsedBytes int64
 	budgetWalkErr   error
+
+	// budgetCreditBytes 是本 build 退役、将从预算口径中扣除的存量字节（审计
+	// 批 1，§L17 差额计费）。重写式 build（Compact）替换 pinned 代：其段文件
+	// 字节在 Commit 后由 pruneHistoryGeneration 释放，检查按「最终足迹」计费
+	// ——新段计入、被替换旧代扣除。零值 = 普通追加 build，检查与旧语义逐字节
+	// 一致（默认行为不变，X10 红线）。
+	budgetCreditBytes int64
 }
 
 type buildState uint8
@@ -144,7 +151,18 @@ func (b *fileBuild) WriteSegment(payload []byte) (SegmentID, error) {
 		// other budget refusal instead of filling the disk blindly.
 		return "", fmt.Errorf("%w: budget walk over %s failed: %w", ErrDiskBudgetExceeded, b.store.root, walkErr)
 	}
-	if used+staged+int64(len(payload))+int64(segHeaderSz)+16 > budget {
+	// Differential billing (§L17, audit batch 1): a rewrite build subtracts
+	// the bytes of the generation it retires from the live total, so the
+	// check bills the eventual footprint instead of the transient
+	// old+new coexistence window. Without the credit, compaction needs ≈2×
+	// the store's payload under budget and a near-capacity store can never
+	// compact. The credit never exceeds what the walk saw: clamp at zero for
+	// the corner where a credited file vanished under us (quarantine race).
+	live := used - b.budgetCreditBytes
+	if live < 0 {
+		live = 0
+	}
+	if live+staged+int64(len(payload))+int64(segHeaderSz)+16 > budget {
 		return "", ErrDiskBudgetExceeded
 	}
 	return b.writeSegmentUnchecked(payload)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // Structure-bounded compaction (registry DEF-COMPACT, goal.md §L16).
@@ -309,6 +310,24 @@ func (s *FileStore) Compact(ctx context.Context) error {
 	}
 	defer lease.Close()
 	view = lease.Snapshot()
+	// Differential budget billing (§L17, audit batch 1): this build rewrites
+	// and retires exactly the pinned generation — its segment files are freed
+	// by pruneHistoryGeneration once the commit lands. Crediting those bytes
+	// against the §L17 walk bills the eventual footprint (output ≤ input:
+	// re-partitioning only merges and compacts, verbatim rewrites are
+	// byte-identical), so a store near capacity can compact without holding
+	// ≈2× its payload under budget. Normal (append) builds keep the zero
+	// credit and the original check verbatim.
+	var budgetCreditBytes int64
+	for _, seg := range view.Segments {
+		budgetCreditBytes += seg.Len
+	}
+	fb, ok := build.(*fileBuild)
+	if !ok {
+		_ = build.Abort()
+		return fmt.Errorf("persistent: compact build session is %T, want *fileBuild", build)
+	}
+	fb.budgetCreditBytes = budgetCreditBytes
 	payloads := make([][]byte, 0, len(view.Segments))
 	for _, seg := range view.Segments {
 		payload, err := view.ReadSegment(seg.ID)

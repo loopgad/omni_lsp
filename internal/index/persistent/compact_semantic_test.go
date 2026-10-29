@@ -273,6 +273,51 @@ func TestCompact_StructuredSemanticGenerationRoundTripIsBitIdentical(t *testing.
 	}
 }
 
+// TestCompact_NearCapacityStoreWithinBudgetCompacts is the red→green guard for
+// differential budget billing (§L17, audit batch 1): a budget that covers the
+// CURRENT store (plus a sliver) must admit compaction. Compaction rewrites and
+// retires the pinned generation, so the budget check bills the eventual
+// footprint — the retired generation's segment bytes are subtracted from the
+// live total. The old check counted the outgoing generation in full, requiring
+// ≈2× the current payload under budget: a store near capacity could never
+// compact, and the old rollback pin masked this by retrying with an unlimited
+// budget.
+func TestCompact_NearCapacityStoreWithinBudgetCompacts(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := persistent.NewFileStore(root, persistent.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	genID := commitTypedGenerationWithExtraBatches(t, store, "BudgetRebound", []string{"ExtraSymA", "ExtraSymB", "ExtraSymC"})
+	before, err := store.OpenSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedBefore := captureGenerationBytes(t, before)
+
+	budget := dirLiveBytes(t, root) + 64
+	tight, err := persistent.NewFileStore(root, persistent.Config{DiskBudgetBytes: budget})
+	if err != nil {
+		t.Fatalf("open budgeted store: %v", err)
+	}
+	if err := tight.Compact(ctx); err != nil {
+		t.Fatalf("compact within a budget covering the current store: %v", err)
+	}
+	after, err := tight.OpenSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("open post-compact generation: %v", err)
+	}
+	if after.ID == genID {
+		t.Errorf("compaction published no new generation (still %d)", genID)
+	}
+	capturedAfter := captureGenerationBytes(t, after)
+	assertSameFacts(t, capturedBefore, capturedAfter)
+	if _, err := semantic.OpenReader(ctx, after); err != nil {
+		t.Errorf("semantic.OpenReader rejected the compacted generation: %v", err)
+	}
+}
+
 // TestCompact_MidCompactionFailureRollsBackAndKeepsQuarantineClean pins the
 // transaction semantics of structure-bounded compaction (TXN-002/L16): a
 // refusal at a mid-compaction checkpoint — after every source segment was
@@ -300,10 +345,19 @@ func TestCompact_MidCompactionFailureRollsBackAndKeepsQuarantineClean(t *testing
 		t.Fatalf("fixture precondition: quarantine holds %v", store.Quarantined())
 	}
 
-	// A budget that covers the current store but leaves no room for any new
-	// segment: the first compaction output write is refused (§L17 fail-closed)
-	// after the compactor already read and verified all source segments.
-	budget := dirLiveBytes(t, root) + 64
+	// A budget that covers the store minus the pinned generation's segment
+	// bytes (the bytes this rewrite retires and credits back — see
+	// TestCompact_NearCapacityStoreWithinBudgetCompacts) plus a sliver: the
+	// first compaction output write is still refused (§L17 fail-closed) after
+	// the compactor already read and verified all source segments. The old pin
+	// sized this budget as dirLiveBytes+64, which differential billing turned
+	// into a succeeding compaction, so the refusal scenario moved to this
+	// tighter budget; the rollback semantics it pins are unchanged.
+	var retired int64
+	for _, seg := range before.Segments {
+		retired += seg.Len
+	}
+	budget := dirLiveBytes(t, root) - retired + 64
 	tight, err := persistent.NewFileStore(root, persistent.Config{DiskBudgetBytes: budget})
 	if err != nil {
 		t.Fatalf("open budgeted store: %v", err)
@@ -341,9 +395,12 @@ func TestCompact_MidCompactionFailureRollsBackAndKeepsQuarantineClean(t *testing
 		t.Errorf("semantic.OpenReader rejected the original generation after a failed compaction: %v", err)
 	}
 
-	// Retry with an adequate budget: the same store content compacts, and the
-	// post-compact roundtrip is bit-identical to the pre-failure generation.
-	retry, err := persistent.NewFileStore(root, persistent.Config{})
+	// Retry with a raised but REAL budget — never the unlimited Config{} the
+	// old pin used, which masked the billing gap: the same store content
+	// compacts, and the post-compact roundtrip is bit-identical to the
+	// pre-failure generation. Under differential billing this budget covers
+	// the store without any 2× headroom.
+	retry, err := persistent.NewFileStore(root, persistent.Config{DiskBudgetBytes: dirLiveBytes(t, root) + 64})
 	if err != nil {
 		t.Fatalf("open retry store: %v", err)
 	}
