@@ -172,12 +172,26 @@ type Server struct {
 	// （索引初始化失败）时插件保持待命、绝不启动（fail-closed）。
 	pluginPending []pluginPendingLaunch
 	pluginOnce    sync.Once // ClosePlugins 幂等
+	// pluginClosing 是关闭置位标志（pluginMu 保护，复证圈 1 审计发现 5）：
+	// closePlugins 先于快照置位——launchReadyPlugins 在置位后丢弃 pending、
+	// 把已 Launch 的结果按「已关闭」处理（kill + Disable 不入表），否则
+	// Launch 与 closePlugins 交错时该进程不会被任何路径 shutdown/exit，
+	// 进程与管道泄漏到宿主退出。
+	pluginClosing bool
 
 	// plugin counters (§P3 低基数可观测性：拒绝与丢弃可见，不静默)。
 	pluginNotifies     atomic.Int64 // 收到的插件通知总数
 	pluginUnknown      atomic.Int64 // 非 diagnostics/emit 的通知数（暂存车道外）
-	pluginEmitRejected atomic.Int64 // 能力门/解析门拒绝的 emit 数（default deny 实证）
+	pluginEmitRejected atomic.Int64 // 能力门/解析门拒绝的 emit 数 + 关闭文档的迟到 emit 丢弃数（default deny 实证）
 }
+
+// indexLadderRefreshTimeout 是 refreshBudgetLadder 对无 deadline ctx 的有界
+// 包裹窗口（复证圈 1 审计发现 9）：initialize 握手路径上的 F13 刷新以
+// context.Background() 打开快照 lease，writer.lock 被另一进程占用时 10ms
+// 轮询仅响应 ctx.Done()——无 deadline 即无限等待，错误路径设计为 fail-open
+// 却没有防「不返回」。声明在 server.go（index.go 的新顶层声明触发 protocol
+// manifest 重生成）。非常量——测试注入更短窗口。
+var indexLadderRefreshTimeout = 5 * time.Second
 
 // wantsDocumentChanges reports whether the client negotiated the version-aware
 // documentChanges WorkspaceEdit form (§C9).
@@ -484,12 +498,20 @@ func (s *Server) launchReadyPlugins() {
 	pending := s.pluginPending
 	s.pluginPending = nil
 	mgr := s.pluginMgr
+	closing := s.pluginClosing // 复证圈 1 审计发现 5：关闭置位后不再起飞
 	s.pluginMu.Unlock()
 	if mgr == nil || len(pending) == 0 {
 		return
 	}
 	for _, e := range pending {
 		id := e.discovery.Manifest.ID
+		if closing {
+			// 关闭置位后 pending 直接 Disable 丢弃，不 Launch（复证圈 1
+			// 审计发现 5：ClosePlugins 置位后的起飞尝试按已关闭处理）。
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 丢弃（服务器关闭中）\n", id)
+			_ = mgr.Disable(id)
+			continue
+		}
 		proc, err := plugin.Launch(context.Background(), e.discovery.Dir, e.discovery.Manifest, e.grant, func(werr error) {
 			s.pluginOnExit(id, werr)
 		}, func() error {
@@ -511,6 +533,19 @@ func (s *Server) launchReadyPlugins() {
 			s.onPluginNotify(pluginID, method, params)
 		})
 		s.pluginMu.Lock()
+		if s.pluginClosing {
+			// 复证圈 1 审计发现 5：Launch 与 ClosePlugins 交错——Launch 期间
+			// 关闭已置位，快照错过该进程（旧实现此刻才入表，进程永不被
+			// shutdown/exit，泄漏到宿主退出）。已 Launch 的结果按已关闭处理：
+			// kill + Disable，不入表。
+			s.pluginMu.Unlock()
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 完成于关闭之后，按已关闭拆除\n", id)
+			if kerr := proc.Kill(); kerr != nil {
+				fmt.Fprintf(os.Stderr, "omnilsp: plugin %s kill: %v\n", id, kerr)
+			}
+			_ = mgr.Disable(id)
+			continue
+		}
 		s.pluginGrants[id] = e.grant
 		s.pluginProcs[id] = proc
 		s.pluginMu.Unlock()
@@ -571,20 +606,31 @@ func (s *Server) pluginOnExit(id string, err error) {
 }
 
 // ClosePlugins 优雅关闭全部插件进程（Run 收尾与宿主退出路径共用）：按 LSP
-// 语义 shutdown → exit。已死进程的 Shutdown 失败直接跳过（Exit 对 lcActive
-// 会拒绝发送，不合规退出拦截照常生效）。幂等。
+// 语义 shutdown → exit。Shutdown 失败（进程已死，或存活但挂起应答）不再只
+// 跳过——统一补一次有界 kill（复证圈 1 审计发现 7），有界拆除覆盖全部退出
+// 路径。幂等。
 func (s *Server) ClosePlugins() {
 	s.pluginOnce.Do(s.closePlugins)
 }
 
 func (s *Server) closePlugins() {
 	s.pluginMu.Lock()
+	s.pluginClosing = true // 复证圈 1 审计发现 5：先置位再快照，堵住 Launch 交错窗口
 	procs := s.pluginProcs
 	s.pluginProcs = make(map[string]*plugin.Process)
 	s.pluginMu.Unlock()
 	for id, p := range procs {
 		if err := p.Shutdown(); err != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s shutdown: %v\n", id, err)
+			// 复证圈 1 审计发现 7：Shutdown 失败的旧实现只 continue——而 Exit
+			// 是唯一带 kill 的路径，于是「存活但挂起应答」（Call 超时，而非
+			// 进程已死）的插件永不终止、OnExit/RecordCrash 不闭合，进程与两根
+			// stdio 管道泄漏为孤儿（这正是 32f5afd 为 Exit 腿修掉的同级故障
+			// 在 Shutdown 腿重开）。统一补一次有界 kill：已死进程上 kill 是
+			// 无害 no-op，存活挂起的进程被强制终止并经 Wait→OnExit 收割。
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s shutdown: %v（有界拆除：强制终止）\n", id, err)
+			if kerr := p.Kill(); kerr != nil {
+				fmt.Fprintf(os.Stderr, "omnilsp: plugin %s kill: %v\n", id, kerr)
+			}
 			continue
 		}
 		if err := p.Exit(); err != nil {

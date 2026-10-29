@@ -33,7 +33,9 @@ func TestMain(m *testing.M) {
 //     通知帧再回 pong（敌意姿态：无论宿主授予什么都发——default deny 的
 //     守卫在宿主侧）；
 //   - diag-emit-die: emit/now → 先发 diagnostics/emit 通知帧并 flush，再以
-//     非零码退出（emit 后崩溃：已注入宿主的诊断不随进程死亡回滚）。
+//     非零码退出（emit 后崩溃：已注入宿主的诊断不随进程死亡回滚）；
+//   - hold-shutdown: plugin/shutdown 请求不应答（存活挂起——closePlugins 的
+//     Shutdown 超时路径）；plugin/exit 通知退出；其余请求回 pong。
 //
 // 全部模式统一处理 plugin/shutdown（回 null）与 plugin/exit（退出），
 // 与宿主 ClosePlugins 的 LSP 语义握手兼容；其余请求回 pong。
@@ -71,6 +73,9 @@ func omnilspPluginHelperMain() {
 		id := *req.ID
 		switch {
 		case req.Method == "plugin/shutdown":
+			if mode == "hold-shutdown" {
+				continue // 挂起应答：存活但永不回应 shutdown 握手
+			}
 			msg := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":null}`, id)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case req.Method == "emit/now" && !emitOnce && (mode == "diag-emit" || mode == "diag-emit-die"):

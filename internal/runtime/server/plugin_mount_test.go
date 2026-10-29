@@ -12,6 +12,7 @@ import (
 
 	"github.com/omnilsp/omni/internal/plugin"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
+	"github.com/omnilsp/omni/internal/workspace/vfs"
 )
 
 // §O0-O5 落差1+3 守卫与端到端测试（DEF-PLUGMOUNT 最小垂直切片）：
@@ -264,6 +265,11 @@ func TestEmit_EndToEndWithDebounce(t *testing.T) {
 	s.InitializeWorkspace(t.TempDir()) // 审计批 2：策略就绪后才 Launch
 	rt := attachRecordingTransport(t, s)
 
+	// 复证圈 1 发现 1 的语义切割：插件 emit 车道与 compute 车道对齐关闭契约
+	// 后，emit 的目标文档必须处于打开态——旧的「对从未 didOpen 的 uri emit
+	// 并期望推送」是无守卫时代的钉法，随守卫落地一并替换。
+	s.vfs.Open("file:///p/main.go", "go", 1, []byte("package main"), vfs.SourceEditor)
+
 	proc := mountedProc(t, s, "diag-e2e")
 	if proc == nil {
 		t.Fatal("diagnostics.emit 插件应正常装配运行")
@@ -319,6 +325,10 @@ func TestEmit_CrashDuringEmitContained(t *testing.T) {
 	defer s.ClosePlugins()
 	s.InitializeWorkspace(t.TempDir()) // 审计批 2：策略就绪后才 Launch
 	rt := attachRecordingTransport(t, s)
+
+	// 复证圈 1 发现 1 的语义切割：emit 目标文档须为打开态（见
+	// TestEmit_EndToEndWithDebounce 同款注记）。
+	s.vfs.Open("file:///p/main.go", "go", 1, []byte("package main"), vfs.SourceEditor)
 
 	proc := mountedProc(t, s, "crasher")
 	if proc == nil {

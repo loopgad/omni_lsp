@@ -122,6 +122,13 @@ func (d *diagCoordinator) diagnosticsUpdated(uri string) {
 // 能力门，§O2）：入插件诊断表（FIFO 有界，与后端缓存同限）并按 diagDebounce
 // 去抖后推送——插件 emit 不直连 notifyClient（diagnostics.go:282 路径的
 // 勘察警告），而是走协调器自己的去抖与来源治理面。
+//
+// 关闭态守卫（复证圈 1 审计发现 1）：文档已关闭（vfs.Get==nil）的迟到 emit
+// 即拒——与 compute 车道的 errDiagnosticDocumentClosed 拒绝（compute 入口、
+// 发布前、提交前三处 vfs.Get==nil 检查）对齐。旧实现插件车道没有这道守卫：
+// didCloseDocument 之后迟到的插件通知会复填充插件诊断表，并去抖上线对已
+// 关闭文档的 publishDiagnostics。丢弃计入可见拒绝计数（pluginEmitRejected）。
+// vfs.Get 在 d.mu 持锁段内调用是本文件既有模式（compute 的提交前守卫同）。
 func (d *diagCoordinator) injectPluginDiagnostics(pluginID, uri string, items []languages.Diagnostic) {
 	uri = canonicalDocumentURI(uri)
 	d.mu.Lock()
@@ -129,7 +136,24 @@ func (d *diagCoordinator) injectPluginDiagnostics(pluginID, uri string, items []
 		d.mu.Unlock()
 		return
 	}
-	if _, seen := d.pluginItems[uri]; !seen {
+	if d.server.vfs.Get(uri) == nil {
+		d.mu.Unlock()
+		d.server.pluginEmitRejected.Add(1)
+		return
+	}
+	// seen 判据以 pluginOrder 成员资格为准（复证圈 1 审计发现 2）：旧实现用
+	// pluginItems 的 map 存在性作判据，与 didCloseDocument 的清理不齐——close
+	// 后 map 键被删而 order 槽位残留（见 didCloseDocument 的过滤修复），同
+	// uri 重开注入时 order 与 pluginItems 键集错位，FIFO 驱逐据 order 长度
+	// 删 map 会误删存活 uri 的插件诊断集。同一次遍历保证两者一致。
+	seen := false
+	for _, queued := range d.pluginOrder {
+		if queued == uri {
+			seen = true
+			break
+		}
+	}
+	if !seen {
 		d.pluginOrder = append(d.pluginOrder, uri)
 		for len(d.pluginOrder) > diagCacheLimit { // FIFO eviction，与后端缓存同限
 			old := d.pluginOrder[0]
@@ -197,6 +221,16 @@ func (d *diagCoordinator) publishPluginDiagnostics(uri string, sets map[string]p
 		"diagnostics": projectDiagnostics(items),
 	})
 	if err != nil {
+		return
+	}
+	// 上线前关闭态复查（复证圈 1 审计发现 1）：去抖回调取出 sets 与真正上线
+	// 之间文档可能已关闭（didCloseDocument 不等待去抖回调），marshal 是两者
+	// 之间的慢段——已关闭文档不得再收到插件诊断推送。与 publishComputed 的
+	// 「上线前复查」同一纪律。
+	d.mu.Lock()
+	stillOpen := !d.closed && d.server.vfs.Get(uri) != nil
+	d.mu.Unlock()
+	if !stillOpen {
 		return
 	}
 	d.server.notifyClient("textDocument/publishDiagnostics", json.RawMessage(payload))
@@ -285,6 +319,17 @@ func (d *diagCoordinator) didCloseDocument(uri string, closeDocument func()) {
 		delete(d.pluginTimers, uri)
 	}
 	delete(d.pluginItems, uri)
+	// pluginOrder 与 d.order 同一原地过滤（复证圈 1 审计发现 2）：旧实现只
+	// 清 pluginItems/pluginTimers，close/reopen 循环后同一 uri 在 pluginOrder
+	// 累积重复槽位——FIFO 驱逐据 order 长度删 map 时会误删存活 uri 的插件
+	// 诊断集。
+	filteredPluginOrder := d.pluginOrder[:0]
+	for _, queued := range d.pluginOrder {
+		if queued != uri {
+			filteredPluginOrder = append(filteredPluginOrder, queued)
+		}
+	}
+	d.pluginOrder = filteredPluginOrder
 	if closeDocument != nil {
 		closeDocument()
 	}
