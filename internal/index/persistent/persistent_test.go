@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -724,33 +725,54 @@ func TestBudget_RejectsWhenFull(t *testing.T) {
 	}
 }
 
-// TestCompact_ReducesSegmentsAndPreservesReads: many segments merge into a
-// fresh generation with identical readable content (§L16).
+// TestCompact_ReducesSegmentsAndPreservesReads: a live-format generation —
+// data batch segments plus a terminal metadata segment — compacts into
+// re-partitioned batch segments (DEF-COMPACT structural bound): segment count
+// shrinks, per-kind records stay bit-identical in their original order, the
+// metadata payload passes through verbatim, and the last segment remains the
+// metadata segment (§L16). The previous pin asserted one mergeAppend-framed
+// segment per generation over opaque payloads; that output is unreadable by
+// the live semantic format (decodeStrict rejects the trailing JSON), and its
+// rejection is pinned in compact_semantic_test.go.
 func TestCompact_ReducesSegmentsAndPreservesReads(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	want := map[string]string{}
+	// Minimal live-format envelopes. The persistent layer never decodes
+	// records, so the fact bodies are opaque JSON; only the structural fields
+	// (format/schemaVersion/kind/records, kind "metadata" terminal) matter to
+	// compaction. The literals mirror the semantic wire envelope.
+	batch := func(kind string, records ...string) string {
+		return `{"format":"omnilsp-semantic-segment","schemaVersion":1,"kind":"` + kind + `","records":[` + strings.Join(records, ",") + `]}`
+	}
+	payloads := []string{
+		batch("symbols", `{"n":1}`, `{"n":2}`),
+		batch("occurrences", `{"n":3}`),
+		batch("symbols", `{"n":4}`),
+		`{"format":"omnilsp-semantic-segment","schemaVersion":1,"kind":"metadata","metadata":{"n":5}}`,
+	}
+
 	b, err := s.BeginBuild(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, p := range []string{"alpha", "beta", "gamma"} {
-		id, err := b.WriteSegment([]byte(p))
-		if err != nil {
+	for _, payload := range payloads {
+		if _, err := b.WriteSegment([]byte(payload)); err != nil {
 			t.Fatal(err)
 		}
-		want[string(id)] = p
-		_ = i
 	}
 	if err := b.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
-	before, _ := s.OpenSnapshot(ctx)
-	if len(before.Segments) < 3 {
-		t.Fatalf("setup produced %d segments", len(before.Segments))
+	before, err := s.OpenSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(before.Segments) != len(payloads) {
+		t.Fatalf("setup produced %d segments, want %d", len(before.Segments), len(payloads))
+	}
+
 	if err := s.Compact(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -761,32 +783,67 @@ func TestCompact_ReducesSegmentsAndPreservesReads(t *testing.T) {
 	if len(after.Segments) >= len(before.Segments) {
 		t.Errorf("compaction did not reduce segments: %d → %d", len(before.Segments), len(after.Segments))
 	}
-	if len(after.Segments) != 1 {
-		t.Errorf("compaction must yield exactly one merged segment, got %d", len(after.Segments))
-	}
-	payload, err := after.ReadSegment(after.Segments[0].ID)
-	if err != nil {
-		t.Fatalf("post-compact read: %v", err)
-	}
-	// Unpack mergeAppend's length-prefixed framing directly: the merged
-	// generation must carry the original payloads in commit order.
-	var got []string
-	for len(payload) >= 8 {
-		n := binary.BigEndian.Uint64(payload[:8])
-		if uint64(len(payload)-8) < n {
-			t.Fatalf("merged segment framing is truncated: %d payload bytes claimed, %d present", n, len(payload)-8)
+
+	// Structural layout: per-kind merged batches in first-appearance order,
+	// terminal metadata segment last.
+	kindOf := func(payload string) string {
+		var probe struct {
+			Kind string `json:"kind"`
 		}
-		got = append(got, string(payload[8:8+n]))
-		payload = payload[8+n:]
-	}
-	wantPayloads := []string{"alpha", "beta", "gamma"}
-	if len(got) != len(wantPayloads) {
-		t.Fatalf("merged segment holds %d payloads, want 3", len(got))
-	}
-	for i := range wantPayloads {
-		if got[i] != wantPayloads[i] {
-			t.Errorf("payload[%d] = %q, want %q", i, got[i], wantPayloads[i])
+		if err := json.Unmarshal([]byte(payload), &probe); err != nil {
+			t.Fatalf("post-compact payload is not a single JSON document: %v", err)
 		}
+		return probe.Kind
+	}
+	recordsOf := func(payload string) []string {
+		var probe struct {
+			Records []json.RawMessage `json:"records"`
+		}
+		if err := json.Unmarshal([]byte(payload), &probe); err != nil {
+			t.Fatalf("post-compact payload records: %v", err)
+		}
+		out := make([]string, len(probe.Records))
+		for i, raw := range probe.Records {
+			out[i] = string(raw)
+		}
+		return out
+	}
+	var gotKinds []string
+	for i, ref := range after.Segments {
+		raw, err := after.ReadSegment(ref.ID)
+		if err != nil {
+			t.Fatalf("post-compact read: %v", err)
+		}
+		payload := string(raw)
+		kind := kindOf(payload)
+		if i == len(after.Segments)-1 && kind != "metadata" {
+			t.Errorf("last post-compact segment kind = %q, want metadata", kind)
+		}
+		if i < len(after.Segments)-1 && kind == "metadata" {
+			t.Errorf("metadata segment at non-terminal position %d", i)
+		}
+		gotKinds = append(gotKinds, kind)
+		switch kind {
+		case "symbols":
+			want := []string{`{"n":1}`, `{"n":2}`, `{"n":4}`}
+			if got := recordsOf(payload); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("merged symbols records = %v, want %v", got, want)
+			}
+		case "occurrences":
+			want := []string{`{"n":3}`}
+			if got := recordsOf(payload); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("merged occurrences records = %v, want %v", got, want)
+			}
+		case "metadata":
+			want := payloads[len(payloads)-1]
+			if payload != want {
+				t.Errorf("metadata payload changed across compaction:\n before: %q\n after:  %q", want, payload)
+			}
+		}
+	}
+	wantKinds := []string{"symbols", "occurrences", "metadata"}
+	if fmt.Sprint(gotKinds) != fmt.Sprint(wantKinds) {
+		t.Errorf("post-compact segment kinds = %v, want %v", gotKinds, wantKinds)
 	}
 }
 

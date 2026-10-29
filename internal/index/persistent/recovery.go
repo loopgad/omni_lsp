@@ -353,72 +353,9 @@ func (s *FileStore) readQuarantined() []SegmentID {
 	return out
 }
 
-// mergeFraming is the length-prefixed layout used to pack many logical
-// payloads into one physical segment during compaction.
-func mergeAppend(dst []byte, payloads ...[]byte) []byte {
-	for _, p := range payloads {
-		var l [8]byte
-		binary.BigEndian.PutUint64(l[:], uint64(len(p)))
-		dst = append(dst, l[:]...)
-		dst = append(dst, p...)
-	}
-	return dst
-}
-
-// Compact merges a pinned snapshot into one fresh segment. It holds the
-// cross-process writer lock only while opening the snapshot, reserving the new
-// generation, publishing it, and pruning history.
-func (s *FileStore) Compact(ctx context.Context) error {
-	writerLock, err := acquireWriterLock(ctx, s.root)
-	if err != nil {
-		return err
-	}
-	defer writerLock.release()
-	s.mu.Lock()
-	err = s.recover()
-	s.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	s.cleanupOrphanSegments()
-	view, err := s.openSnapshotWithWriterLock(ctx)
-	if err != nil {
-		return err
-	}
-	leaseLock, err := acquireGenerationLock(ctx, s.root, view.ID, false, true)
-	if err != nil {
-		return err
-	}
-	lease := &GenerationLease{view: view, lock: leaseLock, store: s}
-	build, err := s.beginBuildWithWriterLock(ctx, writerLock)
-	if err != nil {
-		_ = lease.Close()
-		return err
-	}
-	defer lease.Close()
-	view = lease.Snapshot()
-	var merged []byte
-	for _, seg := range view.Segments {
-		payload, err := view.ReadSegment(seg.ID)
-		if err != nil {
-			build.Abort()
-			return err
-		}
-		merged = mergeAppend(merged, payload)
-	}
-	if _, err := build.WriteSegment(merged); err != nil {
-		_ = build.Abort()
-		return err
-	}
-	if err := build.Commit(ctx); err != nil {
-		_ = build.Abort()
-		return err
-	}
-	_ = lease.Close()
-	// The previous generation is retained in history for fallback. Retire it
-	// from that chain durably before deleting its segments; older fallbacks stay.
-	return s.pruneHistoryGeneration(view.ID)
-}
+// Compact moved to compact.go: structure-bounded compaction (DEF-COMPACT)
+// re-partitions batch envelopes instead of merging payloads into one
+// physical segment, which the live semantic format cannot read back.
 
 func (s *FileStore) pruneHistoryGeneration(genID uint64) error {
 	writerLock, err := acquireWriterLock(context.Background(), s.root)
