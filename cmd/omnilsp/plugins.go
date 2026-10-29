@@ -39,7 +39,10 @@ func cmdPlugins(args []string) error {
 // 校验通过为 verified，否则 failed（运行态由服务进程内的 Manager 维护）。
 func pluginsList(root string) error {
 	mgr := plugin.NewManager()
-	ds := mgr.Discover(root)
+	ds, err := mgr.Discover(root)
+	if err != nil {
+		return err
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tVERSION\tSTATE\tCHECKSUM")
 	for _, d := range ds {

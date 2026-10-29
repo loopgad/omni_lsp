@@ -162,6 +162,9 @@ type Server struct {
 	pluginMgr    *plugin.Manager
 	pluginGrants map[string]plugin.Grant // id → Enable 授权表（emit 能力门的授予半边）
 	pluginProcs  map[string]*plugin.Process
+	// pluginDiscoverErr 记录装配期目录级发现失败的原因（pluginMu 保护）：
+	// 对齐 disableIndex 的 idxReason 可观测约定——空串表示无目录级失败。
+	pluginDiscoverErr string
 	pluginOnce   sync.Once // ClosePlugins 幂等
 
 	// plugin counters (§P3 低基数可观测性：拒绝与丢弃可见，不静默)。
@@ -434,7 +437,17 @@ func (s *Server) mountPlugins(dir string) {
 	s.pluginProcs = make(map[string]*plugin.Process)
 	s.pluginMu.Unlock()
 
-	for _, d := range mgr.Discover(dir) {
+	discoveries, err := mgr.Discover(dir)
+	if err != nil {
+		// 目录级失败对齐 disableIndex 的可观测约定（index.go）：状态字段
+		// 记录原因 + stderr 一条——「不可用 PluginsDir」不得伪装成「无插件」。
+		s.pluginMu.Lock()
+		s.pluginDiscoverErr = err.Error()
+		s.pluginMu.Unlock()
+		fmt.Fprintf(os.Stderr, "omnilsp: plugin discovery failed: %v\n", err)
+		return
+	}
+	for _, d := range discoveries {
 		id := d.Manifest.ID
 		if err := mgr.Install(d); err != nil {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 未通过信任链，拒绝装配: %v\n", id, err)

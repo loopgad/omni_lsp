@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +87,34 @@ func TestPluginsMount_EmptyDirMountsNothing(t *testing.T) {
 	if len(s.pluginProcs) != 0 {
 		t.Fatalf("空目录不得有插件进程，got %d", len(s.pluginProcs))
 	}
+	s.pluginMu.Lock()
+	derr := s.pluginDiscoverErr
+	s.pluginMu.Unlock()
+	if derr != "" {
+		t.Fatalf("可用目录不得记录发现失败，got %q", derr)
+	}
 	s.ClosePlugins() // 空表关闭必须无害
+}
+
+// TestPluginsMount_UnreadableDirIsObservable（审计批 2）：PluginsDir 指向
+// 不存在的目录时，装配点不得把它伪装成「无插件」——目录级失败必须留下
+// 可观测状态（pluginDiscoverErr 记录原因，对齐 disableIndex 的 idxReason
+// 约定；stderr 一条由装配点落盘，此处断言状态半边）。
+func TestPluginsMount_UnreadableDirIsObservable(t *testing.T) {
+	s := New(Config{PluginsDir: filepath.Join(t.TempDir(), "does-not-exist")})
+	defer s.ClosePlugins()
+	if s.pluginMgr == nil {
+		t.Fatal("显式 PluginsDir 应创建 Manager")
+	}
+	s.pluginMu.Lock()
+	derr := s.pluginDiscoverErr
+	s.pluginMu.Unlock()
+	if derr == "" {
+		t.Fatal("不可读 PluginsDir 必须记录目录级失败原因（pluginDiscoverErr 为空）")
+	}
+	if len(s.pluginProcs) != 0 {
+		t.Fatalf("发现失败的装配不得有插件进程，got %d", len(s.pluginProcs))
+	}
 }
 
 // TestPluginsMount_TrustChainFailureNeverSpawns：entrypoint 与声明 checksum

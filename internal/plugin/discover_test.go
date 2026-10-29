@@ -35,7 +35,10 @@ func TestDiscover_ScansAndToleratesBroken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := NewManager().Discover(root)
+	got, err := NewManager().Discover(root)
+	if err != nil {
+		t.Fatalf("discover on a readable root must not fail: %v", err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("discover = %d entries, want 2", len(got))
 	}
@@ -50,8 +53,15 @@ func TestDiscover_ScansAndToleratesBroken(t *testing.T) {
 		t.Errorf("good entry wrong: verifyErr=%v id=%q", got[1].VerifyErr, got[1].Manifest.ID)
 	}
 
-	// Missing root: nil, no panic.
-	if r := NewManager().Discover(filepath.Join(root, "does-not-exist")); r != nil {
-		t.Errorf("missing root should return nil, got %d", len(r))
+	// Missing root: the directory-level failure is surfaced as a returned
+	// error (audit batch 2: a silent nil made an unusable PluginsDir
+	// indistinguishable from "no plugins" — the mount point had no
+	// observability hook for it). Nil slice, non-nil error.
+	ds, derr := NewManager().Discover(filepath.Join(root, "does-not-exist"))
+	if derr == nil {
+		t.Error("missing root must surface a directory-level error, got nil")
+	}
+	if ds != nil {
+		t.Errorf("missing root should return no entries, got %d", len(ds))
 	}
 }

@@ -85,11 +85,13 @@ func NewManager() *Manager {
 }
 
 // Discover 扫描 root 的直接子目录，对每个含 plugin.json 的目录执行信任链。
-// 单目录失败不中断整体，只记录进对应 Discovery.VerifyErr。
-func (m *Manager) Discover(root string) []Discovery {
+// 单目录失败不中断整体，只记录进对应 Discovery.VerifyErr；root 本身不可读
+// （不存在/无权限）作为目录级失败上抛——静默返回 nil 会把「不可用目录」伪装
+// 成「无插件」（审计批 2：装配点对目录级失败没有任何可观测出口）。
+func (m *Manager) Discover(root string) ([]Discovery, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("plugin: 扫描插件根目录 %s: %w", root, err)
 	}
 	var out []Discovery
 	for _, e := range entries {
@@ -105,7 +107,7 @@ func (m *Manager) Discover(root string) []Discovery {
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
-	return out
+	return out, nil
 }
 
 // Install 将一个通过信任链的发现结果注册为 Verified；
