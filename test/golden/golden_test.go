@@ -378,8 +378,25 @@ func runScenario(t *testing.T, sc scenario) [][]byte {
 //
 // 纯函数：同一输入恒得同一输出（TestGoldenNormalizeIdempotent 保证）。
 func normalizeFrames(frames [][]byte, shape bool, tmpDir string) (string, error) {
-	out := make([]any, 0, len(frames))
+	// 帧序 canonical 化：publishDiagnostics 走 diagDebounce 异步推送，它与
+	// 请求响应的相对先后是服务端调度偶然（gate 全包 -race 负载下实测翻转，
+	// golden 误报漂移），不是协议语义——§S9 钉住的请求/响应交互序不受影响，
+	// publish 帧内容仍逐字钉住。稳定分区到序列末尾：分区内相对顺序不变，
+	// 且对已分区的输入幂等。既有 golden 的 publish 本就全部位于末位，
+	// 快照文件零改动。
+	ordered := make([][]byte, 0, len(frames))
+	publishes := make([][]byte, 0)
 	for _, f := range frames {
+		if isPublishDiagnosticsFrame(f) {
+			publishes = append(publishes, f)
+			continue
+		}
+		ordered = append(ordered, f)
+	}
+	ordered = append(ordered, publishes...)
+
+	out := make([]any, 0, len(ordered))
+	for _, f := range ordered {
 		var v any
 		if err := json.Unmarshal(f, &v); err != nil {
 			return "", fmt.Errorf("normalize: bad frame: %w", err)
@@ -436,6 +453,19 @@ func normalizeValue(v any, shape bool, tmpDir string) any {
 	default:
 		return v // bool / null
 	}
+}
+
+// isPublishDiagnosticsFrame 报告一帧是否为服务端去抖推送的
+// textDocument/publishDiagnostics 通知。解析失败的帧按非 publish 处理，
+// 交给 normalizeFrames 的既有坏帧报错路径。
+func isPublishDiagnosticsFrame(f []byte) bool {
+	var probe struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(f, &probe); err != nil {
+		return false
+	}
+	return probe.Method == "textDocument/publishDiagnostics"
 }
 
 // firstDiff 返回两段文本的第一处差异行对，便于直接定位漂移帧。
@@ -537,6 +567,34 @@ func TestGoldenNormalizeIdempotent(t *testing.T) {
 	}
 	if c != d {
 		t.Fatalf("different ids/counters should converge:\nc=%s\nd=%s", c, d)
+	}
+}
+
+// TestGoldenNormalizePublishOrderStable 钉住规范化对 debounced 推送时序的抹平
+// 规则：publishDiagnostics 与请求响应的相对先后是服务端调度偶然（gate 全包
+// -race 负载下实测翻转并误报 golden 漂移），不是协议语义（JSON-RPC 不约束
+// 响应与服务器主动通知的相对顺序；§S9 场景钉住的请求/响应交互序不受影响）。
+// 两种到达序必须归一到同一 canonical 文本（publish 稳定分区到末尾，分区内外
+// 各自相对顺序不变；publish 帧内容仍逐字钉住）。
+func TestGoldenNormalizePublishOrderStable(t *testing.T) {
+	tmpDir := t.TempDir()
+	response := []byte(`{"jsonrpc":"2.0","id":7,"result":[{"uri":"file:///w/demo.rs"}]}`)
+	publish := []byte(`{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///w/demo.rs","version":1,"diagnostics":[]}}`)
+
+	responseFirst, err := normalizeFrames([][]byte{response, publish}, false, tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishFirst, err := normalizeFrames([][]byte{publish, response}, false, tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseFirst != publishFirst {
+		t.Fatalf("debounced publish order must normalize away:\nresponseFirst=%s\npublishFirst=%s", responseFirst, publishFirst)
+	}
+	// 重排不得丢帧或改写 publish 内容。
+	if !strings.Contains(responseFirst, `"method": "textDocument/publishDiagnostics"`) {
+		t.Fatalf("publish frame content must stay pinned: %s", responseFirst)
 	}
 }
 
