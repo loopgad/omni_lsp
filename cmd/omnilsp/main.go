@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // §P6: registers pprof handlers on DefaultServeMux
@@ -239,7 +240,7 @@ func cmdServe(args []string) {
 		}
 		srv.InitializeWorkspace(cfg.WorkspaceDir)
 		info("serving MCP %s over stdio", mcpserver.ProtocolRevision)
-		if err := mcpserver.Serve(ctx, os.Stdin, os.Stdout, mcpCore{srv: srv}); err != nil && ctx.Err() == nil {
+		if err := serveMCP(ctx, srv, os.Stdin, os.Stdout); err != nil && ctx.Err() == nil {
 			fatalErr(err, "mcp server error: %v", err)
 		}
 		return
@@ -294,6 +295,18 @@ func cmdServe(args []string) {
 	if err := srv.Run(ctx, tr); err != nil && ctx.Err() == nil {
 		fatalErr(err, "server error: %v", err)
 	}
+}
+
+// serveMCP 跑 MCP 工具投影并在会话结束后补插件的优雅停机（第 18 轮治理
+// 开口 2）：该分支不经过 server.Run——Run 的 defer 链（ClosePlugins 等）
+// 在此路径不会执行，MCP 会话结束后插件子进程收不到 shutdown→exit 握手，
+// 进程与 stdio 管道泄漏为孤儿。ClosePlugins 幂等，须在 fatalErr 之前完成：
+// fatalErr 直接 os.Exit，defer 不会运行。单独成函数供守卫测试直呼
+// （mcp_plugin_teardown_test.go）。
+func serveMCP(ctx context.Context, srv *server.Server, in io.Reader, out io.Writer) error {
+	err := mcpserver.Serve(ctx, in, out, mcpCore{srv: srv})
+	srv.ClosePlugins()
+	return err
 }
 
 // runTCPSession serves one accepted TCP connection to completion. Each TCP

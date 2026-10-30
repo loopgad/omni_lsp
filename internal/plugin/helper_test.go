@@ -64,6 +64,9 @@ func launchTestBinary(t *testing.T, m Manifest, g Grant, onExit func(error), tru
 //   - emit-notify    : 收到第一个请求时先向宿主发一条无 id 通知帧
 //     （GO_PLUGIN_NOTIFY_METHOD，默认 diagnostics/emit），再回 pong
 //     （验证宿主 readLoop 的 method 解析与订阅回调投递）；
+//   - emit-immediate : 握手（plugin/hello）落地后、任何宿主请求之前立即发
+//     一条 diagnostics/emit 通知帧（验证 Launch 时刻订阅：注册窗口内到达
+//     的通知不再有界有损，见 executor_launch_sink_test.go）；
 //   - notify-flood   : 收到第一个请求时连续发 GO_PLUGIN_FLOOD 条通知帧，
 //     之后才回 pong（验证有界投递：慢消费者下 readLoop 不死、丢弃计数）。
 //   - graceful-shutdown: plugin/shutdown 请求以 null 应答并记录；
@@ -120,6 +123,17 @@ func helperMain() {
 				// ——空 select 会触发运行时死锁检测使子进程提前退出。
 				for {
 					time.Sleep(time.Hour)
+				}
+			}
+			if mode == "emit-immediate" {
+				// 第 18 轮治理开口 4 守卫样本：握手一落地、宿主任何请求都
+				// 未发出之前就向宿主发一条 diagnostics/emit 通知帧——通知
+				// 与 Launch 返回/SetNotifySink 注册之间的竞速是确定性的
+				// （Launch 返回前帧已在管道里）。
+				note := `{"jsonrpc":"2.0","method":"diagnostics/emit","params":{"uri":"file:///p/immediate.go"}}`
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(note), note)
+				if err := w.Flush(); err != nil {
+					return
 				}
 			}
 			continue

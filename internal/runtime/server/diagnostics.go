@@ -90,6 +90,39 @@ type pluginDiagSet struct {
 	items []languages.Diagnostic
 }
 
+// pluginSetsSnapshotLocked 返回 uri 名下全部插件 emit 集的快照（d.mu 持锁段
+// 内调用，与 schedulePluginPush 回调的快照化同一纪律——发布读侧绝不见
+// live inner map）。
+func (d *diagCoordinator) pluginSetsSnapshotLocked(uri string) map[string]pluginDiagSet {
+	live := d.pluginItems[uri]
+	if len(live) == 0 {
+		return nil
+	}
+	out := make(map[string]pluginDiagSet, len(live))
+	for id, set := range live {
+		out[id] = set
+	}
+	return out
+}
+
+// mergePublishItems 把后端计算集与插件 emit 集合并为单一全量报告的条目序：
+// 后端在前、插件按 pluginID 确定性排序在后（与 publishPluginDiagnostics 的
+// 既有排序一致）。第 18 轮治理开口 3：publishDiagnostics 是 uri 级全量替换
+// ——两个车道对同一 uri 各自发布独立 payload 时互相顶掉（客户端只看得见
+// 后到的一帧），合并是唯一保真形态。
+func mergePublishItems(backend []languages.Diagnostic, sets map[string]pluginDiagSet) []languages.Diagnostic {
+	ids := make([]string, 0, len(sets))
+	for id := range sets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	merged := backend
+	for _, id := range ids {
+		merged = append(merged, sets[id].items...)
+	}
+	return merged
+}
+
 type diagRun struct {
 	cancel context.CancelFunc
 }
@@ -207,37 +240,55 @@ func (d *diagCoordinator) schedulePluginPush(uri string) {
 	d.mu.Unlock()
 }
 
-// publishPluginDiagnostics 合并该 uri 下全部插件的最新 emit 集（按插件 ID
-// 确定性排序）后经 notifyClient 推送。每条诊断的 Source 已在注入时被宿主
-// 强制为 "plugin:<id>"——线协议上来源可见、可治理。与后端 publishDiagnostics
-// 的重叠语义（LSP 全量替换）是插件车道的已知限制，见交付说明。
+// publishPluginDiagnostics 推送该 uri 的合并诊断集（第 18 轮治理开口 3）：
+// 后端 compute 车道在 §C11 缓存中的当前集 + 全部插件的最新 emit 集（按插件
+// ID 确定性排序）合并为单一全量报告后经 notifyClient 上线——publishDiagnostics
+// 是 uri 级全量替换，插件车道独占发布会把后端集整体顶掉（反之亦然），因此
+// 两个上线点（本函数与 publishComputed）都在发布前合并对方当前集。每条插件
+// 诊断的 Source 已在注入时被宿主强制为 "plugin:<id>"——线协议上来源可见、
+// 可治理。后端缓存无该 uri 条目（后端从未算过/FIFO 驱逐）时只带插件集，
+// version 字段随缓存条目缺席一并省略（与既有插件 payload 形状一致）。
+//
+// 与后端集的合并读在 d.mu 临界区内取快照（与插件集快照化同一纪律）；后端
+// 缓存集可能是正在被更新代替换的上一代——发布全量报告的收敛语义由两条车道
+// 的下一次去抖推送兜住（后到者同样合并对方），瞬时陈旧无害。
 func (d *diagCoordinator) publishPluginDiagnostics(uri string, sets map[string]pluginDiagSet) {
-	ids := make([]string, 0, len(sets))
-	for id := range sets {
-		ids = append(ids, id)
+	d.mu.Lock()
+	backendItems := []languages.Diagnostic(nil)
+	version := int64(0)
+	hasBackend := false
+	if en, ok := d.cache[uri]; ok {
+		backendItems = en.items
+		version = en.version
+		hasBackend = true
 	}
-	sort.Strings(ids)
-	var items []languages.Diagnostic
-	for _, id := range ids {
-		items = append(items, sets[id].items...)
+	stillOpen := !d.closed && d.server.vfs.Get(uri) != nil
+	d.mu.Unlock()
+	if !stillOpen {
+		return
 	}
+	items := mergePublishItems(backendItems, sets)
 	displayURI := uri
 	if file := d.server.vfs.Get(uri); file != nil {
 		displayURI = file.URI
 	}
-	payload, err := json.Marshal(map[string]any{
+	params := map[string]any{
 		"uri":         displayURI,
 		"diagnostics": projectDiagnostics(items),
-	})
+	}
+	if hasBackend {
+		params["version"] = version
+	}
+	payload, err := json.Marshal(params)
 	if err != nil {
 		return
 	}
-	// 上线前关闭态复查（复证圈 1 审计发现 1）：去抖回调取出 sets 与真正上线
-	// 之间文档可能已关闭（didCloseDocument 不等待去抖回调），marshal 是两者
-	// 之间的慢段——已关闭文档不得再收到插件诊断推送。与 publishComputed 的
-	// 「上线前复查」同一纪律。
+	// 上线前关闭态复查（复证圈 1 审计发现 1）：快照与真正上线之间文档可能
+	// 已关闭（didCloseDocument 不等待去抖回调），marshal 是两者之间的慢段
+	// ——已关闭文档不得再收到诊断推送。与 publishComputed 的「上线前复查」
+	// 同一纪律。
 	d.mu.Lock()
-	stillOpen := !d.closed && d.server.vfs.Get(uri) != nil
+	stillOpen = !d.closed && d.server.vfs.Get(uri) != nil
 	d.mu.Unlock()
 	if !stillOpen {
 		return
@@ -410,6 +461,11 @@ func (d *diagCoordinator) computeAndPush(ctx context.Context, uri string) {
 func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []languages.Diagnostic, be languages.Backend) {
 	d.mu.Lock()
 	cached, ok := d.cache[uri]
+	// 插件集快照（第 18 轮治理开口 3）：后端全量报告必须带上插件车道对该
+	// uri 的当前 emit 集，否则后端发布会把插件诊断整体顶掉（LSP uri 级全量
+	// 替换）。快照在 d.mu 临界区内拍平（发布读侧绝不见 live inner map）；
+	// marshal 慢段内插件再 emit 的增量由插件车道的下一次去抖推送收敛。
+	pluginSnap := d.pluginSetsSnapshotLocked(uri)
 	d.mu.Unlock()
 	if !ok || cached.key != key {
 		// The cache no longer holds this run's entry: a newer generation has
@@ -421,6 +477,7 @@ func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []langu
 		return
 	}
 	version := cached.version
+	items = mergePublishItems(items, pluginSnap)
 	wire := projectDiagnostics(items)
 	displayURI := uri
 	if file := d.server.vfs.Get(uri); file != nil {

@@ -168,7 +168,23 @@ type helloFrame struct {
 // 宿主→插件通知广播（Notify）、优雅停机（Shutdown/Exit 三态状态机，
 // LSP shutdown/exit 语义）、以及按方法→能力映射下沉到 Call 级别的能力门
 // （methodCapability + manifest 声明快照，见 Call）。
+// Launch 不注册订阅回调：Launch 返回与 SetNotifySink 之间的通知按有界有损
+// 语义丢弃并计数（开口 4 的窗口在 Launch 自身签名上不可消除——Process 句柄
+// 此刻才存在）。需要在注册窗口内零丢失的宿主走 LaunchWithSink。
 func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error), trust func() error) (*Process, error) {
+	return launch(ctx, dir, m, grant, onExit, trust, nil)
+}
+
+// LaunchWithSink 是 Launch 的 Launch 时刻订阅变体（第 18 轮治理开口 4）：
+// sink 在宿主 readLoop/pump goroutine 启动之前注册——「Launch 返回 → 宿主
+// SetNotifySink」之间的注册窗口从协议时序上整体移除，握手期/启动期到达的
+// 插件通知不再有界有损。sink 仍可事后经 SetNotifySink 替换或置 nil 复位
+// （无订阅者丢弃语义不变）。传 nil sink 等价 Launch。
+func LaunchWithSink(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error), trust func() error, sink func(method string, params json.RawMessage)) (*Process, error) {
+	return launch(ctx, dir, m, grant, onExit, trust, sink)
+}
+
+func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error), trust func() error, sink func(method string, params json.RawMessage)) (*Process, error) {
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("plugin: launch 前置完整性校验: %w", err)
 	}
@@ -224,6 +240,11 @@ func Launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 		OnExit:   onExit,
 		notifyCh: make(chan pluginNotifyEvent, pluginNotifyBuffer),
 		exited:   make(chan struct{}),
+	}
+	// Launch 时刻订阅（开口 4）：sink 落在 readLoop/pump 启动之前——两个
+	// goroutine 尚不存在，直接写字段不构成数据竞争；pump 随后经 sinkMu 读。
+	if sink != nil {
+		p.sink = sink
 	}
 	for _, c := range m.Capabilities {
 		if c != "" { // 防御：空能力不进声明表（Validate 已拒，双保险）
@@ -451,6 +472,8 @@ func (p *Process) readLoop() {
 // 无 id、带 method 的通知帧后，经 pluginNotifyBuffer 容量的有界通道异步送达
 // fn。并发安全——可在 Launch 前后任意时刻调用；注册窗口与通道饱和期到达的
 // 通知按有界有损语义丢弃并计入 DroppedNotifies（丢弃可见，绝不静默）。
+// 需要「Launch 返回前到达的通知零丢失」的宿主不走本方法，改用
+// LaunchWithSink 在 readLoop/pump 启动前注册（第 18 轮开口 4）。
 // 传 nil 恢复「无订阅者」默认态。
 func (p *Process) SetNotifySink(fn func(method string, params json.RawMessage)) {
 	p.sinkMu.Lock()

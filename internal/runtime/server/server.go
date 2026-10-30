@@ -542,13 +542,16 @@ func (s *Server) launchReadyPlugins() {
 			_ = mgr.Disable(id)
 			continue
 		}
-		proc, err := plugin.Launch(context.Background(), e.discovery.Dir, e.discovery.Manifest, e.grant, func(werr error) {
+		pluginID := id
+		proc, err := plugin.LaunchWithSink(context.Background(), e.discovery.Dir, e.discovery.Manifest, e.grant, func(werr error) {
 			s.pluginOnExit(id, werr)
 		}, func() error {
 			if _, policy, _ := s.indexState(); policy != nil {
 				return policy.Gate(trust.CapPluginLoad)
 			}
 			return fmt.Errorf("plugin: 工作区信任策略尚未建立")
+		}, func(method string, params json.RawMessage) {
+			s.onPluginNotify(pluginID, method, params)
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 被拒: %v\n", id, err)
@@ -556,12 +559,10 @@ func (s *Server) launchReadyPlugins() {
 			continue
 		}
 		mgr.MarkRunning(id)
-		// 订阅接线在 Launch 返回后立即执行：注册窗口内到达的通知按有界
-		// 有损语义丢弃并计数（Process.DroppedNotifies），不静默、不阻塞。
-		pluginID := id
-		proc.SetNotifySink(func(method string, params json.RawMessage) {
-			s.onPluginNotify(pluginID, method, params)
-		})
+		// 订阅接线（第 18 轮治理开口 4）：sink 经 LaunchWithSink 在 readLoop/
+		// pump 启动前注册——Launch 返回与订阅之间的注册窗口从协议时序上移除，
+		// 握手期/启动期到达的通知不再有界有损（旧实现的 DroppedNotifies 窗口
+		// 丢弃路径仅对「无订阅者」与通道饱和保留，见 executor_notify_test.go）。
 		s.pluginMu.Lock()
 		if s.pluginClosing {
 			// 复证圈 1 审计发现 5：Launch 与 ClosePlugins 交错——Launch 期间

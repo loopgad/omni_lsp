@@ -22,6 +22,14 @@ import (
 // with a scripted os.Args and lets the process terminate with the very exit
 // code the CLI contract (goal.md W1) assigns to that failure category.
 func TestMain(m *testing.M) {
+	// 第 18 轮治理开口 2 守卫的子进程半边：MCP 插件拆除测试以本测试二进制
+	// 自身作为插件 entrypoint，子进程经环境变量 OMNILSP_CMD_PLUGIN_HELPER
+	// 分流进最小插件协议循环（探针分流在其之后——父测试进程的 TestMain 先
+	// 于测试内的 t.Setenv 执行，不会误入此分支）。
+	if os.Getenv("OMNILSP_CMD_PLUGIN_HELPER") != "" {
+		mcpPluginHelperMain()
+		return
+	}
 	switch os.Getenv("OMNILSP_CLI_EXIT_PROBE") {
 	case "bogus-command":
 		os.Args = []string{"omnilsp", "bogus-command"}
