@@ -16,8 +16,13 @@ import (
 	"strings"
 
 	"github.com/omnilsp/omni/internal/index/model"
+	"github.com/omnilsp/omni/internal/languages"
 	workspaceuri "github.com/omnilsp/omni/internal/workspace/uri"
 )
+
+// typescriptBudgetOwner is the §F14 backend-buffer budget owner for this
+// backend's staging captures; it matches the nested bridge Config.Name.
+const typescriptBudgetOwner = "tsserver"
 
 //go:embed compiler_exporter.js
 var compilerExporterScript []byte
@@ -337,7 +342,10 @@ func (r *DirectCompilerRunner) runScript(ctx context.Context, nodePath string, p
 	}
 	stderrDone := make(chan []byte, 1)
 	go func() {
-		value, _ := io.ReadAll(stderr)
+		// §F14 (DEF-BUDWIRE): the stderr capture is transient staging, but
+		// unbounded; a configured budget truncates it with a visible marker
+		// and counts the refusal. Unset budget: identical to io.ReadAll.
+		value, _ := languages.ReadBudgetedAll(typescriptBudgetOwner, stderr)
 		stderrDone <- value
 	}()
 

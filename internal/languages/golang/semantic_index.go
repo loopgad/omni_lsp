@@ -23,11 +23,18 @@ import (
 
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/index/model"
+	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/workspace/position"
 	"github.com/omnilsp/omni/internal/workspace/uri"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/packages"
 )
+
+// golangBudgetOwner is the §F14 backend-buffer budget owner for this
+// backend's staging buffers (the module-graph command capture). It matches
+// identity.BackendID.Name so the quota variable is predictable from the
+// backend identity.
+const golangBudgetOwner = "golang-native"
 
 const semanticIndexBatchSize = 256
 const pinnedGoPackagesVersion = "v0.49.0"
@@ -2380,15 +2387,23 @@ func (r *loadResult) exportModules(pkgs []*packages.Package) {
 	cmd := exec.CommandContext(r.ctx, r.tool.path, "list", "-m", "-json", "all")
 	cmd.Dir = moduleRoot
 	cmd.Env = append([]string(nil), r.env...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	// §F14 (DEF-BUDWIRE): the module-graph capture is the golang backend's
+	// unbounded command-output staging. A budgeted capture refuses its
+	// writes past the configured quota, which fails the command visibly —
+	// the failure lands in the partial fact below instead of letting an
+	// arbitrarily large `go list` output sit in memory. Unset budget:
+	// identical to the previous plain bytes.Buffer (X10).
+	stdout, stderr := languages.NewBudgetedBuffer(golangBudgetOwner), languages.NewBudgetedBuffer(golangBudgetOwner)
+	defer stdout.Reset()
+	defer stderr.Reset()
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	err := cmd.Run()
 	if err != nil {
 		r.partial[model.FactModule] = "go list could not resolve the module graph: " + commandFailure(err, stderr.String())
 		r.exportKnownModuleRequirements()
 		return
 	}
-	decoder := json.NewDecoder(&stdout)
+	decoder := json.NewDecoder(stdout)
 	modules := make(map[string]moduleInfo)
 	for {
 		var mod moduleInfo
@@ -2422,14 +2437,14 @@ func (r *loadResult) exportModules(pkgs []*packages.Package) {
 	graphCmd.Env = append([]string(nil), r.env...)
 	stdout.Reset()
 	stderr.Reset()
-	graphCmd.Stdout, graphCmd.Stderr = &stdout, &stderr
+	graphCmd.Stdout, graphCmd.Stderr = stdout, stderr
 	err = graphCmd.Run()
 	if err != nil {
 		r.partial[model.FactModule] = "go mod graph could not enumerate module requirements: " + commandFailure(err, stderr.String())
 		r.exportKnownModuleRequirements()
 		return
 	}
-	scanner := bufio.NewScanner(&stdout)
+	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) != 2 {

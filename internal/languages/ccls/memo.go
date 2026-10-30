@@ -69,6 +69,12 @@ import (
 // disabled while this trace is armed.
 const cclsNestedRPCTimingEnv = "OMNILSP_S18_NESTED_RPC_TRACE"
 
+// cclsMemoBudgetOwner is the §F14 backend-buffer budget owner for the memo
+// tables (DEF-BUDWIRE). The memo has no nested.Conn of its own, so it uses a
+// dedicated owner: OMNILSP_BACKEND_QUOTA_CCLS_MEMO_BYTES caps it, and the
+// global limit always binds.
+const cclsMemoBudgetOwner = "ccls-memo"
+
 const (
 	// cclsMemoCapacity bounds each table; the S18 sampler needs two live
 	// documentSymbol entries (marker A/B alternation), everything beyond is
@@ -144,6 +150,10 @@ type memoEntry[T any] struct {
 	// usedSeq is a monotonic access sequence (deterministic LRU; wall-clock
 	// stamps can tie on coarse clocks).
 	usedSeq uint64
+	// budgetBytes is the §F14 backend-buffer charge for value (its JSON
+	// wire size), held from store until the entry is replaced, evicted, or
+	// dropped. Zero when no budget is configured or sizing failed.
+	budgetBytes int64
 }
 
 // cclsMemo is embedded by value in Backend; its zero value is ready to use.
@@ -202,6 +212,17 @@ func (m *cclsMemo) completionServe(key completionMemoKey, now time.Time) (langua
 func (m *cclsMemo) completionStore(key completionMemoKey, value languages.CompletionList, now time.Time) {
 	m.lock()
 	defer m.mu.Unlock()
+	// §F14 (DEF-BUDWIRE): a memo value is resident backend memory and
+	// counts against the "ccls-memo" quota. The charge is the value's JSON
+	// wire size — the same measure the admission sort already pays. A
+	// refused charge skips the store: the next identical request re-forwards
+	// to clangd instead of staging unbounded memory, and the refusal is
+	// counted (the memo hit is a cache; the request itself still succeeds).
+	charged := memoValueBytes(value)
+	if charged > 0 && !languages.ReserveBackendBuffer(cclsMemoBudgetOwner, charged) {
+		languages.NoteBackendBufferRefusal(cclsMemoBudgetOwner)
+		return
+	}
 	if m.completions == nil {
 		m.completions = make(map[completionMemoKey]*memoEntry[languages.CompletionList])
 	}
@@ -213,18 +234,39 @@ func (m *cclsMemo) completionStore(key completionMemoKey, value languages.Comple
 		// admitted once it ages past the quiet window (which started at the
 		// first observation of this value). The stored value refreshes to
 		// the latest raw upstream ordering, so what is served is a
-		// byte-exact answer clangd actually produced.
+		// byte-exact answer clangd actually produced. The charge swaps to
+		// the refreshed value's size (identical multisets encode to the
+		// same total, but the swap keeps the accounting honest regardless).
+		languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, entry.budgetBytes)
 		entry.value = value
+		entry.budgetBytes = charged
 		entry.confirmed = true
 		entry.usedSeq = m.useSeq
 		return
+	}
+	if ok {
+		languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, entry.budgetBytes)
+		entry.budgetBytes = 0
 	}
 	if !ok && len(m.completions) >= cclsMemoCapacity {
 		m.evictCompletionLocked()
 	}
 	m.completions[key] = &memoEntry[languages.CompletionList]{
 		value: value, confirmed: false, firstSeen: now, usedSeq: m.useSeq,
+		budgetBytes: charged,
 	}
+}
+
+// memoValueBytes measures a memo value's resident size by its JSON wire
+// encoding — the same total the sort-key admission path already pays per
+// item. A marshal failure (unreachable for these JSON-safe types) returns 0,
+// storing the entry uncharged rather than refusing a good answer.
+func memoValueBytes(value any) int64 {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return 0
+	}
+	return int64(len(encoded))
 }
 
 // completionListsEquivalent reports whether two decoded completion lists
@@ -303,6 +345,7 @@ func (m *cclsMemo) evictCompletionLocked() {
 		}
 	}
 	if !first {
+		languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, m.completions[oldest].budgetBytes)
 		delete(m.completions, oldest)
 	}
 }
@@ -324,20 +367,35 @@ func (m *cclsMemo) symbolServe(key symbolMemoKey, now time.Time) ([]languages.Do
 func (m *cclsMemo) symbolStore(key symbolMemoKey, value []languages.DocumentSymbol, now time.Time) {
 	m.lock()
 	defer m.mu.Unlock()
+	// §F14 (DEF-BUDWIRE): same charge-and-refuse discipline as
+	// completionStore, against the "ccls-memo" quota.
+	charged := memoValueBytes(value)
+	if charged > 0 && !languages.ReserveBackendBuffer(cclsMemoBudgetOwner, charged) {
+		languages.NoteBackendBufferRefusal(cclsMemoBudgetOwner)
+		return
+	}
 	if m.symbols == nil {
 		m.symbols = make(map[symbolMemoKey]*memoEntry[[]languages.DocumentSymbol])
 	}
 	entry, ok := m.symbols[key]
 	if ok && reflect.DeepEqual(entry.value, value) {
+		languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, entry.budgetBytes)
+		entry.value = value
+		entry.budgetBytes = charged
 		entry.confirmed = true
 		entry.usedSeq = m.useSeq
 		return
+	}
+	if ok {
+		languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, entry.budgetBytes)
+		entry.budgetBytes = 0
 	}
 	if !ok && len(m.symbols) >= cclsMemoCapacity {
 		m.evictSymbolLocked()
 	}
 	m.symbols[key] = &memoEntry[[]languages.DocumentSymbol]{
 		value: value, confirmed: false, firstSeen: now, usedSeq: m.useSeq,
+		budgetBytes: charged,
 	}
 }
 
@@ -351,6 +409,7 @@ func (m *cclsMemo) evictSymbolLocked() {
 		}
 	}
 	if !first {
+		languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, m.symbols[oldest].budgetBytes)
 		delete(m.symbols, oldest)
 	}
 }
@@ -435,11 +494,13 @@ func (m *cclsMemo) dropEntriesChangedUnder(changed map[string]struct{}) {
 	}
 	for key := range m.completions {
 		if entrySeesForeignChange(key.uri) {
+			languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, m.completions[key].budgetBytes)
 			delete(m.completions, key)
 		}
 	}
 	for key := range m.symbols {
 		if entrySeesForeignChange(key.uri) {
+			languages.ReleaseBackendBuffer(cclsMemoBudgetOwner, m.symbols[key].budgetBytes)
 			delete(m.symbols, key)
 		}
 	}

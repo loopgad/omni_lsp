@@ -18,7 +18,12 @@ import (
 	"time"
 
 	"github.com/omnilsp/omni/internal/index/model"
+	"github.com/omnilsp/omni/internal/languages"
 )
+
+// pyrightBudgetOwner is the §F14 backend-buffer budget owner for this
+// backend's staging captures; it matches the nested bridge Config.Name.
+const pyrightBudgetOwner = "pyright"
 
 const (
 	pyrightInternalSHA256 = "41fb260ad72f2a16c5657e1f2fe837104d7529255d0fcd955f48432b276e7cae"
@@ -403,7 +408,10 @@ func (r *DirectPyrightRunner) runScript(ctx context.Context, nodePath string, pa
 	}
 	stderrDone := make(chan []byte, 1)
 	go func() {
-		value, _ := io.ReadAll(stderr)
+		// §F14 (DEF-BUDWIRE): the stderr capture is transient staging, but
+		// unbounded; a configured budget truncates it with a visible marker
+		// and counts the refusal. Unset budget: identical to io.ReadAll.
+		value, _ := languages.ReadBudgetedAll(pyrightBudgetOwner, stderr)
 		stderrDone <- value
 	}()
 	decoder := json.NewDecoder(bufio.NewReader(stdout))

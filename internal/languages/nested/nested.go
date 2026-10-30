@@ -32,9 +32,11 @@
 // Allowed dependencies:
 //
 //	internal/{jsonrpc,supervisor,errors,buildctx,identity,trust,uri,workspace/position}
-//	only. No LSP semantic types beyond position/textDocument envelopes it must
-//	forward. trust and workspace/position were missing from this list while
-//	being imported.
+//	and internal/languages (the §F14 backend-buffer budget latch, which the
+//
+// backends share and which imports nothing from this tree). No LSP semantic
+// types beyond position/textDocument envelopes it must forward. trust and
+// workspace/position were missing from this list while being imported.
 //
 // Failure behavior:
 //
@@ -50,12 +52,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
+	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/runtime/supervisor"
 	"github.com/omnilsp/omni/internal/trust"
@@ -595,6 +599,21 @@ func (c *Conn) Initialize() error {
 	return nil
 }
 
+// newReadCodec builds the codec for one reader epoch. §F14 (DEF-BUDWIRE):
+// when the owner has a configured buffer quota below the codec default, the
+// inbound pipe frame cap tightens to it, so the codec's per-frame body
+// allocation — the real pipe buffer — is refused pre-allocation instead of
+// materializing an oversized frame. The sentinel 0 leaves the codec default
+// in place (no budget configured, or a quota above it): default behavior
+// unchanged (X10).
+func (c *Conn) newReadCodec() *jsonrpc.Codec {
+	codec := jsonrpc.NewCodec()
+	if cap := languages.BackendBufferCap(c.cfg.Name); cap > 0 {
+		codec.MaxMessageSize = cap
+	}
+	return codec
+}
+
 // readLoop is the single reader goroutine for server output (F15).
 // It owns the pipe snapshot it was started with; later Attach calls install
 // new pipes without touching this goroutine's view (no cross-epoch race).
@@ -602,11 +621,20 @@ func (c *Conn) Initialize() error {
 // size limits and header parsing stay in one place (C1).
 func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}) {
 	defer close(done)
-	codec := jsonrpc.NewCodec()
+	codec := c.newReadCodec()
 	r := bufio.NewReader(stdout)
 	for {
 		msg, err := codec.ReadMessage(r)
 		if err != nil {
+			// §F14 (DEF-BUDWIRE): a frame the tightened owner cap refuses is
+			// a counted refusal, not a silent disconnect — the stream-end
+			// retirement below is already visible through supervision. The
+			// note is gated on a configured budget so the unconfigured
+			// default path (the §C1 static cap refusing a pathological
+			// frame) stays zero-change (X10).
+			if strings.HasPrefix(err.Error(), "jsonrpc: message too large") && languages.BackendBudget() != nil {
+				languages.NoteBackendBufferRefusal(c.cfg.Name)
+			}
 			break
 		}
 		c.lastActivity.Store(time.Now().UnixNano())

@@ -91,3 +91,13 @@ func (m *Manager) Usage() (total int64, softExceeded bool) {
 	defer m.mu.Unlock()
 	return m.total, m.soft > 0 && m.total > m.soft
 }
+
+// Quota reports the configured per-owner limit, if any (§F14). Callers use
+// it to derive policy from the manager — e.g. tightening a stream's frame
+// cap — without reaching into the quota table.
+func (m *Manager) Quota(owner string) (int64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	limit, ok := m.quota[owner]
+	return limit, ok
+}

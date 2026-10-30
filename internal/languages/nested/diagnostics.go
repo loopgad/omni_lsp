@@ -10,6 +10,7 @@ import (
 	"time"
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
+	"github.com/omnilsp/omni/internal/languages"
 	"github.com/omnilsp/omni/internal/runtime/supervisor"
 	"github.com/omnilsp/omni/internal/workspace/position"
 )
@@ -51,11 +52,16 @@ type documentState struct {
 	allowUnversioned             bool
 	diagnosticsRefreshGeneration uint64
 	diagnostics                  []Diagnostic
-	diagnosticsReceived          bool
-	diagnosticsPublishing        chan struct{}
-	diagnosticsReady             chan struct{}
-	diagnosticsClosed            bool
-	diagnosticsErr               error
+	// budgetReserved is the §F14 backend-buffer charge for the staged
+	// diagnostics (their wire size, the dominant retained bytes), held from
+	// publication until the report is replaced or the document state drops
+	// its diagnostics. Every mutation site below runs under c.mu.
+	budgetReserved        int64
+	diagnosticsReceived   bool
+	diagnosticsPublishing chan struct{}
+	diagnosticsReady      chan struct{}
+	diagnosticsClosed     bool
+	diagnosticsErr        error
 }
 
 type publishDiagnosticsParams struct {
@@ -222,12 +228,14 @@ func (c *Conn) syncDocumentAtRevision(langID, uri string, content []byte, snapsh
 				}
 				c.nextDocumentGeneration++
 				updated := *previous
+				c.releaseDocumentBudgetLocked(previous)
 				updated.serial = c.nextDocumentGeneration
 				updated.snapshotRevision = snapshotRevision
 				if snapshotRevision > updated.highestRevision {
 					updated.highestRevision = snapshotRevision
 				}
 				updated.allowUnversioned = false
+				updated.budgetReserved = 0
 				updated.diagnostics = nil
 				updated.diagnosticsPublishing = nil
 				updated.diagnosticsReady = make(chan struct{})
@@ -310,6 +318,7 @@ func (c *Conn) syncDocumentAtRevision(langID, uri string, content []byte, snapsh
 	if err := c.Notify(method, params); err != nil {
 		c.mu.Lock()
 		if c.documents[uri] == state {
+			c.releaseDocumentBudgetLocked(state)
 			state.open = false
 			state.contentHash = [32]byte{}
 			state.diagnostics = nil
@@ -505,6 +514,7 @@ func (c *Conn) closeDocument(uri string, snapshotRevision uint64) error {
 	c.workspaceGeneration++
 	state.snapshotRevision = snapshotRevision
 	state.contentHash = [32]byte{}
+	c.releaseDocumentBudgetLocked(state)
 	state.diagnostics = nil
 	state.diagnosticsReceived = false
 	state.open = false
@@ -718,6 +728,17 @@ func (c *Conn) validateDocumentVersion(token DocumentVersion) error {
 	return nil
 }
 
+// releaseDocumentBudgetLocked drops a document state's §F14 diagnostics
+// charge when its staged report leaves the connection (cleared on close,
+// restart invalidation, sync failure, or state replacement). Caller holds
+// c.mu; every budgetReserved mutation in this package happens under it.
+func (c *Conn) releaseDocumentBudgetLocked(state *documentState) {
+	if state.budgetReserved != 0 {
+		languages.ReleaseBackendBuffer(c.cfg.Name, state.budgetReserved)
+		state.budgetReserved = 0
+	}
+}
+
 func (c *Conn) receiveDiagnostics(epoch uint64, raw json.RawMessage) {
 	var params publishDiagnosticsParams
 	if err := json.Unmarshal(raw, &params); err != nil {
@@ -774,6 +795,26 @@ func (c *Conn) receiveDiagnostics(epoch uint64, raw json.RawMessage) {
 		c.mu.Unlock()
 		return
 	}
+	// §F14 (DEF-BUDWIRE): the staged diagnostics are resident backend memory
+	// and count against the budget. The charge is the report's wire size —
+	// the dominant retained bytes; the decoded structs duplicate it. A
+	// refused reservation drops this publication fail-closed (the previously
+	// published report stays, diagnosticsReceived stays false, the refusal
+	// is counted) instead of staging unbounded memory silently. The gate
+	// sits after every drop-return above, so a reservation is only taken for
+	// a publication that would otherwise commit.
+	staged := int64(len(params.Diagnostics))
+	if !languages.ReserveBackendBuffer(c.cfg.Name, staged) {
+		c.mu.Unlock()
+		languages.NoteBackendBufferRefusal(c.cfg.Name)
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			languages.ReleaseBackendBuffer(c.cfg.Name, staged)
+		}
+	}()
 	changed := !state.diagnosticsReceived || !equalDiagnostics(state.diagnostics, diagnostics)
 	handler := c.diagnosticsUpdateHandler
 	var publishing chan struct{}
@@ -791,6 +832,14 @@ func (c *Conn) receiveDiagnostics(epoch uint64, raw json.RawMessage) {
 	// the callback-to-commit window.
 	c.mu.Lock()
 	if current := c.documents[documentURI]; current == state && state.open && state.epoch == epoch {
+		// Swap the §F14 charge to the new report: the reservation taken
+		// above becomes the document's held charge, the previous one is
+		// released. If the re-check below fails instead, the defer returns
+		// the reservation so the budget never leaks a dropped publication.
+		committed = true
+		previous := state.budgetReserved
+		state.budgetReserved = staged
+		languages.ReleaseBackendBuffer(c.cfg.Name, previous)
 		state.diagnostics = diagnostics
 		state.diagnosticsReceived = true
 		if !state.diagnosticsClosed {
@@ -884,6 +933,7 @@ func (c *Conn) invalidateDocumentsLocked(err error) {
 func (c *Conn) invalidateDocumentsForRestartLocked(err error, epoch uint64) {
 	c.workspaceGeneration++
 	for _, state := range c.documents {
+		c.releaseDocumentBudgetLocked(state)
 		state.open = false
 		state.contentHash = [32]byte{}
 		state.diagnostics = nil
