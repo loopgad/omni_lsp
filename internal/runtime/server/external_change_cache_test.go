@@ -128,8 +128,24 @@ go 1.26.1
 		}
 	}()
 	movedRoot := root + "-moved"
-	if err := os.Rename(root, movedRoot); err != nil {
-		t.Fatal(err)
+	// Windows: the watched root doubles as the golang backend's working
+	// directory. Under full-suite -race load a go-toolchain subprocess can
+	// still be tearing down when the rename fires, and its CWD handle fails
+	// the rename with ERROR_SHARING_VIOLATION ("used by another process").
+	// The pin is the scan-error evidence path AFTER the rename, not the
+	// rename winning that teardown race on its first attempt, so retry
+	// briefly (5s, matching this test's other liveness bounds) before
+	// failing. Full-gate evidence 2026-10-31: solo and package-isolated
+	// runs pass; two consecutive full runs failed on this exact rename.
+	var renameErr error
+	for i := 0; i < 50; i++ {
+		if renameErr = os.Rename(root, movedRoot); renameErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if renameErr != nil {
+		t.Fatal(renameErr)
 	}
 	defer func() {
 		if _, err := os.Stat(movedRoot); err == nil {
