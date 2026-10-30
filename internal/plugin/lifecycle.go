@@ -155,10 +155,72 @@ func (m *Manager) Install(d Discovery) error {
 	return nil
 }
 
+// GrantPolicy 是 EnableWithPolicy 的授予策略输入（审计批·注册变更越权覆盖
+// 面）：对 manifest 声明的每一项能力做裁决，false 即该项不进入授予表——
+// 授权表不再由 manifest 声明逐字构造。nil 等价旧语义（按声明授予），仅供
+// 直接嵌入 Manager 的宿主使用；生产装配点必须经 DefaultGrantPolicy 建立
+// 高权第二道门。
+type GrantPolicy func(Capability) bool
+
+// highPrivilegeCapabilities 是需第二道授予门的高权能力（审计批·注册变更越权
+// 覆盖面）：这三项等价于在用户机器上执行任意进程/写文件系统/出网。旧的
+// 「Enable 即按声明授予」使「进入 PluginsDir 且过 checksum」等同于自授它们
+// ——必须由显式 opt-in（admin 策略/用户信任面，生产为 OMNILSP_PLUGIN_CAPS_ALLOW）
+// 逐项授予，default deny 才对已声明项也有第二守门人。
+var highPrivilegeCapabilities = []Capability{CapProcessExecute, CapFilesystemWrite, CapNetworkAccess}
+
+// IsHighPrivilegeCapability 报告 c 是否属于高权集合。
+func IsHighPrivilegeCapability(c Capability) bool {
+	for _, hp := range highPrivilegeCapabilities {
+		if c == hp {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultGrantPolicy 返回生产装配点的默认授予策略：低权能力按声明授予不变；
+// 高权能力仅当出现在 allow（显式 opt-in 集合）时授予。allow 为 nil 或不含
+// 该项即拒绝。
+func DefaultGrantPolicy(allow map[Capability]bool) GrantPolicy {
+	return func(c Capability) bool {
+		if !IsHighPrivilegeCapability(c) {
+			return true
+		}
+		return allow[c]
+	}
+}
+
+// ApplyGrantPolicy 以与授予表同一策略过滤声明能力：生产装配点用它产出
+// 「有效声明」传给 Launch，使 Launch 前置门（声明 ⊆ 授予）与授予表由同一
+// 策略产出、按构造一致。policy 为 nil 时原样返回（旧语义）。
+func ApplyGrantPolicy(caps []Capability, policy GrantPolicy) []Capability {
+	if policy == nil {
+		return caps
+	}
+	out := make([]Capability, 0, len(caps))
+	for _, c := range caps {
+		if policy(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // Enable 允许 Verified/Failed → Enabled（Failed 是上次运行崩溃后的可重启态，
 // 与 Disable 的 switch 保持同一覆盖面），并按 manifest.capabilities 建立授权表。
 // 隔离态或连续崩溃达阈值时返回 ErrQuarantined。成功启用会清零连续崩溃计数。
+//
+// 无策略变体：按声明授予、无高权第二道门，仅供直接嵌入 Manager 的宿主；
+// 生产装配点（runtime/server mountPlugins）必须走 EnableWithPolicy。
 func (m *Manager) Enable(id string) (Grant, error) {
+	return m.EnableWithPolicy(id, nil)
+}
+
+// EnableWithPolicy 在 Enable 的状态机约束之上叠加授予策略输入：声明能力逐项
+// 过 policy，false 者不进入授予表（审计批·注册变更越权覆盖面）。policy 为
+// nil 等价 Enable（按声明授予）。
+func (m *Manager) EnableWithPolicy(id string, policy GrantPolicy) (Grant, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.states[id] == StateQuarantined || m.crashes[id] >= MaxConsecutivePluginCrashes {
@@ -167,10 +229,9 @@ func (m *Manager) Enable(id string) (Grant, error) {
 	if m.states[id] != StateVerified && m.states[id] != StateFailed {
 		return Grant{}, fmt.Errorf("plugin: %s 处于 %v，仅 verified/failed 可启用", id, m.states[id])
 	}
-	caps := m.manifests[id].Capabilities
-	g := Grant{caps: make(map[Capability]bool, len(caps))}
-	for _, c := range caps {
-		g.caps[c] = true // Enable 即按声明授予（仍受 Launch 前能力门约束）
+	g := Grant{caps: make(map[Capability]bool)}
+	for _, c := range ApplyGrantPolicy(m.manifests[id].Capabilities, policy) {
+		g.caps[c] = true // 授予 = 声明 ∩ 策略白名单（仍受 Launch 前能力门约束）
 	}
 	m.grants[id] = g
 	delete(m.crashes, id) // 全新启动，连续计数归零

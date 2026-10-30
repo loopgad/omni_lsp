@@ -376,3 +376,74 @@ func TestEmit_CrashDuringEmitContained(t *testing.T) {
 		t.Fatalf("state = %v (err %v), want quarantined", st, err)
 	}
 }
+
+// TestPluginsMount_HighPrivilegeCapsRequireOptIn（审计批·注册变更越权覆盖面）：
+// 装配点对三项高权能力（process.execute/filesystem.write/network.access）执行
+// 第二道授予门——授予策略（DefaultGrantPolicy）默认剔除，仅 OMNILSP_PLUGIN_CAPS_ALLOW
+// 显式列名者放行；有效声明经同一策略过滤后进入 pending，使 Launch 前置门
+// 「声明 ⊆ 授予」按构造成立，低权能力不受影响。旧的「Enable 即按声明授予」
+// 使「进入 PluginsDir 且过 checksum」等同自授全部高权能力，随本守卫切割。
+func TestPluginsMount_HighPrivilegeCapsRequireOptIn(t *testing.T) {
+	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "diag-emit")
+	t.Setenv("OMNILSP_TRUST", "trusted")
+	allCaps := []plugin.Capability{plugin.CapDiagnosticsEmit, plugin.CapProcessExecute, plugin.CapFilesystemWrite, plugin.CapNetworkAccess}
+
+	// 装配快照：pending 首条（信任策略就绪前不 Launch，pending 稳定）。
+	snapshot := func(s *Server) (plugin.Grant, []plugin.Capability) {
+		s.pluginMu.Lock()
+		defer s.pluginMu.Unlock()
+		if len(s.pluginPending) != 1 {
+			return plugin.Grant{}, nil
+		}
+		return s.pluginPending[0].grant, s.pluginPending[0].discovery.Manifest.Capabilities
+	}
+	grantHas := func(t *testing.T, g plugin.Grant, c plugin.Capability, want bool) {
+		t.Helper()
+		err := g.Check(c)
+		if want && err != nil {
+			t.Errorf("授予表缺 %s: %v", c, err)
+		}
+		if !want && err == nil {
+			t.Errorf("授予表不应含 %s（第二道门未生效）", c)
+		}
+	}
+
+	t.Run("default-withholds-high-privilege", func(t *testing.T) {
+		root := t.TempDir()
+		writePluginDir(t, root, "highpriv", allCaps, nil)
+		s := New(Config{PluginsDir: root})
+		defer s.ClosePlugins()
+		grant, eff := snapshot(s)
+		if eff == nil {
+			t.Fatal("高权声明插件应正常装配待命（低权车道不受第二道门影响）")
+		}
+		grantHas(t, grant, plugin.CapDiagnosticsEmit, true)
+		grantHas(t, grant, plugin.CapProcessExecute, false)
+		grantHas(t, grant, plugin.CapFilesystemWrite, false)
+		grantHas(t, grant, plugin.CapNetworkAccess, false)
+		// 有效声明与授予表同源：Launch 前置门（声明 ⊆ 授予）不被第二道门破坏。
+		if len(eff) != 1 || eff[0] != plugin.CapDiagnosticsEmit {
+			t.Fatalf("有效声明 = %v, want [diagnostics.emit]", eff)
+		}
+	})
+
+	t.Run("explicit-opt-in-restores-named-cap", func(t *testing.T) {
+		t.Setenv("OMNILSP_PLUGIN_CAPS_ALLOW", "process.execute")
+		root := t.TempDir()
+		writePluginDir(t, root, "highpriv", allCaps, nil)
+		s := New(Config{PluginsDir: root})
+		defer s.ClosePlugins()
+		grant, eff := snapshot(s)
+		if eff == nil {
+			t.Fatal("opt-in 后插件应正常装配待命")
+		}
+		grantHas(t, grant, plugin.CapProcessExecute, true)
+		grantHas(t, grant, plugin.CapFilesystemWrite, false)
+		grantHas(t, grant, plugin.CapNetworkAccess, false)
+		grantHas(t, grant, plugin.CapDiagnosticsEmit, true)
+		if len(eff) != 2 || eff[0] != plugin.CapDiagnosticsEmit || eff[1] != plugin.CapProcessExecute {
+			t.Fatalf("有效声明 = %v, want [diagnostics.emit process.execute]", eff)
+		}
+	})
+}

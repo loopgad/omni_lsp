@@ -266,3 +266,77 @@ func TestExecutor_LaunchHandshake(t *testing.T) {
 		}
 	})
 }
+
+// TestO2_GrantPolicyGatesHighPrivilege（审计批·注册变更越权覆盖面）：
+// EnableWithPolicy 是 Enable 的授予策略输入——声明能力先过策略白名单再入
+// Grant，授权表不再由 manifest 声明逐字构造。生产装配点默认策略
+// （DefaultGrantPolicy）把三项高权能力（process.execute/filesystem.write/
+// network.access）降级为需显式 opt-in：「进入 PluginsDir 且过 checksum」
+// 不再等价于自授全部声明能力。
+func TestO2_GrantPolicyGatesHighPrivilege(t *testing.T) {
+	id := "demo.plugin"
+	newMgr := func(t *testing.T) *Manager {
+		t.Helper()
+		m := newValidManifest([]byte("x"))
+		m.Capabilities = []Capability{CapDiagnosticsEmit, CapProcessExecute, CapFilesystemWrite, CapNetworkAccess}
+		mgr := NewManager()
+		if err := mgr.Install(Discovery{Dir: "d", Manifest: m}); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		return mgr
+	}
+
+	// 高权集合恰为审计点名的三项。
+	for _, c := range AllCapabilities() {
+		want := c == CapProcessExecute || c == CapFilesystemWrite || c == CapNetworkAccess
+		if got := IsHighPrivilegeCapability(c); got != want {
+			t.Errorf("IsHighPrivilegeCapability(%s) = %v, want %v", c, got, want)
+		}
+	}
+
+	// 默认策略（无 opt-in）：高权能力全部剔除，低权照常授予。
+	g, err := newMgr(t).EnableWithPolicy(id, DefaultGrantPolicy(nil))
+	if err != nil {
+		t.Fatalf("EnableWithPolicy: %v", err)
+	}
+	for _, c := range []Capability{CapProcessExecute, CapFilesystemWrite, CapNetworkAccess} {
+		if err := g.Check(c); !errors.Is(err, ErrCapabilityDenied) {
+			t.Errorf("无 opt-in 时高权 %q 应拒绝（默认第二道门），实际 %v", c, err)
+		}
+	}
+	if err := g.Check(CapDiagnosticsEmit); err != nil {
+		t.Errorf("低权 diagnostics.emit 应照常授予: %v", err)
+	}
+
+	// 显式 opt-in：仅列名者回到授予表，未列名的高权仍剔除。
+	g2, err := newMgr(t).EnableWithPolicy(id, DefaultGrantPolicy(map[Capability]bool{CapProcessExecute: true}))
+	if err != nil {
+		t.Fatalf("EnableWithPolicy(opt-in): %v", err)
+	}
+	if err := g2.Check(CapProcessExecute); err != nil {
+		t.Errorf("opt-in 后 process.execute 应授予: %v", err)
+	}
+	if err := g2.Check(CapFilesystemWrite); !errors.Is(err, ErrCapabilityDenied) {
+		t.Errorf("未列入 opt-in 的 filesystem.write 应拒绝，实际 %v", err)
+	}
+
+	// ApplyGrantPolicy 与授予同源过滤声明：生产装配点用它产出「有效声明」
+	// 传给 Launch，使 Launch 前置门（声明 ⊆ 授予）按构造成立。
+	eff := ApplyGrantPolicy([]Capability{CapDiagnosticsEmit, CapProcessExecute, CapFilesystemWrite, CapNetworkAccess},
+		DefaultGrantPolicy(map[Capability]bool{CapNetworkAccess: true}))
+	if len(eff) != 2 || eff[0] != CapDiagnosticsEmit || eff[1] != CapNetworkAccess {
+		t.Errorf("ApplyGrantPolicy 有效声明 = %v, want [diagnostics.emit network.access]", eff)
+	}
+
+	// nil 策略 = Enable 旧语义（直接嵌入 Manager 的宿主按声明授予；
+	// 生产装配点必须走 DefaultGrantPolicy）。
+	g3, err := newMgr(t).EnableWithPolicy(id, nil)
+	if err != nil {
+		t.Fatalf("EnableWithPolicy(nil): %v", err)
+	}
+	for _, c := range []Capability{CapDiagnosticsEmit, CapProcessExecute, CapFilesystemWrite, CapNetworkAccess} {
+		if err := g3.Check(c); err != nil {
+			t.Errorf("nil 策略下 %q 应按声明授予: %v", c, err)
+		}
+	}
+}

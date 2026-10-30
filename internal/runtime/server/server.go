@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -443,14 +444,34 @@ type pluginEmitDiag struct {
 }
 
 // pluginPendingLaunch 是一条待 Launch 的装配结果：discovery 提供目录来源与
-// manifest，grant 是 Enable 建立的授权表。
+// 有效 manifest（声明能力经装配点授予策略过滤后的副本，原始声明留在 Manager
+// 注册表与磁盘清单），grant 是 EnableWithPolicy 建立的授权表。
 type pluginPendingLaunch struct {
 	discovery plugin.Discovery
 	grant     plugin.Grant
 }
 
+// pluginCapsAllow 解析 OMNILSP_PLUGIN_CAPS_ALLOW（逗号分隔能力名）：装配点
+// 高权能力第二道门的显式 opt-in 面（admin 策略/用户信任输入）。空/未设 =
+// 无 opt-in（高权默认拒绝）。低权与未知能力名在此无效果——低权本就按声明
+// 授予，未知名会被 DefaultGrantPolicy 静默忽略（装配面不做二次校验）。
+func pluginCapsAllow() map[plugin.Capability]bool {
+	raw := os.Getenv("OMNILSP_PLUGIN_CAPS_ALLOW")
+	if raw == "" {
+		return nil
+	}
+	allow := make(map[plugin.Capability]bool)
+	for _, name := range strings.Split(raw, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			allow[plugin.Capability(name)] = true
+		}
+	}
+	return allow
+}
+
 // mountPlugins 是进程内插件装配点（§O0-O5 落差1）：PluginsDir 非空时执行
-// Discover → Install → Enable。单插件失败不中断整体（与 Discover 同哲学）：
+// Discover → Install → EnableWithPolicy（高权能力第二道门，审计批·注册变更
+// 越权覆盖面）。单插件失败不中断整体（与 Discover 同哲学）：
 // VerifyErr 目录被 Install 拒绝（信任链失败不 spawn）、Enable 失败（崩溃隔离
 // 态）只记账不重试。
 //
@@ -506,10 +527,36 @@ func (s *Server) mountPlugins(dir string) {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 未通过信任链，拒绝装配: %v\n", id, err)
 			continue
 		}
-		grant, err := mgr.Enable(id)
+		// 装配点授予第二道门（审计批·注册变更越权覆盖面）：声明能力先过授予
+		// 策略再入 Grant——三项高权能力（process.execute/filesystem.write/
+		// network.access）默认不授予，仅 OMNILSP_PLUGIN_CAPS_ALLOW（逗号分隔，
+		// admin 策略/用户显式 opt-in）列名者放行；低权能力照常按声明授予。
+		// 「Enable 即按声明授予」的旧约定使凡进入 PluginsDir 且过 checksum 的
+		// 插件即自授全部声明能力，default deny 对已声明项没有第二守门人。
+		policy := plugin.DefaultGrantPolicy(pluginCapsAllow())
+		grant, err := mgr.EnableWithPolicy(id, policy)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 启用被拒: %v\n", id, err)
 			continue
+		}
+		// 有效声明与授予表由同一策略产出（plugin.ApplyGrantPolicy）：Launch 前置
+		// 门（声明 ⊆ 授予）按构造成立——高权能力被剔除时同步从 pending 携带的
+		// manifest 副本中移除，插件进程侧能力表随之降级，而 Manager 注册表与
+		// CLI 展示仍保留原始声明。被剔除的声明能力落 stderr 可见记账；全部声明
+		// 被剔除的插件仍装配（空能力表 = 纯 inert，所有 Call/emit 门拒绝）。
+		if eff := plugin.ApplyGrantPolicy(d.Manifest.Capabilities, policy); len(eff) != len(d.Manifest.Capabilities) {
+			granted := make(map[plugin.Capability]bool, len(eff))
+			for _, c := range eff {
+				granted[c] = true
+			}
+			var removed []string
+			for _, c := range d.Manifest.Capabilities {
+				if !granted[c] {
+					removed = append(removed, string(c))
+				}
+			}
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 声明的高权能力未获显式授权（OMNILSP_PLUGIN_CAPS_ALLOW），已从授予表剔除: %s\n", id, strings.Join(removed, ","))
+			d.Manifest.Capabilities = eff
 		}
 		s.pluginMu.Lock()
 		s.pluginPending = append(s.pluginPending, pluginPendingLaunch{discovery: d, grant: grant})
