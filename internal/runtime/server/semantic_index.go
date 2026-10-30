@@ -28,10 +28,20 @@ func (s *Server) semanticIndexBindings() []namedSemanticIndexBinding {
 	unique := bindings[:0]
 	for _, binding := range bindings {
 		duplicate := false
-		for _, prior := range unique {
+		for i, prior := range unique {
 			if sameSemanticCapability(binding.binding.provider, prior.binding.provider) &&
 				sameSemanticCapability(binding.binding.planner, prior.binding.planner) {
 				duplicate = true
+				// One capability per family, but report it under the canonical
+				// family key: alias and dialect keys (c, javascript,
+				// typescriptreact, javascriptreact) sort before their canonical
+				// key, and downstream exact-language consumers (SCIP/LSIF
+				// import selection, reindex labels) must keep seeing the
+				// canonical language the artifacts were planned under.
+				if semanticIndexFamily(binding.language) == binding.language &&
+					semanticIndexFamily(prior.language) != prior.language {
+					unique[i] = binding
+				}
 				break
 			}
 		}

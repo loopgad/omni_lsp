@@ -274,13 +274,18 @@ func goOverlayContextAtRevision(s *Server, ctx context.Context, revision uint64)
 
 // semanticIndexBindingForLanguage returns the registered semantic index
 // binding for one language, if that language has a complete provider/planner
-// capability.
+// capability. The lookup resolves through the language's semantic-index
+// family (semanticIndexFamily), so backend aliases and editor dialect keys —
+// c, javascript, typescriptreact, javascriptreact — resolve the same
+// capability as their canonical key, while the enumerated binding list keeps
+// reporting the canonical language.
 func (s *Server) semanticIndexBindingForLanguage(language string) (semanticIndexBinding, bool) {
 	if language == "" {
 		return semanticIndexBinding{}, false
 	}
+	family := semanticIndexFamily(language)
 	for _, candidate := range s.semanticIndexBindings() {
-		if candidate.language == language && candidate.binding.provider != nil && candidate.binding.planner != nil {
+		if candidate.language == family && candidate.binding.provider != nil && candidate.binding.planner != nil {
 			return candidate.binding, true
 		}
 	}

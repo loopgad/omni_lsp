@@ -367,6 +367,13 @@ func registerBackends(srv *server.Server, cfg config.Config) {
 		} else {
 			srv.RegisterBackend(cb.LanguageID(), cb)
 			srv.RegisterBackend("c", cb)
+			// Explicit semantic index registration (behavior-authorized): the
+			// dirty cpp workspace/symbol guard now trusts this capability, so
+			// dirty cpp requests fail closed (or answer snapshot-exact when
+			// the exporter proves completeness) instead of serving stale disk
+			// symbols. Both family keys bind the same capability; the server
+			// keeps enumerating it under the canonical cpp key.
+			registerCclsSemanticIndex(srv, cb)
 			info("ccls backend registered (clangd bridge)")
 		}
 	}
@@ -380,6 +387,25 @@ func registerBackends(srv *server.Server, cfg config.Config) {
 func wrap[T languages.Backend](f func(string) (T, error)) func(string) (languages.Backend, error) {
 	return func(dir string) (languages.Backend, error) { return f(dir) }
 }
+
+// registerCclsSemanticIndex explicitly registers the ccls exporter capability
+// under both language keys the bridge serves: the canonical "cpp" backend
+// identity and the "c" alias. The dirty workspace/symbol guard consults the
+// canonical key; the alias keeps the capability resolvable for c-family
+// document overlays. The registered key set is pinned by
+// TestRegisterCclsSemanticIndexBindsCanonicalAndAliasKeys.
+func registerCclsSemanticIndex(srv *server.Server, cb *ccls.Backend) {
+	srv.RegisterSemanticIndexProvider(cb.LanguageID(), cb, cb)
+	srv.RegisterSemanticIndexProvider("c", cb, cb)
+}
+
+// typescriptSemanticIndexLanguages lists every language key the pinned
+// TypeScript exporter serves. The provider normalizes the whole TS/JS dialect
+// family (typescript, javascript, typescriptreact, javascriptreact), so each
+// dialect gets its own explicit binding key while the server keeps
+// enumerating one capability under the canonical typescript key. Pinned by
+// TestTypescriptSemanticIndexLanguagesCoverJSFamily.
+var typescriptSemanticIndexLanguages = []string{"typescript", "javascript", "typescriptreact", "javascriptreact"}
 
 // nestedEntry describes one optional nested-LSP language pack. A missing
 // toolchain is a doctor-visible warning, never a fatal serve error (§D0:
@@ -405,14 +431,16 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 	type settled struct {
 		e  nestedEntry
 		be languages.Backend
-		// semanticLang/provider/planner carry the pinning product built during
+		// semanticLangs/provider/planner carry the pinning product built during
 		// spawn. provider nil means the language has no semantic provider or
 		// pinning failed (already warned); registration still happens after
-		// settle, in results order.
-		semanticLang string
-		provider     languages.SemanticIndexProvider
-		planner      languages.SemanticIndexRequestBuilder
-		providerNote string
+		// settle, in results order. semanticLangs lists every language key the
+		// provider serves (the TypeScript exporter covers the whole JS dialect
+		// family, so it registers four keys).
+		semanticLangs []string
+		provider      languages.SemanticIndexProvider
+		planner       languages.SemanticIndexRequestBuilder
+		providerNote  string
 	}
 	results := make(chan settled, len(entries))
 	var wg sync.WaitGroup
@@ -435,7 +463,7 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 				if configErr != nil {
 					warn("Rust semantic index unavailable: %v", configErr)
 				} else {
-					st.semanticLang = "rust"
+					st.semanticLangs = []string{"rust"}
 					st.provider = backend
 					st.planner = rustanalyzer.NewSemanticIndexRequestBuilder(backend, toolConfig)
 					st.providerNote = "Rust semantic index provider registered with pinned tool identities"
@@ -447,7 +475,11 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 				if providerErr != nil {
 					warn("TypeScript/JavaScript semantic index unavailable: %v", providerErr)
 				} else {
-					st.semanticLang = "typescript"
+					// Explicit js-family registration: the pinned TypeScript
+					// capability is bound under every dialect key it serves,
+					// so dirty js/jsx documents resolve the same exporter as
+					// typescript documents.
+					st.semanticLangs = typescriptSemanticIndexLanguages
 					st.provider = provider
 					st.planner = provider
 					st.providerNote = "TypeScript/JavaScript semantic index provider registered with pinned Node, compiler, and candidate identities"
@@ -459,7 +491,7 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 				if providerErr != nil {
 					warn("Python semantic index unavailable: %v", providerErr)
 				} else {
-					st.semanticLang = "python"
+					st.semanticLangs = []string{"python"}
 					st.provider = provider
 					st.planner = provider
 					st.providerNote = "Python semantic index provider registered with pinned analyzer identities"
@@ -476,7 +508,9 @@ func registerNested(srv *server.Server, enabled func(string) bool, workDir strin
 			srv.RegisterBackend(st.e.short, st.be) // short alias, e.g. "py" → python
 		}
 		if st.provider != nil {
-			srv.RegisterSemanticIndexProvider(st.semanticLang, st.provider, st.planner)
+			for _, lang := range st.semanticLangs {
+				srv.RegisterSemanticIndexProvider(lang, st.provider, st.planner)
+			}
 			info("%s", st.providerNote)
 		}
 		info("%s backend registered (%s bridge)", st.e.langID, st.e.binary)

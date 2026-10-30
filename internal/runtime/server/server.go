@@ -743,6 +743,25 @@ func (s *Server) hasExplicitSemanticIndex(language string) bool {
 	return ok
 }
 
+// semanticIndexFamily normalizes a language key to its semantic-index family:
+// the canonical language under which one exporter capability is enumerated.
+// Backend aliases and editor dialect keys share the capability of their
+// canonical backend identity — the ccls bridge serves .c/.h documents under
+// the cpp family (its planner derives every scope from the canonical cpp/ccls
+// identity), and the TypeScript exporter serves the javascript,
+// typescriptreact, and javascriptreact dialects under the typescript family.
+// Mirrors the family grouping in semanticPlanningStillMatches.
+func semanticIndexFamily(language string) string {
+	switch language {
+	case "c":
+		return "cpp"
+	case "javascript", "typescriptreact", "javascriptreact":
+		return "typescript"
+	default:
+		return language
+	}
+}
+
 // Run runs the server with the given transport. Blocks until shutdown.
 // All incoming messages are admitted through the lifecycle gate (C2) and the
 // scheduler (F3/F5). The Running state is entered only via the initialize
