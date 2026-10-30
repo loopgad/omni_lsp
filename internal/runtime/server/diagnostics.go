@@ -246,26 +246,40 @@ func (d *diagCoordinator) schedulePluginPush(uri string) {
 // 是 uri 级全量替换，插件车道独占发布会把后端集整体顶掉（反之亦然），因此
 // 两个上线点（本函数与 publishComputed）都在发布前合并对方当前集。每条插件
 // 诊断的 Source 已在注入时被宿主强制为 "plugin:<id>"——线协议上来源可见、
-// 可治理。后端缓存无该 uri 条目（后端从未算过/FIFO 驱逐）时只带插件集，
-// version 字段随缓存条目缺席一并省略（与既有插件 payload 形状一致）。
+// 可治理。后端缓存无该 uri 条目（后端从未算过/FIFO 驱逐）时补一次后端重算
+// 并入同一帧（审计批 3 发现 2 的缓存缺席残余面：客户端已显示的后端诊断不得
+// 被插件帧一次性顶掉）；重算失败或 uri 无可解析后端时退回只带插件集，version
+// 字段随后端集缺席一并省略（与既有插件 payload 形状一致）。
 //
 // 与后端集的合并读在 d.mu 临界区内取快照（与插件集快照化同一纪律）；后端
 // 缓存集可能是正在被更新代替换的上一代——发布全量报告的收敛语义由两条车道
-// 的下一次去抖推送兜住（后到者同样合并对方），瞬时陈旧无害。
+// 的下一次去抖推送兜住（后到者同样合并对方），瞬时陈旧无害。重算用的
+// context.Background 不可提前取消（d.runs 的单槽位归 push 车道，不复用）：
+// compute 自带的关闭态守卫保证关闭后不提交、不发布，最坏代价是关闭竞态下
+// 一次有界的后端调用。
 func (d *diagCoordinator) publishPluginDiagnostics(uri string, sets map[string]pluginDiagSet) {
 	d.mu.Lock()
-	backendItems := []languages.Diagnostic(nil)
-	version := int64(0)
-	hasBackend := false
-	if en, ok := d.cache[uri]; ok {
-		backendItems = en.items
-		version = en.version
-		hasBackend = true
-	}
+	en, hasBackend := d.cache[uri]
 	stillOpen := !d.closed && d.server.vfs.Get(uri) != nil
 	d.mu.Unlock()
 	if !stillOpen {
 		return
+	}
+	var backendItems []languages.Diagnostic
+	version := int64(0)
+	if hasBackend {
+		backendItems, version = en.items, en.version
+	} else if be := d.server.findWorkspaceBackendFor(uri); be != nil {
+		// 缓存缺席（后端从未算过/FIFO 驱逐）：发布前补一次后端重算，让该帧
+		// 与 push 车道的合并形态一致。重算成功即提交缓存，随后按缓存条目
+		// （可能已是更新的一代——收敛语义同上）取集与 version。
+		if _, _, cerr := d.compute(context.Background(), uri); cerr == nil {
+			d.mu.Lock()
+			if en, ok := d.cache[uri]; ok {
+				backendItems, version, hasBackend = en.items, en.version, true
+			}
+			d.mu.Unlock()
+		}
 	}
 	items := mergePublishItems(backendItems, sets)
 	displayURI := uri
@@ -739,6 +753,20 @@ func (d *diagCoordinator) computePull(parent context.Context, uri string) ([]lan
 	return items, nil
 }
 
+// mergePullItems 把 pull 应答的后端集与插件车道对该 uri 的当前 emit 集合并
+// （审计批 3 发现 2）：pull 全量应答按 LSP 语义被客户端整集替换——只带纯
+// 后端集会把已上线的插件诊断整体顶掉，直到该插件下一次去抖推送才恢复（插件
+// 静默期则无限期）。插件集快照在 d.mu 临界区内拍平（与 publishComputed 同一
+// 纪律——发布读侧绝不见 live inner map）；文档已关闭时 didCloseDocument 已
+// 清空插件表，合并自然退化为纯后端集（关闭文档的空报告仍是真话，§Q4）。
+func (d *diagCoordinator) mergePullItems(uri string, backend []languages.Diagnostic) []languages.Diagnostic {
+	uri = canonicalDocumentURI(uri)
+	d.mu.Lock()
+	sets := d.pluginSetsSnapshotLocked(uri)
+	d.mu.Unlock()
+	return mergePublishItems(backend, sets)
+}
+
 // findWorkspaceBackendFor resolves diagnostics through the same URI-to-backend
 // path used by semantic requests. In particular, language IDs such as
 // javascriptreact and typescriptreact are routed by their file extension to
@@ -818,6 +846,10 @@ func projectDiagnostics(items []languages.Diagnostic) []map[string]any {
 // failed computation simply does not publish (§Q4: no silent fallback — the
 // failure is visible both as the error response and in backend-failure
 // metrics).
+//
+// 同一全量替换语义要求应答前并入插件车道当前集（审计批 3 发现 2）——纯后
+// 端集应答会把已上线的插件诊断整体顶掉；resultId 覆盖合并集，§I18 稳定 ID
+// 不随车道遗漏漂移。
 func (s *Server) handlePullDiagnostics(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params struct {
 		TextDocument struct {
@@ -846,6 +878,7 @@ func (s *Server) handlePullDiagnostics(ctx context.Context, msg *jsonrpc.Message
 		// truthful answer (§Q4), and no backend work was spent.
 		items = nil
 	}
+	items = s.diag.mergePullItems(params.TextDocument.URI, items)
 	payload, _ := json.Marshal(map[string]any{
 		"kind":     "full",
 		"resultId": diagnosticsResultID(items),
