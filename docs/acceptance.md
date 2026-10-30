@@ -1092,3 +1092,89 @@ offset debt on file in `freeze-record.txt`):
   开口（七语言 fact 完整性其余语言端到端、剩余 overlay、完整跨进程 replay）；
   ⑤ DEFERRED 条目 Reason 不入 docs/conformance.md 投影（投影仅 PARTIAL 带
   Reason），维护性更新以 registry.go 为准。
+
+## Evidence record — 2026-10-31 第十九轮记账（四车道证据评估：DEF-BUDWIRE 升 AUTO + DEF-IDXWIRE 按证据维持）
+
+- 性质：第十九轮记账轮（记账员域）。对第十八轮后四条并发车道（F14 后端缓冲
+  配额 8cbb440、插件治理 3b82767、语义注册 e381441、七语言索引链 71d01fa，
+  均收束提交）的证据逐条实跑复核后，对两条 post-X9 台账条目作出 promote/维持
+  结论。改动仅记账员边界内文件：internal/conformance/registry.go、
+  docs/conformance.md（再生投影）、test/conformance/testdata/baseline.json
+  （本轮零 diff）、docs/acceptance.md（本节）。
+- 车道证据实跑复核（本 session 全部实跑，非转抄）：`go test
+  ./internal/runtime/budget/ ./internal/languages/ -count=1` ok/ok；`go test
+  ./internal/plugin/ -count=1` ok 4.195s（含插件车道口5 通知配额测试——该
+  半边 executor_budget.go 尚未提交，未纳入台账文本与 Probe，见 selfCheck）；
+  `go test ./internal/languages/ccls/ -count=1` ok 16.011s（F14 车道按共享包
+  纪律遗留首跑的 memo_budget_test.go 本轮收束实跑，4 测绿）；`go test
+  ./internal/languages/nested/ -count=1` ok 13.818s（W1 帧帽 + W2 诊断暂存
+  6 守卫）；`go test ./internal/languages/golang/ -count=1` ok 38.715s
+  （W3 接线点 semantic_index.go:2396）；`go vet ./internal/languages/pyright/
+  ./internal/languages/typescript/` 干净（W4 接线点 direct_compiler.go:414、
+  compiler_exporter.go:348 编译级核验）；`go test ./internal/runtime/server/
+  -run TestF13_ -count=1 -v` 6 测全 PASS（F13 生产构造点 index.go:188）。
+  代码面核实：F14 锁存器 internal/languages/budget.go:90（env 未设返回 nil
+  =零行为变化）、六 owner 表 budget.go:45、五个接线点 grep 逐一在位。
+- DEF-IDXWIRE 证据实跑复核：`go test ./internal/index/persistent/ -run
+  TestSevenLanguageTypedFactExportPersistsWithStableIdentity -count=1 -v` PASS
+  26.7s（go/rust/typescript/python/javascript 五语言子测全 PASS；cpp/c 子测
+  以精确哨兵自愈 SKIP）；`go test ./internal/replay/ -run
+  TestSevenLanguageTypedGenerationsReplayFreshOnlyAcrossStoreReopen -count=1
+  -v` PASS 45.7s（同五语言 PASS，cpp/c 同哨兵 SKIP——首轮 grep 只匹配行首
+  标记曾漏看缩进 SKIP，复跑带缩进匹配后确认，车道证据与实况一致）。上游
+  阻塞在源码面确认仍在：internal/index/extractors/clang/extractor.go:1664
+  convertPosition 对缺 end 列的边事件产出 EndChar=0 无 clamp（该文件在
+  记账员边界外，仅登记）。
+- promote（本轮唯一）：DEF-BUDWIRE（post-x9/BUDGET，F13/F14 production
+  wiring）DEFERRED→AUTO，提交 433f092。判定链：原 Reason 的阻塞面「F14 半边
+  未接线、budget.New 零生产调用者」已由 8cbb440 消除——languages 层锁存器
+  以 OMNILSP_BACKEND_BUDGET_BYTES + OMNILSP_BACKEND_QUOTA_<OWNER>_BYTES
+  构造 budget.Manager（env 未设 nil 短路，X10 红线下默认关是被要求形态而非
+  缺口），五个真实分配点 fail-closed 拒绝+计数；F13 半边（index.go:188
+  阶梯）第 18 轮已在。按体例删 Reason 与 Milestone、补 Probe 四组（server
+  F13 阶梯三测、languages 执法+默认关十测、nested W1/W2 六守卫、ccls W5
+  memo 四测，全部本轮实跑绿）。同笔刷新 Y1-11（core/Y1）Text——其「neither
+  budget.Manager nor scheduler.BudgetManager has a production construction
+  point」在 promote 后成为假命题，按诚实原则随 promote 一体改写（状态与
+  Probe 不动，Y1 分数不变）。
+- 维持（本轮一条）：DEF-IDXWIRE 维持 PARTIAL，提交 1616105。七语言端到端
+  五分之四到齐（五语言链+跨 store 重开 replay 全绿）但 cpp/c 双腿被上游
+  clang 提取器 bug 阻断（七语言条件不齐），不上 AUTO；Reason 按实况改写：
+  增五语言证据与两个钉住测试名、撤除已过时的「显式注册被 X10 阻止」表述
+  （cpp/c/TS 方言键本轮已在授权下注册落地 e381441、family 归一保既有键
+  解析逐一不变，registerCclsSemanticIndex main.go:398、typescriptSemantic
+  IndexLanguages main.go:409、semanticIndexFamily server.go:868）、明确剩余
+  开口=提取器 clamp。Probe 增补两个七语言证据测试（persistent 组追加链测、
+  新增 internal/replay 组）。其余 post-X9 条目零触碰（registry diff 仅
+  DEF-BUDWIRE/Y1-11/DEF-IDXWIRE 三条目）。
+- 分数核验（先预测后断言，TOL 1e-9）：编辑前实跑 `go run ./cmd/omnilsp
+  verify -json`（out/ledger-r19/verify-before.json）→ coreScore
+  98.45959595959597、post-x9 0.1（BUDGET 0/1）。预测：BUDGET 为 post-x9
+  单条目类目，promote 后 post-x9 = 4.0/30 = 0.13333333333333333（+1/30），
+  coreScore 不动。promote 后实跑（verify-budwire.json）→ post-x9
+  0.13333333333333333（与预测 delta 0.0）、coreScore 零位移、BUDGET 0→1；
+  IDXWIRE 维持后再跑（verify-ledger.json）→ post-x9/coreScore 均零位移
+  （INDEX 0.125 不动，PARTIAL 0.5 信用保留）。两次断言均在 TOL 1e-9 内
+  通过；baseline.json 再生流程走查后逐字节零 diff（post-x9 为非 gated
+  延迟域，不入 core baseline，先例 433f092 沿 9d24c40）。
+- 门禁（本轮实跑）：`go test ./test/conformance/ -count=1 -run
+  TestConformanceNoRegression -v` promote 后 PASS 200.86s、终态再跑 PASS
+  243.49s（含 DEF-BUDWIRE 新 Probe 四组与 DEF-IDXWIRE 增补的七语言链/replay
+  真实执行）；`go run ./cmd/omnilsp verify --min 90` → floor 90.0% PASS、
+  exit 0（promote 后与终态各一次）；`go test ./internal/conformance/
+  -count=1` ok 2.713s（含 TestRegistry_DataShape 形状门：AUTO 带 Probe 无
+  Reason）；gofmt -l internal/conformance/ 零输出；OMNISP_UPDATE_CONFORMANCE=1
+  TestGenerateDocs 再生两次。未 push、未 git add -A、未触碰 ACL 锁定区、
+  未触碰 internal/plugin 在制品（口5 三文件仍为工作树未提交态，提交权归
+  收束方）。
+- selfCheck（信息性，非阻塞）：① 插件车道口5（OMNILSP_PLUGIN_NOTIFY_
+  BUDGET_BYTES 通知缓冲配额，internal/plugin/executor_budget.go 未提交
+  在制品）与 F14 后端配额同构，本轮实跑其测试绿，但因其未入提交故未纳入
+  DEF-BUDWIRE 的 Text/Probe——待其提交后可作台账增量；② DEF-BUDWIRE Text
+  所列 pyright/tsserver stderr 接线点为编译级核验（vet+grep），共享 helper
+  行为（ReadBudgetedAll 截断+计数）由 languages 组探针钉住；③ 七语言
+  replay 的「跨进程」是 X5-7 先例的 store 重开模拟，真实双 OS 进程验收
+  仍归 S21/acceptance 门禁（Reason 已如实措辞）；④ NoRegression 耗时因
+  新探针（ccls memo 组、七语言链/replay）从 163s 增至 243s，属证据变重
+  的预期代价；⑤ go run verify 的 fast 模式为 AST 存在性核验，真实执行
+  由 NoRegression（fast-probe）与 internal/conformance 包测试承担。
