@@ -38,6 +38,18 @@ type Codec struct {
 	// class) instead of being amplified per element. Values <=0 select
 	// DefaultMaxBatchElements.
 	MaxBatchElements int
+
+	// SkipOversizedFrames changes what an oversized inbound frame means.
+	// Default false: a declared Content-Length above MaxMessageSize is a
+	// per-stream fatal error (the §C1 posture — zero behavior change, X10).
+	// When true, the frame body is drained and discarded exactly per the
+	// declared length and ReadMessage/ReadFrame return a *FrameSkippedError:
+	// the stream stays usable, so the caller may count the refusal and keep
+	// reading. Bounded memory either way — the oversized body is never
+	// allocated, only drained. Set this only where the size cap expresses a
+	// memory quota (a tightened per-owner cap), not where it expresses a
+	// protocol validity judgment.
+	SkipOversizedFrames bool
 }
 
 // NewCodec creates a new codec with the default message size limit.
@@ -99,6 +111,16 @@ func (c *Codec) readBody(r io.Reader) ([]byte, error) {
 	// C1: reject oversized declared length BEFORE allocating the buffer so an
 	// attacker-controlled header cannot force a large allocation.
 	if contentLength > c.maxMessageSize() {
+		if c.SkipOversizedFrames {
+			// 审计批 2 发现 1：拒绝的是这一帧的内存分配，不是这条流。按声明
+			// 长度排空 body（分段搬运，不按帧大小分配）后报告跳帧，调用方
+			// 计数后可继续读。排空失败（流中断/EOF）仍是 fatal——那不是
+			// 策略拒绝，是流本身断了。
+			if derr := drainFrame(r, int64(contentLength)); derr != nil {
+				return nil, fmt.Errorf("jsonrpc: failed to drain oversized frame body (%d bytes): %w", contentLength, derr)
+			}
+			return nil, &FrameSkippedError{Declared: contentLength, Cap: c.maxMessageSize()}
+		}
 		return nil, fmt.Errorf("jsonrpc: message too large: %d bytes (max %d)", contentLength, c.maxMessageSize())
 	}
 
@@ -196,3 +218,36 @@ type CodecError struct {
 }
 
 func (e *CodecError) Error() string { return e.Message }
+
+// FrameSkippedError reports one inbound frame refused by MaxMessageSize whose
+// body was drained and discarded (Codec.SkipOversizedFrames). The stream is
+// still framed correctly at the byte after the skipped body — the caller may
+// count the refusal (audit batch 2, finding 1: a quota refusal must be visible
+// without killing the read loop) and read the next frame. It is not a
+// CodecError: it is a per-frame policy outcome, not a protocol fault.
+type FrameSkippedError struct {
+	// Declared is the refused frame's Content-Length.
+	Declared int
+	// Cap is the codec's active MaxMessageSize at the refusal.
+	Cap int
+}
+
+func (e *FrameSkippedError) Error() string {
+	return "jsonrpc: oversized frame skipped: " +
+		strconv.Itoa(e.Declared) + " bytes declared (max " + strconv.Itoa(e.Cap) + ")"
+}
+
+// drainFrame consumes exactly n bytes from r without buffering the frame
+// (segmented hand-off to io.Discard; the pooled 8 KiB block is the only
+// staging). io.CopyN reports io.EOF for a short frame; normalize it to
+// ErrUnexpectedEOF — a truncated body means the stream itself broke, which is
+// the caller's fatal class, not a skip.
+func drainFrame(r io.Reader, n int64) error {
+	if _, err := io.CopyN(io.Discard, r, n); err != nil {
+		if err == io.EOF {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	return nil
+}

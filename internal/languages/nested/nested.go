@@ -52,6 +52,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	stderrors "errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -606,10 +607,18 @@ func (c *Conn) Initialize() error {
 // materializing an oversized frame. The sentinel 0 leaves the codec default
 // in place (no budget configured, or a quota above it): default behavior
 // unchanged (X10).
+//
+// 审计批 2 发现 1：收紧的帧上限拒绝的是单帧内存分配，不是整条流——跳帧
+// 原语让超限帧按 Content-Length 排空丢弃后继续读。否则一条合法的超配额
+// 消息（如 rust-analyzer 对大生成文件的 publishDiagnostics）会杀死读循环，
+// 监督重启后子进程重发同一帧再死，而 MarkReady 清零 crashes 使隔离计数
+// 永不触发。仅配额收紧路径启用跳帧：未配置预算的 §C1 静态上限保持 fatal
+// 语义（X10 零变化）。
 func (c *Conn) newReadCodec() *jsonrpc.Codec {
 	codec := jsonrpc.NewCodec()
 	if cap := languages.BackendBufferCap(c.cfg.Name); cap > 0 {
 		codec.MaxMessageSize = cap
+		codec.SkipOversizedFrames = true
 	}
 	return codec
 }
@@ -626,6 +635,15 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 	for {
 		msg, err := codec.ReadMessage(r)
 		if err != nil {
+			// 审计批 2 发现 1：配额收紧路径的超限帧是单帧跳过（body 已按
+			// Content-Length 排空，流仍完好）——计数后继续读，不断链。旧
+			// 行为（break → 监督重启 → 子进程重发同一帧 → 死循环）已随
+			// buffer_budget_test.go 的旧守卫替换整体切割。
+			var skipped *jsonrpc.FrameSkippedError
+			if stderrors.As(err, &skipped) && languages.BackendBudget() != nil {
+				languages.NoteBackendBufferRefusal(c.cfg.Name)
+				continue
+			}
 			// §F14 (DEF-BUDWIRE): a frame the tightened owner cap refuses is
 			// a counted refusal, not a silent disconnect — the stream-end
 			// retirement below is already visible through supervision. The

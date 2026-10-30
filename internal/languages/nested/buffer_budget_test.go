@@ -178,21 +178,38 @@ func TestDiagnosticsUnconfiguredBehaviorUnchanged(t *testing.T) {
 	}
 }
 
-func TestReadLoopFrameCapRefusesOversizedFrames(t *testing.T) {
+// TestReadLoopFrameCapSkipsOversizedFrameKeepsStreamAlive 替换了旧守卫
+// TestReadLoopFrameCapRefusesOversizedFrames（其断言 spawns >= 2，钉住的正是
+// 审计批 2 发现 1 的缺陷行为：超限帧杀死整条读循环 → 重启 → 子进程重发同一
+// 帧 → 再死，crashes 在 MarkReady 清零下 0↔1 摆动，隔离永不触发，且该文件
+// 诊断永不送达）。新语义（审计批 2 发现 1 修复，fixSketch (b)）：配额收紧的
+// 帧上限拒绝的是单帧分配，不是整条流——超限帧按 Content-Length 排空丢弃、
+// 计数，读循环继续；后续合法帧照常处理。旧语义钉住测试随本替换整体切割，
+// 无并存。
+func TestReadLoopFrameCapSkipsOversizedFrameKeepsStreamAlive(t *testing.T) {
 	resetBudgetForTest(t, map[string]string{
-		"OMNILSP_BACKEND_QUOTA_FAKE_LSP_BYTES": "256",
+		"OMNILSP_BACKEND_QUOTA_FAKE_LSP_BYTES": "4096",
 	})
 
+	conn := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir(), Sup: fastSup(), CaptureDiagnostics: true})
+	const uri = "file:///workspace/main.go"
+	conn.mu.Lock()
+	state := &documentState{
+		langID:           "test",
+		open:             true,
+		epoch:            conn.readerEpoch.Load(),
+		version:          1,
+		diagnosticsReady: make(chan struct{}),
+	}
+	conn.storeDocumentLocked(uri, state)
+	conn.mu.Unlock()
+
 	var spawns atomic.Int32
-	conn := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir(), Sup: fastSup()})
 	// io.Pipe returns (reader, writer): the test writes frames into the
 	// writer, the conn's readLoop consumes the reader.
 	childReader, childWriter := io.Pipe()
 	conn.cfg.Start = func(c *Conn) error {
 		spawns.Add(1)
-		// Every epoch attaches the same pipe: the first readLoop exits on
-		// the refused frame, the replacement blocks on the still-open
-		// writer until the test ends.
 		c.Attach(nil, nopWriteCloser{}, childReader)
 		c.MarkReady()
 		return nil
@@ -200,27 +217,56 @@ func TestReadLoopFrameCapRefusesOversizedFrames(t *testing.T) {
 	if err := conn.StartSupervised(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	// Attach 每次把 readerEpoch +1 并把预存文档整体作废（open=false、ready
+	// 通道关闭，invalidateDocumentsForRestartLocked）——生产语义里文档在
+	// attach 之后经 didOpen 打开。此处按 attach 后状态重开文档，否则
+	// receiveDiagnostics 按 open/epoch 失配丢弃本次发布。
+	conn.mu.Lock()
+	state.epoch = conn.readerEpoch.Load()
+	state.open = true
+	state.diagnosticsClosed = false
+	state.diagnosticsReady = make(chan struct{})
+	conn.mu.Unlock()
 
-	// A 512-byte frame against a 256-byte owner quota: the pipe buffer
-	// allocation is refused pre-allocation, the read loop ends, and the
-	// refusal is counted before supervision takes over.
-	frame := fmt.Sprintf("Content-Length: 512\r\n\r\n%s", strings.Repeat("x", 512))
-	if _, err := io.WriteString(childWriter, frame); err != nil {
-		t.Fatalf("write oversized frame: %v", err)
+	// 一个 8192 字节帧（配额 4096）后跟一个合法 publishDiagnostics 帧，单次
+	// 写入保序：超限帧必须被排空丢弃（计数），随后的合法帧必须照常入账——
+	// 读循环断链或后续帧丢失任一发生都算回归。合法帧 body 是完整 JSON-RPC
+	// 通知（带 method），publishRaw 只是其 params。
+	oversized := fmt.Sprintf("Content-Length: 8192\r\n\r\n%s", strings.Repeat("x", 8192))
+	valid := publishRaw(uri, 1, diagnosticsPayload(1))
+	notification, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "textDocument/publishDiagnostics",
+		"params":  json.RawMessage(valid),
+	})
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+	}
+	validFrame := fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(notification), string(notification))
+	if _, err := io.WriteString(childWriter, oversized+validFrame); err != nil {
+		t.Fatalf("write frames: %v", err)
 	}
 
+	// 合法帧的诊断必须送达（流仍可用）；有界窗口等待。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if languages.BackendBufferRefusals("fake-lsp") >= 1 && spawns.Load() >= 2 {
+		if len(state.diagnostics) == 1 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := languages.BackendBufferRefusals("fake-lsp"); got < 1 {
-		t.Fatalf("refusals(fake-lsp) = %d, want >= 1: an oversized frame must be a counted refusal", got)
+	if len(state.diagnostics) != 1 {
+		t.Fatalf("frame after the oversized one was not processed: %d diagnostics, want 1 (stream must stay usable)", len(state.diagnostics))
 	}
-	if got := spawns.Load(); got < 2 {
-		t.Fatalf("spawns = %d, want >= 2: refusing the frame must retire the reader (visible, not silent)", got)
+	if got := languages.BackendBufferRefusals("fake-lsp"); got < 1 {
+		t.Fatalf("refusals(fake-lsp) = %d, want >= 1: the skipped frame must be a counted refusal (visible, not silent)", got)
+	}
+	// 读循环不得因超限帧断链：无第二次 spawn（缺陷行为是退出+重启）。
+	if time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond) // 给（不该发生的）重启留出显形窗口
+	}
+	if got := spawns.Load(); got != 1 {
+		t.Fatalf("spawns = %d, want 1: a skipped oversized frame must not retire the read loop (the old behavior respawned forever)", got)
 	}
 	_ = childWriter.Close()
 	_ = conn.Close()
