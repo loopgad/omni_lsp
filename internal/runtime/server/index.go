@@ -147,7 +147,13 @@ func (s *Server) initIndex(rootURI string) {
 		s.disableIndex(err)
 		return
 	}
-	store, err := persistent.NewFileStore(dir, persistent.Config{DiskBudgetBytes: s.config.IndexDiskBudgetBytes})
+	// 复证圈 2 审计发现 2：构造期的跨进程 writer.lock 获取必须有界——无
+	// deadline 的调用在另一进程持锁（reindex/Compact 长临界区）时无限等待，
+	// initialize 握手挂死。超时走既有 disableIndex fail-open 分支（索引禁用、
+	// 原因可观测、服务器进程照常运行）。
+	lockCtx, cancel := context.WithTimeout(context.Background(), indexLadderRefreshTimeout)
+	defer cancel()
+	store, err := persistent.NewFileStoreContext(lockCtx, dir, persistent.Config{DiskBudgetBytes: s.config.IndexDiskBudgetBytes})
 	if err != nil {
 		s.disableIndex(err)
 		return
@@ -164,7 +170,7 @@ func (s *Server) initIndex(rootURI string) {
 		// a failed seed leaves usage at zero (fail-open) while the
 		// persistent store's WriteSegment budget stays the authoritative
 		// hard stop.
-		s.idx.refreshBudgetLadder(context.Background())
+		s.idx.refreshBudgetLadder()
 	}
 	// 工作区信任策略此刻已建立（审计批 2）：推进装配期延后的插件 Launch
 	// （mountPlugins 只装配到 Enabled，launchReadyPlugins 过 plugin.load 门）。
@@ -199,43 +205,20 @@ func newIndexBudgetLadder(diskBudget int64) *scheduler.BudgetManager {
 // generation's segment bytes — real byte accounting on the actual allocation
 // point (DEF-BUDWIRE), not accumulation: retired generations shrink the
 // recorded usage along with the store. With no generation on disk the usage
-// clears to zero. Refresh failures announce on stderr and leave the previous
-// usage in place (fail-open); the persistent store's own budget-first
-// WriteSegment check remains the authoritative hard stop on every path.
+// clears to zero.
 //
-// 有界等待（复证圈 1 审计发现 9）：无 deadline 的调用（initialize 握手路径
-// 传 context.Background()）在 writer.lock 被另一进程占用时无限等待——10ms
-// 轮询仅响应 ctx.Done()，Background 永不 Done，错误路径设计为 fail-open 却
-// 没有防「不返回」。对无 deadline 的 ctx 包一层 indexLadderRefreshTimeout，
-// 超时走既有 fail-open 分支（保留上次用量）。带 deadline 的调用方（请求 ctx）
-// 不受影响。
-func (idx *indexService) refreshBudgetLadder(ctx context.Context) {
+// manifest 只读口径（复证圈 2 审计发现 8）：段长总和来自
+// FileStore.CurrentGenerationLenSum（s.mu 下对 current 求和）——旧实现为求和
+// 走 OpenSnapshotLease，全代读盘+CRC 校验且独占跨进程 writer.lock，校验循环
+// 对 deadline 盲（5s 有界包裹包错了段），initialize 关键路径因此做全量 I/O。
+// 无 I/O 失败面后旧 fail-open 分支退化为「无代清零」（等价旧 ErrNoGeneration
+// 分支）。ReplaceUsage 一次持锁完成「扣旧值→记新值」（圈 1 发现 6），并发
+// 记账方与 refresh 交错不产生撕裂。
+func (idx *indexService) refreshBudgetLadder() {
 	if idx.ladder == nil {
 		return
 	}
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		bounded, cancel := context.WithTimeout(ctx, indexLadderRefreshTimeout)
-		defer cancel()
-		ctx = bounded
-	}
-	lease, err := idx.store.OpenSnapshotLease(ctx)
-	if err != nil {
-		if errors.Is(err, persistent.ErrNoGeneration) {
-			idx.ladder.ReplaceUsage(scheduler.CatDynamicIndex, 0)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "omnilsp: index budget ladder refresh failed (gate stays fail-open): %v\n", err)
-		return
-	}
-	defer lease.Close()
-	var live int64
-	for _, seg := range lease.Snapshot().Segments {
-		live += seg.Len
-	}
-	// ReplaceUsage 一次持锁完成「扣旧值→记新值」（复证圈 1 审计发现 6）：
-	// 消除 UsageSnapshot→ReleaseUsage→RecordUsage 三步读-改-写分离的 TOCTOU
-	// 窗口——并发记账方与 refresh 交错即产生用量漂移。
-	idx.ladder.ReplaceUsage(scheduler.CatDynamicIndex, live)
+	idx.ladder.ReplaceUsage(scheduler.CatDynamicIndex, idx.store.CurrentGenerationLenSum())
 }
 
 // indexBudgetRefusal shapes a §F13 ladder refusal as a visible reindex
@@ -413,10 +396,25 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 			last.Error = semanticErr.Error()
 			return nil, reindexResponseError(semanticErr)
 		}
-		idx.refreshBudgetLadder(ctx)
+		idx.refreshBudgetLadder()
 		return result, nil
 	}
-	records, err := idx.inventory(ctx, &last)
+	// 门在物化前布防（复证圈 2 审计发现 5）：inventory 流式按累计 payload
+	// 估算超限即中止（fail-closed 可见拒绝）——inventoryPayload 的一次性
+	// json.Marshal 不再为注定被拒的分配买单。物化后的精确 CanAllocate
+	// （下方）保留为权威兜底（流式估算逐文件累计，阈值一致）。
+	records, err := idx.inventoryWithGate(ctx, &last, func(cumulative int64) bool {
+		return idx.ladder == nil || idx.ladder.CanAllocate(cumulative)
+	})
+	if err != nil {
+		if errors.Is(err, errInventoryOverBudget) {
+			msg := fmt.Sprintf("F13 memory budget ladder refuses an index inventory beyond its remaining budget (pressure %.1f%%)", idx.ladder.Pressure()*100)
+			last.Error = msg
+			return nil, indexBudgetRefusal(msg)
+		}
+		last.Error = err.Error()
+		return nil, reindexResponseError(err)
+	}
 	if err == nil {
 		err = ctx.Err()
 	}
@@ -482,7 +480,7 @@ func (s *Server) handleReindex(ctx context.Context, _ *jsonrpc.Message) (json.Ra
 		return nil, reindexResponseError(err)
 	}
 	committed = true
-	idx.refreshBudgetLadder(ctx)
+	idx.refreshBudgetLadder()
 	return json.Marshal(map[string]any{"generation": generation, "files": last.Files, "bytes": last.Bytes, "skipped": last.Skipped, "revision": revision})
 }
 
@@ -538,7 +536,21 @@ func inventorySourceHash(workspaceID identity.WorkspaceID, inventoryHash string)
 }
 
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error) {
+	return idx.inventoryWithGate(ctx, stats, nil)
+}
+
+// errInventoryOverBudget 是 inventoryWithGate 的预算中止信号（复证圈 2 审计
+// 发现 5）：累计 payload 估算超过 §F13 阶梯剩余额度时逐文件流式中止——旧
+// 实现整量物化后才 CanAllocate，门防不住它要门控的那次分配。
+var errInventoryOverBudget = errors.New("inventory budget exceeded")
+
+// inventoryWithGate 在 inventory 的逐文件循环上接预算闸门：每收录一个文件
+// 累计其 payload 估算字节（JSON 字段名与结构开销的保守余量，估算略高即早拒
+// ——门语义保守，物化后的精确 CanAllocate 仍是权威兜底），admit 返回 false
+// 即流式中止（fail-closed 可见拒绝）。admit 为 nil 等价无闸门。
+func (idx *indexService) inventoryWithGate(ctx context.Context, stats *IndexRebuildStats, admit func(cumulative int64) bool) ([]fileRecord, error) {
 	records := make([]fileRecord, 0)
+	var cumulative int64
 	indexInfo, err := os.Stat(idx.dir)
 	if err != nil {
 		return nil, err
@@ -605,6 +617,13 @@ func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats
 		records = append(records, fileRecord{Path: filepath.ToSlash(rel), Size: n, SHA256: hex.EncodeToString(h.Sum(nil))})
 		stats.Files++
 		stats.Bytes += n
+		if admit != nil {
+			last := records[len(records)-1]
+			cumulative += int64(len(last.Path) + len(last.SHA256) + 96)
+			if !admit(cumulative) {
+				return errInventoryOverBudget
+			}
+		}
 		return nil
 	})
 	if err != nil {

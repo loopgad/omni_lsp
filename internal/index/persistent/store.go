@@ -157,11 +157,23 @@ type FileStore struct {
 
 // NewFileStore opens (creating if needed) a store at root and recovers the
 // newest verifiable generation (§L8).
+//
+// 无界构造语义保留给测试与工具：构造期以 context.Background() 抢跨进程
+// writer.lock，另一进程持锁（reindex/Compact 长临界区）时无限等待。请求
+// 路径（initialize → initIndex）必须走 NewFileStoreContext（复证圈 2 审计
+// 发现 2）。
 func NewFileStore(root string, cfg Config) (*FileStore, error) {
+	return NewFileStoreContext(context.Background(), root, cfg)
+}
+
+// NewFileStoreContext 是带界构造（复证圈 2 审计发现 2）：ctx 同时约束构造期
+// 的跨进程 writer.lock 获取（10ms 轮询仅响应 ctx.Done——无 deadline 即无限
+// 等待）。超时由调用方走各自的 fail-open/fail-closed 分支。
+func NewFileStoreContext(ctx context.Context, root string, cfg Config) (*FileStore, error) {
 	if err := ensureLayout(root); err != nil {
 		return nil, err
 	}
-	writerLock, err := acquireWriterLock(context.Background(), root)
+	writerLock, err := acquireWriterLock(ctx, root)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +187,24 @@ func NewFileStore(root string, cfg Config) (*FileStore, error) {
 	}
 	s.cleanupOrphanSegments()
 	return s, nil
+}
+
+// CurrentGenerationLenSum 返回已提交 current generation 的段长总和——manifest
+// 只读口径（复证圈 2 审计发现 8）：s.mu 临界区内对 s.current 段长求和，不做
+// 读盘与 CRC 校验、不获取跨进程 writer.lock。无已提交代时返回 0（由构造期的
+// recover 确立 current；调用方无需先行 recover——OpenSnapshotLease 口径的
+// 重复校验由构造与提交点覆盖）。
+func (s *FileStore) CurrentGenerationLenSum() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return 0
+	}
+	var total int64
+	for _, seg := range s.current.Segments {
+		total += seg.Len
+	}
+	return total
 }
 
 // manifestPath / historyPath are root-level pointers (atomic rename target).

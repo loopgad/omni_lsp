@@ -60,7 +60,8 @@ const SymbolStruct
 const SymbolTypeParameter
 const SymbolVariable
 func (idx *indexService) inventory(ctx context.Context, stats *IndexRebuildStats) ([]fileRecord, error)
-func (idx *indexService) refreshBudgetLadder(ctx context.Context)
+func (idx *indexService) inventoryWithGate(ctx context.Context, stats *IndexRebuildStats, admit func(cumulative int64) bool) ([]fileRecord, error)
+func (idx *indexService) refreshBudgetLadder()
 func (s *Server) InitializeWorkspace(root string)
 func (s *Server) backendGates() backendGates
 func (s *Server) disableIndex(err error)

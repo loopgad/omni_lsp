@@ -124,9 +124,44 @@ func encodeCompactJSON(value any) []byte {
 }
 
 // kindMerge accumulates one kind's records plus the shared envelope template.
+//
+// 增量定批（复证圈 2 审计发现 9）：记录凑满一个 batchLimit 即编码为输出批并
+// 释放该批记录副本——旧实现把全部 records 聚合驻留到规划结束（全部 payload
+// 驻留 + 按 kind 聚合全部 records + 再产出全部输出三份同驻，峰值 ≈3× 全代
+// 体积）。批边界贪心规则与原 chunkCompactRecords 完全一致，输出逐字节相同。
 type kindMerge struct {
 	template []byte
-	records  [][]byte
+	records  [][]byte // 当前未满批的记录副本（定批后释放）
+	batches  [][]byte // 已定稿的输出批
+	used     int64    // 当前批已用字节（含 envelope overhead）
+}
+
+// add 收录一条记录：单记录超出硬段上限返回 false（整代 verbatim 回退，原
+// 语义）；当前批再放不下即先定稿（编码 + 释放该批副本）。
+func (m *kindMerge) add(record []byte, batchLimit, segmentLimit int64) bool {
+	overhead := compactEnvelopeOverhead(m.template)
+	if overhead+2+int64(len(record)) > segmentLimit {
+		return false
+	}
+	if len(m.records) > 0 && m.used+int64(len(record))+1 > batchLimit {
+		m.batches = append(m.batches, encodeCompactBatch(m.template, m.records))
+		m.records = nil // 释放该批记录副本（峰值治理）
+		m.used = overhead
+	}
+	if len(m.records) > 0 {
+		m.used++ // comma
+	}
+	m.used += int64(len(record))
+	m.records = append(m.records, record)
+	return true
+}
+
+// finish 定稿当前未满批（无残留记录时为 no-op）。
+func (m *kindMerge) finish() {
+	if len(m.records) > 0 {
+		m.batches = append(m.batches, encodeCompactBatch(m.template, m.records))
+		m.records = nil
+	}
 }
 
 // planCompaction maps verified source payloads to output payloads.
@@ -172,14 +207,20 @@ func planCompaction(payloads [][]byte, batchLimit, segmentLimit int64) [][]byte 
 			}
 			merged := byKind[kind]
 			if merged == nil {
-				byKind[kind] = &kindMerge{template: template, records: records}
+				// 新批从 envelope overhead 起算（与原 chunkCompactRecords 的
+				// 每批 used := overhead 同一口径）——漏算会让首个批次少记
+				// envelope 字节、超限合并。
+				merged = &kindMerge{template: template, used: compactEnvelopeOverhead(template)}
+				byKind[kind] = merged
 				order = append(order, kind)
-				continue
-			}
-			if string(merged.template) != string(template) {
+			} else if string(merged.template) != string(template) {
 				return payloads // differing envelopes must not be silently unified
 			}
-			merged.records = append(merged.records, records...)
+			for _, record := range records {
+				if !merged.add(record, batchLimit, segmentLimit) {
+					return payloads // one record cannot fit under the hard segment cap
+				}
+			}
 		default:
 			return payloads
 		}
@@ -189,45 +230,11 @@ func planCompaction(payloads [][]byte, batchLimit, segmentLimit int64) [][]byte 
 	}
 	var plan [][]byte
 	for _, kind := range order {
-		chunks, ok := chunkCompactRecords(byKind[kind], batchLimit, segmentLimit)
-		if !ok {
-			return payloads // one record cannot fit under the hard segment cap
-		}
-		plan = append(plan, chunks...)
+		merged := byKind[kind]
+		merged.finish()
+		plan = append(plan, merged.batches...)
 	}
 	return append(plan, metaPayload)
-}
-
-// chunkCompactRecords splits one kind's records into bounded envelope
-// payloads. Records are never split and never re-encoded; a record that
-// cannot fit a bounded segment even alone reports !ok so the caller falls
-// back to a verbatim rewrite.
-func chunkCompactRecords(merged *kindMerge, batchLimit, segmentLimit int64) ([][]byte, bool) {
-	overhead := compactEnvelopeOverhead(merged.template)
-	for _, record := range merged.records {
-		if overhead+2+int64(len(record)) > segmentLimit {
-			return nil, false
-		}
-	}
-	var out [][]byte
-	for start := 0; start < len(merged.records); {
-		used := overhead
-		end := start
-		for end < len(merged.records) {
-			next := used + int64(len(merged.records[end]))
-			if end > start {
-				next++ // comma
-			}
-			if end > start && next > batchLimit {
-				break
-			}
-			used = next
-			end++
-		}
-		out = append(out, encodeCompactBatch(merged.template, merged.records[start:end]))
-		start = end
-	}
-	return out, true
 }
 
 // compactEnvelopeOverhead is the encoded size of one of this kind's envelopes
@@ -337,7 +344,12 @@ func (s *FileStore) Compact(ctx context.Context) error {
 		}
 		payloads = append(payloads, payload)
 	}
-	for _, payload := range planCompaction(payloads, compactBatchBytes, compactSegmentBytes) {
+	// 规划完成后释放输入段引用（复证圈 2 审计发现 9）：plan 的输出是新编码
+	// 字节（仅终端 metadata 段与 verbatim 回退路径个别别名），写盘阶段不再
+	// 与全部输入同驻——三份同驻的峰值（输入+记录副本+输出）降为 ≈输出。
+	plan := planCompaction(payloads, compactBatchBytes, compactSegmentBytes)
+	payloads = nil
+	for _, payload := range plan {
 		if _, err := build.WriteSegment(payload); err != nil {
 			_ = build.Abort()
 			return err
