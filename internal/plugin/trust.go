@@ -82,11 +82,20 @@ func verifyChecksum(path, declared string) error {
 // verifyChecksumContext 是带界变体（复证圈 2 审计发现 6）：读循环逐块检查
 // ctx——旧实现 io.Copy 无界，装配路径上的大 entrypoint 哈希不可取消。
 func verifyChecksumContext(ctx context.Context, path, declared string) error {
-	f, err := os.Open(path)
+	f, err := openEntryFile(path)
 	if err != nil {
 		return fmt.Errorf("plugin: 打开 entrypoint: %w", err)
 	}
 	defer f.Close()
+	return verifyChecksumFromFile(ctx, f, declared)
+}
+
+// verifyChecksumFromFile 对「调用方持有的句柄」计算 sha256 并与 manifest
+// 声明值比对（审计批 2 发现 3）。与按路径重开的变体的差别在这里是本质的：
+// 哈希消费的就是调用方稍后要执行的那一份字节——调用方必须保持句柄存续到
+// 执行时刻（Launch 持有到 Start 返回），哈希与执行才钉在同一份文件上；
+// 哈希完就关句柄、随后按路径重开的写法留给敌意换包一个可重复的窗口。
+func verifyChecksumFromFile(ctx context.Context, f *os.File, declared string) error {
 	sum := sha256.New()
 	buf := make([]byte, 64<<10)
 	for {

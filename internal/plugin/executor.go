@@ -159,9 +159,13 @@ type helloFrame struct {
 //     任一被拒即返回 ErrCapabilityDenied，不产生子进程；
 //  4. 信任链执行时刻复核——entrypoint 必须是 dir 下的裸文件名，且启动前对
 //     dir/<entrypoint> 重算 sha256 与 manifest.Checksum 比对（N14/§O3）。
-//     校验体与执行体由此钉在同一个文件上：先前的 Verify 结果不顶替本次
-//     复核（校验与 exec 之间二进制可能已被调包），裸文件名绝不经 PATH
+//     复核句柄自持到 Start 返回（Windows 上为拒绝写/删的共享模式）：被
+//     复核的字节与被执行的字节钉在同一份文件上，先前的 Verify 结果不顶替
+//     本次复核（校验与 exec 之间二进制可能已被调包），裸文件名绝不经 PATH
 //     解析——PATH 上的同名影子二进制不得顶替已通过 checksum 的那一个。
+//     审计批 2 发现 3 更正：旧注释「钉在同一个文件上」按路径重开而言是
+//     overstated（钉的是同一路径，不是同一份字节）；句柄贯穿修复后该句
+//     在 Windows 上成立，Unix 上残余窗口在 openEntryFile 记录。
 //
 // 协议完整版已落地：id 关联多路复用（Call 任意并发，按响应 id 配对）、
 // Content-Length 头分帧（附加头容忍、帧边界精确消费、单帧大小上限）、
@@ -210,7 +214,18 @@ func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 		return nil, fmt.Errorf("plugin: 解析插件目录: %w", err)
 	}
 	exe := filepath.Join(absDir, m.Entrypoint)
-	if err := verifyChecksum(exe, m.Checksum); err != nil {
+	// 审计批 2 发现 3：复核与 exec 之间按路径重开是可复用的 TOCTOU 窗口
+	// （mountPlugins 每会话重跑 Discover→Install→Launch）。改为打开-复核-
+	// 执行同一句柄贯穿：Windows 上句柄以拒绝写/删共享模式打开并存续到
+	// Start 返回，窗口内的写打开/删除/换名全部失败；Unix 无强制共享锁，
+	// 残余窗口在 openEntryFile 处显式记录（收窄而非闭合）。注意 open 在
+	// 哈希之前——被哈希的字节与被持有的句柄是同一对象。
+	vf, err := openEntryFile(exe)
+	if err != nil {
+		return nil, fmt.Errorf("plugin: 打开 entrypoint: %w", err)
+	}
+	if err := verifyChecksumFromFile(ctx, vf, m.Checksum); err != nil {
+		vf.Close()
 		return nil, err
 	}
 
@@ -219,14 +234,18 @@ func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 	cmd := exec.CommandContext(ctx, exe)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		vf.Close()
 		return nil, fmt.Errorf("plugin: stdin 管道: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		vf.Close()
 		return nil, fmt.Errorf("plugin: stdout 管道: %w", err)
 	}
 	cmd.Stderr = os.Stderr // ponytail: stderr 直通父进程；静默捕获留待完整协议
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	vf.Close() // 复核→执行窗口在 Start 返回时闭合；此后句柄不再有用
+	if err != nil {
 		return nil, fmt.Errorf("plugin: 启动 %q: %w", m.Entrypoint, err)
 	}
 
