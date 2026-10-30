@@ -185,12 +185,13 @@ type Server struct {
 	pluginEmitRejected atomic.Int64 // 能力门/解析门拒绝的 emit 数 + 关闭文档的迟到 emit 丢弃数（default deny 实证）
 }
 
-// indexLadderRefreshTimeout 是 refreshBudgetLadder 对无 deadline ctx 的有界
-// 包裹窗口（复证圈 1 审计发现 9）：initialize 握手路径上的 F13 刷新以
-// context.Background() 打开快照 lease，writer.lock 被另一进程占用时 10ms
-// 轮询仅响应 ctx.Done()——无 deadline 即无限等待，错误路径设计为 fail-open
-// 却没有防「不返回」。声明在 server.go（index.go 的新顶层声明触发 protocol
-// manifest 重生成）。非常量——测试注入更短窗口。
+// indexLadderRefreshTimeout 是 initialize 索引初始化路径上有界等待的统一
+// 窗口（复证圈 1 审计发现 9 引入时护住 refreshBudgetLadder 的快照 lease；
+// 复证圈 2 审计发现 8 把 refresh 改为 manifest 只读口径后不再有等待点，
+// 本窗口现在护住发现 2 的最后一个跨进程等待点——NewFileStore 构造期的
+// writer.lock 获取）。超时走既有 disableIndex fail-open 分支。声明在
+// server.go（index.go 的新顶层声明触发 protocol manifest 重生成）。
+// 非常量——测试注入更短窗口。
 var indexLadderRefreshTimeout = 5 * time.Second
 
 // wantsDocumentChanges reports whether the client negotiated the version-aware
@@ -419,6 +420,18 @@ type pluginEmitParams struct {
 	Diagnostics []pluginEmitDiag `json:"diagnostics"`
 }
 
+// maxPluginEmitDiagnostics 是单次插件 emit 的诊断条数预算（复证圈 2 审计
+// 发现 3）：解析后的诊断集整集驻留 pluginItems，FIFO 只限 uri 数不限每 uri
+// 内容——每 emit 超过该条数即整帧拒绝（可见计数，不部分采纳）。
+const maxPluginEmitDiagnostics = 1024
+
+// pluginMountBudget 是单次插件装配（Discover + 全量信任链复核）的整体预算
+// （复证圈 2 审计发现 6）：装配同步运行在 TCP accept 关键路径上且每个会话
+// 重复，无界 sha256 复核让 accept 与首字节延迟无界；超时落入 pluginDiscoverErr
+// 可观测路径。取 c7a1ef6 toolchain pinning 加界先例（probe 30s / 整体 2m）
+// 的整体档。非常量——测试注入更短窗口。
+var pluginMountBudget = 2 * time.Minute
+
 type pluginEmitDiag struct {
 	StartLine uint32 `json:"startLine"`
 	StartChar uint32 `json:"startChar"`
@@ -460,7 +473,13 @@ func (s *Server) mountPlugins(dir string) {
 	s.pluginProcs = make(map[string]*plugin.Process)
 	s.pluginMu.Unlock()
 
-	discoveries, err := mgr.Discover(dir)
+	// 装配预算（复证圈 2 审计发现 6）：装配同步运行在 TCP accept 关键路径上
+	// 且每个会话重复（server.New → mountPlugins）——Discover + 全文件 sha256
+	// 信任链复核无 deadline 时，大插件目录让 accept 与首字节延迟无界。超时以
+	// 目录级失败落入 pluginDiscoverErr 可观测路径（与目录级失败同一约定）。
+	mountCtx, cancel := context.WithTimeout(context.Background(), pluginMountBudget)
+	defer cancel()
+	discoveries, err := mgr.DiscoverContext(mountCtx, dir)
 	if err != nil {
 		// 目录级失败对齐 disableIndex 的可观测约定（index.go）：状态字段
 		// 记录原因 + stderr 一条——「不可用 PluginsDir」不得伪装成「无插件」。
@@ -470,8 +489,19 @@ func (s *Server) mountPlugins(dir string) {
 		fmt.Fprintf(os.Stderr, "omnilsp: plugin discovery failed: %v\n", err)
 		return
 	}
+	seen := make(map[string]struct{}, len(discoveries))
 	for _, d := range discoveries {
 		id := d.Manifest.ID
+		if _, dup := seen[id]; dup {
+			// manifest.ID 唯一性（复证圈 2 审计发现 1）：重复 ID 的发现结果
+			// 可见拒绝——同 ID 的两个插件目录互相顶替会破坏有界拆除（宿主
+			// 注册表同键覆盖使先 Launch 的进程失去登记句柄）、崩溃隔离
+			// （RecordCrash 按 ID 连坐）与 emit 来源治理。Install 侧的
+			// ErrDuplicatePluginID 是第二道闸。
+			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 重复 manifest.ID（目录 %s）拒绝装配\n", id, d.Dir)
+			continue
+		}
+		seen[id] = struct{}{}
 		if err := mgr.Install(d); err != nil {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 未通过信任链，拒绝装配: %v\n", id, err)
 			continue
@@ -575,6 +605,14 @@ func (s *Server) onPluginNotify(pluginID, method string, params json.RawMessage)
 	}
 	var ep pluginEmitParams
 	if err := json.Unmarshal(params, &ep); err != nil || ep.URI == "" {
+		s.pluginEmitRejected.Add(1)
+		return
+	}
+	// 条数预算（复证圈 2 审计发现 3）：单帧有 executor 的 maxPluginFrameSize
+	// （4MiB）兜底，但解析后的诊断集整集驻留 pluginItems——FIFO 只限 uri 数
+	// （diagCacheLimit=512）不限每 uri 内容，无预算接车。超限整帧拒绝并计入
+	// 可见拒绝计数（不部分采纳——整帧拒绝与 LSP 全量报告语义一致）。
+	if len(ep.Diagnostics) > maxPluginEmitDiagnostics {
 		s.pluginEmitRejected.Add(1)
 		return
 	}

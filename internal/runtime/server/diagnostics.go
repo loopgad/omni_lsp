@@ -141,19 +141,15 @@ func (d *diagCoordinator) injectPluginDiagnostics(pluginID, uri string, items []
 		d.server.pluginEmitRejected.Add(1)
 		return
 	}
-	// seen 判据以 pluginOrder 成员资格为准（复证圈 1 审计发现 2）：旧实现用
-	// pluginItems 的 map 存在性作判据，与 didCloseDocument 的清理不齐——close
-	// 后 map 键被删而 order 槽位残留（见 didCloseDocument 的过滤修复），同
-	// uri 重开注入时 order 与 pluginItems 键集错位，FIFO 驱逐据 order 长度
-	// 删 map 会误删存活 uri 的插件诊断集。同一次遍历保证两者一致。
-	seen := false
-	for _, queued := range d.pluginOrder {
-		if queued == uri {
-			seen = true
-			break
-		}
-	}
-	if !seen {
+	// seen 判据 O(1)（复证圈 2 审计发现 10）：pluginItems 的键存在性即
+	// order 成员资格——order↔map 键集不变量在每个变更点同步维护（注入配对
+	// 增删、didCloseDocument 对 order 与 map 的双重清理、FIFO 驱逐成对、
+	// Close 双清空），由 TestPluginOrder_FilteredOnDocumentClose 钉住。圈 1
+	// 修复曾以 order 线性扫描作判据（当时不变量刚由过滤修复确立）；不变量
+	// 确立后，每次 emit 的 O(diagCacheLimit=512) 线性扫描不再必要。嵌套的
+	// vfs.Get 有意保留在 d.mu 临界区内：提到锁外会让「关闭竞态」依赖上线前
+	// 复查兜底而重新打开陈旧集复填窗口。
+	if _, seen := d.pluginItems[uri]; !seen {
 		d.pluginOrder = append(d.pluginOrder, uri)
 		for len(d.pluginOrder) > diagCacheLimit { // FIFO eviction，与后端缓存同限
 			old := d.pluginOrder[0]
@@ -188,9 +184,22 @@ func (d *diagCoordinator) schedulePluginPush(uri string) {
 			return
 		}
 		delete(d.pluginTimers, uri)
-		sets, ok := d.pluginItems[uri]
-		d.mu.Unlock()
+		live, ok := d.pluginItems[uri]
+		var sets map[string]pluginDiagSet
 		if ok {
+			// 快照化（复证圈 2 审计发现 7）：在 d.mu 临界区内把 inner map 拍成
+			// 局部副本再解锁。旧实现把 live 引用直接交给发布读侧无锁迭代——
+			// 与 injectPluginDiagnostics 对同一 inner map 的写入时间重叠即触发
+			// Go 运行时不可恢复 fatal（concurrent map iteration and map
+			// write），整个 LSP 进程崩溃。值类型 pluginDiagSet 按值拷贝，其
+			// items 切片在注入侧只做整体替换不就地改写，快照共享安全。
+			sets = make(map[string]pluginDiagSet, len(live))
+			for id, set := range live {
+				sets[id] = set
+			}
+		}
+		d.mu.Unlock()
+		if sets != nil {
 			d.publishPluginDiagnostics(uri, sets)
 		}
 	})
@@ -431,10 +440,51 @@ func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []langu
 	if !ok || cached.key != key {
 		return
 	}
-	if cur := d.currentKey(uri, be); cur != key {
+	// 上线前复查的廉价化（复证圈 2 审计发现 12）：此处只比较身份字段，不再
+	// 整文档重拷贝 + 全内容 sha256。等价性：内容变更必经 publishSnapshot 推进
+	// SnapshotRev（vfs.Update/Save/Close 各自 AdvanceRevision，handlers.go 的
+	// publishSnapshot 以 vfs.Revision() 发布快照），「ContentHash 单独变化而
+	// 身份字段全同」的组合在生产路径不可达；marshal 前的全量 currentKey 复查
+	// （本函数上方）保留完整保真度，旧实现的逐发布 2 份全量拷贝 + 3 次全内容
+	// 哈希降为 1 份 + 1 次。
+	if cur := d.currentKeyIdentity(uri, be); !sameKeyIdentity(cur, key) {
 		return
 	}
 	d.server.notifyClient("textDocument/publishDiagnostics", json.RawMessage(payload))
+}
+
+// currentKeyIdentity 是 currentKey 的廉价口径：只计算身份字段（URI、快照
+// 修订、构建上下文、backend epoch、工作区代、诊断代、配置哈希），不做整文档
+// 拷贝与全内容 sha256（复证圈 2 审计发现 12）。ContentHash 字段留零值——
+// 仅配 sameKeyIdentity 使用，不得与完整 diagKey 直接比较。
+func (d *diagCoordinator) currentKeyIdentity(uri string, be languages.Backend) diagKey {
+	uri = canonicalDocumentURI(uri)
+	rev := uint64(0)
+	if snap := d.server.snapMgr.Current(); snap != nil {
+		rev = snap.ID().Revision
+	}
+	d.mu.Lock()
+	diagnosticsGeneration := d.updates[uri]
+	d.mu.Unlock()
+	return diagKey{
+		URI:                   uri,
+		SnapshotRev:           rev,
+		BuildContext:          string(backendBuildContext(be)),
+		BackendEpoch:          backendEpoch(be),
+		WorkspaceGeneration:   backendWorkspaceGeneration(be),
+		DiagnosticsGeneration: diagnosticsGeneration,
+		ConfigHash:            diagConfigVersion,
+	}
+}
+
+// sameKeyIdentity 比较 diagKey 的身份字段（不含 ContentHash——键的其余字段
+// 全同时，内容哈希由 compute 的缓存键与 marshal 前的 currentKey 全量复查承担）。
+func sameKeyIdentity(a, b diagKey) bool {
+	return a.URI == b.URI && a.SnapshotRev == b.SnapshotRev &&
+		a.BuildContext == b.BuildContext && a.BackendEpoch == b.BackendEpoch &&
+		a.WorkspaceGeneration == b.WorkspaceGeneration &&
+		a.DiagnosticsGeneration == b.DiagnosticsGeneration &&
+		a.ConfigHash == b.ConfigHash
 }
 
 func (d *diagCoordinator) currentKey(uri string, be languages.Backend) diagKey {
