@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -334,17 +335,22 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 			if size >= 0 {
 				return nil, fmt.Errorf("plugin: 重复的 Content-Length 头")
 			}
-			var n int
-			if _, err := fmt.Sscanf(strings.TrimSpace(value), "%d", &n); err != nil {
-				return nil, fmt.Errorf("plugin: malformed Content-Length header: %w", err)
+			// 严格解析（复证圈 2 审计发现 4）：旧实现 fmt.Sscanf("%d") 对
+			// "12junk" 一类畸形值静默截断接受，与同函数其余 fail-fast 纪律
+			// （重复 Content-Length、帧头块意外行均拒绝）不一致；strconv.ParseInt
+			// 要求整串消耗，畸形值按帧结构损坏拒绝——与宿主侧 codec readHeader
+			// 的 strconv 严格语义对齐。
+			parsed, perr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if perr != nil {
+				return nil, fmt.Errorf("plugin: malformed Content-Length header: %w", perr)
 			}
-			if n < 0 {
-				return nil, fmt.Errorf("plugin: invalid Content-Length %d", n)
+			if parsed < 0 {
+				return nil, fmt.Errorf("plugin: invalid Content-Length %d", parsed)
 			}
-			if n > maxPluginFrameSize {
-				return nil, fmt.Errorf("plugin: Content-Length %d 超出单帧上限 %d", n, maxPluginFrameSize)
+			if parsed > maxPluginFrameSize {
+				return nil, fmt.Errorf("plugin: Content-Length %d 超出单帧上限 %d", parsed, maxPluginFrameSize)
 			}
-			size = n
+			size = int(parsed)
 			continue
 		}
 		// 其余头（如 Content-Type）按规范忽略——无论它出现在 Content-Length

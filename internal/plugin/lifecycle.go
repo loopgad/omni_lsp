@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +15,10 @@ const MaxConsecutivePluginCrashes = 5
 
 // ErrQuarantined 表示插件已因崩溃循环被隔离，不再允许启用。
 var ErrQuarantined = fmt.Errorf("plugin: 已隔离（崩溃循环）")
+
+// ErrDuplicatePluginID 表示 manifest.ID 已在注册表——装配点对插件 ID 唯一
+// （复证圈 2 审计发现 1，errors.Is 可判别）。
+var ErrDuplicatePluginID = errors.New("plugin: 重复的 manifest.ID")
 
 // State 枚举 §O4 全生命周期。
 type State int
@@ -91,12 +97,27 @@ func NewManager() *Manager {
 // （不存在/无权限）作为目录级失败上抛——静默返回 nil 会把「不可用目录」伪装
 // 成「无插件」（审计批 2：装配点对目录级失败没有任何可观测出口）。
 func (m *Manager) Discover(root string) ([]Discovery, error) {
+	return m.DiscoverContext(context.Background(), root)
+}
+
+// DiscoverContext 是带界变体（复证圈 2 审计发现 6）：逐目录信任链（含全文件
+// sha256 复核）响应 ctx 取消——装配同步运行在 TCP accept 关键路径上且每个
+// 会话重复，大插件目录的无界复核会让 accept 与首字节延迟无界（与 c7a1ef6
+// 给 toolchain pinning 加界的同一审计逻辑）。ctx 耗尽作为目录级失败上抛，
+// 由调用方落入 pluginDiscoverErr 可观测路径。
+func (m *Manager) DiscoverContext(ctx context.Context, root string) ([]Discovery, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("plugin: 扫描插件根目录 %s: %w", root, err)
 	}
 	var out []Discovery
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !e.IsDir() {
 			continue
 		}
@@ -105,7 +126,7 @@ func (m *Manager) Discover(root string) ([]Discovery, error) {
 			continue
 		}
 		d := Discovery{Dir: dir}
-		d.Manifest, d.VerifyErr = Verify(dir)
+		d.Manifest, d.VerifyErr = VerifyContext(ctx, dir)
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
@@ -114,11 +135,20 @@ func (m *Manager) Discover(root string) ([]Discovery, error) {
 
 // Install 将一个通过信任链的发现结果注册为 Verified；
 // VerifyErr 非 nil 时拒绝注册（不可信元数据不入表）。
+//
+// manifest.ID 唯一性（复证圈 2 审计发现 1）：同 ID 的第二次 Install 拒绝并
+// 返回 ErrDuplicatePluginID（errors.Is 可判别）——旧实现静默覆盖
+// m.manifests[ID]，同 ID 的两个插件目录互相顶替，破坏有界拆除（宿主注册表
+// 同键覆盖使先 Launch 的进程失去登记句柄）、崩溃隔离（RecordCrash 按 ID
+// 连坐）与 emit 来源治理。
 func (m *Manager) Install(d Discovery) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if d.VerifyErr != nil {
 		return fmt.Errorf("plugin: 未通过校验，拒绝安装: %w", d.VerifyErr)
+	}
+	if _, exists := m.manifests[d.Manifest.ID]; exists {
+		return fmt.Errorf("plugin: %s 已注册（manifest.ID 必须唯一）: %w", d.Manifest.ID, ErrDuplicatePluginID)
 	}
 	m.manifests[d.Manifest.ID] = d.Manifest
 	m.states[d.Manifest.ID] = StateVerified

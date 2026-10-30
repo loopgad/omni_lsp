@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,13 @@ func Load(dir string) (Manifest, error) {
 // Verify 执行完整信任链：Load → Validate → entrypoint 路径安全检查 →
 // 存在性检查 → sha256 比对。任一步失败即整体拒绝（N14：未验证元数据不可信）。
 func Verify(dir string) (Manifest, error) {
+	return VerifyContext(context.Background(), dir)
+}
+
+// VerifyContext 是带界变体（复证圈 2 审计发现 6）：sha256 复核逐块响应 ctx
+// 取消——装配同步运行在 TCP accept 关键路径上时，大 entrypoint 的全文件
+// 哈希不能让 accept 无界等待。
+func VerifyContext(ctx context.Context, dir string) (Manifest, error) {
 	m, err := Load(dir)
 	if err != nil {
 		return Manifest{}, err
@@ -48,7 +56,7 @@ func Verify(dir string) (Manifest, error) {
 	if _, err := os.Stat(p); err != nil {
 		return m, fmt.Errorf("plugin: entrypoint 缺失: %w", err)
 	}
-	if err := verifyChecksum(p, m.Checksum); err != nil {
+	if err := verifyChecksumContext(ctx, p, m.Checksum); err != nil {
 		return m, err
 	}
 	return m, nil
@@ -68,14 +76,35 @@ func safeEntrypoint(ep string) error {
 
 // verifyChecksum 计算 path 处文件的 sha256 并与 manifest 声明值比对（N14）。
 func verifyChecksum(path, declared string) error {
+	return verifyChecksumContext(context.Background(), path, declared)
+}
+
+// verifyChecksumContext 是带界变体（复证圈 2 审计发现 6）：读循环逐块检查
+// ctx——旧实现 io.Copy 无界，装配路径上的大 entrypoint 哈希不可取消。
+func verifyChecksumContext(ctx context.Context, path, declared string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("plugin: 打开 entrypoint: %w", err)
 	}
 	defer f.Close()
 	sum := sha256.New()
-	if _, err := io.Copy(sum, f); err != nil {
-		return fmt.Errorf("plugin: 计算 sha256: %w", err)
+	buf := make([]byte, 64<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("plugin: 计算 sha256 被取消: %w", err)
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if _, werr := sum.Write(buf[:n]); werr != nil {
+				return fmt.Errorf("plugin: 计算 sha256: %w", werr)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("plugin: 计算 sha256: %w", rerr)
+		}
 	}
 	actual := "sha256:" + hex.EncodeToString(sum.Sum(nil))
 	if actual != declared {
