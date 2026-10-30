@@ -78,6 +78,12 @@ func TestDiagnosticsBudgetRefusalDropsPublicationAndCounts(t *testing.T) {
 
 	conn, state, uri := newBudgetTestConn(t, "fake-lsp")
 
+	// Refusal counters are process-global and persist across -count
+	// iterations; this test pins ITS OWN contribution (exactly one counted
+	// refusal), following the delta convention of
+	// TestDiagnosticsUnconfiguredBehaviorUnchanged below.
+	refusalsBefore := languages.BackendBufferRefusals("fake-lsp")
+
 	// A publication whose wire staging exceeds the 16-byte budget is
 	// refused: the previously stored diagnostics (none) stay, the refusal is
 	// counted, nothing panics.
@@ -89,8 +95,8 @@ func TestDiagnosticsBudgetRefusalDropsPublicationAndCounts(t *testing.T) {
 	if state.diagnosticsReceived {
 		t.Fatal("over-quota publication must not mark diagnostics received")
 	}
-	if got := languages.BackendBufferRefusals("fake-lsp"); got != 1 {
-		t.Fatalf("refusals(fake-lsp) = %d, want 1 (fail-closed must be countable, not silent)", got)
+	if got := languages.BackendBufferRefusals("fake-lsp"); got != refusalsBefore+1 {
+		t.Fatalf("refusals(fake-lsp) delta = %d, want exactly 1 (fail-closed must be countable, not silent)", got-refusalsBefore)
 	}
 }
 
@@ -247,16 +253,24 @@ func TestReadLoopFrameCapSkipsOversizedFrameKeepsStreamAlive(t *testing.T) {
 		t.Fatalf("write frames: %v", err)
 	}
 
-	// 合法帧的诊断必须送达（流仍可用）；有界窗口等待。
+	// 合法帧的诊断必须送达（流仍可用）；有界窗口等待。诊断切片由
+	// receiveDiagnostics 在 c.mu 内整体替换（diagnostics.go:843），此处与
+	// readLoop goroutine 并发，读取必须持同一把锁，否则构成数据竞争
+	//（race 门禁实测捕获：本测试裸读 vs receiveDiagnostics 写）。
+	diagnosticsLen := func() int {
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		return len(state.diagnostics)
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(state.diagnostics) == 1 {
+		if diagnosticsLen() == 1 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(state.diagnostics) != 1 {
-		t.Fatalf("frame after the oversized one was not processed: %d diagnostics, want 1 (stream must stay usable)", len(state.diagnostics))
+	if got := diagnosticsLen(); got != 1 {
+		t.Fatalf("frame after the oversized one was not processed: %d diagnostics, want 1 (stream must stay usable)", got)
 	}
 	if got := languages.BackendBufferRefusals("fake-lsp"); got < 1 {
 		t.Fatalf("refusals(fake-lsp) = %d, want >= 1: the skipped frame must be a counted refusal (visible, not silent)", got)
