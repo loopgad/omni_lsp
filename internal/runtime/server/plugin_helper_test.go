@@ -34,6 +34,8 @@ func TestMain(m *testing.M) {
 //     守卫在宿主侧）；
 //   - diag-emit-die: emit/now → 先发 diagnostics/emit 通知帧并 flush，再以
 //     非零码退出（emit 后崩溃：已注入宿主的诊断不随进程死亡回滚）；
+//   - hello-emit  : 收到 plugin/hello 的当下立即发 diagnostics/emit——握手期
+//     emit（审计批 3 发现 1 守卫模式：通知在宿主对 Launch 结果记账之前抵达）。
 //   - hold-shutdown: plugin/shutdown 请求不应答（存活挂起——closePlugins 的
 //     Shutdown 超时路径）；plugin/exit 通知退出；其余请求回 pong。
 //
@@ -68,6 +70,22 @@ func omnilspPluginHelperMain() {
 				_ = w.Flush()
 				return // 干净退出（exit 0）
 			}
+			// hello-emit（审计批 3 发现 1 守卫模式）：hello 一到立即 emit——
+			// 该通知与宿主侧「Launch 返回 → MarkRunning → 授权登记」的记账
+			// 并发竞速，是订阅窗口的到达样本。
+			if req.Method == "plugin/hello" && mode == "hello-emit" {
+				uri := os.Getenv("GO_PLUGIN_EMIT_URI")
+				if uri == "" {
+					uri = "file:///p/main.go"
+				}
+				message := os.Getenv("GO_PLUGIN_EMIT_MESSAGE")
+				if message == "" {
+					message = "boom"
+				}
+				note := helperEmitNote(uri, message)
+				fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(note), note)
+				_ = w.Flush()
+			}
 			continue
 		}
 		id := *req.ID
@@ -88,7 +106,7 @@ func omnilspPluginHelperMain() {
 			if message == "" {
 				message = "boom"
 			}
-			note := fmt.Sprintf(`{"jsonrpc":"2.0","method":"diagnostics/emit","params":{"uri":%q,"diagnostics":[{"startLine":0,"startChar":0,"endLine":0,"endChar":3,"severity":1,"code":"E1","message":%q}]}}`, uri, message)
+			note := helperEmitNote(uri, message)
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(note), note)
 			if err := w.Flush(); err != nil {
 				return
@@ -106,6 +124,11 @@ func omnilspPluginHelperMain() {
 			return
 		}
 	}
+}
+
+// helperEmitNote 构造 diagnostics/emit 通知帧（emit/now 与 hello-emit 共用）。
+func helperEmitNote(uri, message string) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","method":"diagnostics/emit","params":{"uri":%q,"diagnostics":[{"startLine":0,"startChar":0,"endLine":0,"endChar":3,"severity":1,"code":"E1","message":%q}]}}`, uri, message)
 }
 
 func readHelperFrame(r *bufio.Reader) ([]byte, error) {

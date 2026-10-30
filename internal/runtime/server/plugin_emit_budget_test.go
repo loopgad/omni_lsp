@@ -18,14 +18,10 @@ func TestPluginEmit_OversizedFrameIsRejectedAndCounted(t *testing.T) {
 	attachRecordingTransport(t, s)
 	uri := "file:///p/main.go"
 	s.vfs.Open(uri, "go", 1, []byte("package main"), vfs.SourceEditor)
-	// 白盒播种授权表：让 emit 越过 Grant 门（default deny），使条数门成为
-	// 本测试唯一的拒绝来源。（未装配插件时 pluginGrants 为 nil，须先初始化。）
-	s.pluginMu.Lock()
-	if s.pluginGrants == nil {
-		s.pluginGrants = make(map[string]plugin.Grant)
-	}
-	s.pluginGrants["p1"] = plugin.NewGrant(plugin.CapDiagnosticsEmit)
-	s.pluginMu.Unlock()
+	// 白盒直授 grant：让 emit 越过 Grant 门（default deny），使条数门成为
+	// 本测试唯一的拒绝来源。（审计批 3 发现 1：grant 改随 sink 闭包作显式
+	// 实参抵达 onPluginNotify，旧的白盒 pluginGrants 播种随查表门一并切割。）
+	grant := plugin.NewGrant(plugin.CapDiagnosticsEmit)
 
 	// 组一帧超过条数预算的 emit（1024 上限 + 1）。
 	diags := make([]map[string]any, 0, maxPluginEmitDiagnostics+1)
@@ -40,7 +36,7 @@ func TestPluginEmit_OversizedFrameIsRejectedAndCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.onPluginNotify("p1", "diagnostics/emit", params)
+	s.onPluginNotify("p1", grant, "diagnostics/emit", params)
 
 	if n := s.pluginEmitRejected.Load(); n != 1 {
 		t.Fatalf("超预算 emit 未被拒绝计数，pluginEmitRejected=%d（旧实现无条数预算，全集驻留）", n)
@@ -58,7 +54,7 @@ func TestPluginEmit_OversizedFrameIsRejectedAndCounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.onPluginNotify("p1", "diagnostics/emit", params)
+	s.onPluginNotify("p1", grant, "diagnostics/emit", params)
 	s.diag.mu.Lock()
 	_, injected = s.diag.pluginItems[uri]
 	s.diag.mu.Unlock()

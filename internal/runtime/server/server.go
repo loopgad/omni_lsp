@@ -159,11 +159,12 @@ type Server struct {
 
 	// plugin lane (§O0-O5): mounted only when Config.PluginsDir is set.
 	// pluginMu guards the registry maps; counters are atomic.
-	pluginMu     sync.Mutex
-	pluginMgr    *plugin.Manager
-	pluginGrants map[string]plugin.Grant // id → Enable 授权表（emit 能力门的授予半边）
-	pluginLangs  map[string][]string     // id → manifest.languages（emit 语言范围门的声明半边，审计批·合并策略来源伪造面）
-	pluginProcs  map[string]*plugin.Process
+	// （pluginGrants 表已随审计批 3 发现 1 移除：emit 能力门的授予半边改为
+	// 随 sink 闭包与被 Launch 的进程同源抵达——见 onPluginNotify。）
+	pluginMu    sync.Mutex
+	pluginMgr   *plugin.Manager
+	pluginLangs map[string][]string // id → manifest.languages（emit 语言范围门的声明半边，审计批·合并策略来源伪造面）
+	pluginProcs map[string]*plugin.Process
 	// pluginDiscoverErr 记录装配期目录级发现失败的原因（pluginMu 保护）：
 	// 对齐 disableIndex 的 idxReason 可观测约定——空串表示无目录级失败。
 	pluginDiscoverErr string
@@ -491,7 +492,6 @@ func (s *Server) mountPlugins(dir string) {
 		return
 	}
 	s.pluginMgr = mgr
-	s.pluginGrants = make(map[string]plugin.Grant)
 	s.pluginLangs = make(map[string][]string)
 	s.pluginProcs = make(map[string]*plugin.Process)
 	s.pluginMu.Unlock()
@@ -593,6 +593,15 @@ func (s *Server) launchReadyPlugins() {
 			continue
 		}
 		pluginID := id
+		// 审计批 3 发现 1：grant 随 sink 闭包与被 Launch 的进程同源抵达——
+		// 通知门的能力判定用「该进程被 Launch 时所持的同一张授予表」，不经
+		// 任何宿主侧登记表转手。旧实现的 pluginGrants 登记在 Launch 返回 +
+		// MarkRunning 之后才落表，sink 却已在 readLoop/pump 启动前接活：插件
+		// 收到 plugin/hello 后立即 emit 的通知在查表门被拒（pluginEmitRejected
+		// ），「注册窗口从协议时序上整体移除」的旧注释与实际不符——窗口内
+		// 通知到不了诊断车道，只是丢弃科目从 DroppedNotifies 换名。闭包捕获
+		// 使「已接 sink 但未登记」态在存活路径上不可达，窗口按构造闭合；
+		// 零值 Grant 全 deny（plugin.DefaultGrants），fail-closed 语义不变。
 		proc, err := plugin.LaunchWithSink(context.Background(), e.discovery.Dir, e.discovery.Manifest, e.grant, func(werr error) {
 			s.pluginOnExit(id, werr)
 		}, func() error {
@@ -601,7 +610,7 @@ func (s *Server) launchReadyPlugins() {
 			}
 			return fmt.Errorf("plugin: 工作区信任策略尚未建立")
 		}, func(method string, params json.RawMessage) {
-			s.onPluginNotify(pluginID, method, params)
+			s.onPluginNotify(pluginID, e.grant, method, params)
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 被拒: %v\n", id, err)
@@ -609,10 +618,12 @@ func (s *Server) launchReadyPlugins() {
 			continue
 		}
 		mgr.MarkRunning(id)
-		// 订阅接线（第 18 轮治理开口 4）：sink 经 LaunchWithSink 在 readLoop/
-		// pump 启动前注册——Launch 返回与订阅之间的注册窗口从协议时序上移除，
-		// 握手期/启动期到达的通知不再有界有损（旧实现的 DroppedNotifies 窗口
-		// 丢弃路径仅对「无订阅者」与通道饱和保留，见 executor_notify_test.go）。
+		// 订阅接线（第 18 轮治理开口 4 + 审计批 3 发现 1）：sink 经
+		// LaunchWithSink 在 readLoop/pump 启动前注册，且 grant 随同一闭包抵达
+		// 通知门（见上方 LaunchWithSink 调用点注记）——握手期/启动期到达的
+		// 通知从协议时序上整体可投递，无登记窗口、无 DroppedNotifies 丢弃路径
+		// 的旧窗口残留（旧实现该窗口的通知被 grant 查表门拒为
+		// pluginEmitRejected，仅对「无订阅者」与通道饱和保留有界有损丢弃）。
 		s.pluginMu.Lock()
 		if s.pluginClosing {
 			// 复证圈 1 审计发现 5：Launch 与 ClosePlugins 交错——Launch 期间
@@ -627,27 +638,25 @@ func (s *Server) launchReadyPlugins() {
 			_ = mgr.Disable(id)
 			continue
 		}
-		s.pluginGrants[id] = e.grant
 		s.pluginProcs[id] = proc
 		s.pluginMu.Unlock()
 	}
 }
 
 // onPluginNotify 是插件→宿主通知的宿主半边（pump 线程调用）：统计、能力门
-// （Grant.Check——default deny 的 emit 实证点）、解析、语言范围门
+// （grant.Check——default deny 的 emit 实证点）、解析、语言范围门
 // （manifest.languages 与目标文档语言比对，审计批·合并策略来源伪造面），
 // 最后把诊断集带宿主强制来源标记汇入 diagnostics 协调器（去抖路径，不直连推送）。
-func (s *Server) onPluginNotify(pluginID, method string, params json.RawMessage) {
+//
+// grant 形参是审计批 3 发现 1 的修复形态：授予表由 LaunchWithSink 的 sink
+// 闭包随进程同源传入（该进程被 Launch 时所持的同一张授予表），不经宿主侧
+// 登记表转手——旧实现查 pluginGrants 表，登记滞后于 sink 使握手期 emit 在
+// 「未登记」分支被拒（丢弃科目从 DroppedNotifies 换名，窗口未消）。零值
+// Grant 全 deny（plugin.DefaultGrants），fail-closed 语义不变。
+func (s *Server) onPluginNotify(pluginID string, grant plugin.Grant, method string, params json.RawMessage) {
 	s.pluginNotifies.Add(1)
 	if method != "diagnostics/emit" {
 		s.pluginUnknown.Add(1) // 车道外方法：可见丢弃（最小切片只放行单能力）
-		return
-	}
-	s.pluginMu.Lock()
-	grant, ok := s.pluginGrants[pluginID]
-	s.pluginMu.Unlock()
-	if !ok {
-		s.pluginEmitRejected.Add(1)
 		return
 	}
 	// 能力门（§O2）：无 diagnostics.emit 授予的 emit 在此拒绝——default deny。
