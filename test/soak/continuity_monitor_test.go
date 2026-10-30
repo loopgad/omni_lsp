@@ -68,10 +68,19 @@ func TestSoakContinuityMonitorAdvancesWithoutTickConsumers(t *testing.T) {
 			t.Fatal("monitor stopped consuming ticks before the run was advancing")
 		}
 	}
+	// run() 的单调基线 lastMono 在监控 goroutine 首次被调度时才捕获；缓冲
+	// ticks（64）让发送方从不停等，goroutine 可能晚于下方 base 采集才启动，
+	// 6 个 tick 入账后 active 恒为 30s−(lastMono−base)，缺口永不闭合——
+	// 全包 -race 并行负载下实测缺口 522µs，无论轮询多久都到不了 30s
+	//（gate 全包 race 实录）。钉住的语义是"全部 6 个合成 tick 都入账"：
+	// 丢一个 tick 就是 5s 缺口，远超启动偏斜容差，仍然失败；容差只吸收
+	// goroutine 启动调度偏斜，不放宽任何 tick 记账断言。
+	const startSkewAllowance = 500 * time.Millisecond
 	deadline := time.Now().Add(2 * time.Second)
-	for monitor.activeDuration() < 6*soakPollPeriod {
+	for monitor.activeDuration() < 6*soakPollPeriod-startSkewAllowance {
 		if time.Now().After(deadline) {
-			t.Fatalf("monitor did not advance active to 30s while the main loop was busy: got %s", monitor.activeDuration())
+			t.Fatalf("monitor did not advance active to ~30s while the main loop was busy: got %s, want >= %s (a dropped tick is a 5s gap and must fail)",
+				monitor.activeDuration(), 6*soakPollPeriod-startSkewAllowance)
 		}
 		time.Sleep(time.Millisecond)
 	}
