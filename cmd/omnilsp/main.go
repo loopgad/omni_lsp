@@ -297,16 +297,17 @@ func cmdServe(args []string) {
 	}
 }
 
-// serveMCP 跑 MCP 工具投影并在会话结束后补插件的优雅停机（第 18 轮治理
-// 开口 2）：该分支不经过 server.Run——Run 的 defer 链（ClosePlugins 等）
-// 在此路径不会执行，MCP 会话结束后插件子进程收不到 shutdown→exit 握手，
-// 进程与 stdio 管道泄漏为孤儿。ClosePlugins 幂等，须在 fatalErr 之前完成：
-// fatalErr 直接 os.Exit，defer 不会运行。单独成函数供守卫测试直呼
-// （mcp_plugin_teardown_test.go）。
+// serveMCP 跑 MCP 工具投影并在会话结束后执行完整会话收尾。该分支不经过
+// server.Run——Run 的 defer 链在此路径不会执行。第 18 轮治理开口 2 补了插件
+// 腿（ClosePlugins）；审计批 2 发现 2 补齐其余腿：closeBackends（嵌套后端
+// 唯一拆除点，含优雅 shutdown→exit 握手与 kill 兜底）、diag.Close、
+// scheduler.Shutdown——四腿统一走 server.CloseSession（与 Run defer 链同序、
+// 同幂等）。收尾必须显式在 fatalErr（os.Exit）之前完成——os.Exit 不跑 defer；
+// 收尾错误并入返回值，与 Run 路径把 closeBackends 错误并入 runErr 的既有
+// 语义一致。
 func serveMCP(ctx context.Context, srv *server.Server, in io.Reader, out io.Writer) error {
 	err := mcpserver.Serve(ctx, in, out, mcpCore{srv: srv})
-	srv.ClosePlugins()
-	return err
+	return errors.Join(err, srv.CloseSession())
 }
 
 // runTCPSession serves one accepted TCP connection to completion. Each TCP

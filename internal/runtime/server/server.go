@@ -882,13 +882,9 @@ func (s *Server) Run(ctx context.Context, t transport.Transport) (runErr error) 
 		if watcher != nil {
 			watcher.CloseAndWait()
 		}
-		s.scheduler.Shutdown()
-		s.ClosePlugins()
-		runErr = stderrors.Join(runErr, s.closeBackends())
-		s.mu.RLock()
-		runErr = stderrors.Join(runErr, s.shutdownErr)
-		s.mu.RUnlock()
-		s.diag.Close()
+		if err := s.CloseSession(); err != nil {
+			runErr = stderrors.Join(runErr, err)
+		}
 		if err := s.completionPhaseTrace.close(); err != nil {
 			runErr = stderrors.Join(runErr, err)
 		}
@@ -984,6 +980,29 @@ func (s *Server) Run(ctx context.Context, t transport.Transport) (runErr error) 
 			}
 		}
 	}
+}
+
+// CloseSession runs the session teardown tail shared by Run's defer chain and
+// any path that serves without Run (audit batch 2, finding 2: the MCP
+// projection never entered Run, so the backends leg — the only teardown point
+// for the supervised nested language servers — never executed there).
+//
+// Order is the historical Run defer order: scheduler shutdown, plugin graceful
+// teardown (shutdown→exit + bounded kill), backend reaping (closeBackends,
+// which closes the diagnostics coordinator first), then the shutdown-request
+// error and a final diag.Close. Every step is idempotent (pluginOnce /
+// backendCloseOnce / coordinator close), so calling it from two paths — or
+// twice — is safe. The error joins closeBackends' reap failures with the
+// pending shutdown-request error, mirroring what Run used to return.
+func (s *Server) CloseSession() error {
+	s.scheduler.Shutdown()
+	s.ClosePlugins()
+	err := s.closeBackends()
+	s.mu.RLock()
+	err = stderrors.Join(err, s.shutdownErr)
+	s.mu.RUnlock()
+	s.diag.Close()
+	return err
 }
 
 // closeBackends reaps each unique child service once. Shutdown calls it before
