@@ -129,7 +129,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| Y3-1 | Trust gates enforced (workspace states Untrusted/Restricted/Trusted + plugin default-deny) | N1/N2/N3 trust gates | `TestN1_DefaultUntrusted`, `TestN3_UntrustedBlocksExecution`, `TestN1_RestrictedWhitelist`, `TestN3_UntrustedWorkspaceBlocksBackendStart`, `TestO2_DefaultDeny` | AUTO |
+| Y3-1 | Trust gates enforced (mechanism: workspace states Untrusted/Restricted/Trusted + plugin default-deny); production backend default is implicit-local-launch TRUSTED when OMNILSP_TRUST is unset (fact pinned, not the §N1 literal default) | N1/N2/N3 trust gates | `TestN1_DefaultUntrusted`, `TestN3_UntrustedBlocksExecution`, `TestN1_RestrictedWhitelist`, `TestN1_PolicyForBackendProductionDefault`, `TestN3_UntrustedWorkspaceBlocksBackendStart`, `TestO2_DefaultDeny` | AUTO |
 | Y3-2 | No shell execution of compile database commands | SEC-EXEC-001/§N4 | `TestN4_CompileDbNoShell`, `TestSEC_N4_NoShellExecution` | AUTO |
 | Y3-3 | Symlink escape contained; path traversal rejected | §N7/S23 | `TestSEC_N7_SymlinkEscapeContained`, `TestSEC_N7_PathTraversalRejected` | AUTO |
 | Y3-4 | Secrets redacted in logs/errors | §N11/S23 | `TestSEC_N11_RedactionAudit` | AUTO |

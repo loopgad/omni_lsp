@@ -2,6 +2,7 @@ package trust
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -134,3 +135,51 @@ func TestN4_CompileDbNoShell(t *testing.T) {
 func CanReplayCompileCommand(p *Policy) error { return p.Gate(CapProcessExecute) }
 
 func ExtractSemanticFlags(p *Policy) error { return p.Gate(CapWorkspaceRead) }
+
+// TestN1_PolicyForBackendProductionDefault 钉住生产唯一策略构造路径
+// PolicyForBackend 的默认分支事实（审计批·Y3-1 AUTO 误导）：OMNILSP_TRUST
+// 未设（开箱默认）时返回 StateTrusted、source "implicit-local-launch"——
+// 即生产默认是 implicit-trusted，而非 §N1 字面默认 Untrusted。NewPolicy 的
+// Untrusted 默认（TestN1_DefaultUntrusted 所锚）在生产路径上仅当 OMNILSP_TRUST
+// 显式设为 untrusted 时可达。本探针把这一事实钉进 Y3-1 探针集，使台账读者
+// 不会从机制半边的 AUTO 绿灯推出与线上默认相反的结论。
+func TestN1_PolicyForBackendProductionDefault(t *testing.T) {
+	// 未设分支：t.Setenv 无法表达「未设」，手工保存/恢复。
+	old, had := os.LookupEnv("OMNILSP_TRUST")
+	os.Unsetenv("OMNILSP_TRUST")
+	defer func() {
+		if had {
+			os.Setenv("OMNILSP_TRUST", old)
+		} else {
+			os.Unsetenv("OMNILSP_TRUST")
+		}
+	}()
+
+	p, err := PolicyForBackend("D:/some/random/repo", "gopls")
+	if err != nil {
+		t.Fatalf("PolicyForBackend: %v", err)
+	}
+	if p.State() != StateTrusted {
+		t.Fatalf("OMNILSP_TRUST 未设时 state = %v, want trusted（implicit-local-launch 事实钉住）", p.State())
+	}
+	if p.Source() != "implicit-local-launch" {
+		t.Fatalf("source = %q, want implicit-local-launch", p.Source())
+	}
+	// 该默认下高权门放行——这正是生产默认与 §N1 字面默认的差别所在。
+	if err := p.Gate(CapProcessExecute); err != nil {
+		t.Errorf("implicit-trusted 下 Gate(process.execute) = %v, want nil", err)
+	}
+
+	// 显式设值分支：机制半边（FromEnv → Untrusted 拒绝）在生产路径可达且生效。
+	t.Setenv("OMNILSP_TRUST", "untrusted")
+	p2, err := PolicyForBackend("/repo", "gopls")
+	if err != nil {
+		t.Fatalf("PolicyForBackend(untrusted): %v", err)
+	}
+	if p2.State() != StateUntrusted || p2.Source() != "env" {
+		t.Fatalf("显式 untrusted 时 state=%v source=%q, want untrusted/env", p2.State(), p2.Source())
+	}
+	if err := p2.CanStartBackend("gopls"); !isUntrusted(err) {
+		t.Errorf("untrusted 下 CanStartBackend = %v, want ErrUntrustedOperation", err)
+	}
+}

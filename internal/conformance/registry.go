@@ -178,9 +178,16 @@ var Registry = struct{ Checks []Check }{
 
 		// ---------- Y3 Security ----------
 		{ID: "Y3-1", Domain: "core", Category: "Y3", Clause: "N1/N2/N3 trust gates", Weight: 1,
-			Text: "Trust gates enforced (workspace states Untrusted/Restricted/Trusted + plugin default-deny)", Status: StatusAuto,
+			// 文案两半（审计批·Y3-1 AUTO 误导）：AUTO 探针验证的是「机制」——
+			// 状态机/门在给定策略下的行为；生产唯一构造路径 PolicyForBackend 的
+			// 默认分支（OMNILSP_TRUST 未设）返回 implicit-local-launch 的
+			// StateTrusted，而非 §N1 字面默认 Untrusted——由
+			// TestN1_PolicyForBackendProductionDefault 钉住，台账读者不得从
+			// 机制半边的绿灯推出「生产默认 Untrusted」的相反结论。
+			Text:   "Trust gates enforced (mechanism: workspace states Untrusted/Restricted/Trusted + plugin default-deny); production backend default is implicit-local-launch TRUSTED when OMNILSP_TRUST is unset (fact pinned, not the §N1 literal default)",
+			Status: StatusAuto,
 			Probe: &Probe{Groups: []ProbeGroup{
-				{Pkg: "internal/trust", Tests: []string{"TestN1_DefaultUntrusted", "TestN3_UntrustedBlocksExecution", "TestN1_RestrictedWhitelist"}},
+				{Pkg: "internal/trust", Tests: []string{"TestN1_DefaultUntrusted", "TestN3_UntrustedBlocksExecution", "TestN1_RestrictedWhitelist", "TestN1_PolicyForBackendProductionDefault"}},
 				{Pkg: "internal/languages/nested", Tests: []string{"TestN3_UntrustedWorkspaceBlocksBackendStart"}},
 				{Pkg: "internal/plugin", Tests: []string{"TestO2_DefaultDeny"}}}}},
 		{ID: "Y3-2", Domain: "core", Category: "Y3", Clause: "SEC-EXEC-001/§N4", Weight: 1,
