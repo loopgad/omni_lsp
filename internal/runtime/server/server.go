@@ -162,6 +162,7 @@ type Server struct {
 	pluginMu     sync.Mutex
 	pluginMgr    *plugin.Manager
 	pluginGrants map[string]plugin.Grant // id → Enable 授权表（emit 能力门的授予半边）
+	pluginLangs  map[string][]string     // id → manifest.languages（emit 语言范围门的声明半边，审计批·合并策略来源伪造面）
 	pluginProcs  map[string]*plugin.Process
 	// pluginDiscoverErr 记录装配期目录级发现失败的原因（pluginMu 保护）：
 	// 对齐 disableIndex 的 idxReason 可观测约定——空串表示无目录级失败。
@@ -491,6 +492,7 @@ func (s *Server) mountPlugins(dir string) {
 	}
 	s.pluginMgr = mgr
 	s.pluginGrants = make(map[string]plugin.Grant)
+	s.pluginLangs = make(map[string][]string)
 	s.pluginProcs = make(map[string]*plugin.Process)
 	s.pluginMu.Unlock()
 
@@ -559,6 +561,7 @@ func (s *Server) mountPlugins(dir string) {
 			d.Manifest.Capabilities = eff
 		}
 		s.pluginMu.Lock()
+		s.pluginLangs[id] = d.Manifest.Languages // 语言范围门的声明半边（语言不经能力策略过滤，原始声明即有效声明）
 		s.pluginPending = append(s.pluginPending, pluginPendingLaunch{discovery: d, grant: grant})
 		s.pluginMu.Unlock()
 	}
@@ -631,8 +634,9 @@ func (s *Server) launchReadyPlugins() {
 }
 
 // onPluginNotify 是插件→宿主通知的宿主半边（pump 线程调用）：统计、能力门
-// （Grant.Check——default deny 的 emit 实证点）、解析，最后把诊断集带宿主
-// 强制来源标记汇入 diagnostics 协调器（去抖路径，不直连推送）。
+// （Grant.Check——default deny 的 emit 实证点）、解析、语言范围门
+// （manifest.languages 与目标文档语言比对，审计批·合并策略来源伪造面），
+// 最后把诊断集带宿主强制来源标记汇入 diagnostics 协调器（去抖路径，不直连推送）。
 func (s *Server) onPluginNotify(pluginID, method string, params json.RawMessage) {
 	s.pluginNotifies.Add(1)
 	if method != "diagnostics/emit" {
@@ -656,6 +660,14 @@ func (s *Server) onPluginNotify(pluginID, method string, params json.RawMessage)
 		s.pluginEmitRejected.Add(1)
 		return
 	}
+	// 语言范围门（审计批·合并策略来源伪造面）：manifest.languages（§O3 必填）
+	// 此前在 emit 路径零执行——声明 languages:[go] 的插件可对任意打开文档
+	// emit 诊断（onPluginNotify 只查授予、预算与打开态）。越界 emit 与能力门
+	// 同待遇：拒绝并计入 pluginEmitRejected 可见计数。
+	if !s.pluginWithinLanguageScope(pluginID, ep.URI) {
+		s.pluginEmitRejected.Add(1)
+		return
+	}
 	// 条数预算（复证圈 2 审计发现 3）：单帧有 executor 的 maxPluginFrameSize
 	// （4MiB）兜底，但解析后的诊断集整集驻留 pluginItems——FIFO 只限 uri 数
 	// （diagCacheLimit=512）不限每 uri 内容，无预算接车。超限整帧拒绝并计入
@@ -675,6 +687,52 @@ func (s *Server) onPluginNotify(pluginID, method string, params json.RawMessage)
 		})
 	}
 	s.diag.injectPluginDiagnostics(pluginID, ep.URI, items)
+}
+
+// pluginWithinLanguageScope 报告插件对 uri 的 emit 是否落在其 manifest 声明
+// 的语言范围内（审计批·合并策略来源伪造面）。目标文档语言的判定来源：打开
+// 文档的 languageId（didOpen 客户端声明，VFS 权威），辅以注册后端扩展名匹配
+// 的语言 ID（languageId 为空时的后缀兜底，对齐 resolveBackend 的匹配语义）；
+// 与声明语言求交（大小写不敏感）。语言不可判定（文档未打开/无 languageId
+// 且无后端命中）时保持既有放行语义——本门针对「声明 languages:[go] 却对可
+// 判定语言文档越界 emit」的伪造面，未打开文档由 injectPluginDiagnostics 的
+// 打开态门拒绝，语言未知时的通用投放治理留待 §O 后续轮次。
+func (s *Server) pluginWithinLanguageScope(pluginID, uri string) bool {
+	s.pluginMu.Lock()
+	declaredList := s.pluginLangs[pluginID]
+	s.pluginMu.Unlock()
+	if len(declaredList) == 0 {
+		// 无声明信息不设门（防御半边：§O3 校验保证 manifest.languages 非空，
+		// 仅非常规装配路径可能缺席）。
+		return true
+	}
+	declared := make(map[string]bool, len(declaredList))
+	for _, l := range declaredList {
+		declared[strings.ToLower(strings.TrimSpace(l))] = true
+	}
+	var resolved []string
+	if st := s.vfs.Get(uri); st != nil && st.LanguageID != "" {
+		resolved = append(resolved, strings.ToLower(strings.TrimSpace(st.LanguageID)))
+	}
+	s.mu.RLock()
+	for langID, be := range s.languages {
+		for _, ext := range be.FileExtensions() {
+			if strings.HasSuffix(strings.ToLower(uri), strings.ToLower(ext)) {
+				resolved = append(resolved, strings.ToLower(langID))
+				break
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if len(resolved) == 0 {
+		return true
+	}
+	for _, l := range resolved {
+		if declared[l] {
+			return true
+		}
+	}
+	return false
 }
 
 // pluginOnExit 接入 Manager.RecordCrash（§O4 崩溃循环遏制）：进程异常退出

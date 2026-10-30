@@ -447,3 +447,64 @@ func TestPluginsMount_HighPrivilegeCapsRequireOptIn(t *testing.T) {
 		}
 	})
 }
+
+// TestEmit_LanguageScopeEnforced（审计批·合并策略来源伪造面）：manifest.languages
+// （§O3 必填）此前在 emit 路径零执行——声明 languages:[go] 的插件可对任意
+// 打开文档 emit 诊断。守卫：对可判定语言的越界 emit（[go] 插件对 python 文档）
+// 与能力门同待遇——拒绝并计入 pluginEmitRejected，无推送；同声明语言的文档
+// emit 照常放行（正控，证明门不误伤）。
+func TestEmit_LanguageScopeEnforced(t *testing.T) {
+	t.Setenv("OMNILSP_SERVER_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "diag-emit")
+	t.Setenv("OMNILSP_TRUST", "trusted")
+
+	t.Run("out-of-scope-rejected", func(t *testing.T) {
+		t.Setenv("GO_PLUGIN_EMIT_URI", "file:///p/main.py")
+		root := t.TempDir()
+		writePluginDir(t, root, "langscope", []plugin.Capability{plugin.CapDiagnosticsEmit}, nil)
+		s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
+		defer s.ClosePlugins()
+		s.InitializeWorkspace(t.TempDir())
+		rt := attachRecordingTransport(t, s)
+		s.vfs.Open("file:///p/main.py", "python", 1, []byte("print(1)"), vfs.SourceEditor)
+
+		proc := mountedProc(t, s, "langscope")
+		if proc == nil {
+			t.Fatal("languages:[go] 插件应正常装配运行")
+		}
+		if _, err := proc.Call("emit/now", nil); err != nil {
+			t.Fatalf("Call: %v", err)
+		}
+		waitUntil(t, func() bool { return s.pluginEmitRejected.Load() >= 1 },
+			"[go] 插件对 python 文档的越界 emit 未被拒绝计数")
+		time.Sleep(300 * time.Millisecond) // 越过 diagDebounce 窗口
+		if pushes := rt.filterMethod("textDocument/publishDiagnostics"); len(pushes) != 0 {
+			t.Fatalf("越界 emit 不得推送诊断: %+v", pushes)
+		}
+	})
+
+	t.Run("in-scope-accepted", func(t *testing.T) {
+		root := t.TempDir()
+		writePluginDir(t, root, "langscope", []plugin.Capability{plugin.CapDiagnosticsEmit}, nil)
+		s := New(Config{PluginsDir: root, IndexDir: filepath.Join(t.TempDir(), "idx")})
+		defer s.ClosePlugins()
+		s.InitializeWorkspace(t.TempDir())
+		rt := attachRecordingTransport(t, s)
+		s.vfs.Open("file:///p/main.go", "go", 1, []byte("package main"), vfs.SourceEditor)
+
+		proc := mountedProc(t, s, "langscope")
+		if proc == nil {
+			t.Fatal("languages:[go] 插件应正常装配运行")
+		}
+		if _, err := proc.Call("emit/now", nil); err != nil {
+			t.Fatalf("Call: %v", err)
+		}
+		time.Sleep(300 * time.Millisecond) // 越过 diagDebounce 窗口
+		if n := s.pluginEmitRejected.Load(); n != 0 {
+			t.Fatalf("声明语言内的 emit 不得被拒，pluginEmitRejected = %d", n)
+		}
+		waitUntil(t, func() bool {
+			return len(rt.filterMethod("textDocument/publishDiagnostics")) > 0
+		}, "声明语言内的 emit 未推送（正控失败）")
+	})
+}
