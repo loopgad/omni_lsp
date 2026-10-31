@@ -149,7 +149,7 @@ func TestFraming_HeaderBlockAndChunkedStream(t *testing.T) {
 }
 
 // TestFraming_RejectsOversizedFrame pins the single-frame size cap: a child
-// declaring a Content-Length far beyond maxPluginFrameSize must be refused
+// declaring a Content-Length far beyond MaxPluginFrameSize must be refused
 // immediately with the cap error — not honored (unbounded allocation) and
 // not surfacing as a bare EOF.
 func TestFraming_RejectsOversizedFrame(t *testing.T) {

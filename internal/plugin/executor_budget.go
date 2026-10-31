@@ -12,7 +12,7 @@ import (
 // F14 车道（DEF-BUDWIRE，internal/languages 后端缓冲半边）确立了接线形态：
 // 预算来源是进程环境而非配置文件，未配置即整体关闭（X10 红线：默认行为
 // 零变化），配置后拒绝 fail-closed 且可见计数、绝不静默。插件车道的缓冲区
-// ——notifyCh（容量 pluginNotifyBuffer=64，单帧负载上限 maxPluginFrameSize
+// ——notifyCh（容量 pluginNotifyBuffer=64，单帧负载上限 MaxPluginFrameSize
 // =4MiB）——是同一故障面：64×4MiB ≈ 256MiB 的敌意/失控插件通知可驻留在
 // 宿主内存里等 pump 消费。本文件把同一形态接到通知缓冲上。
 //
@@ -37,7 +37,7 @@ const notifyBudgetOwner = "plugin-notify"
 // 构造的 Manager（全局硬限与 owner 配额同值：单 owner 单用途的预算面）。
 //
 // 复证圈 1 sweep 发现 6：Reserve 的拒绝条件是 used+n>quota（budget.go:61），
-// 配额 Q < maxPluginFrameSize（4MiB）时，负载落在 (Q, 4MiB] 的协议合法通知
+// 配额 Q < MaxPluginFrameSize（4MiB）时，负载落在 (Q, 4MiB] 的协议合法通知
 // 帧在缓冲完全空闲时也被永久拒绝——只落入 BudgetDroppedNotifies 计数，而
 // 该计数与 pluginNotifies/pluginEmitRejected 一样无生产侧读取点，操作者只
 // 看得到「配额内小通知能过、大通知全灭」。languages 车道对同一配置形态的
@@ -54,10 +54,10 @@ func notifyBudgetFromEnv() *budget.Manager {
 	if !ok {
 		return nil
 	}
-	if quota < maxPluginFrameSize {
+	if quota < MaxPluginFrameSize {
 		fmt.Fprintf(os.Stderr,
 			"omnilsp: %s=%d 低于插件通道单帧上限 %d——负载超过配额的通知帧即使缓冲空闲也会被整帧拒绝（计入 BudgetDroppedNotifies，不静默）\n",
-			pluginNotifyBudgetEnv, quota, maxPluginFrameSize)
+			pluginNotifyBudgetEnv, quota, MaxPluginFrameSize)
 	}
 	m := budget.New(quota, quota)
 	m.SetQuota(notifyBudgetOwner, quota)

@@ -211,7 +211,7 @@ func captureStderr(t *testing.T, fn func()) string {
 }
 
 // TestNotifyBudget_SubFrameQuotaAnnouncesOnStderr（复证圈 1 sweep 发现 6）：
-// Reserve 的拒绝条件是 used+n>quota，配额 Q < maxPluginFrameSize(4MiB) 时，
+// Reserve 的拒绝条件是 used+n>quota，配额 Q < MaxPluginFrameSize(4MiB) 时，
 // 负载落在 (Q, 4MiB] 的协议合法通知帧在缓冲完全空闲时也被永久拒绝（每插件
 // 进程一个 Manager，终进程生命周期）——而该拒绝只落入 BudgetDroppedNotifies
 // 计数，生产侧无任何读取点。与 languages 车道 BackendBufferCap 把配额映射为
@@ -221,7 +221,7 @@ func captureStderr(t *testing.T, fn func()) string {
 // ParsePositiveBytes 的非法值宣告纪律同构）：配置了会静默拒大帧的配额，操
 // 作者必须被告知。对照：配额 ≥ 单帧上限时不宣告。
 func TestNotifyBudget_SubFrameQuotaAnnouncesOnStderr(t *testing.T) {
-	t.Setenv(pluginNotifyBudgetEnv, "1024") // < maxPluginFrameSize（4MiB）
+	t.Setenv(pluginNotifyBudgetEnv, "1024") // < MaxPluginFrameSize（4MiB）
 
 	out := captureStderr(t, func() {
 		if m := notifyBudgetFromEnv(); m == nil {

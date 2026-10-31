@@ -326,15 +326,15 @@ func writeFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
-// maxPluginFrameSize 是单帧负载上限：敌意/损坏的 Content-Length 声明不允许
+// MaxPluginFrameSize 是单帧负载上限：敌意/损坏的 Content-Length 声明不允许
 // 让宿主按声明值无界分配内存（N14 防御纵深，覆盖 manifest 信任链之外的运行期）。
-const maxPluginFrameSize = 4 << 20 // 4 MiB
+const MaxPluginFrameSize = 4 << 20 // 4 MiB
 
 // maxHeaderLineBytes 是帧头块单行的硬上限：头行扫描逐行缓冲，敌意/损坏插件
 // 的无换行长流不允许在宿主内无界累积内存（N14 运行期防御——4MiB 单帧上限只
 // 约束 Content-Length 声明值，不约束头块扫描本身，见审计批 1 的 64MiB 堆增量
 // 探针）。8 KiB 足以容纳任何规范头（Content-Type 等附加头）；骨架行分隔负载
-// 一并限界——大负载必须走 Content-Length 分帧（上限 maxPluginFrameSize）。
+// 一并限界——大负载必须走 Content-Length 分帧（上限 MaxPluginFrameSize）。
 const maxHeaderLineBytes = 8 << 10 // 8 KiB
 
 // readHeaderLine 以硬上限读一行（含行尾换行）：bufio.ReadSlice 在缓冲区填满
@@ -399,8 +399,8 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 			if parsed < 0 {
 				return nil, fmt.Errorf("plugin: invalid Content-Length %d", parsed)
 			}
-			if parsed > maxPluginFrameSize {
-				return nil, fmt.Errorf("plugin: Content-Length %d 超出单帧上限 %d", parsed, maxPluginFrameSize)
+			if parsed > MaxPluginFrameSize {
+				return nil, fmt.Errorf("plugin: Content-Length %d 超出单帧上限 %d", parsed, MaxPluginFrameSize)
 			}
 			size = int(parsed)
 			continue

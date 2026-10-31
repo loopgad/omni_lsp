@@ -183,9 +183,17 @@ type Server struct {
 	pluginClosing bool
 
 	// plugin counters (§P3 低基数可观测性：拒绝与丢弃可见，不静默)。
-	pluginNotifies     atomic.Int64 // 收到的插件通知总数
-	pluginUnknown      atomic.Int64 // 非 diagnostics/emit 的通知数（暂存车道外）
-	pluginEmitRejected atomic.Int64 // 能力门/解析门拒绝的 emit 数 + 关闭文档的迟到 emit 丢弃数（default deny 实证）
+	pluginNotifies atomic.Int64 // 收到的插件通知总数
+	pluginUnknown  atomic.Int64 // 非 diagnostics/emit 的通知数（暂存车道外）
+	// pluginEmitRejected 是六类 emit 拒绝的混计（复证圈 3 sweep 发现 7 对账：
+	// 语言域门/条数门/字节门三次扩充均未回写本注释，混计在声明面不可见）：
+	// ① 能力门（onPluginNotify grant.Check，default deny 实证）；② 解析门
+	// （params unmarshal/uri 空）；③ 语言域门（manifest.languages 越界 emit）；
+	// ④ 条数门（maxPluginEmitDiagnostics）；⑤ 字节门（maxPluginEmitFrameBytes，
+	// 驻留序列化预算）；⑥ 关闭文档的迟到 emit（injectPluginDiagnostics 的
+	// vfs.Get==nil 门）。混计且无生产侧读取点（无 getter/metrics 暴露）——
+	// 六类事件的发生率在计数器层面不可分辨，需拆分时按门立计数器。
+	pluginEmitRejected atomic.Int64
 }
 
 // indexLadderRefreshTimeout 是 initialize 索引初始化路径上有界等待的统一
@@ -434,7 +442,7 @@ const maxPluginEmitDiagnostics = 1024
 // 且此前无字节记账。预算按注入前 projectDiagnostics 的序列化长度设硬上限
 // （记账口径与真正上线的 payload 一致），超限整帧拒绝并计入
 // pluginEmitRejected——与条数门同待遇，不部分采纳。取值与插件通道单帧上限
-// maxPluginFrameSize（4MiB）同锚：协议上不存在比它更大的合法 emit 帧，预算
+// MaxPluginFrameSize（4MiB）同锚：协议上不存在比它更大的合法 emit 帧，预算
 // 拦下的是转投影展开后的极端驻留（消息体再转义/结构展开放大），常规 emit
 // 不受影响。任务书点名的默认行为收紧（非 X10 默认关项）。代价：emit 路径
 // 每帧多一次 marshal（≤1024 条，发布侧的去抖 marshal 不变）。
@@ -689,7 +697,7 @@ func (s *Server) onPluginNotify(pluginID string, grant plugin.Grant, method stri
 		s.pluginEmitRejected.Add(1)
 		return
 	}
-	// 条数预算（复证圈 2 审计发现 3）：单帧有 executor 的 maxPluginFrameSize
+	// 条数预算（复证圈 2 审计发现 3）：单帧有 executor 的 MaxPluginFrameSize
 	// （4MiB）兜底，但解析后的诊断集整集驻留 pluginItems——FIFO 只限 uri 数
 	// （diagCacheLimit=512）不限每 uri 内容，无预算接车。超限整帧拒绝并计入
 	// 可见拒绝计数（不部分采纳——整帧拒绝与 LSP 全量报告语义一致）。

@@ -120,3 +120,16 @@ func TestPluginEmit_OverByteBudgetResidentSetRejectedAndCounted(t *testing.T) {
 		t.Fatal("字节预算内的 emit 必须照常注入")
 	}
 }
+
+// TestPluginEmitFrameBytesMirrorsPluginFrameCap（复证圈 3 sweep 发现 5）：
+// maxPluginEmitFrameBytes 注释里的「与 maxPluginFrameSize 同锚」此前只是
+// 跨包注释，无任何测试或编译期手段钉住——未来调大插件单帧上限时 emit 驻
+// 留预算静默留在 4MiB，协议新接受的合法 emit 帧被默认开启的字节门整帧拒绝
+// 而无报警。比照 TestMaxCodecDefaultFrameCapMirror 先例把「同锚」升格为被
+// 执法的跨包不变量（plugin 侧导出 MaxPluginFrameSize）。
+func TestPluginEmitFrameBytesMirrorsPluginFrameCap(t *testing.T) {
+	if int64(maxPluginEmitFrameBytes) != int64(plugin.MaxPluginFrameSize) {
+		t.Fatalf("maxPluginEmitFrameBytes = %d, want plugin.MaxPluginFrameSize %d（跨包同锚漂移：emit 驻留预算与插件通道单帧上限不同步）",
+			int64(maxPluginEmitFrameBytes), int64(plugin.MaxPluginFrameSize))
+	}
+}
