@@ -235,10 +235,22 @@ func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 	if err != nil {
 		return nil, fmt.Errorf("plugin: 打开 entrypoint: %w", err)
 	}
-	if err := verifyChecksumFromFile(ctx, vf, m.Checksum); err != nil {
+	// 复证圈 7 sweep 发现 4：sha256 复核腿以 launchChecksumBudget 独立加界
+	// （只约束哈希段——调用方 ctx 原样进 exec.CommandContext，预算即便落在
+	// Start 之后也不会杀运行中的插件）。旧实现消费调用方 ctx：唯一生产调用
+	// 点传 context.Background()，复核无 deadline 不可取消，entrypoint 被持续
+	// 追加时 EOF-唯一退出循环永不结束，launchReadyPlugins 永不返回，
+	// initialize 永久挂起。
+	checksumCtx, cancelChecksum := context.WithTimeout(ctx, launchChecksumBudget)
+	if err := verifyChecksumFromFile(checksumCtx, vf, m.Checksum); err != nil {
+		cancelChecksum()
 		vf.Close()
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("plugin: entrypoint sha256 复核 %v 内未完成（entrypoint 可能被持续写入）: %w", launchChecksumBudget, err)
+		}
 		return nil, err
 	}
+	cancelChecksum()
 
 	// 绝对路径启动：exec.Command 对含路径分隔符的名字不再走 LookPath，
 	// PATH 解析（及其影子命中）从执行路径上整体移除。
@@ -865,3 +877,14 @@ func (l *pluginStderrLogger) flushLine() {
 	l.forwarded += len(line)
 	fmt.Fprintf(l.w, "omnilsp: plugin %s stderr: %s\n", l.id, line)
 }
+
+// launchChecksumBudget 是 Launch 时刻 entrypoint sha256 复核腿的独立预算
+// （复证圈 7 sweep 发现 4）。非常量——测试注入更短窗口（与 callTimeout/
+// writeStuckTimeout/exitGracePeriod 同一约定；生产默认值不变）。取 30s：
+// c7a1ef6 toolchain pinning 加界先例的单探针档——单个文件的全量哈希在慢盘
+// 上也有余量，同时把「entrypoint 被持续追加 → EOF-唯一退出循环永不结束 →
+// launchReadyPlugins 永不返回 → initialize 挂死」的尖锐边缘封顶。
+// 注意该预算只约束哈希段：调用方 ctx 原样进 exec.CommandContext——预算即
+// 便落在 Start 之后也不会杀运行中的插件（Launch ctx 同时是进程 ctx 的拆
+// 分约束）。
+var launchChecksumBudget = 30 * time.Second

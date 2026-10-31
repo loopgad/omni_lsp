@@ -129,3 +129,26 @@ func TestLaunch_TrustAssertionIsRequiredGate(t *testing.T) {
 		t.Fatalf("放行后的插件应可用: %v", err)
 	}
 }
+
+// TestLaunchChecksumBounded（复证圈 7 sweep 发现 4 的守卫）：Launch 时刻的
+// entrypoint sha256 复核腿必须受 launchChecksumBudget 约束——唯一生产调用
+// 点（server launchReadyPlugins）传 context.Background()，旧实现该腿无
+// deadline 不可取消，entrypoint 被持续追加时 EOF-唯一退出循环永不结束，
+// initialize 永久挂起。守卫以 1ns 预算注入：预算必须立即到期并以含预算语
+// 义的错误可观测（「未完成」），Launch 不得成功。
+func TestLaunchChecksumBounded(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	old := launchChecksumBudget
+	launchChecksumBudget = 1 // 1ns：预算立即到期
+	t.Cleanup(func() { launchChecksumBudget = old })
+
+	m := newValidManifest([]byte("x"))
+	p, err := launchTestBinary(t, m, NewGrant(CapDiagnosticsEmit), nil, trustAllow)
+	if err == nil {
+		_ = p.cmd.Process.Kill()
+		t.Fatal("checksum 复核腿不受 launchChecksumBudget 约束：1ns 预算下 Launch 仍成功（该腿无界）")
+	}
+	if !strings.Contains(err.Error(), "未完成") {
+		t.Fatalf("超时错误必须携带预算语义（含「未完成」）: %v", err)
+	}
+}
