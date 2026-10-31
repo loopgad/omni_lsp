@@ -116,6 +116,15 @@ func TestCodecRejectsBrokenFraming(t *testing.T) {
 			raw:     "X-Pad: " + strings.Repeat("a", 1100) + "\r\n\r\n",
 			wantMsg: "header too large",
 		},
+		{
+			// 复证圈 1 sweep 发现 2：重复 Content-Length 是帧结构损坏，不是
+			// "最后一个生效"。旧实现 last-wins：按第二个值消费 body，剩余字节
+			// 被当作下一帧头扫描，流失步而非干净的拒绝。与插件 executor
+			// readFrame 的「重复的 Content-Length 头」fatal 语义对齐。
+			name:    "duplicate Content-Length header",
+			raw:     "Content-Length: 4\r\nContent-Length: 2\r\n\r\n{}ab",
+			wantMsg: "duplicate Content-Length",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Codec{MaxMessageSize: sizeCap}

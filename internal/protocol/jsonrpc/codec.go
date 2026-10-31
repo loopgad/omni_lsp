@@ -182,7 +182,20 @@ func (c *Codec) readHeader(r io.Reader) (int, error) {
 		}
 	}
 
-	// Parse headers.
+	// Parse headers. A second Content-Length is frame-structure corruption,
+	// not "last one wins": the old code overwrote contentLength with each
+	// occurrence, so a hostile/desynchronized frame was consumed under an
+	// arbitrary declared length and the leftover bytes were re-scanned as the
+	// next header block — the stream desynced instead of failing cleanly. This
+	// matches the plugin executor's readFrame, which rejects a repeated
+	// Content-Length outright (executor.go「重复的 Content-Length 头」).
+	// Additional headers remain tolerated (Content-Type etc.), and the LF-only
+	// header terminator stays tolerated as well: both lanes (codec and plugin
+	// reader) accept it today, a frame accepted under it still consumes exactly
+	// Content-Length bytes, and TestCodecAcceptsToleratedFraming pins it as a
+	// deliberate bend — narrowing it would cost sessions over a byte with no
+	// desync to prevent.
+	seenLength := false
 	lines := strings.Split(strings.ReplaceAll(string(buf), "\r\n", "\n"), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -196,11 +209,15 @@ func (c *Codec) readHeader(r io.Reader) (int, error) {
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		if strings.EqualFold(key, HeaderContentLength) {
+			if seenLength {
+				return 0, fmt.Errorf("jsonrpc: duplicate Content-Length header")
+			}
 			n, err := strconv.Atoi(val)
 			if err != nil {
 				return 0, fmt.Errorf("jsonrpc: invalid Content-Length value: %q", val)
 			}
 			contentLength = n
+			seenLength = true
 		}
 	}
 
