@@ -428,6 +428,18 @@ type pluginEmitParams struct {
 // 内容——每 emit 超过该条数即整帧拒绝（可见计数，不部分采纳）。
 const maxPluginEmitDiagnostics = 1024
 
+// maxPluginEmitFrameBytes 是单次插件 emit 驻留集的序列化字节预算（复证圈 1
+// sweep 发现 1）：条数上限不约束单条体积，diagCacheLimit=512 的 FIFO 只按
+// uri 计数——驻留总量 = 打开文档数 × 插件数 × 单帧解析后结构，GiB 量级可达
+// 且此前无字节记账。预算按注入前 projectDiagnostics 的序列化长度设硬上限
+// （记账口径与真正上线的 payload 一致），超限整帧拒绝并计入
+// pluginEmitRejected——与条数门同待遇，不部分采纳。取值与插件通道单帧上限
+// maxPluginFrameSize（4MiB）同锚：协议上不存在比它更大的合法 emit 帧，预算
+// 拦下的是转投影展开后的极端驻留（消息体再转义/结构展开放大），常规 emit
+// 不受影响。任务书点名的默认行为收紧（非 X10 默认关项）。代价：emit 路径
+// 每帧多一次 marshal（≤1024 条，发布侧的去抖 marshal 不变）。
+const maxPluginEmitFrameBytes = 4 << 20
+
 // pluginMountBudget 是单次插件装配（Discover + 全量信任链复核）的整体预算
 // （复证圈 2 审计发现 6）：装配同步运行在 TCP accept 关键路径上且每个会话
 // 重复，无界 sha256 复核让 accept 与首字节延迟无界；超时落入 pluginDiscoverErr
@@ -694,6 +706,14 @@ func (s *Server) onPluginNotify(pluginID string, grant plugin.Grant, method stri
 			// 来源治理：宿主强制覆盖——插件无法伪装宿主或后端来源。
 			Source: "plugin:" + pluginID,
 		})
+	}
+	// 字节预算（复证圈 1 sweep 发现 1，见 maxPluginEmitFrameBytes）：条数门
+	// 之后的第二道驻留面闸门——按投影序列化长度整帧拒绝，超限计入
+	// pluginEmitRejected。marshal 失败（projectDiagnostics 输出的纯 JSON
+	// 安全类型上不可达）按 fail-closed 处理：无法记账的集不驻留。
+	if wire, merr := json.Marshal(projectDiagnostics(items)); merr != nil || len(wire) > maxPluginEmitFrameBytes {
+		s.pluginEmitRejected.Add(1)
+		return
 	}
 	s.diag.injectPluginDiagnostics(pluginID, ep.URI, items)
 }
