@@ -690,6 +690,13 @@ func (s *Server) onPluginNotify(pluginID string, grant plugin.Grant, method stri
 		s.pluginEmitRejected.Add(1)
 		return
 	}
+	// 复证圈 7 sweep 发现 1：语言范围门与注入必须用同一 uri 形态——旧实现
+	// 把插件可控的原始 ep.URI 原样传给 pluginWithinLanguageScope，而
+	// injectPluginDiagnostics 注入前才 canonicalDocumentURI：percent-encoding
+	// 变体（"prog.%70%79"）在原始文本上后缀不命中 → 语言不可判定 fail-open
+	// 放行 → 注入命中 canonical 键，跨语言诊断上线。此处先行 canonical 化，
+	// 两个消费点（语言门 vfs/后缀分支、injectPluginDiagnostics）天然同形态。
+	ep.URI = canonicalDocumentURI(ep.URI)
 	// 语言范围门（审计批·合并策略来源伪造面）：manifest.languages（§O3 必填）
 	// 此前在 emit 路径零执行——声明 languages:[go] 的插件可对任意打开文档
 	// emit 诊断（onPluginNotify 只查授予、预算与打开态）。越界 emit 与能力门
