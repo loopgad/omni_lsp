@@ -2,17 +2,29 @@
 // warns (visible, non-fatal) and a hard limit plus per-owner quotas that
 // refuse allocation with ErrOverloaded.
 //
-// It has no production caller yet: nothing in the server constructs a
-// Manager, so ErrOverloaded is currently unreachable outside tests. The
-// §F13 per-category memory ladder — the categories, and the thresholds that
-// move from warn to evict to throttle to refuse as pressure rises — is a
-// separate implementation in internal/runtime/scheduler (f13_budget.go).
-// The two do not share a model: this one counts bytes per owner with no
-// categories, that one counts per-category bytes against a threshold
-// ladder. Consolidating them is a separate decision, not a comment fix.
+// Production construction points exist (复证圈 3 sweep 文档对账): the F14
+// manager latches inside the languages layer (internal/languages/budget.go,
+// OMNILSP_BACKEND_BUDGET_BYTES + per-owner quota variables) and the plugin
+// notify-buffer lane builds one Manager per plugin process
+// (internal/plugin/executor_budget.go, OMNILSP_PLUGIN_NOTIFY_BUDGET_BYTES).
+// Reserve is production-reachable at the plugin notify readLoop and the five
+// backend wiring sites, so ErrOverloaded is a live production outcome, not a
+// test-only value. Both wirings stay opt-in via env and default off (X10):
+// with no budget configured the managers are nil and every Reserve/Release is
+// a passthrough. The §F13 per-category memory ladder — the categories, and
+// the thresholds that move from warn to evict to throttle to refuse as
+// pressure rises — is a separate implementation in internal/runtime/scheduler
+// (f13_budget.go). The two do not share a model: this one counts bytes per
+// owner with no categories, that one counts per-category bytes against a
+// threshold ladder. Consolidating them is a separate decision, not a comment
+// fix.
 //
 // Concurrency model: one mutex guards the counters; Reserve/Release are
-// O(1). Owners are language backend names or "server".
+// O(1). Owners are language backend names, "server", the plugin notify
+// buffer's "plugin-notify", and de-normalized per-owner names derived from
+// OMNILSP_BACKEND_QUOTA_<OWNER>_BYTES variables the latch does not know by
+// name (internal/runtime/budget EnvironQuotaLimits maps them back
+// best-effort).
 //
 // Invariants:
 //  1. Hard limit is absolute: total usage never exceeds it through this API.
