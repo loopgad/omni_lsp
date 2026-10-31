@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -412,5 +413,41 @@ func TestSafeEntrypoint_BareDotRejected(t *testing.T) {
 	// 合法裸文件名不回退。
 	if err := safeEntrypoint("demo.bin"); err != nil {
 		t.Fatalf("合法裸文件名不得被拒: %v", err)
+	}
+}
+
+// TestLoad_OversizedManifestRejected（复证圈 5 sweep 发现 6）：plugin.json
+// 是插件车道唯一读取前无大小上限的协议输入面（生产链 server.New 每会话装
+// 配 → DiscoverContext → VerifyContext → Load），非敌意损坏（大二进制误拷
+// 成 manifest）或本地低权写者可制造按文件大小的全量内存尖峰。运行期帧界
+// 纪律（MaxPluginFrameSize 4MiB、帧头 8KiB、codec 64MiB 分配前拒绝）在
+// manifest 车道补齐对应物：1 MiB 上限，超限按帧结构损坏类错误拒绝。
+// 守卫用「合法 JSON 但超大」构造——parse 失败类拒绝无法区分大小门。
+func TestLoad_OversizedManifestRejected(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidManifest([]byte("x"))
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	giant := strings.Replace(string(raw),
+		`"version":"1.0.0"`, `"version":"`+strings.Repeat("v", 2<<20)+`"`, 1)
+	if len(giant) <= maxManifestBytes {
+		t.Fatalf("守卫样本未超上限：%d 字节", len(giant))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(giant), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Load(dir)
+	if err == nil {
+		t.Fatal("超限 plugin.json 必须被大小门拒绝（旧实现按文件大小全量读入）")
+	}
+	if !strings.Contains(err.Error(), "超出") {
+		t.Fatalf("拒绝原因必须是大小门而非解析错误: %v", err)
+	}
+	// 常规 manifest 不受影响。
+	okDir := newPluginDir(t)
+	if _, err := Load(okDir); err != nil {
+		t.Fatalf("常规 manifest 被误拒: %v", err)
 	}
 }

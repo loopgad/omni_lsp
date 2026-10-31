@@ -16,6 +16,15 @@ import (
 // ErrChecksumMismatch 表示 entrypoint 实际内容与声明的 sha256 不一致（N14）。
 var ErrChecksumMismatch = errors.New("plugin: checksum 不匹配")
 
+// maxManifestBytes 是 plugin.json 的大小上限（复证圈 5 sweep 发现 6）：manifest
+// 是插件车道唯一读取前无大小上限的协议输入面（生产链 server.New 每会话装配
+// → DiscoverContext → VerifyContext → Load），非敌意损坏（大二进制误拷成
+// manifest）或本地低权写者可制造按文件大小的全量内存尖峰——运行期帧界纪律
+// （MaxPluginFrameSize 4MiB、帧头行 8KiB）在 manifest 车道的对应物，超限按
+// 帧结构损坏类错误拒绝并保留 Discover 的单目录 VerifyErr 可观测性。1 MiB
+// 足以容纳任何合法清单（§O3 七必填 + 能力/语言列表）。
+const maxManifestBytes = 1 << 20
+
 // Load 读取并反序列化 dir/plugin.json。未知字段一律拒绝，
 // 防止敌意 manifest 携带未定义语义。首个 JSON 值之后的首个值之外的尾随
 // 非空白字节同样拒绝（复证圈 1 sweep 发现 3）：DisallowUnknownFields 只
@@ -23,7 +32,14 @@ var ErrChecksumMismatch = errors.New("plugin: checksum 不匹配")
 // 字节不在校验面内——尾随文档/垃圾字节按帧结构损坏拒绝，纯空白尾随
 // （JSON 流分帧的空白填充）不受影响。
 func Load(dir string) (Manifest, error) {
-	b, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
+	path := filepath.Join(dir, "plugin.json")
+	// 大小门（复证圈 5 sweep 发现 6，见 maxManifestBytes）：读取前拒绝，
+	// 不按敌意/损坏文件的字节数分配内存。Stat 失败不在此处理——ReadFile
+	// 会以自己的错误上抛，保留原始失败原因。
+	if fi, err := os.Stat(path); err == nil && fi.Size() > maxManifestBytes {
+		return Manifest{}, fmt.Errorf("plugin: plugin.json %d 字节超出 %d 上限（帧结构损坏类拒绝）", fi.Size(), maxManifestBytes)
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("plugin: 读取 plugin.json: %w", err)
 	}
