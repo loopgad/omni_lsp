@@ -38,7 +38,7 @@ type RecorderTransport struct {
 // the session ends.
 func NewRecorder(inner transport.Transport, path string, meta Meta, revFn func() uint64) (*RecorderTransport, error) {
 	meta.FormatVersion = FormatVersion
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) // §P9 录制含全量源码帧，owner-only（复证圈 5 sweep 发现 2）
 	if err != nil {
 		return nil, err
 	}

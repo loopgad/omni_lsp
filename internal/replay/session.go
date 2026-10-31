@@ -623,7 +623,7 @@ func ConfigHash(v any) string {
 
 // Save writes the session as JSONL (meta first, then entries in order).
 func Save(path string, s *Session) error {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) // §P9 录制含全量源码帧，owner-only（复证圈 5 sweep 发现 2）
 	if err != nil {
 		return fmt.Errorf("replay: create %q: %w", path, err)
 	}

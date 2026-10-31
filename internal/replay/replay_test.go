@@ -11,6 +11,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -783,5 +785,36 @@ func TestRecorder_WriteFailureSurfaces(t *testing.T) {
 	rec.log("out", raw(gotMsg))
 	if rec.Err() != first {
 		t.Fatal("first recorded error was overwritten by a later failure")
+	}
+}
+
+// TestRecordingOwnerOnlyPermissions（复证圈 5 sweep 发现 2）：录制文件是本
+// 工具可产出的内容最敏感的持久化工件（进出双向原始 LSP 帧，didOpen/
+// didChange 携带完整源码文本），落盘必须 owner-only（0600），与
+// completion_phase_trace.go / file_lock.go / lease.go 的既有 0600 惯例对齐。
+// Windows 的 os.Stat perm 恒为 0666（权限走 ACL），断言仅 Unix 有意义。
+func TestRecordingOwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows perm bits are ACL-emulated; the 0600 assertion is Unix-only")
+	}
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	r, err := NewRecorder(newFeedTransport(), path, Meta{}, func() uint64 { return 0 })
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	_ = r.Close()
+	if info, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("录制文件权限 %o 含组/其他人位，want owner-only 0600", perm)
+	}
+	sessPath := filepath.Join(t.TempDir(), "saved.jsonl")
+	if err := Save(sessPath, &Session{}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if info, err := os.Stat(sessPath); err != nil {
+		t.Fatal(err)
+	} else if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("Save 文件权限 %o 含组/其他人位，want owner-only 0600", perm)
 	}
 }
