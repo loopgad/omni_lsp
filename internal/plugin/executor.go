@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/omnilsp/omni/internal/runtime/budget"
 )
 
 // 进程生命周期三态（LSP shutdown/exit 语义的宿主半边，goal.md §C2）：
@@ -128,6 +130,13 @@ type Process struct {
 	// 慢消费者最多拖慢 pump 自己，永远拖不到 readLoop。
 	notifyCh        chan pluginNotifyEvent
 	droppedNotifies atomic.Uint64
+	// notifyBudget 是通知缓冲区的 §F14 字节配额（第 18 轮开口 5，与
+	// internal/languages 的后端缓冲接线同构：env 显式开关、默认 nil 关、
+	// fail-closed 拒绝）。nil = 未配置 = 零行为变化（X10）。
+	notifyBudget *budget.Manager
+	// budgetDroppedNotifies 计数因超出配额被整帧拒绝的通知数（可见不静默；
+	// 与通道饱和/无订阅者的 DroppedNotifies 分开记账，拒绝原因可辨）。
+	budgetDroppedNotifies atomic.Uint64
 	// sink 是宿主订阅回调（SetNotifySink 注册，sinkMu 保护：可在 Launch
 	// 前后任意时刻并发注册/替换）。nil 表示无订阅者——通知照投递进通道、
 	// 由 pump 计数丢弃，保持「丢弃可见不静默」的同一语义。
@@ -172,6 +181,7 @@ type helloFrame struct {
 // 宿主→插件通知广播（Notify）、优雅停机（Shutdown/Exit 三态状态机，
 // LSP shutdown/exit 语义）、以及按方法→能力映射下沉到 Call 级别的能力门
 // （methodCapability + manifest 声明快照，见 Call）。
+//
 // Launch 不注册订阅回调：Launch 返回与 SetNotifySink 之间的通知按有界有损
 // 语义丢弃并计数（开口 4 的窗口在 Launch 自身签名上不可消除——Process 句柄
 // 此刻才存在）。需要在注册窗口内零丢失的宿主走 LaunchWithSink。
@@ -259,6 +269,8 @@ func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 		OnExit:   onExit,
 		notifyCh: make(chan pluginNotifyEvent, pluginNotifyBuffer),
 		exited:   make(chan struct{}),
+		// 第 18 轮开口 5：通知缓冲 §F14 配额（默认 nil 关，见 executor_budget.go）。
+		notifyBudget: notifyBudgetFromEnv(),
 	}
 	// Launch 时刻订阅（开口 4）：sink 落在 readLoop/pump 启动之前——两个
 	// goroutine 尚不存在，直接写字段不构成数据竞争；pump 随后经 sinkMu 读。
@@ -461,9 +473,23 @@ func (p *Process) readLoop() {
 			// 插件→宿主通知（无 id、带 method）：有界投递，满即丢弃计数。
 			if frame.Method != "" {
 				ev := pluginNotifyEvent{method: frame.Method, params: frame.Params}
+				// §F14 通知缓冲配额（第 18 轮开口 5）：入队前先按驻留字节
+				// Reserve——超配额整帧拒绝并计入 BudgetDroppedNotifies
+				// （fail-closed 可见，不部分采纳，不牵连响应多路复用）。
+				// Reserve 成功但入队失败（通道饱和）必须即时 Release，防止
+				// 记账泄漏；入队成功方由 pumpNotifies 收货时 Release。
+				if p.notifyBudget != nil {
+					if err := p.notifyBudget.Reserve(notifyBudgetOwner, notifyEventBytes(ev)); err != nil {
+						p.budgetDroppedNotifies.Add(1)
+						continue
+					}
+				}
 				select {
 				case p.notifyCh <- ev:
 				default:
+					if p.notifyBudget != nil {
+						p.notifyBudget.Release(notifyBudgetOwner, notifyEventBytes(ev))
+					}
 					p.droppedNotifies.Add(1)
 				}
 			}
@@ -503,11 +529,20 @@ func (p *Process) SetNotifySink(fn func(method string, params json.RawMessage)) 
 // DroppedNotifies 返回因无订阅者或通道饱和而被丢弃的插件通知数。
 func (p *Process) DroppedNotifies() uint64 { return p.droppedNotifies.Load() }
 
+// BudgetDroppedNotifies 返回因超出 §F14 通知缓冲配额而被整帧拒绝的通知数
+// （第 18 轮开口 5）。未配置配额时恒为 0。
+func (p *Process) BudgetDroppedNotifies() uint64 { return p.budgetDroppedNotifies.Load() }
+
 // pumpNotifies 是通知投递的唯一消费者：从有界通道逐条取出，送达当前注册的
 // 宿主回调。readLoop 退出（进程终止）时关闭通道，本循环排空余量后结束。
 // 回调阻塞只拖慢 pump 自身——readLoop 的非阻塞投递永不等待这里。
 func (p *Process) pumpNotifies() {
 	for ev := range p.notifyCh {
+		// §F14 记账闭环（第 18 轮开口 5）：入队时 Reserve 的驻留字节在收货
+		// 时 Release——通道关闭后排空余量，每条入队通知恰好释放一次。
+		if p.notifyBudget != nil {
+			p.notifyBudget.Release(notifyBudgetOwner, notifyEventBytes(ev))
+		}
 		p.sinkMu.Lock()
 		fn := p.sink
 		p.sinkMu.Unlock()
