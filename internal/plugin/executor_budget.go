@@ -1,6 +1,9 @@
 package plugin
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/omnilsp/omni/internal/runtime/budget"
 )
 
@@ -32,10 +35,29 @@ const notifyBudgetOwner = "plugin-notify"
 // notifyBudgetFromEnv 解析通知缓冲配额：未设置返回 nil（关闭——默认行为
 // 零变化），非法值经 ParsePositiveBytes 宣告并保持关闭，正值返回按该值
 // 构造的 Manager（全局硬限与 owner 配额同值：单 owner 单用途的预算面）。
+//
+// 复证圈 1 sweep 发现 6：Reserve 的拒绝条件是 used+n>quota（budget.go:61），
+// 配额 Q < maxPluginFrameSize（4MiB）时，负载落在 (Q, 4MiB] 的协议合法通知
+// 帧在缓冲完全空闲时也被永久拒绝——只落入 BudgetDroppedNotifies 计数，而
+// 该计数与 pluginNotifies/pluginEmitRejected 一样无生产侧读取点，操作者只
+// 看得到「配额内小通知能过、大通知全灭」。languages 车道对同一配置形态的
+// 处理是把配额映射为协议层帧上限收紧（BackendBufferCap + codec 的
+// SkipOversizedFrames：排空该帧、流继续可用）；插件 readFrame 没有 skip-drain
+// 机制——帧上限拒绝在 readLoop 是连接级 fatal（notifyPendingLocked 连坐全部
+// 多路复用响应），照搬会把「计数的帧拒绝」恶化成「连接拆除」，可用性严格
+// 变差。取舍登记：本车道不收紧帧上限，改为在配置了低于单帧上限的配额时向
+// stderr 显式声明「大帧将按配额拒绝」（与 ParsePositiveBytes 非法值宣告纪
+// 律同构）——语义与 F14 接线的「同构」缺口在此点如实标注而非假装闭合。
+// 配额 ≥ 单帧上限时不宣告（通知帧不会因配额被拒，无可声明行为）。
 func notifyBudgetFromEnv() *budget.Manager {
 	quota, ok := budget.ParsePositiveBytes(pluginNotifyBudgetEnv)
 	if !ok {
 		return nil
+	}
+	if quota < maxPluginFrameSize {
+		fmt.Fprintf(os.Stderr,
+			"omnilsp: %s=%d 低于插件通道单帧上限 %d——负载超过配额的通知帧即使缓冲空闲也会被整帧拒绝（计入 BudgetDroppedNotifies，不静默）\n",
+			pluginNotifyBudgetEnv, quota, maxPluginFrameSize)
 	}
 	m := budget.New(quota, quota)
 	m.SetQuota(notifyBudgetOwner, quota)

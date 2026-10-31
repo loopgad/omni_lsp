@@ -2,6 +2,9 @@ package plugin
 
 import (
 	"encoding/json"
+	"io"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -181,5 +184,214 @@ func TestNotifyBudget_InvalidValueKeepsOff(t *testing.T) {
 	}, "非法预算值必须保持配额关闭（通知照常投递）")
 	if n := p.BudgetDroppedNotifies(); n != 0 {
 		t.Errorf("BudgetDroppedNotifies = %d, want 0（非法值保持关闭）", n)
+	}
+}
+
+// captureStderr 在闭包执行期间重定向进程 stderr 并返回其输出（顺序测试内
+// 使用；并发写者不在捕获窗口内）。
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = old
+	if err := w.Close(); err != nil {
+		t.Fatalf("关闭捕获写端: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("读取捕获输出: %v", err)
+	}
+	_ = r.Close()
+	return string(out)
+}
+
+// TestNotifyBudget_SubFrameQuotaAnnouncesOnStderr（复证圈 1 sweep 发现 6）：
+// Reserve 的拒绝条件是 used+n>quota，配额 Q < maxPluginFrameSize(4MiB) 时，
+// 负载落在 (Q, 4MiB] 的协议合法通知帧在缓冲完全空闲时也被永久拒绝（每插件
+// 进程一个 Manager，终进程生命周期）——而该拒绝只落入 BudgetDroppedNotifies
+// 计数，生产侧无任何读取点。与 languages 车道 BackendBufferCap 把配额映射为
+// 协议层帧上限收紧不同（插件 readFrame 无 skip-drain 机制，帧上限拒绝在
+// readLoop 是连接级 fatal，会连坐多路复用响应——见 executor_budget.go 的取
+// 舍登记），本车道选择把「大帧将按配额拒绝」向 stderr 显式声明（与
+// ParsePositiveBytes 的非法值宣告纪律同构）：配置了会静默拒大帧的配额，操
+// 作者必须被告知。对照：配额 ≥ 单帧上限时不宣告。
+func TestNotifyBudget_SubFrameQuotaAnnouncesOnStderr(t *testing.T) {
+	t.Setenv(pluginNotifyBudgetEnv, "1024") // < maxPluginFrameSize（4MiB）
+
+	out := captureStderr(t, func() {
+		if m := notifyBudgetFromEnv(); m == nil {
+			t.Fatal("合法正值必须构造 Manager")
+		}
+	})
+	if !strings.Contains(out, pluginNotifyBudgetEnv) || !strings.Contains(out, "低于") {
+		t.Fatalf("配额 %d < 单帧上限时必须向 stderr 声明大帧拒绝语义，got %q（旧实现静默）",
+			1024, out)
+	}
+
+	// 对照：配额 ≥ 单帧上限 → 通知帧不会被配额拒，无需宣告。
+	t.Setenv(pluginNotifyBudgetEnv, "16777216") // 16MiB > 4MiB
+	out = captureStderr(t, func() {
+		if m := notifyBudgetFromEnv(); m == nil {
+			t.Fatal("合法正值必须构造 Manager")
+		}
+	})
+	if strings.Contains(out, "低于") {
+		t.Fatalf("配额 ≥ 单帧上限时不得宣告，got %q", out)
+	}
+}
+
+// TestNotifyBudget_FloodSlowSinkEnqueueFailureReleases（复证圈 1 sweep 发现
+// 5）：钉住 readLoop 的「Reserve 成功但入队失败（通道饱和）即时 Release」
+// 路径（executor.go readLoop 的 select default 分支）——这是 readLoop 与
+// pumpNotifies 两个 goroutine 对同一 Manager 并发 Release 不相交事件的唯一
+// 交错点，此前在整个测试套件下零覆盖（notify-flood 不设预算、设预算的测试
+// 全部单通知 emit-notify）。
+//
+// 确定性构造：配额 ≥ 全部 200 帧驻留字节（零配额拒绝），sink 在第一条后
+// 阻塞 pump——通道（64 槽）必然饱和，其后 200-64=136 帧只能走 default 分支。
+// 断言记账不变量：三科目守恒（送达 + 通道丢弃 + 配额拒绝 = 发送总数）且
+// 稳定后 Manager 全局用量回零——default 分支的即时 Release 若缺失，136 帧
+// 的驻留字节将永久滞留 used/total，Usage() 不回零（守卫即变异敏感）。
+func TestNotifyBudget_FloodSlowSinkEnqueueFailureReleases(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "notify-flood")
+	t.Setenv("GO_PLUGIN_FLOOD", "200")
+	// 5MiB > 单帧上限（不触发 sub-frame stderr 宣告）且 ≫ 200 帧 × ~27 字节
+	// ≈ 5.4KiB：配额全程不绑定，default 分支是唯一的饱和出路。
+	t.Setenv("OMNILSP_PLUGIN_NOTIFY_BUDGET_BYTES", "5242880")
+
+	m := newValidManifest([]byte("x"))
+	m.Capabilities = []Capability{CapDiagnosticsEmit}
+
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var delivered int
+	p, err := launchTestBinaryWithSink(t, m, NewGrant(CapDiagnosticsEmit), nil, trustAllow,
+		func(string, json.RawMessage) {
+			mu.Lock()
+			delivered++
+			mu.Unlock()
+			<-gate // 慢消费者：第一条之后 pump 整体阻塞，通道必然饱和
+		})
+	if err != nil {
+		t.Fatalf("LaunchWithSink: %v", err)
+	}
+	t.Cleanup(func() { _ = p.cmd.Process.Kill() })
+
+	// readLoop 不被饱和/丢弃路径拖死：pong 照常路由（帧序上 pong 在全部
+	// 通知帧之后——Call 返回即 200 帧的 readLoop 记账已定）。
+	if _, err := p.Call("probe/flood", nil); err != nil {
+		t.Fatalf("Call must survive notify flood under budget: %v", err)
+	}
+
+	// 饱和期四科目守恒：pump 被闸门阻塞后不再消费——Call 返回时每帧必然
+	// 已落入「已送达 / 通道丢弃 / 配额拒绝 / 通道内驻留（len(notifyCh)）」
+	// 之一（readLoop 已读完 pong，其后不再有帧）。readLoop 终态下该等式
+	// 竞速无关。
+	mu.Lock()
+	got := delivered
+	mu.Unlock()
+	if got+int(p.DroppedNotifies())+int(p.BudgetDroppedNotifies())+len(p.notifyCh) != 200 {
+		t.Fatalf("饱和期守恒破坏：delivered=%d dropped=%d budgetDropped=%d channel=%d，want 合计 200",
+			got, p.DroppedNotifies(), p.BudgetDroppedNotifies(), len(p.notifyCh))
+	}
+	if n := p.BudgetDroppedNotifies(); n != 0 {
+		t.Fatalf("配额全程不绑定，不得有配额拒绝：BudgetDroppedNotifies=%d", n)
+	}
+	if p.DroppedNotifies() == 0 {
+		t.Fatal("通道饱和后必须有 default 分支丢弃——本测试的目标路径未被执行")
+	}
+
+	// 放行慢消费者：pump 排空通道余量（每帧收货 Release），连接继续可用。
+	// 注：pump 取走第 1 帧阻塞在 sink 期间 readLoop 仍可回填通道，入队总量
+	// 在 64~65 之间摆动——精确科目配比不钉，钉守恒与回零。
+	close(gate)
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return delivered+int(p.DroppedNotifies())+int(p.BudgetDroppedNotifies()) == 200
+	}, "闸门放行后全部 200 帧必须收敛到三个科目（通道排空）")
+	mu.Lock()
+	defer mu.Unlock()
+	if delivered+int(p.DroppedNotifies())+int(p.BudgetDroppedNotifies()) != 200 {
+		t.Fatalf("排空后守恒破坏：delivered=%d dropped=%d budgetDropped=%d，want 合计 200",
+			delivered, p.DroppedNotifies(), p.BudgetDroppedNotifies())
+	}
+	// 记账闭环主断言：每笔 Reserve 恰好一次 Release（default 分支即时或
+	// pump 收货）——全局用量必须回零。default 分支 Release 缺失即此处红。
+	if total, _ := p.notifyBudget.Usage(); total != 0 {
+		t.Fatalf("稳定后 manager.Usage() = %d，want 0（default 分支或 pump 的 Release 记账泄漏）", total)
+	}
+}
+
+// TestNotifyBudget_FloodRefusalAccountingConserves（复证圈 1 sweep 发现 5 的
+// 拒绝面）：配额设为 64 帧驻留总量的一半（~832 字节 ≈ 30 帧记账），sink 在
+// 第一条后阻塞 pump——配额（≈30 帧）先于通道容量（64 槽）绑定，readLoop
+// 的其余帧确定性落入 Reserve 拒绝分支（TestNotifyBudget_QuotaRefusesWhen
+// Exceeded 的单通知构造升级为 flood 构造）。断言：拒绝确定性发生、四科目
+// 守恒（送达 + 通道丢弃 + 配额拒绝 + 通道驻留 = 发送总数）、放行后守恒且
+// 稳定后 Usage() 回零（每笔成功 Reserve 恰好一次 Release——pump 侧合账）。
+func TestNotifyBudget_FloodRefusalAccountingConserves(t *testing.T) {
+	t.Setenv("OMNISP_PLUGIN_HELPER", "1")
+	t.Setenv("GO_PLUGIN_MODE", "notify-flood")
+	t.Setenv("GO_PLUGIN_FLOOD", "200")
+	t.Setenv("OMNILSP_PLUGIN_NOTIFY_BUDGET_BYTES", "832")
+
+	m := newValidManifest([]byte("x"))
+	m.Capabilities = []Capability{CapDiagnosticsEmit}
+
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var delivered int
+	p, err := launchTestBinaryWithSink(t, m, NewGrant(CapDiagnosticsEmit), nil, trustAllow,
+		func(string, json.RawMessage) {
+			mu.Lock()
+			delivered++
+			mu.Unlock()
+			<-gate
+		})
+	if err != nil {
+		t.Fatalf("LaunchWithSink: %v", err)
+	}
+	t.Cleanup(func() { _ = p.cmd.Process.Kill() })
+
+	if _, err := p.Call("probe/flood", nil); err != nil {
+		t.Fatalf("Call must survive notify flood under budget: %v", err)
+	}
+
+	// 配额（~832B ≈ 30 帧）先于通道容量（64 槽）绑定：拒绝必须确定性发生。
+	if n := p.BudgetDroppedNotifies(); n == 0 {
+		t.Fatalf("配额 < 64 帧驻留总量时 flood 必须触发整帧拒绝，BudgetDroppedNotifies=0")
+	}
+	mu.Lock()
+	got := delivered
+	mu.Unlock()
+	if got+int(p.DroppedNotifies())+int(p.BudgetDroppedNotifies())+len(p.notifyCh) != 200 {
+		t.Fatalf("饱和期守恒破坏：delivered=%d dropped=%d budgetDropped=%d channel=%d，want 合计 200",
+			got, p.DroppedNotifies(), p.BudgetDroppedNotifies(), len(p.notifyCh))
+	}
+
+	// 放行：pump 排空通道内余量（配额内的帧全部送达），连接继续可用。
+	close(gate)
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return delivered+int(p.DroppedNotifies())+int(p.BudgetDroppedNotifies()) == 200
+	}, "闸门放行后全部 200 帧必须收敛到三个科目（通道排空）")
+	mu.Lock()
+	defer mu.Unlock()
+	if delivered+int(p.DroppedNotifies())+int(p.BudgetDroppedNotifies()) != 200 {
+		t.Fatalf("排空后守恒破坏：delivered=%d dropped=%d budgetDropped=%d，want 合计 200",
+			delivered, p.DroppedNotifies(), p.BudgetDroppedNotifies())
+	}
+	t.Logf("科目配比：delivered=%d dropped=%d budgetDropped=%d",
+		delivered, p.DroppedNotifies(), p.BudgetDroppedNotifies())
+	if total, _ := p.notifyBudget.Usage(); total != 0 {
+		t.Fatalf("稳定后 manager.Usage() = %d，want 0（Refuse/pump/default 三路径的记账闭环泄漏）", total)
 	}
 }
