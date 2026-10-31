@@ -1178,3 +1178,28 @@ offset debt on file in `freeze-record.txt`):
   新探针（ccls memo 组、七语言链/replay）从 163s 增至 243s，属证据变重
   的预期代价；⑤ go run verify 的 fast 模式为 AST 存在性核验，真实执行
   由 NoRegression（fast-probe）与 internal/conformance 包测试承担。
+
+## Evidence record — 2026-10-31 第二十轮记账（复证圈 3 sweep：DEF-BUDWIRE 插件车道增量兑现 + 文档对账）
+
+- 性质：第二十轮 sweep（复证圈 3，7 条缺陷）。与台账相关的增量兑现了第
+  十九轮 selfCheck① 的待办：插件车道口5 已随 f4f0bcf/2b0d32f 入库，本节
+  把 OMNILSP_PLUGIN_NOTIFY_BUDGET_BYTES（TestNotifyBudget_* 七测）与
+  default-on 的 emit 驻留字节预算（TestPluginEmit_* 三测，含跨包镜像钉）
+  增入 DEF-BUDWIRE 的 Text/Probe，Y1-11 Text 同步补插件车道构造点——插件
+  车道与 languages 车道的语义分歧（sub-frame 配额=计数整帧拒绝而非帧上限
+  收紧，理由：插件 readFrame 无 skip-drain，帧上限收紧是连接级 fatal）自
+  本节起在台账层可见。改动文件：internal/conformance/registry.go、
+  docs/conformance.md（再生投影）、docs/acceptance.md（本节）。
+- 门禁（本轮实跑）：`OMNISP_UPDATE_CONFORMANCE=1 go test ./test/conformance
+  -run TestGenerateDocs` 再生投影；`go test ./test/conformance/ -count=1 -run
+  TestConformanceNoRegression -v` PASS 249.48s（新增 10 探针真实执行，含
+  plugin 组七测与 server 组三测）；`git status test/conformance/testdata/`
+  零 diff——插件探针属 deferred 域，baseline.json 零位移（core 分数不动）；
+  `go test ./internal/conformance/ -count=1` ok（TestRegistry_DataShape 形
+  状门：AUTO 带 Probe 无 Reason）。未 push、未 git add -A、未触碰 ACL 锁
+  定区。
+- 同轮非台账修复（各自提交，见 git log）：safeEntrypoint 裸点显式拒绝、
+  budget 包文档对账（生产构造点/owner 清单）、pluginEmitRejected 六源注释
+  对账、MaxPluginFrameSize 导出 + 跨包镜像钉、StateInstalled reserved 标注
+  （可执行文档钉沿全生命周期驱走）；段ID白名单负结果核验（12 类敌意探针
+  全拒，探针跑毕即删，不改码）。
