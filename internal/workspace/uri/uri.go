@@ -58,10 +58,50 @@ func Parse(s string) (URI, error) {
 func FromPath(path string) URI {
 	p := strings.ReplaceAll(path, "\\", "/")
 	switch {
-	case len(p) >= 2 && p[1] == ':': // drive letter
+	// Drive letter discipline mirrors Path()'s: the letter must be ASCII —
+	// any byte followed by a colon ("/:" from "\\:") is not a drive, and
+	// pushing it through the drive branch produced four-slash shapes whose
+	// roundtrip never settled (FuzzURI crasher 57526ff2f6a8277d:
+	// "file:/:" → "file:////:" → "file://:").
+	case len(p) >= 2 && p[1] == ':' && isASCIILetter(p[0]): // drive letter
 		return mustFile("file:///" + normalizeDrive(p))
-	case strings.HasPrefix(p, "//"): // UNC
-		return mustFile("file:" + p) // url.String re-encodes as file://host/...
+	case strings.HasPrefix(p, "//") && len(p) > 2 && p[2] != '/': // UNC（host 段非空）
+		// The host portion must actually form a parseable URI naming a host:
+		// an adversarial or garbage path like "\\0 " yields "//0 " whose
+		// would-be host contains a space, and fabricating "file://0 " returns
+		// a URI our own Parse rejects — a canonical that never re-parses,
+		// killing the uri→path→uri roundtrip (FuzzURI crasher
+		// 23b5f660a4b884f0). Probe the UNC spelling and require a bare host;
+		// otherwise fall back to the path spelling, which carries the bytes
+		// in the path component (re-encoded on String) and round-trips
+		// losslessly.
+		//
+		// The host segment must also be non-empty: p starting with "///" has
+		// no host at all, and the UNC spelling would swallow leading slashes
+		// from the path ("////" → path "//" → "\\\\" → "//" → …), so the
+		// roundtrip never reached a fixed point (FuzzURI crasher
+		// ce45fb56088df37c: "file://////" → "file:////" → "file:"). Empty-host
+		// shapes fall to the path spelling, which preserves every byte.
+		//
+		// The host must also be colon-free: Path() derives the OS path from
+		// Hostname(), which drops everything from the port separator on — a
+		// "host" like "0:" (from "\\0:") survives Parse but loses its tail in
+		// Path(), so back→again diverged (FuzzURI crasher 75ec77f6f0a1a63d:
+		// "file:////0:" → "file://0:" → "file://0"). UNC targets are NetBIOS/
+		// DNS names; a colon has no place in one, and port-bearing or IPv6
+		// spellings take the lossless path branch instead.
+		//
+		// Userinfo is excluded for the same reason: Path() drops everything
+		// before the host, so an authority spelling like "@0" (from "\\@0")
+		// survives Parse as empty-user userinfo and vanishes in Path()
+		// (FuzzURI crasher eafc06eae782a46e: "file:////@0" → "file://@0" →
+		// "file://0"). The authority must be exactly a bare host — no
+		// userinfo, no port — or the bytes take the path branch.
+		if pu, perr := url.Parse("file:" + p); perr == nil &&
+			pu.Host != "" && pu.User == nil && !strings.Contains(pu.Host, ":") {
+			return mustFile("file:" + p)
+		}
+		return mustFile("file://" + p)
 	default:
 		return mustFile("file://" + p)
 	}
@@ -112,8 +152,14 @@ func (u URI) Path() (string, error) {
 			// UNC: file://server/share/x -> \\server\share\x
 			return "\\\\" + host + strings.ReplaceAll(path, "/", "\\"), nil
 		}
-		// Drive letter: /c/x -> C:\x
-		if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		// Drive letter: /c/x -> C:\x. The letter discipline is mandatory:
+		// path[1] must be an ASCII letter, else any byte followed by a colon
+		// ("/\xa6:") was promoted to a "drive" — strings.ToUpper corrupted
+		// invalid UTF-8 into U+FFFD and the dropped leading slash turned the
+		// residue into a host when reconverted (FuzzURI crasher
+		// 541391ec4a3ad20c: "file:/\xa6:" → "file://%EF%BF%BD:" →
+		// "file://%EF%BF%BD"). Mirrors normalizeDriveInPath's letter check.
+		if len(path) >= 3 && path[0] == '/' && path[2] == ':' && isASCIILetter(path[1]) {
 			path = strings.ToUpper(path[1:2]) + path[2:]
 		}
 		return strings.ReplaceAll(path, "/", "\\"), nil
@@ -144,8 +190,16 @@ func normalize(u *url.URL) string {
 	cp.Scheme = strings.ToLower(u.Scheme)
 	if cp.Scheme == "file" {
 		if cp.Host != "" {
-			// Lowercase drive-letter hosts (file:///C:/... parses Host="c:").
-			cp.Host = normalizeDrive(cp.Host)
+			// Fold host case (RFC 3986 §3.2.2): hosts are case-insensitive,
+			// and Path() already lowercases the UNC host when deriving an OS
+			// path. Leaving case in Canonical made the two mappings disagree
+			// — pathToUri("\\A") produced "file://A" while
+			// pathToUri(uriToPath("file://A")) produced "file://a", so the
+			// uri→path→uri roundtrip never reached a fixed point in one step
+			// (FuzzURI crasher a074a1c9171fbfa9: "file:////A" → "file://A" →
+			// "file://a"). Lowercasing here also subsumes the drive-letter
+			// fold for hosts ("file:///C:/..." parses Host="c:").
+			cp.Host = strings.ToLower(cp.Host)
 		}
 		if cp.Path != "" {
 			cp.Path = normalizeDriveInPath(cp.Path)
