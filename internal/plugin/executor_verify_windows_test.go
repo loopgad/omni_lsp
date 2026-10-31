@@ -70,3 +70,33 @@ func TestLaunchSucceedsWithDenyShareHandle(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.cmd.Process.Kill() })
 }
+
+// TestVerify_RejectsSymlinkEntrypoint（复证圈 5 sweep 发现 7）：entrypoint
+// 本身是 NTFS symlink 的形态下，旧实现跟随链接打开最终目标——共享冲突锁
+// 的是目标文件的句柄，对 symlink 记录本身的删除/替换不触碰该句柄，随后
+// cmd.Start 按路径重新解析 symlink 到新目标：被哈希的字节 ≠ 被执行的字节，
+// 注释声称的「TOCTOU 窗口在本平台闭合」对该形态失真。修复后
+// openEntryFile 以 FILE_FLAG_OPEN_REPARSE_POINT 打开并对 reparse point
+// fail-closed 拒绝（symlink/junction 不是合法执行入口）。
+// symlink 创建在 Windows 需要开发者模式/管理员特权——创建失败时如实跳过。
+func TestVerify_RejectsSymlinkEntrypoint(t *testing.T) {
+	dir := newPluginDir(t)
+	entry := filepath.Join(dir, "demo.bin")
+	raw, err := os.ReadFile(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "real.bin")
+	if err := os.WriteFile(target, raw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, entry); err != nil {
+		t.Skipf("symlink 创建失败（需开发者模式/管理员特权）: %v", err)
+	}
+	if _, err := Verify(dir); err == nil {
+		t.Fatal("symlink entrypoint 必须被 reparse-point 门拒绝（旧实现跟随链接，哈希目标字节后放行）")
+	}
+}
