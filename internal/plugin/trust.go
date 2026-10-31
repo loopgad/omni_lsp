@@ -17,7 +17,11 @@ import (
 var ErrChecksumMismatch = errors.New("plugin: checksum 不匹配")
 
 // Load 读取并反序列化 dir/plugin.json。未知字段一律拒绝，
-// 防止敌意 manifest 携带未定义语义。
+// 防止敌意 manifest 携带未定义语义。首个 JSON 值之后的首个值之外的尾随
+// 非空白字节同样拒绝（复证圈 1 sweep 发现 3）：DisallowUnknownFields 只
+// 作用于第一个文档，Decode 成功后若解码器仍有余量，说明清单文件的完整
+// 字节不在校验面内——尾随文档/垃圾字节按帧结构损坏拒绝，纯空白尾随
+// （JSON 流分帧的空白填充）不受影响。
 func Load(dir string) (Manifest, error) {
 	b, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
 	if err != nil {
@@ -28,6 +32,9 @@ func Load(dir string) (Manifest, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, fmt.Errorf("plugin: 解析 plugin.json: %w", err)
+	}
+	if dec.More() {
+		return Manifest{}, fmt.Errorf("plugin: plugin.json 首个 JSON 值之后存在尾随内容（清单必须是单一完整文档）")
 	}
 	return m, nil
 }

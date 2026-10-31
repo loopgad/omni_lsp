@@ -94,6 +94,60 @@ func TestO3_ManifestValidation(t *testing.T) {
 	})
 }
 
+// TestLoad_TrailingBytesAfterManifestRejected（复证圈 1 sweep 发现 3）：
+// DisallowUnknownFields 的「未知字段一律拒绝」只作用于第一个 JSON 文档——
+// 旧实现 Decode 成功后不检查解码器是否还有余量，plugin.json 首个值之后的
+// 尾随字节（第二个文档、垃圾字节）被静默吞掉，清单文件的完整字节不在校验
+// 面内。修复后：尾随非空白内容按帧结构损坏拒绝；纯空白尾随仍合法（JSON
+// 流分帧允许空白填充，dec.More() 对空白/EOF 返回 false）。
+func TestLoad_TrailingBytesAfterManifestRejected(t *testing.T) {
+	// 合法清单 + 尾随第二个文档：旧实现 err=nil 且尾随文档被吞。
+	hostile := newPluginDir(t)
+	manifest := filepath.Join(hostile, "plugin.json")
+	raw, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("读取 plugin.json: %v", err)
+	}
+	if err := os.WriteFile(manifest, append(raw, []byte("\n{\"id\":\"evil\"}")...), 0o644); err != nil {
+		t.Fatalf("追加尾随文档: %v", err)
+	}
+	if _, err := Load(hostile); err == nil {
+		t.Fatal("首个 JSON 值之后的尾随文档必须被拒绝（旧实现静默吞掉）")
+	}
+
+	// 尾随垃圾字节同样拒绝（同一对账点）。
+	junk := newPluginDir(t)
+	manifest = filepath.Join(junk, "plugin.json")
+	raw, err = os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("读取 plugin.json: %v", err)
+	}
+	if err := os.WriteFile(manifest, append(raw, []byte("\x00trailing-junk")...), 0o644); err != nil {
+		t.Fatalf("追加尾随垃圾: %v", err)
+	}
+	if _, err := Load(junk); err == nil {
+		t.Fatal("首个 JSON 值之后的垃圾字节必须被拒绝")
+	}
+
+	// 纯空白尾随仍合法：JSON 流分帧允许空白填充，不得误伤。
+	padded := newPluginDir(t)
+	manifest = filepath.Join(padded, "plugin.json")
+	raw, err = os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("读取 plugin.json: %v", err)
+	}
+	if err := os.WriteFile(manifest, append(raw, []byte("\n\n  \n")...), 0o644); err != nil {
+		t.Fatalf("追加空白: %v", err)
+	}
+	m, err := Load(padded)
+	if err != nil {
+		t.Fatalf("纯空白尾随不得被拒绝: %v", err)
+	}
+	if m.ID != "demo.plugin" {
+		t.Fatalf("ID = %q, want demo.plugin（空白尾随下清单字段不受影响）", m.ID)
+	}
+}
+
 // TestN14_ChecksumMismatchRejected —— entrypoint 实际内容与声明 sha256 不符必须拒绝；
 // 内容一致时校验链放行。
 func TestN14_ChecksumMismatchRejected(t *testing.T) {
