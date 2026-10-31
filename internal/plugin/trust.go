@@ -70,11 +70,16 @@ func VerifyContext(ctx context.Context, dir string) (Manifest, error) {
 }
 
 // safeEntrypoint 强制 entrypoint 为与 plugin.json 同级的裸文件名，覆盖
-// 穿越/绝对路径/盘符三类敌意样本（ponytail：支持子目录需加相对路径遍历
-// 校验）。Verify 与 Launch 共用——一旦目录来源进入执行路径，形态检查
+// 穿越/绝对路径/盘符/裸点四类敌意样本（ponytail：支持子目录需加相对路径
+// 遍历校验）。Verify 与 Launch 共用——一旦目录来源进入执行路径，形态检查
 // 必须在启动时刻同样生效，否则 Join(dir, ep) 可被带分隔符的 ep 引出目录。
+// 裸点 "." 通过 Base/ ".."/绝对/冒号四项检查（复证圈 3 sweep 发现 1），旧
+// 实现只靠下游 openEntryFile 打不开目录而偶然 fail-closed——若未来
+// openEntryFile 语义变化（如加 FILE_FLAG_BACKUP_SEMANTICS 支持目录），该
+// 形态将滑入执行路径；形态门必须自持。其余点形态（"./" 等）已被 Base
+// 不等检查拒绝；".." 含 ".." 同拒。
 func safeEntrypoint(ep string) error {
-	if ep != filepath.Base(ep) || strings.Contains(ep, "..") ||
+	if ep == "." || ep != filepath.Base(ep) || strings.Contains(ep, "..") ||
 		filepath.IsAbs(ep) || strings.ContainsRune(ep, ':') {
 		return fmt.Errorf("plugin: 敌意 entrypoint 被拒绝: %q", ep)
 	}

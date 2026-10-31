@@ -168,9 +168,11 @@ func TestN14_ChecksumMismatchRejected(t *testing.T) {
 	}
 }
 
-// TestN14_HostileEntrypointRejected —— 路径穿越、绝对路径、缺失文件三类敌意样本全部拒绝。
+// TestN14_HostileEntrypointRejected —— 路径穿越、绝对路径、裸点、缺失文件
+// 四类敌意样本全部拒绝（复证圈 3 sweep 发现 1 补 "."：Verify 级的端到端
+// 拒绝此前只靠 openEntryFile 打不开目录偶然闭合，形态门现显式拒绝）。
 func TestN14_HostileEntrypointRejected(t *testing.T) {
-	for _, ep := range []string{"../evil.exe", "/abs/path", "ghost.exe"} {
+	for _, ep := range []string{"../evil.exe", "/abs/path", ".", "ghost.exe"} {
 		t.Run(ep, func(t *testing.T) {
 			dir := newPluginDir(t, func(m *Manifest) { m.Entrypoint = ep })
 			if _, err := Verify(dir); err == nil {
@@ -392,5 +394,23 @@ func TestO2_GrantPolicyGatesHighPrivilege(t *testing.T) {
 		if err := g3.Check(c); err != nil {
 			t.Errorf("nil 策略下 %q 应按声明授予: %v", c, err)
 		}
+	}
+}
+
+// TestSafeEntrypoint_BareDotRejected（复证圈 3 sweep 发现 1）：裸点
+// entrypoint="." 通过旧四项形态检查（Base(".")==". "、无 ".."、非绝对、
+// 无冒号），形态门与下游拒绝之间的耦合是隐式的——Verify/Launch 只因
+// openEntryFile 打不开目录而偶然 fail-closed（Windows Access denied /
+// Unix EISDIR）。修复后 safeEntrypoint 显式拒绝，形态门自持，不再依赖
+// 下游文件语义。 "./" 形态今天已被 Base 不等检查拒绝，一并钉住。
+func TestSafeEntrypoint_BareDotRejected(t *testing.T) {
+	for _, ep := range []string{".", "./"} {
+		if err := safeEntrypoint(ep); err == nil {
+			t.Fatalf("safeEntrypoint(%q) 必须显式拒绝（旧实现放行，靠下游打开目录失败偶然闭合）", ep)
+		}
+	}
+	// 合法裸文件名不回退。
+	if err := safeEntrypoint("demo.bin"); err != nil {
+		t.Fatalf("合法裸文件名不得被拒: %v", err)
 	}
 }
