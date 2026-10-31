@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/omnilsp/omni/internal/security"
 	"github.com/omnilsp/omni/internal/trust"
 )
 
@@ -340,7 +341,7 @@ func (s *Supervisor) notify(from, to State, err error) {
 	// stderr line is the always-on observer — structured consumers attach
 	// via RegisterCallbacks.
 	if from == StateReady && to != StateReady {
-		fmt.Fprintf(os.Stderr, "omnilsp: supervisor: %s -> %s (%v)\n", from, to, err)
+		security.FprintfRedacted(os.Stderr, "omnilsp: supervisor: %s -> %s (%v)\n", from, to, err)
 	}
 	// Read the callback under the lock that RegisterCallbacks writes it with.
 	// Copying it out first keeps the callback itself outside the critical

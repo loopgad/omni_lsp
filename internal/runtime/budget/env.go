@@ -1,7 +1,7 @@
 package budget
 
 import (
-	"fmt"
+	"github.com/omnilsp/omni/internal/security"
 	"os"
 	"strconv"
 	"strings"
@@ -63,7 +63,7 @@ func ParsePositiveBytes(name string) (int64, bool) {
 	}
 	value, err := strconv.ParseInt(text, 10, 64)
 	if err != nil || value <= 0 {
-		fmt.Fprintf(os.Stderr, "omnilsp: ignoring invalid %s=%q (want a positive integer); the budget stays off\n", name, text)
+		security.FprintfRedacted(os.Stderr, "omnilsp: ignoring invalid %s=%q (want a positive integer); the budget stays off\n", name, text)
 		return 0, false
 	}
 	return value, true

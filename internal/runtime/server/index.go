@@ -24,6 +24,7 @@ import (
 	"github.com/omnilsp/omni/internal/index/semantic"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/runtime/scheduler"
+	"github.com/omnilsp/omni/internal/security"
 	"github.com/omnilsp/omni/internal/trust"
 	"github.com/omnilsp/omni/internal/workspace/uri"
 )
@@ -192,7 +193,7 @@ func newIndexBudgetLadder(diskBudget int64) *scheduler.BudgetManager {
 	}
 	total, err := strconv.ParseInt(text, 10, 64)
 	if err != nil || total <= 0 {
-		fmt.Fprintf(os.Stderr, "omnilsp: ignoring invalid %s=%q (want a positive integer); the index budget ladder stays off\n", indexBudgetLadderEnv, text)
+		security.FprintfRedacted(os.Stderr, "omnilsp: ignoring invalid %s=%q (want a positive integer); the index budget ladder stays off\n", indexBudgetLadderEnv, text)
 		return nil
 	}
 	ladder := scheduler.NewBudgetManager(scheduler.DefaultBudgetThresholds())
@@ -252,7 +253,7 @@ func (s *Server) disableIndex(err error) {
 	s.idx = nil
 	s.idxReason = err.Error()
 	s.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "omnilsp: persistent index disabled: %v\n", err)
+	security.FprintfRedacted(os.Stderr, "omnilsp: persistent index disabled: %v\n", err)
 }
 
 func (s *Server) indexState() (*indexService, *trust.Policy, string) {

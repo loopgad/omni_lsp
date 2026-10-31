@@ -46,6 +46,7 @@ import (
 	"github.com/omnilsp/omni/internal/plugin"
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/runtime/scheduler"
+	"github.com/omnilsp/omni/internal/security"
 	"github.com/omnilsp/omni/internal/semantic/query"
 	"github.com/omnilsp/omni/internal/telemetry"
 	"github.com/omnilsp/omni/internal/transport"
@@ -529,7 +530,7 @@ func (s *Server) mountPlugins(dir string) {
 		s.pluginMu.Lock()
 		s.pluginDiscoverErr = err.Error()
 		s.pluginMu.Unlock()
-		fmt.Fprintf(os.Stderr, "omnilsp: plugin discovery failed: %v\n", err)
+		security.FprintfRedacted(os.Stderr, "omnilsp: plugin discovery failed: %v\n", err)
 		return
 	}
 	seen := make(map[string]struct{}, len(discoveries))
@@ -541,12 +542,12 @@ func (s *Server) mountPlugins(dir string) {
 			// 注册表同键覆盖使先 Launch 的进程失去登记句柄）、崩溃隔离
 			// （RecordCrash 按 ID 连坐）与 emit 来源治理。Install 侧的
 			// ErrDuplicatePluginID 是第二道闸。
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 重复 manifest.ID（目录 %s）拒绝装配\n", id, d.Dir)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s 重复 manifest.ID（目录 %s）拒绝装配\n", id, d.Dir)
 			continue
 		}
 		seen[id] = struct{}{}
 		if err := mgr.Install(d); err != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 未通过信任链，拒绝装配: %v\n", id, err)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s 未通过信任链，拒绝装配: %v\n", id, err)
 			continue
 		}
 		// 装配点授予第二道门（审计批·注册变更越权覆盖面）：声明能力先过授予
@@ -558,7 +559,7 @@ func (s *Server) mountPlugins(dir string) {
 		policy := plugin.DefaultGrantPolicy(pluginCapsAllow())
 		grant, err := mgr.EnableWithPolicy(id, policy)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 启用被拒: %v\n", id, err)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s 启用被拒: %v\n", id, err)
 			continue
 		}
 		// 有效声明与授予表由同一策略产出（plugin.ApplyGrantPolicy）：Launch 前置
@@ -577,7 +578,7 @@ func (s *Server) mountPlugins(dir string) {
 					removed = append(removed, string(c))
 				}
 			}
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s 声明的高权能力未获显式授权（OMNILSP_PLUGIN_CAPS_ALLOW），已从授予表剔除: %s\n", id, strings.Join(removed, ","))
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s 声明的高权能力未获显式授权（OMNILSP_PLUGIN_CAPS_ALLOW），已从授予表剔除: %s\n", id, strings.Join(removed, ","))
 			d.Manifest.Capabilities = eff
 		}
 		s.pluginMu.Lock()
@@ -608,7 +609,7 @@ func (s *Server) launchReadyPlugins() {
 		if closing {
 			// 关闭置位后 pending 直接 Disable 丢弃，不 Launch（复证圈 1
 			// 审计发现 5：ClosePlugins 置位后的起飞尝试按已关闭处理）。
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 丢弃（服务器关闭中）\n", id)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s launch 丢弃（服务器关闭中）\n", id)
 			_ = mgr.Disable(id)
 			continue
 		}
@@ -633,7 +634,7 @@ func (s *Server) launchReadyPlugins() {
 			s.onPluginNotify(pluginID, e.grant, method, params)
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 被拒: %v\n", id, err)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s launch 被拒: %v\n", id, err)
 			_ = mgr.Disable(id)
 			continue
 		}
@@ -651,9 +652,9 @@ func (s *Server) launchReadyPlugins() {
 			// shutdown/exit，泄漏到宿主退出）。已 Launch 的结果按已关闭处理：
 			// kill + Disable，不入表。
 			s.pluginMu.Unlock()
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s launch 完成于关闭之后，按已关闭拆除\n", id)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s launch 完成于关闭之后，按已关闭拆除\n", id)
 			if kerr := proc.Kill(); kerr != nil {
-				fmt.Fprintf(os.Stderr, "omnilsp: plugin %s kill: %v\n", id, kerr)
+				security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s kill: %v\n", id, kerr)
 			}
 			_ = mgr.Disable(id)
 			continue
@@ -808,14 +809,14 @@ func (s *Server) closePlugins() {
 			// stdio 管道泄漏为孤儿（这正是 32f5afd 为 Exit 腿修掉的同级故障
 			// 在 Shutdown 腿重开）。统一补一次有界 kill：已死进程上 kill 是
 			// 无害 no-op，存活挂起的进程被强制终止并经 Wait→OnExit 收割。
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s shutdown: %v（有界拆除：强制终止）\n", id, err)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s shutdown: %v（有界拆除：强制终止）\n", id, err)
 			if kerr := p.Kill(); kerr != nil {
-				fmt.Fprintf(os.Stderr, "omnilsp: plugin %s kill: %v\n", id, kerr)
+				security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s kill: %v\n", id, kerr)
 			}
 			continue
 		}
 		if err := p.Exit(); err != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: plugin %s exit: %v\n", id, err)
+			security.FprintfRedacted(os.Stderr, "omnilsp: plugin %s exit: %v\n", id, err)
 		}
 	}
 }
@@ -1403,7 +1404,7 @@ func (s *Server) drainResult(req *scheduler.Request, reqID string) {
 	// simply never gets a protocol response (logged below).
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: drainResult panic for %s: %v\n", reqID, r)
+			security.FprintfRedacted(os.Stderr, "omnilsp: drainResult panic for %s: %v\n", reqID, r)
 		}
 		if phaseSpan != nil && !phaseTraceFinished {
 			phaseSpan.sample.ResponseOutcome = "drain_result_panic"
@@ -1420,7 +1421,7 @@ func (s *Server) drainResult(req *scheduler.Request, reqID string) {
 		// (e.g. §F9 deadline expiry while queued) must stay silent instead of
 		// emitting a response with a fabricated ID.
 		if req.OriginalID == nil {
-			fmt.Fprintf(os.Stderr, "omnilsp: scheduled notification %s terminated: %v\n", req.RequestID, res.Err)
+			security.FprintfRedacted(os.Stderr, "omnilsp: scheduled notification %s terminated: %v\n", req.RequestID, res.Err)
 			return
 		}
 		// Echo the client's wire ID when we captured it; fall back to the

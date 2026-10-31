@@ -64,22 +64,22 @@ func main() {
 		}
 	case "verify":
 		if err := cmdVerify(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "verify: %v\n", err)
+			fmt.Fprintf(os.Stderr, "verify: %s\n", security.RedactString(err.Error()))
 			os.Exit(w1ExitCode(err))
 		}
 	case "replay":
 		if err := cmdReplay(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "replay: %v\n", err)
+			fmt.Fprintf(os.Stderr, "replay: %s\n", security.RedactString(err.Error()))
 			os.Exit(w1ExitCode(err))
 		}
 	case "repro":
 		if err := cmdRepro(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "repro: %v\n", err)
+			fmt.Fprintf(os.Stderr, "repro: %s\n", security.RedactString(err.Error()))
 			os.Exit(w1ExitCode(err))
 		}
 	case "plugins":
 		if err := cmdPlugins(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "plugins: %v\n", err)
+			fmt.Fprintf(os.Stderr, "plugins: %s\n", security.RedactString(err.Error()))
 			os.Exit(w1ExitCode(err))
 		}
 	case "index":
