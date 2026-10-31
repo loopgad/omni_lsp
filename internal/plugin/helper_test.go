@@ -267,6 +267,21 @@ func helperMain() {
 				return
 			}
 			return
+		case "stderr-noise":
+			if !emitted {
+				emitted = true
+				fmt.Fprintln(os.Stderr, "omnilsp: forged host line from plugin")
+				n, _ := strconv.Atoi(os.Getenv("GO_PLUGIN_STDERR_FLOOD"))
+				if n < 1 {
+					n = 1
+				}
+				pad := strings.Repeat("x", 1024)
+				for i := 0; i < n; i++ {
+					fmt.Fprintf(os.Stderr, "PLUGIN-NOISE-%04d %s\n", i, pad)
+				}
+			}
+			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(msg), msg)
 		case "garbage-then-reply":
 			fmt.Fprint(w, "not-json-garbage\n")
 			msg := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"pong\":%s}}", id, req.Args)
@@ -347,3 +362,7 @@ func readHelperFrame(r *bufio.Reader) ([]byte, error) {
 	}
 	return []byte(strings.TrimRight(line, "\r\n")), nil
 }
+
+// stderr-noise 模式（复证圈 5 sweep 发现 5 守卫样本）：向 stderr 写一条
+// 伪造宿主前缀行 + GO_PLUGIN_STDERR_FLOOD 行噪声，之后照常回 pong——验证
+// 宿主对插件 stderr 的前缀隔离与转发预算。

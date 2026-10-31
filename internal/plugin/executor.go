@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -252,7 +253,14 @@ func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 		vf.Close()
 		return nil, fmt.Errorf("plugin: stdout 管道: %w", err)
 	}
-	cmd.Stderr = os.Stderr // ponytail: stderr 直通父进程；静默捕获留待完整协议
+	// 复证圈 5 sweep 发现 5：插件 stderr 不再直通宿主 stderr——子进程可向
+	// 操作日志流写入任意字节（伪造 'omnilsp: …' 前缀行、凭据形态文本），
+	// 宿主对其无前缀隔离、无有界性，日志可信边界在进程面上开放。改为经
+	// pluginStderrLogger：每行带插件 id 前缀转发、行缓冲与转发总量有界
+	// （原 ponytail 债「stderr 直通父进程；静默捕获留待完整协议」的折中
+	// 交付——脱敏由宿主侧 stderr 统一脱敏口承接，plugin 包按其「仅标准库」
+	// 依赖纪律不 import internal/security）。
+	cmd.Stderr = newPluginStderrLogger(m.ID, os.Stderr)
 	err = cmd.Start()
 	vf.Close() // 复核→执行窗口在 Start 返回时闭合；此后句柄不再有用
 	if err != nil {
@@ -788,4 +796,72 @@ func (p *Process) Notify(method string, params any) error {
 		return fmt.Errorf("plugin: 写通知: %w", err)
 	}
 	return nil
+}
+
+// pluginStderrBudgetBytes 是单插件进程 stderr 的转发字节预算：超预算后停
+// 止转发并发一次抑制标记——插件不得用 stderr 洪泛宿主操作日志（有界性沿
+// N14 防御纵深纪律）。
+const pluginStderrBudgetBytes = 64 << 10
+
+// pluginStderrMaxLineBytes 是转发行的缓冲上限：无换行流按该长度强制成行，
+// 行缓冲不无界累积（与 maxHeaderLineBytes 同值不同责——那是帧头行扫描，
+// 这是子进程日志行）。
+const pluginStderrMaxLineBytes = 8 << 10
+
+// pluginStderrLogger 把插件子进程的 stderr 以「omnilsp: plugin <id> stderr:
+// 」前缀转发进宿主操作日志（复证圈 5 sweep 发现 5）：操作者可区分宿主行
+// 与插件行，伪造宿主前缀的裸行不再以自身形态出现在日志流里。转发总量受
+// pluginStderrBudgetBytes 约束——超预算发一次抑制标记（含丢弃字节数），
+// 后续字节丢弃。单写者（子进程经 exec 拷贝 goroutine 串行到达），无需锁。
+type pluginStderrLogger struct {
+	id         string
+	w          io.Writer
+	buf        []byte
+	forwarded  int
+	suppressed bool
+	dropped    int
+}
+
+func newPluginStderrLogger(id string, w io.Writer) *pluginStderrLogger {
+	return &pluginStderrLogger{id: id, w: w}
+}
+
+// Write 消费整段输入并按行转发；返回值恒为 len(p)——转发预算只约束落到宿
+// 主日志的量，不反压子进程（stderr 阻塞会拖死插件自身，不是宿主的故障面）。
+func (l *pluginStderrLogger) Write(p []byte) (int, error) {
+	total := len(p)
+	for len(p) > 0 {
+		if i := bytes.IndexByte(p, '\n'); i >= 0 {
+			l.buf = append(l.buf, p[:i]...)
+			p = p[i+1:]
+			l.flushLine()
+			continue
+		}
+		l.buf = append(l.buf, p...)
+		p = nil
+		if len(l.buf) >= pluginStderrMaxLineBytes {
+			l.flushLine() // 无换行长流强制成行，行缓冲有界
+		}
+	}
+	return total, nil
+}
+
+func (l *pluginStderrLogger) flushLine() {
+	line := strings.TrimRight(string(l.buf), "\r")
+	l.buf = l.buf[:0]
+	if line == "" {
+		return
+	}
+	if l.suppressed {
+		l.dropped += len(line)
+		return
+	}
+	if l.forwarded+len(line) > pluginStderrBudgetBytes {
+		l.suppressed = true
+		fmt.Fprintf(l.w, "omnilsp: plugin %s stderr: 超过 %d 字节转发预算，后续 stderr 丢弃（当前丢弃 %d 字节）\n",
+			l.id, pluginStderrBudgetBytes, l.dropped+len(line))
+		return
+	}
+	l.forwarded += len(line)
+	fmt.Fprintf(l.w, "omnilsp: plugin %s stderr: %s\n", l.id, line)
 }
