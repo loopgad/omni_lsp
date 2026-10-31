@@ -33,15 +33,22 @@ const maxManifestBytes = 1 << 20
 // （JSON 流分帧的空白填充）不受影响。
 func Load(dir string) (Manifest, error) {
 	path := filepath.Join(dir, "plugin.json")
-	// 大小门（复证圈 5 sweep 发现 6，见 maxManifestBytes）：读取前拒绝，
-	// 不按敌意/损坏文件的字节数分配内存。Stat 失败不在此处理——ReadFile
-	// 会以自己的错误上抛，保留原始失败原因。
-	if fi, err := os.Stat(path); err == nil && fi.Size() > maxManifestBytes {
-		return Manifest{}, fmt.Errorf("plugin: plugin.json %d 字节超出 %d 上限（帧结构损坏类拒绝）", fi.Size(), maxManifestBytes)
-	}
-	b, err := os.ReadFile(path)
+	// 单句柄消除 check-then-act（复证圈 7 sweep 发现 3）：旧形态 Stat 门尺
+	// 寸后 os.ReadFile 全量读、读后无复核——并发写者以「小尺寸过 Stat、读中
+	// 高速增长」绕过任何读前门。改为 open → 按句柄 Stat → readManifestBounded
+	// （LimitReader cap+1 硬上界 + 读后复核）：读面恒 ≤ maxManifestBytes+1
+	// 字节，与文件是否在读期间增长无关。
+	f, err := os.Open(path)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("plugin: 读取 plugin.json: %w", err)
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() > maxManifestBytes {
+		return Manifest{}, fmt.Errorf("plugin: plugin.json %d 字节超出 %d 上限（帧结构损坏类拒绝）", fi.Size(), maxManifestBytes)
+	}
+	b, err := readManifestBounded(f)
+	if err != nil {
+		return Manifest{}, err
 	}
 	var m Manifest
 	dec := json.NewDecoder(strings.NewReader(string(b)))
@@ -53,6 +60,21 @@ func Load(dir string) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("plugin: plugin.json 首个 JSON 值之后存在尾随内容（清单必须是单一完整文档）")
 	}
 	return m, nil
+}
+
+// readManifestBounded 以 maxManifestBytes+1 的硬上界读 r 并复核读后长度
+// （复证圈 7 sweep 发现 3）：即使底层文件在 Stat 之后被并发写者增长，读面
+// 也恒有界，越界按帧结构损坏类错误拒绝——读后复核是读前门（句柄 Stat）
+// 之外的第二条带，两条都在才闭合「按文件大小的全量内存尖峰」。
+func readManifestBounded(r io.Reader) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxManifestBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("plugin: 读取 plugin.json: %w", err)
+	}
+	if len(b) > maxManifestBytes {
+		return nil, fmt.Errorf("plugin: plugin.json 读入 %d 字节超出 %d 上限（帧结构损坏类拒绝）", len(b), maxManifestBytes)
+	}
+	return b, nil
 }
 
 // Verify 执行完整信任链：Load → Validate → entrypoint 路径安全检查 →

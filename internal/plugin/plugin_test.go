@@ -451,3 +451,26 @@ func TestLoad_OversizedManifestRejected(t *testing.T) {
 		t.Fatalf("常规 manifest 被误拒: %v", err)
 	}
 }
+
+// TestReadManifestBounded_HardCap（复证圈 7 sweep 发现 3 的机制钉）：读面
+// 本身必须硬上界——无论底层来源尺寸声明如何（Stat 之后被并发增长正是
+// check-then-act 的缺口形态），readManifestBounded 读入超过 maxManifestBytes
+// 即拒绝。Load 的句柄 Stat 门是第一条带，本函数的读后复核是第二条带；变
+// 异敏感性：移除 len 复核此测试即红。
+func TestReadManifestBounded_HardCap(t *testing.T) {
+	over := strings.NewReader(strings.Repeat(" ", maxManifestBytes+1))
+	if b, err := readManifestBounded(over); err == nil {
+		t.Fatalf("读入 %d 字节未被拒绝（读面无界）", len(b))
+	} else if !strings.Contains(err.Error(), "超出") {
+		t.Fatalf("拒绝原因必须是大小门: %v", err)
+	}
+	// 恰在上限内的输入照常通过。
+	exact := strings.NewReader(strings.Repeat(" ", maxManifestBytes))
+	b, err := readManifestBounded(exact)
+	if err != nil {
+		t.Fatalf("恰在上限内的输入被误拒: %v", err)
+	}
+	if len(b) != maxManifestBytes {
+		t.Fatalf("读入 %d 字节, want %d", len(b), maxManifestBytes)
+	}
+}
