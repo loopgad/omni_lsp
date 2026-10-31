@@ -146,6 +146,25 @@ func TestSEC_N11_RedactionAudit(t *testing.T) {
 			keep: []string{"token", "secret", "[REDACTED]"},
 			drop: []string{"aaa", "bbb"},
 		},
+		{
+			// 复证圈 5 sweep 发现 1：多行 pretty 数组（readApiTokens 的真实
+			// 配置形态）——键名含关键词作为子串、值跨行，二者都曾绕过脱敏。
+			name: "pretty_json_token_array",
+			in: "{\n" +
+				"  \"readApiTokens\": [\n" +
+				"    \"E2E-ALPHA\",\n" +
+				"    \"E2E-BETA\"\n" +
+				"  ]\n" +
+				"}",
+			keep: []string{"readApiTokens", "[REDACTED]"},
+			drop: []string{"E2E-ALPHA", "E2E-BETA"},
+		},
+		{
+			name: "compact_token_array",
+			in:   `{"readApiTokens":["t1","t2"]}`,
+			keep: []string{"readApiTokens", "[REDACTED]"},
+			drop: []string{"t1", "t2"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

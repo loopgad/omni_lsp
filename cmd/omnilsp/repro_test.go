@@ -12,11 +12,14 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/omnilsp/omni/internal/security"
 )
 
 const reproSecret = "abc123"
+
+// reproArrayTokens 是复证圈 5 sweep 发现 1 的缺陷形态：多行 pretty JSON
+// 数组（用户手写配置的真实形态）——RedactString 的值交替式第一通道只能吃
+// 单行标量，数组值整体绕过脱敏进入 repro 包。
+var reproArrayTokens = []string{"E2E-REPRO-TOKEN-ALPHA", "E2E-REPRO-TOKEN-BETA"}
 
 const reproSrcFixture = "package x\n\nconst token = \"" + reproSecret + "\"\n"
 
@@ -25,8 +28,20 @@ func reproFixture(t *testing.T) (configPath, workspace, tracePath string) {
 	t.Helper()
 	dir := t.TempDir()
 	configPath = filepath.Join(dir, "omnilsp.json")
-	cfg := `{"logLevel":"info","transport":"stdio","maxConcurrentRequests":8,` +
-		`"maxQueueSize":16,"requestTimeoutMs":1000,"token":"` + reproSecret + `"}`
+	// 配置同时覆盖两种形态：单行标量 token（既有覆盖）+ 多行数组
+	// readApiTokens（发现 1 的缺陷形态，pretty JSON 用户手写档）。
+	cfg := `{
+  "logLevel": "info",
+  "transport": "stdio",
+  "maxConcurrentRequests": 8,
+  "maxQueueSize": 16,
+  "requestTimeoutMs": 1000,
+  "token": "` + reproSecret + `",
+  "readApiTokens": [
+    "` + reproArrayTokens[0] + `",
+    "` + reproArrayTokens[1] + `"
+  ]
+}`
 	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -125,13 +140,25 @@ func TestN13_NoSecretsInBundle(t *testing.T) {
 	cfg, ws, trace := reproFixture(t)
 	for _, mode := range []string{string(ReproMetadataOnly), string(ReproRedacted), string(ReproFullSource)} {
 		entries := reproBundle(t, "--mode", mode, "--config", cfg, "--workspace", ws, "--trace", trace)
-		var all strings.Builder
-		for _, data := range entries {
-			all.WriteString(security.RedactString(string(data)))
-			all.WriteByte('\n')
-		}
-		if strings.Contains(all.String(), reproSecret) {
-			t.Errorf("mode %s: secret %q leaked in bundle:\n%s", mode, reproSecret, all.String())
+		for name, data := range entries {
+			// 复证圈 5 sweep 发现 1 的断言切割：不再把包内容再过一遍
+			// RedactString（旧断言的二次脱敏把管线级缺口遮蔽了）——元数据/
+			// redacted 模式的每个条目、full-source 模式除 sources/ 外的每个
+			// 条目，都必须由管线自身脱敏干净。full-source 按契约携带原始源
+			// 文件（显式 opt-in，reproSrcFixture 含 reproSecret），豁免
+			// sources/ 下对 reproSecret 的断言；reproArrayTokens 不在任何
+			// 源文件里，任何模式下泄漏即失败。
+			secretSet := []string{reproSecret}
+			secretSet = append(secretSet, reproArrayTokens...)
+			for _, secret := range secretSet {
+				if mode == string(ReproFullSource) && strings.HasPrefix(name, "sources/") &&
+					secret == reproSecret {
+					continue
+				}
+				if strings.Contains(string(data), secret) {
+					t.Errorf("mode %s: %s 明文泄漏 %q（管线未脱敏）:\n%s", mode, name, secret, data)
+				}
+			}
 		}
 	}
 }
