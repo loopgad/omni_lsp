@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -1190,5 +1192,40 @@ func TestQuarantine_RecycledUnderCapacityCap(t *testing.T) {
 	want := []SegmentID{"2-bbbbbbbb"}
 	if got := s.Quarantined(); len(got) != 1 || got[0] != want[0] {
 		t.Fatalf("quarantine list: want %v, got %v", want, got)
+	}
+}
+
+// TestPersistentStoreOwnerOnlyPermissions（复证圈 5 sweep 发现 3）：持久段
+// 载荷含完整 Scope（Build.Environment 可携带 GOPROXY 代理凭据）与工作区符
+// 号清单，manifest/history 同理——落盘必须 owner-only，与同包 file_lock/
+// lease 的既有 0600 惯例对齐。全树遍历断言：文件无组/其他人位、目录 0700。
+// Windows 的 perm 位是 ACL 仿真（恒 0666/0777），断言仅 Unix 有意义。
+func TestPersistentStoreOwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows perm bits are ACL-emulated; the 0600/0700 assertion is Unix-only")
+	}
+	s := newStore(t)
+	publishOne(t, s, "perm-probe-payload")
+	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if perm := info.Mode().Perm(); perm != 0o700 {
+				return fmt.Errorf("目录 %s 权限 %o，want 0700", path, perm)
+			}
+			return nil
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			return fmt.Errorf("文件 %s 权限 %o 含组/其他人位，want owner-only", path, perm)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

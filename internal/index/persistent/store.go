@@ -344,7 +344,7 @@ func (s *FileStore) beginBuildWithWriterLock(ctx context.Context, writerLock *wr
 	}
 	genID := s.nextGenID + 1
 	stage := filepath.Join(s.root, fmt.Sprintf("staging-%d", genID))
-	if err := os.Mkdir(stage, 0o755); err != nil {
+	if err := os.Mkdir(stage, 0o700); err != nil {
 		return nil, fmt.Errorf("persistent: staging: %w", err)
 	}
 	if err := writeGenerationSequence(s.root, genID); err != nil {

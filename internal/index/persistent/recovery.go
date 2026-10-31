@@ -149,7 +149,7 @@ func (s *FileStore) recover() error {
 // open retries, instead of the store silently continuing with the only
 // diagnostic destroyed. Caller holds the writer lock (recover contract).
 func (s *FileStore) quarantineCorruptManifest(reason string) error {
-	if err := os.MkdirAll(s.quarantineDir(), 0o755); err != nil {
+	if err := os.MkdirAll(s.quarantineDir(), 0o700); err != nil {
 		return fmt.Errorf("persistent: quarantine corrupt manifest: %w", err)
 	}
 	name := fmt.Sprintf("manifest-corrupt-%s-%s.json", reason, time.Now().UTC().Format("20060102T150405.000000000"))

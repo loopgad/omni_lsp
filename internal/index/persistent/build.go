@@ -178,7 +178,7 @@ func (b *fileBuild) writeSegmentUnchecked(payload []byte) (SegmentID, error) {
 
 	raw := encodeSegment(b.genID, payload)
 	dst := filepath.Join(b.stageDir, segFileName(id))
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("persistent: create %s: %w", id, err)
 	}
@@ -402,7 +402,7 @@ func (b *fileBuild) closedError() error {
 }
 
 func writeFileSync(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("persistent: open %s: %w", filepath.Base(path), err)
 	}

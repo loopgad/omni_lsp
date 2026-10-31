@@ -94,7 +94,7 @@ func validGeneration(gen *Generation) bool {
 // ensureLayout creates the store root layout on first open.
 func ensureLayout(root string) error {
 	for _, d := range []string{"", dirQuarantine, dirLeases} {
-		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
 			return fmt.Errorf("persistent: layout %s: %w", d, err)
 		}
 	}
