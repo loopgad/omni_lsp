@@ -12,6 +12,7 @@ package plugin
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -154,4 +155,58 @@ func TestO4_RemoveClearsGrantAndCrashCount(t *testing.T) {
 	if hadGrant || crashes != 0 {
 		t.Fatalf("Remove 未清空授权/崩溃计数: grant=%v crashes=%d", hadGrant, crashes)
 	}
+}
+
+// TestO4_StateInstalledNeverProduced（复证圈 3 sweep 发现 6 的可执行文档）：
+// StateInstalled 在枚举里占位（§O4 图示含 install 步）但当前状态机从不产生
+// 它——Install 直落 Verified，Enable 收 Verified/Failed。本测试沿全生命周期
+// 驱走一遍，钉住「机器不产生 StateInstalled」这一文档声明：若未来引入独立
+// install 步（Install→StateInstalled + Enable 准入扩展），此测试红，须同步
+// 更新 lifecycle.go 的 reserved 标注与 §O4 台账，不得静默改语义。
+func TestO4_StateInstalledNeverProduced(t *testing.T) {
+	m := NewManager()
+	dir := newPluginDir(t)
+	// Discover 扫描 root 的直接子目录——插件目录的父目录才是 root。
+	ds, err := m.Discover(filepath.Dir(dir))
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("Discover: %v (%d)", err, len(ds))
+	}
+	// Install 前未入表：State() 必须报未知，而不是静默给出某状态。
+	if _, serr := m.State(ds[0].Manifest.ID); serr == nil {
+		t.Fatal("discover 后未 Install 不应入表")
+	}
+	check := func(stage string) {
+		t.Helper()
+		s, serr := m.State(ds[0].Manifest.ID)
+		if serr != nil {
+			t.Fatalf("%s: State: %v", stage, serr)
+		}
+		if s == StateInstalled {
+			t.Fatalf("%s: 状态机产生了 StateInstalled——lifecycle.go 的 reserved 标注已失真，须同步更新", stage)
+		}
+	}
+	if err := m.Install(ds[0]); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	check("install 后（直落 Verified）")
+	if _, err := m.Enable(ds[0].Manifest.ID); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	check("enable 后")
+	if err := m.MarkRunning(ds[0].Manifest.ID); err != nil {
+		t.Fatalf("MarkRunning: %v", err)
+	}
+	check("running 后")
+	for i := 0; i < MaxConsecutivePluginCrashes-1; i++ {
+		m.RecordCrash(ds[0].Manifest.ID) // 未达阈值：Failed
+		check("crash 后")
+	}
+	if err := m.Disable(ds[0].Manifest.ID); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+	check("disable 后")
+	if err := m.Remove(ds[0].Manifest.ID); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	check("remove 后")
 }

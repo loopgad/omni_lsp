@@ -20,7 +20,13 @@ var ErrQuarantined = fmt.Errorf("plugin: 已隔离（崩溃循环）")
 // （复证圈 2 审计发现 1，errors.Is 可判别）。
 var ErrDuplicatePluginID = errors.New("plugin: 重复的 manifest.ID")
 
-// State 枚举 §O4 全生命周期。
+// State 枚举 §O4 全生命周期。与机器的关系（复证圈 3 sweep 发现 6 对账）：
+// §O4 图示含 Installed 步，但当前状态机把装配折叠进 Verified——Install
+// 直落 StateVerified、EnableWithPolicy 只收 Verified/Failed，机器从不产生
+// StateInstalled（TestO4_StateInstalledNeverProduced 沿全生命周期钉住）。
+// 该值保留为 reserved 占位：删除会使后续导出常量的 iota 值整体位移（任何
+// 按值持久化 State 的消费方被静默重编号）；若未来引入独立 install 步，
+// 须同步扩展 Enable 准入集合并更新本标注与 §O4 台账，不得静默改语义。
 type State int
 
 const (
