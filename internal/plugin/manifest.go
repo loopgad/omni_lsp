@@ -88,8 +88,12 @@ var ErrUnknownCapability = fmt.Errorf("plugin: 未知能力")
 
 var checksumRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
-// Manifest 对应 §O3 的七必填字段；Signature 为可选信任字段，
-// 缺省或 "unsigned" 时 Validate 记录 Warning 而不报错（本地开发档）。
+// Manifest 对应 §O3 的七必填字段；Signature 为可选信任字段。
+// 全仓当前没有签名验证实现（真实信任链是 sha256 checksum 门 + 句柄钉定，
+// §N14/§O3），因此 Signature 在 Validate 里始终是咨询信号：缺省或
+// "unsigned" 记未签名告警（本地开发档），任何非空其他值在宿主具备验证
+// 实现之前一律记「声明了但未验证」告警——未验证的声明值不得静音告警
+// （复证圈 1 sweep 发现 4：旧实现对伪造值不告警，诚实未签名反而带告警）。
 type Manifest struct {
 	ID           string       `json:"id"`
 	Version      string       `json:"version"`
@@ -141,8 +145,16 @@ func (m *Manifest) Validate() error {
 	if !checksumRe.MatchString(m.Checksum) {
 		return fmt.Errorf("plugin: checksum 格式非法（期望 sha256:<64位十六进制>）")
 	}
-	if m.Signature == "" || m.Signature == "unsigned" {
+	switch {
+	case m.Signature == "" || m.Signature == "unsigned":
 		m.Warning = "signature 未签名（本地开发档）；发布前必须签名"
+	default:
+		// 复证圈 1 sweep 发现 4：宿主没有签名验证实现，任何非空非
+		// "unsigned" 的声明值都无法被验证——不能因它非空就静音告警
+		// （否则伪造签名的清单比诚实未签名更「干净」）。验证实现落地前，
+		// 该字段一律按未验证咨询信号处理；不拒绝是为了不把可选字段变成
+		// 破坏性门槛（既有清单与 §O3 契约不回退）。
+		m.Warning = "signature 已声明但宿主无签名验证实现（未验证，不作为信任依据）"
 	}
 	return nil
 }
