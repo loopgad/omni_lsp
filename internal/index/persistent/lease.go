@@ -111,7 +111,14 @@ func errorsIsLockBusy(err error) bool { return err == errWriterLockBusy }
 
 // removeGenerationSegments deletes files only when no reader in any process
 // holds a shared generation lease. A busy generation is left for later
-// garbage collection.
+// garbage collection. Once the segments are gone the generation can never be
+// leased meaningfully again, so its lease lock file goes with them — without
+// this, every generation ever leased accumulated a
+// leases/generation-<id>.lock file in the store root forever. Our own handle
+// is released before the remove (Windows refuses to delete the file behind an
+// open handle); a remove failure (a concurrent opener re-created demand for
+// it, sharing violation) is ignored and the file waits for a later
+// retirement pass.
 func (s *FileStore) removeGenerationSegments(gen *Generation) error {
 	if gen == nil {
 		return nil
@@ -123,12 +130,14 @@ func (s *FileStore) removeGenerationSegments(gen *Generation) error {
 		}
 		return err
 	}
-	defer lock.release()
 	for _, seg := range gen.Segments {
 		if err := os.Remove(filepath.Join(s.root, segFileName(seg.ID))); err != nil && !os.IsNotExist(err) {
+			lock.release()
 			return fmt.Errorf("persistent: retire generation %d segment %s: %w", gen.ID, seg.ID, err)
 		}
 	}
+	lock.release()
+	_ = os.Remove(generationLockPath(s.root, gen.ID))
 	return nil
 }
 
