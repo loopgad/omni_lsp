@@ -284,6 +284,15 @@ func (c *Conn) syncDocumentAtRevision(langID, uri string, content []byte, snapsh
 			close(previous.diagnosticsReady)
 		}
 	}
+	// round20 第 2 圈: this path replaces the slot's state object with a
+	// fresh one — the replaced report's §F14 charge must leave with the
+	// object (releaseDocumentBudgetLocked is idempotent; a previously closed
+	// document already released at closeDocument and releases zero here).
+	// Every reachability of `previous` below this point treats it as a
+	// tombstone/history carrier, never as the charge owner.
+	if previous != nil {
+		c.releaseDocumentBudgetLocked(previous)
+	}
 	c.nextDocumentGeneration++
 	state := &documentState{
 		langID:                       langID,
@@ -433,6 +442,9 @@ func (c *Conn) refreshDiagnosticsDocument(langID, uri string, content []byte, sn
 		state.diagnosticsClosed = true
 		close(state.diagnosticsReady)
 	}
+	// round20 第 2 圈: the refreshed state replaces this object in the slot —
+	// the staged report's §F14 charge must leave with the object.
+	c.releaseDocumentBudgetLocked(state)
 	c.nextDocumentGeneration++
 	refreshed := &documentState{
 		langID:                       state.langID,
@@ -917,6 +929,10 @@ func ConvertDiagnosticPositions(content []byte, diagnostics []Diagnostic, target
 func (c *Conn) invalidateDocumentsLocked(err error) {
 	c.workspaceGeneration++
 	for _, state := range c.documents {
+		// round20 第 2 圈: the map is dropped wholesale — every staged
+		// report's §F14 charge must be released here, mirroring the restart
+		// variant (invalidateDocumentsForRestartLocked).
+		c.releaseDocumentBudgetLocked(state)
 		if !state.diagnosticsClosed {
 			state.diagnosticsErr = err
 			state.diagnosticsClosed = true
