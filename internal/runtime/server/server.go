@@ -1042,6 +1042,9 @@ func (s *Server) Run(ctx context.Context, t transport.Transport) (runErr error) 
 func (s *Server) CloseSession() error {
 	s.scheduler.Shutdown()
 	s.ClosePlugins()
+	// Bug round 20 A#11 (圈 4): backstop sweep — no embedder-registered
+	// host↔virtual mapping may survive into the next session.
+	s.virtualReg.UnregisterAll()
 	err := s.closeBackends()
 	s.mu.RLock()
 	err = stderrors.Join(err, s.shutdownErr)
