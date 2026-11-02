@@ -48,11 +48,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	stderrors "errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -662,8 +662,32 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 		if !c.closed.Load() && c.cfg.CaptureDiagnostics && msg.Method == "textDocument/publishDiagnostics" {
 			c.receiveDiagnostics(epoch, msg.Params)
 		}
-		if msg.ID == nil || msg.ID.IsStr {
-			continue // server notifications are handled above; string IDs are unsupported
+		if msg.ID == nil {
+			continue // server notifications are handled above; nothing to answer
+		}
+		// round20/bugC: only a genuine response may enter the pending table.
+		// A message with an id AND a method is the child requesting something
+		// of us (workspace/configuration, client/registerCapability,
+		// window/workDoneProgress/create). Pre-fix it was fed to the pending
+		// table as if it were our response: with a colliding id the in-flight
+		// request "succeeded" with a nil result (a faked handshake success),
+		// without one it was silently dropped — leaving a real server
+		// hanging on its own request. JSON-RPC requires an answer; the
+		// minimal honest one is MethodNotFound under the same id, which real
+		// servers treat as the capability being unsupported.
+		if !msg.IsResponse() {
+			c.mu.Lock()
+			current := c.readerEpoch.Load() == epoch && !c.closed.Load()
+			c.mu.Unlock()
+			if !current {
+				return // epoch replaced: never write toward a replacement child
+			}
+			_ = c.writeMessage(jsonrpc.NewErrorResponse(*msg.ID, jsonrpc.MethodNotFound,
+				fmt.Sprintf("%s does not support client-bound method %q", c.cfg.Name, msg.Method), nil))
+			continue
+		}
+		if msg.ID.IsStr {
+			continue // responses with string ids: we never issue string ids
 		}
 		c.mu.Lock()
 		if c.readerEpoch.Load() != epoch {
