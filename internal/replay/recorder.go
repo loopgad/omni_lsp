@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -11,6 +12,11 @@ import (
 	"github.com/omnilsp/omni/internal/protocol/jsonrpc"
 	"github.com/omnilsp/omni/internal/transport"
 )
+
+// ErrRecordedAfterClose reports that a message arrived after the recorder
+// was closed (a worker still in flight when the session ended): the live
+// session kept flowing, but the entry is not in the recording.
+var ErrRecordedAfterClose = errors.New("replay: recorder closed")
 
 // RecorderTransport wraps a Transport and records every message in both
 // directions to a JSONL session file (§P9). revFn samples the server's
@@ -175,6 +181,18 @@ func (r *RecorderTransport) logOutbound(msg *jsonrpc.Message) error {
 }
 
 func (r *RecorderTransport) logLocked(dir string, payload json.RawMessage, binding *SemanticResponseBinding) error {
+	if r.w == nil {
+		// Close already released the writer. A late Write/Read/identity
+		// registration from a worker still in flight (Shutdown does not join
+		// admitted workers and the session closes the recorder after Run
+		// returns) must degrade to a retained firstErr instead of
+		// dereferencing the nil writer: a recording lifecycle problem never
+		// aborts or corrupts the live session (§P9 contract).
+		if r.firstErr == nil {
+			r.firstErr = fmt.Errorf("replay: record %s #%d after close: %w", dir, r.seq+1, ErrRecordedAfterClose)
+		}
+		return ErrRecordedAfterClose
+	}
 	r.seq++
 	var rev uint64
 	if r.revFn != nil {
