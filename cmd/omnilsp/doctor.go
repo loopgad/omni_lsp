@@ -9,6 +9,7 @@ package main
 // doctor_disk_unix.go) and SKIPs only when that call itself fails.
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -91,7 +92,9 @@ func cmdDoctor(args []string) error {
 	if goPath, lerr := exec.LookPath("go"); lerr != nil {
 		collect(probe{"go toolchain", statusWarn, "go not found — Go semantics disabled"})
 	} else {
-		out, rerr := exec.Command(goPath, "version").Output()
+		// Bug round 20 A#10 (圈 4): bare exec here stalled doctor indefinitely on
+		// a hung toolchain; every version probe is deadline-bounded now.
+		out, rerr := runProbe(context.Background(), versionProbeTimeout, goPath, "version")
 		if rerr != nil {
 			collect(probe{"go toolchain", statusWarn, "go version failed: " + rerr.Error()})
 		} else {
@@ -103,7 +106,7 @@ func cmdDoctor(args []string) error {
 	if _, lerr := exec.LookPath("clangd"); lerr != nil {
 		collect(probe{"clangd", statusWarn, "clangd not found — C/C++ semantics disabled"})
 	} else {
-		out, rerr := exec.Command("clangd", "--version").Output()
+		out, rerr := runProbe(context.Background(), versionProbeTimeout, "clangd", "--version")
 		if rerr != nil {
 			collect(probe{"clangd", statusWarn, "clangd --version failed"})
 		} else {
@@ -115,7 +118,7 @@ func cmdDoctor(args []string) error {
 	if _, lerr := exec.LookPath("rustc"); lerr != nil {
 		collect(probe{"rust toolchain", statusSkip, "rustc not found — Rust language pack inactive"})
 	} else {
-		out, rerr := exec.Command("rustc", "--version").Output()
+		out, rerr := runProbe(context.Background(), versionProbeTimeout, "rustc", "--version")
 		if rerr != nil {
 			collect(probe{"rust toolchain", statusWarn, "rustc --version failed"})
 		} else {
@@ -131,7 +134,7 @@ func cmdDoctor(args []string) error {
 	if _, lerr := exec.LookPath(pyBin); lerr != nil {
 		collect(probe{"python", statusSkip, "python/python3 not found — Python language pack inactive"})
 	} else {
-		out, rerr := exec.Command(pyBin, "--version").CombinedOutput()
+		out, rerr := runProbeCombined(context.Background(), versionProbeTimeout, pyBin, "--version")
 		if rerr != nil {
 			collect(probe{"python", statusWarn, pyBin + " --version failed"})
 		} else {
@@ -143,12 +146,12 @@ func cmdDoctor(args []string) error {
 	if _, lerr := exec.LookPath("node"); lerr != nil {
 		collect(probe{"node/tsc", statusSkip, "node not found — TypeScript language pack inactive"})
 	} else {
-		out, rerr := exec.Command("node", "--version").Output()
+		out, rerr := runProbe(context.Background(), versionProbeTimeout, "node", "--version")
 		if rerr != nil {
 			collect(probe{"node/tsc", statusWarn, "node --version failed"})
 		} else {
 			detail := trimLine(string(out))
-			if tout, terr := exec.Command("tsc", "--version").CombinedOutput(); terr == nil {
+			if tout, terr := runProbeCombined(context.Background(), versionProbeTimeout, "tsc", "--version"); terr == nil {
 				detail += ", tsc " + trimLine(string(tout))
 			} else {
 				detail += ", tsc not found"

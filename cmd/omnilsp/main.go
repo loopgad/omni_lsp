@@ -117,12 +117,14 @@ func usage() {
 // the semantic-response observer, so recording covers whichever transport the
 // session runs on (§P9: "wraps whichever transport was selected"). Returns nil
 // when recording is disabled (empty path). The caller owns closing the
-// recorder when its session ends.
-func startSessionRecorder(srv *server.Server, cfg config.Config, inner transport.Transport, recordPath string) *replay.RecorderTransport {
+// recorder when its session ends. ctx bounds the startup toolchain probes
+// inside sessionMeta — signal cancellation must stay able to interrupt the
+// pre-Run window it already owns (bug round 20 A#10, 圈 4).
+func startSessionRecorder(ctx context.Context, srv *server.Server, cfg config.Config, inner transport.Transport, recordPath string) *replay.RecorderTransport {
 	if recordPath == "" {
 		return nil
 	}
-	rec, err := replay.NewRecorder(inner, recordPath, sessionMeta(cfg, srv), srv.SnapshotRevision)
+	rec, err := replay.NewRecorder(inner, recordPath, sessionMeta(ctx, cfg, srv), srv.SnapshotRevision)
 	if err != nil {
 		fatal("record: %v", err)
 	}
@@ -290,7 +292,7 @@ func cmdServe(args []string) {
 	// §P9 session recording wraps whichever transport was selected. This path
 	// serves the stdio transport; the tcp branch wraps its own per-session
 	// transport above, and the mcp branch warns that recording is unsupported.
-	if rec := startSessionRecorder(srv, cfg, tr, *recordPath); rec != nil {
+	if rec := startSessionRecorder(ctx, srv, cfg, tr, *recordPath); rec != nil {
 		defer rec.Close()
 		tr = rec
 	}
@@ -339,7 +341,7 @@ func runTCPSession(ctx context.Context, session int, conn net.Conn, srv *server.
 	tr := transport.NewTCPTransport(conn)
 	var sessionTr transport.Transport = tr
 	var rec *replay.RecorderTransport
-	if rec = startSessionRecorder(srv, cfg, tr, recordPath); rec != nil {
+	if rec = startSessionRecorder(ctx, srv, cfg, tr, recordPath); rec != nil {
 		sessionTr = rec
 	}
 	if rerr := srv.Run(ctx, sessionTr); rerr != nil && ctx.Err() == nil {
@@ -606,6 +608,14 @@ const (
 	toolchainPinTimeout = 2 * time.Minute
 )
 
+// versionProbeTimeout bounds ONE toolchain version probe on the serve
+// --record startup path (sessionMeta) and in doctor. A var, not a const, so
+// the boundedness pin can shrink it; both paths previously called
+// exec.Command().Output() bare — a hung toolchain stalled serve startup
+// indefinitely with SIGINT already owned by signal.NotifyContext (bug round
+// 20 A#10, 圈 4).
+var versionProbeTimeout = toolchainProbeTimeout
+
 // runProbe executes name/args under a hard deadline: a hung toolchain is
 // killed and surfaces as a context error (the same warn-and-degrade path as a
 // missing toolchain), never as an unbounded wait.
@@ -613,6 +623,21 @@ func runProbe(ctx context.Context, timeout time.Duration, name string, args ...s
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out, err := exec.CommandContext(probeCtx, name, args...).Output()
+	if err != nil {
+		if perr := probeCtx.Err(); perr != nil {
+			return out, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), perr)
+		}
+		return out, err
+	}
+	return out, nil
+}
+
+// runProbeCombined is runProbe for probes whose version banner lands on
+// stderr (python/tsc on some distros): same hard deadline, stderr merged.
+func runProbeCombined(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, name, args...).CombinedOutput()
 	if err != nil {
 		if perr := probeCtx.Err(); perr != nil {
 			return out, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), perr)
@@ -752,14 +777,22 @@ func exitFatal(code int, f string, args ...any) {
 }
 
 // sessionMeta assembles the §P9 header record: config digest plus the
-// backend/toolchain inventory discovered at serve time.
-func sessionMeta(cfg config.Config, srv *server.Server) replay.Meta {
+// backend/toolchain inventory discovered at serve time. Version probes run
+// through runProbe with a hard deadline and the caller's ctx (the signal ctx
+// on the serve path): a hung toolchain degrades to a missing entry — the same
+// shape as a missing toolchain — instead of stalling startup indefinitely
+// with SIGINT already owned by signal.NotifyContext (bug round 20 A#10, 圈 4).
+func sessionMeta(ctx context.Context, cfg config.Config, srv *server.Server) replay.Meta {
 	tool := map[string]string{}
-	if out, err := exec.Command("go", "version").Output(); err == nil {
+	if out, err := runProbe(ctx, versionProbeTimeout, "go", "version"); err == nil {
 		tool["go"] = firstLine(string(out))
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		warn("recording: go version probe exceeded %s: %v", versionProbeTimeout, err)
 	}
-	if out, err := exec.Command("clangd", "--version").Output(); err == nil {
+	if out, err := runProbe(ctx, versionProbeTimeout, "clangd", "--version"); err == nil {
 		tool["clangd"] = firstLine(string(out))
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		warn("recording: clangd version probe exceeded %s: %v", versionProbeTimeout, err)
 	}
 	backends := map[string]string{}
 	for _, b := range cfg.Backends {
