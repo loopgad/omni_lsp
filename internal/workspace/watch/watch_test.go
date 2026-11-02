@@ -173,7 +173,11 @@ func TestIncompleteScanKeepsPreviousBaseline(t *testing.T) {
 	if err := os.Rename(movedRoot, root); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+	// Same-tick guard (round 20 A#2 bug): the rewrite must differ in length
+	// from the baseline's "old" (3 bytes) — equal-length rewrites can share
+	// the baseline's mtime tick and the short-circuit then treats them as
+	// quiet by contract.
+	if err := os.WriteFile(path, []byte("new-state"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) || has(evs, "existing.txt", Created) {
@@ -211,11 +215,19 @@ func TestSizeLimitsReportIncompleteAndPreserveBaseline(t *testing.T) {
 	if err := os.Remove(oversized); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+	// "new!" and not "new": the 4-byte length must differ from the
+	// baseline's "old" (3 bytes) so a same-timestamp-tick rewrite cannot be
+	// treated as quiet by the (mtime,size)+identity short-circuit, and from
+	// the later "end" (3 bytes) for the same reason; 4 bytes also stays
+	// within maxFileBytes/maxTreeBytes, whose limits this test manipulates.
+	if err := os.WriteFile(path, []byte("new!"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) {
 		t.Fatalf("file-limit recovery lost the valid baseline: %+v", evs)
+	}
+	if err := p.LastScanError(); err != nil {
+		t.Fatalf("file-limit recovery scan was incomplete: %v", err)
 	}
 
 	p.maxTreeBytes = 4
@@ -238,6 +250,9 @@ func TestSizeLimitsReportIncompleteAndPreserveBaseline(t *testing.T) {
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) {
 		t.Fatalf("tree-limit recovery lost the valid baseline: %+v", evs)
 	}
+	if err := p.LastScanError(); err != nil {
+		t.Fatalf("tree-limit recovery scan was incomplete: %v", err)
+	}
 }
 
 func TestDepthLimitReportsIncompleteScan(t *testing.T) {
@@ -257,7 +272,13 @@ func TestDepthLimitReportsIncompleteScan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+	// Probe content must differ in LENGTH from the baseline's "old": two
+	// equal-length writes can land on the same kernel timestamp tick (26%
+	// back-to-back on the bug host), and the (mtime,size)+identity
+	// short-circuit then correctly treats the rewrite as quiet — a documented
+	// cut line (TestWatcherSkipsRereadForUnchangedStatSignature), not a
+	// watcher fault. Unequal length keeps the probe off that cut line.
+	if err := os.WriteFile(path, []byte("new-content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); len(evs) != 0 {
@@ -271,6 +292,11 @@ func TestDepthLimitReportsIncompleteScan(t *testing.T) {
 	}
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) {
 		t.Fatalf("depth-limited scan lost the valid baseline: %+v", evs)
+	}
+	// A transiently incomplete recovery scan also returns no events; pin its
+	// completeness so that failure shape can never masquerade as the swallow.
+	if err := p.LastScanError(); err != nil {
+		t.Fatalf("recovery scan was incomplete: %v", err)
 	}
 }
 
