@@ -1733,8 +1733,18 @@ var facadeMutatingMethods = map[string]bool{
 // bypass). Mutating methods are gated to the Ready (Running) state with C2-gate
 // semantics; anything unregistered returns a typed method-not-found error.
 func (s *Server) CallMethod(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	if facadeMutatingMethods[method] && s.State() != StateRunning {
-		return nil, fmt.Errorf("method %q not allowed in state %s", method, s.State())
+	if facadeMutatingMethods[method] {
+		if s.State() != StateRunning {
+			return nil, fmt.Errorf("method %q not allowed in state %s", method, s.State())
+		}
+		// Bug round 20 A#9（圈 3）：VFS 变异型通知必须与读循环共用同一把单写
+		// 者锁（dispatchInline 的 mutationMu）——门面此前在调用方 goroutine
+		// 直派 handleDidChange，version 门 + Update 的 check-then-act 可被同
+		// 版本双编辑同时穿过，静默丢失其一（PROT-SYNC-001 形态）。锁纪律与
+		// dispatchInline 完全一致：mutationMu 下调 Dispatch 本就是生产不变量
+		// （读循环路径），不存在重入死锁面。
+		s.mutationMu.Lock()
+		defer s.mutationMu.Unlock()
 	}
 	rawParams, err := json.Marshal(params)
 	if err != nil {
