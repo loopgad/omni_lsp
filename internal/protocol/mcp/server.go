@@ -70,31 +70,66 @@ type wireRequest struct {
 // Malformed input produces an error response, never a panic (§C1). Requests
 // without an id are notifications and are ignored. Serve returns on EOF or
 // scanner failure.
+//
+// round20/bugC: ctx cancellation must be able to interrupt a Serve that is
+// blocked IN Scan — checking ctx.Err() only between scans left the `--transport
+// mcp` process hanging on Ctrl+C (signal.NotifyContext) until the client
+// closed stdin or sent a line, so CloseSession was unreachable. The scanner
+// now runs on its own goroutine and Serve selects between a ready line and
+// ctx.Done(). Known boundary: io.Reader has no cancellation primitive, so the
+// reader goroutine itself exits only on EOF / the next line / ctx during a
+// pending line hand-off — Serve's caller (and the process) are not held back
+// by it.
 func Serve(ctx context.Context, in io.Reader, out io.Writer, core Core) error {
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), maxFrameSize)
-	for sc.Scan() {
-		if ctx.Err() != nil {
+	lines := make(chan string)
+	readerDone := make(chan error, 1)
+	go func() {
+		defer close(lines)
+		sc := bufio.NewScanner(in)
+		sc.Buffer(make([]byte, 0, 64*1024), maxFrameSize)
+		for sc.Scan() {
+			select {
+			case lines <- sc.Text():
+			case <-ctx.Done():
+				return
+			}
+		}
+		readerDone <- sc.Err()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
 			return ctx.Err()
-		}
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		resp := handle(ctx, line, core)
-		if resp == nil {
-			continue // notification: no response in the stateless model
-		}
-		b, err := json.Marshal(resp)
-		if err != nil {
-			return err
-		}
-		b = append(b, '\n')
-		if _, err := out.Write(b); err != nil {
-			return err
+		case line, ok := <-lines:
+			if !ok {
+				// Scanner ended: surface its error (nil on clean EOF). A
+				// goroutine exiting via ctx.Done() closes the channel without
+				// writing readerDone; ctx.Err() is then the honest cause.
+				select {
+				case err := <-readerDone:
+					return err
+				default:
+					return ctx.Err()
+				}
+			}
+			trimmed := bytes.TrimSpace([]byte(line))
+			if len(trimmed) == 0 {
+				continue
+			}
+			resp := handle(ctx, trimmed, core)
+			if resp == nil {
+				continue // notification: no response in the stateless model
+			}
+			b, err := json.Marshal(resp)
+			if err != nil {
+				return err
+			}
+			b = append(b, '\n')
+			if _, err := out.Write(b); err != nil {
+				return err
+			}
 		}
 	}
-	return sc.Err()
 }
 
 // handle routes one request line to a response message. A nil return means
