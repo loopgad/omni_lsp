@@ -1797,6 +1797,18 @@ func sourcePosition(data []byte, line, column uint32) uint32 {
 			start = i + 1
 		}
 	}
+	// A line number beyond the file's content has no byte offset, so pin it
+	// to EOF. Without this, a trailing newline already left start past the
+	// final break (a zero-width position at EOF) while a file without one
+	// kept the last line's start — the same out-of-range event then decoded
+	// different columns depending on the file's final byte, and the
+	// no-newline shape silently reused the last line's content for a line
+	// that does not exist. The strict comparison keeps the phantom EOF line
+	// of a trailing-newline file (current == line) at its zero-width
+	// position.
+	if current < line {
+		start = len(data)
+	}
 	// end = start + (column-1), clamped to the buffer with 64-bit math: the
 	// column arrives from untrusted helper event JSON, and on 32-bit GOARCH
 	// int(column-1) wraps negative for huge values (slice panic), while on
