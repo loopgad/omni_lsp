@@ -569,6 +569,23 @@ func (c *Conn) failPending(msg string) {
 	failAll(pending, msg)
 }
 
+// failPendingIfEpoch fails every parked request only when the reader epoch
+// still matches (round20 第 4 圈): the watchdog's cancel half obeys the same
+// fence as its kill half — a full restart cycle between the hung judgment and
+// this delivery must not stamp "worker hung" onto the replacement epoch's
+// pending table and drop its real responses.
+func (c *Conn) failPendingIfEpoch(epoch uint64, msg string) {
+	c.mu.Lock()
+	if c.readerEpoch.Load() != epoch {
+		c.mu.Unlock()
+		return
+	}
+	pending := c.pending
+	c.pending = make(map[int64]chan *jsonrpc.Message)
+	c.mu.Unlock()
+	failAll(pending, msg)
+}
+
 // failAll delivers a fast-fail error to every parked response channel.
 // Non-blocking send: senders that already timed out must not be blocked.
 func failAll(pending map[int64]chan *jsonrpc.Message, msg string) {
@@ -1238,11 +1255,15 @@ func (c *Conn) startWatchdog(grace time.Duration) {
 			}
 			go func() {
 				sup.HandleHungWorker(
-					func() { c.failPending(c.cfg.Name + " worker hung; requests failed") },
-					// The kill carries the epoch the hung judgment was made
-					// on (round20 第 3 圈): judgment and kill run in
-					// different goroutines, and a full restart cycle in
-					// between must not murder the healthy replacement.
+					// The cancel half carries the same epoch fence as the
+					// kill half (round20 第 4 圈, closing what 4eeea22 left
+					// half-open): failPending swaps the whole pending table,
+					// and a full restart cycle between judgment and delivery
+					// must not stamp "worker hung" on the replacement's
+					// requests — the fenced kill correctly no-ops, so the
+					// healthy child would live on with its in-flight requests
+					// mislabeled as hung and their real responses dropped.
+					func() { c.failPendingIfEpoch(epoch, c.cfg.Name+" worker hung; requests failed") },
 					func() { c.killProcess(epoch) },
 				)
 			}()
