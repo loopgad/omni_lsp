@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -81,6 +82,13 @@ func (c *Codec) ReadFrame(r io.Reader) (*Frame, error) {
 			Message: fmt.Sprintf("parse error: %v", err),
 		}
 	}
+	// Frame-layer note (bug round 20 A#15, 圈 5): the codec stays
+	// payload-agnostic — the 2026-10-25 ruling keeps framing integrity and
+	// message validity in two layers, and ReadMessage/ReadFrame double as
+	// framed-JSON readers for non-message payloads. A body that decodes but
+	// is tri-state-none (literal null, empty object) therefore leaves THIS
+	// layer as the zero Message; the terminal InvalidRequest outcome is
+	// delivered by the protocol layer (Dispatcher.Dispatch).
 	return &Frame{Msg: &msg}, nil
 }
 
@@ -119,6 +127,13 @@ func decodeBatchFrame(body []byte, maxElements int) (*Frame, error) {
 		var m Message
 		if err := json.Unmarshal(raw, &m); err != nil {
 			el.Reply = batchElementReply(raw, err)
+		} else if !m.IsRequest() && !m.IsNotification() && !m.IsResponse() {
+			// Same tri-state-none hole, element side (bug round 20 A#15,
+			// 圈 5): a literal null or empty object decodes into the zero
+			// Message and would silently escape the element-isolation
+			// contract. It is valid JSON that is merely not a valid message
+			// — InvalidRequest, per BatchElement.Reply's own semantics.
+			el.Reply = batchElementReply(raw, errNotAJSONRPCMessage)
 		} else {
 			el.Msg = &m
 		}
@@ -170,6 +185,11 @@ func countTopLevelArrayElements(body []byte) int {
 // §4.2: an id that cannot be detected MUST be Null) — the ruling's "id
 // 未知则 null". The detection probe is deliberately lenient: it decodes only
 // the id field and ignores everything else about the broken element.
+// errNotAJSONRPCMessage names the tri-state-none decode outcome (valid JSON
+// that is neither request, notification nor response — literal null, empty
+// object) so the element-isolation reply can cite it.
+var errNotAJSONRPCMessage = errors.New("decoded to a value that is neither request, notification nor response")
+
 func batchElementReply(raw json.RawMessage, cause error) *Message {
 	id := RequestID{IsNull: true}
 	var probe struct {
