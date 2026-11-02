@@ -383,8 +383,16 @@ func (r *DirectCompilerRunner) runScript(ctx context.Context, nodePath string, p
 			return SCIPResult{}, fmt.Errorf("TypeScript exporter emitted unknown message %q", message.Type)
 		}
 	}
-	waitErr := cmd.Wait()
+	// round20 第 3 圈: drain stderr BEFORE Wait. os/exec's StdoutPipe/
+	// StderrPipe contract: it is incorrect to call Wait before all reads
+	// from the pipe have completed — Wait closes the read end after the
+	// process exits, discarding whatever the capture goroutine had not yet
+	// drained (including bytes a late handle-inheriting descendant writes
+	// after exit). The stdout decode loop above has already left on EOF, so
+	// waiting here has no deadlock face: stderr's EOF comes from the child
+	// (and any handle-inheriting descendant) closing its write end.
 	stderrOutput := <-stderrDone
+	waitErr := cmd.Wait()
 	if err := ctx.Err(); err != nil {
 		return SCIPResult{}, err
 	}
