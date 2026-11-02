@@ -1239,7 +1239,11 @@ func (c *Conn) startWatchdog(grace time.Duration) {
 			go func() {
 				sup.HandleHungWorker(
 					func() { c.failPending(c.cfg.Name + " worker hung; requests failed") },
-					c.killProcess,
+					// The kill carries the epoch the hung judgment was made
+					// on (round20 第 3 圈): judgment and kill run in
+					// different goroutines, and a full restart cycle in
+					// between must not murder the healthy replacement.
+					func() { c.killProcess(epoch) },
 				)
 			}()
 			return // process death routes through HandleProcessExit → restart;
@@ -1304,11 +1308,20 @@ func (c *Conn) BuildContextID() identity.BuildContextID {
 
 // killProcess terminates the worker without marking the Conn permanently
 // closed: unlike Close (manual shutdown), a watchdog kill must let the read
-// loop observe EOF so the supervisor's crash/restart cycle engages.
-func (c *Conn) killProcess() {
+// loop observe EOF so the supervisor's crash/restart cycle engages. epoch is
+// the reader epoch the hung judgment was made on (round20 第 3 圈): the kill
+// is fenced like every other termination path (retireProcessEpoch's
+// `current` check) — if a full restart cycle completed between judgment and
+// kill, the healthy replacement child must not be murdered and its pending
+// table must not be failed as "worker hung".
+func (c *Conn) killProcess(epoch uint64) {
 	c.mu.Lock()
+	current := c.readerEpoch.Load() == epoch
 	stdin, stdout, cmd := c.stdin, c.stdout, c.cmd
 	c.mu.Unlock()
+	if !current {
+		return
+	}
 	_ = c.stopProcessNow(stdin, stdout, cmd)
 }
 
