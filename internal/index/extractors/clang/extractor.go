@@ -1778,8 +1778,22 @@ func sourcePosition(data []byte, line, column uint32) uint32 {
 			start = i
 			break
 		}
-		if b == '\n' {
+		// Line boundaries follow the canonical position engine
+		// (internal/workspace/position lineSpan): LF, CR, and CRLF each end a
+		// line. libclang reports CR-only and CRLF sources with line numbers
+		// on that model, so measuring columns against line 1's byte prefix
+		// silently misplaced every position on lines ≥ 2 of a CR-only file.
+		// Multi-byte UTF-8 sequences never contain 0x0A or 0x0D bytes, so the
+		// byte-wise scan is encoding-safe.
+		if b == '\r' {
 			current++
+			start = i + 1
+			continue
+		}
+		if b == '\n' {
+			if i == 0 || data[i-1] != '\r' {
+				current++
+			}
 			start = i + 1
 		}
 	}
