@@ -309,7 +309,24 @@ func cmdServe(args []string) {
 // 收尾错误并入返回值，与 Run 路径把 closeBackends 错误并入 runErr 的既有
 // 语义一致。
 func serveMCP(ctx context.Context, srv *server.Server, in io.Reader, out io.Writer) error {
-	err := mcpserver.Serve(ctx, in, out, mcpCore{srv: srv})
+	// Bug round 20 A#6（圈 3）：mcpserver.Serve 的 ctx 检查只在每行 Scan
+	// 返回之后执行——空闲 stdin 上 scanner 永久阻塞，signal.NotifyContext
+	// 的取消永远到不了 Serve，进程挂死且 serveMCP 的 CloseSession 收尾
+	// （closeBackends/diag.Close/scheduler.Shutdown/ClosePlugins）整体不可
+	// 达——与 3f32aa0 给 TCP accept loop / HTTP listener 修的是同族故障的第
+	// 三条腿。把 Serve 挪进 goroutine，select 监听 ctx.Done()：取消即返回
+	// 并照常走幂等的 srv.CloseSession()；仍阻塞在 stdin 上的 scanner
+	// goroutine 在 main 返回、进程退出时随之消亡（此路径返回即退出）。
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- mcpserver.Serve(ctx, in, out, mcpCore{srv: srv})
+	}()
+	var err error
+	select {
+	case err = <-serveDone:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
 	return errors.Join(err, srv.CloseSession())
 }
 
