@@ -81,8 +81,27 @@ func TestWatcherAtomicReplaceSurfacesAsModifyNotDeletePlusCreate(t *testing.T) {
 	if err := os.WriteFile(temp, []byte("new\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Windows timestamp coalescing (bug round 20 A#1): the temp file is
+	// written milliseconds after the target, so NTFS lands both writes in
+	// the same timestamp tick and the replacement's mtime equals the
+	// baseline's (measured 19% of atomic replaces on the bug host). Force
+	// that exact shape — same mtime, same size — so the guard is
+	// deterministic instead of a ~5% flake.
+	baseline, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(temp, baseline.ModTime(), baseline.ModTime()); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(temp, target); err != nil {
 		t.Fatal(err)
+	}
+	if replaced, rerr := os.Stat(target); rerr != nil {
+		t.Fatal(rerr)
+	} else if !replaced.ModTime().Equal(baseline.ModTime()) || replaced.Size() != baseline.Size() {
+		t.Fatalf("fixture drifted: replaced (size %d, mtime %v) vs baseline (size %d, mtime %v)",
+			replaced.Size(), replaced.ModTime(), baseline.Size(), baseline.ModTime())
 	}
 	assertTransitionEvents(t, root, p.Scan(), map[string]Kind{"editor.go": Modified})
 }
