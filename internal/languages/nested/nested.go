@@ -53,7 +53,6 @@ import (
 	"os"
 	"os/exec"
 	stderrors "errors"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -649,8 +648,12 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 			// retirement below is already visible through supervision. The
 			// note is gated on a configured budget so the unconfigured
 			// default path (the §C1 static cap refusing a pathological
-			// frame) stays zero-change (X10).
-			if strings.HasPrefix(err.Error(), "jsonrpc: message too large") && languages.BackendBudget() != nil {
+			// frame) stays zero-change (X10). round20/bugC: classification
+			// is structural (errors.As on the codec's typed carrier), never
+			// a message-text prefix — the counter must survive protocol-side
+			// wording changes.
+			var tooLarge *jsonrpc.MessageTooLargeError
+			if stderrors.As(err, &tooLarge) && languages.BackendBudget() != nil {
 				languages.NoteBackendBufferRefusal(c.cfg.Name)
 			}
 			break

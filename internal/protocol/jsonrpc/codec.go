@@ -121,7 +121,7 @@ func (c *Codec) readBody(r io.Reader) ([]byte, error) {
 			}
 			return nil, &FrameSkippedError{Declared: contentLength, Cap: c.maxMessageSize()}
 		}
-		return nil, fmt.Errorf("jsonrpc: message too large: %d bytes (max %d)", contentLength, c.maxMessageSize())
+		return nil, &MessageTooLargeError{Declared: contentLength, Cap: c.maxMessageSize()}
 	}
 
 	body := make([]byte, contentLength)
@@ -235,6 +235,28 @@ type CodecError struct {
 }
 
 func (e *CodecError) Error() string { return e.Message }
+
+// MessageTooLargeError reports an inbound frame refused because its declared
+// Content-Length exceeds MaxMessageSize and the body was NOT consumed (the
+// §C1 fatal path — SkipOversizedFrames false). Like FrameSkippedError it is
+// a policy outcome of the size gate, not a protocol fault, so it is not a
+// CodecError. It is a typed carrier so callers classify the refusal
+// structurally instead of matching the message text: the nested bridge's
+// default-cap refusal counter used to string-match "jsonrpc: message too
+// large", so any wording change here silently zeroed the counter while every
+// text pin was mechanically updated in the same commit (round20/bugC). The
+// text itself is pinned by codec_skip_test/codec_framing_test and must not
+// drift independently of those pins.
+type MessageTooLargeError struct {
+	// Declared is the refused frame's Content-Length.
+	Declared int
+	// Cap is the codec's active MaxMessageSize at the refusal.
+	Cap int
+}
+
+func (e *MessageTooLargeError) Error() string {
+	return fmt.Sprintf("jsonrpc: message too large: %d bytes (max %d)", e.Declared, e.Cap)
+}
 
 // FrameSkippedError reports one inbound frame refused by MaxMessageSize whose
 // body was drained and discarded (Codec.SkipOversizedFrames). The stream is

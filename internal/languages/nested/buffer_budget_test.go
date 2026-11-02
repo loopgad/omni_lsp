@@ -303,3 +303,45 @@ func TestReadLoopFrameCapUnconfiguredKeepsDefault(t *testing.T) {
 		t.Fatalf("configured codec cap = %d, want the owner quota 256", got)
 	}
 }
+
+// TestReadLoopDefaultCapRefusalCountedUnderGlobalBudget 钉住默认 §C1 帧帽
+// 拒绝路径的计数（round20/bugC）。配了全局预算但 owner 无配额（或配额 ≥
+// 默认帽）时 BackendBufferCap 返回 0，SkipOversizedFrames 不启用，超限帧走
+// codec 默认帽的 fatal 拒绝——该拒绝必须被计数，且计数不得依赖 codec 错误
+// 文案的稳定：修复前 readLoop 用 strings.HasPrefix(err.Error(), "jsonrpc:
+// message too large") 判定，协议包自己的文案 pin（contains 断言）会在文案
+// 改动的同一次提交里被机械更新，而本路径在 nested 侧零守卫——计数静默归
+// 零、全程无测试失败。本测试即是缺失的守卫。
+func TestReadLoopDefaultCapRefusalCountedUnderGlobalBudget(t *testing.T) {
+	resetBudgetForTest(t, map[string]string{
+		"OMNILSP_BACKEND_BUDGET_BYTES": "1048576", // 仅全局预算：owner 无配额
+	})
+
+	conn := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir(), RequestTimeout: time.Second})
+	codec := conn.newReadCodec()
+	if codec.MaxMessageSize != jsonrpc.DefaultMaxMessageSize || codec.SkipOversizedFrames {
+		t.Fatalf("a global budget alone must leave the §C1 default cap and fatal posture: cap=%d skip=%v",
+			codec.MaxMessageSize, codec.SkipOversizedFrames)
+	}
+
+	// 拒绝计数是进程全局的，跨 -count 迭代累积；按既有约定钉增量。
+	refusalsBefore := languages.BackendBufferRefusals("fake-lsp")
+
+	// io.Pipe：只写帧头。默认帽在分配 body 之前就拒绝，body 无需存在。
+	childReader, childWriter := io.Pipe()
+	conn.Attach(nil, nopWriteCloser{}, childReader)
+	oversized := fmt.Sprintf("Content-Length: %d\r\n\r\n", jsonrpc.DefaultMaxMessageSize+1)
+	if _, err := io.WriteString(childWriter, oversized); err != nil {
+		t.Fatalf("write oversized header: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && languages.BackendBufferRefusals("fake-lsp") == refusalsBefore {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := languages.BackendBufferRefusals("fake-lsp"); got != refusalsBefore+1 {
+		t.Fatalf("refusals(fake-lsp) delta = %d, want 1: the §C1 default-cap refusal must be countable without string-matching the codec message", got-refusalsBefore)
+	}
+	_ = childWriter.Close()
+	_ = conn.Close()
+}
