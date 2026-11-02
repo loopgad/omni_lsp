@@ -6107,7 +6107,7 @@ func TestE2EPerformanceReportWriterUsesSharedSchema(t *testing.T) {
 			},
 		}},
 		S19: e2eS19Report{
-			Status: "partial",
+			Status:  "partial",
 			Scaling: s19FixtureScales,
 			Cancellation: e2eCancellationOutcome{
 				Status: "pass", Attempted: true, RequestID: 5, ProgressToken: "omnilsp-s19-cancel", ProgressBegan: true,

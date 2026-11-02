@@ -17,15 +17,15 @@ import (
 // 临界区内把 inner map 拍成局部快照再解锁，发布只吃快照。
 //
 // 红的机制与确定性说明（诚实注记）：
-//   1. Go race detector 对「读侧持锁取样、读侧无锁消费、写侧持锁写」的模式
-//      结构性沉默——mutex 全序把读与后续写排成 happens-after；真实的红是
-//      runtime 的 map 硬检查 fatal，只在时间重叠时触发。
-//   2. 去抖有「追写」特性（fire 前的任何 inject 都把 fire 推迟 150ms），墙钟
-//      猜测 fire 时刻不可靠。本测试用白盒确定信号：回调 fire 的第一个动作是
-//      delete(pluginTimers, uri)（diagnostics.go 回调体）——写侧自旋轮询该
-//      信号，fire 后 µs 级落写；20000 个插件键把 merge 迭代窗口拉宽到毫秒级，
-//      落写与无锁迭代的时间重叠因此是确定性的。红阶段命中即整测试二进制
-//      fatal crash；修复后迭代吃快照、与 live map 脱钩，稳定绿。
+//  1. Go race detector 对「读侧持锁取样、读侧无锁消费、写侧持锁写」的模式
+//     结构性沉默——mutex 全序把读与后续写排成 happens-after；真实的红是
+//     runtime 的 map 硬检查 fatal，只在时间重叠时触发。
+//  2. 去抖有「追写」特性（fire 前的任何 inject 都把 fire 推迟 150ms），墙钟
+//     猜测 fire 时刻不可靠。本测试用白盒确定信号：回调 fire 的第一个动作是
+//     delete(pluginTimers, uri)（diagnostics.go 回调体）——写侧自旋轮询该
+//     信号，fire 后 µs 级落写；20000 个插件键把 merge 迭代窗口拉宽到毫秒级，
+//     落写与无锁迭代的时间重叠因此是确定性的。红阶段命中即整测试二进制
+//     fatal crash；修复后迭代吃快照、与 live map 脱钩，稳定绿。
 func TestPluginEmit_ConcurrentInjectDoesNotRacePublish(t *testing.T) {
 	s := New(DefaultConfig())
 	rt := attachRecordingTransport(t, s)
