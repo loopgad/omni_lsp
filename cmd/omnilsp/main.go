@@ -186,6 +186,12 @@ func cmdServe(args []string) {
 
 	registerBackends(srv, cfg)
 
+	// Signal ownership starts before any listener is created (bug round 20
+	// A#2): every listener created below must be reachable from this ctx so
+	// SIGINT/SIGTERM can release it instead of leaving the process wedged.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// §X6: optional read-only HTTP API alongside the main transport. Loopback
 	// enforced by ValidateAddr (N8 v1); mutating endpoints do not exist.
 	if *httpAddr != "" {
@@ -209,6 +215,13 @@ func cmdServe(args []string) {
 			info("read-only http api on http://%s", ln.Addr())
 			_ = http.Serve(ln, hs)
 		}()
+		// Release the read-API port on shutdown (bug round 20 A#2, minor
+		// leg): the serve goroutine does not block process exit, but the
+		// listener used to stay bound forever after ctx cancellation.
+		go func() {
+			<-ctx.Done()
+			_ = ln.Close()
+		}()
 	}
 
 	// §P6: optional debug/pprof endpoint. Loopback-only by ValidateAddr
@@ -222,9 +235,6 @@ func cmdServe(args []string) {
 			_ = http.ListenAndServe(*debugAddr, nil) // DefaultServeMux carries pprof via the import below
 		}()
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	var tr transport.Transport
 	switch cfg.Transport {
@@ -265,21 +275,14 @@ func cmdServe(args []string) {
 		// re-registered backends while the process, HTTP API and debug ports
 		// stay warm. One session at a time (v1 semantics preserved); X10 may
 		// later multiplex concurrent sessions over this loop.
-		for session := 0; ; session++ {
-			conn, aerr := ln.Accept()
-			if aerr != nil {
-				if errors.Is(aerr, net.ErrClosed) {
-					return // listener shut down with the process
-				}
-				fmt.Fprintf(os.Stderr, "omnilsp: tcp accept: %v\n", aerr)
-				continue
-			}
+		runSession := func(session int, conn net.Conn) {
 			sessionSrv := server.New(serveConfig(cfg, *pluginsDir))
 			registerBackends(sessionSrv, cfg)
 			sharedCore.srv.Store(sessionSrv)
 			runTCPSession(ctx, session, conn, sessionSrv, cfg, *recordPath)
-			fmt.Fprintln(os.Stderr, "omnilsp: client disconnected; waiting for reconnect")
 		}
+		tcpAcceptLoop(ctx, ln, runSession)
+		return
 	default:
 		tr = transport.NewStdioTransportFromOS()
 	}
@@ -336,6 +339,60 @@ func runTCPSession(ctx context.Context, session int, conn net.Conn, srv *server.
 	// Close is idempotent (closeOnce), and it unblocks readLoop, which then
 	// exits through its own done channel.
 	_ = tr.Close()
+}
+
+// tcpAcceptLoop accepts clients one at a time until the process stops,
+// handing each connection to runSession. A dropped client returns the
+// listener to Ready instead of killing the process — reconnect gets a fresh
+// session server with re-registered backends while the process, HTTP API and
+// debug ports stay warm.
+//
+// The loop must also observe ctx (bug round 20 A#2): cmdServe installs
+// signal.NotifyContext, so SIGINT/SIGTERM arrive as cancellation rather than
+// default termination, and a bare Accept would block forever — the process
+// would neither exit nor run teardown until killed. Accept cannot be selected
+// on directly, so a bridge goroutine feeds accept results through a channel
+// and exits on cancellation, and the ctx.Done branch closes the listener so
+// both ends wind down.
+func tcpAcceptLoop(ctx context.Context, ln net.Listener, runSession func(session int, conn net.Conn)) {
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan acceptResult, 1)
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			select {
+			case results <- acceptResult{conn: conn, err: aerr}:
+			case <-ctx.Done():
+				if conn != nil {
+					conn.Close()
+				}
+				return
+			}
+		}
+	}()
+	for session := 0; ; session++ {
+		select {
+		case <-ctx.Done():
+			// Any running session already wound down inside runTCPSession
+			// through the same ctx; releasing the listener here unblocks the
+			// bridge and returns the port, letting the process exit.
+			ln.Close()
+			return
+		case res := <-results:
+			if res.err != nil {
+				if errors.Is(res.err, net.ErrClosed) {
+					return // listener shut down with the process
+				}
+				fmt.Fprintf(os.Stderr, "omnilsp: tcp accept: %v\n", res.err)
+				continue
+			}
+			runSession(session, res.conn)
+			fmt.Fprintln(os.Stderr, "omnilsp: client disconnected; waiting for reconnect")
+		}
+	}
 }
 
 // registerBackends discovers available language toolchains and registers the
