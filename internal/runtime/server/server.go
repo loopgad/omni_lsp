@@ -1492,8 +1492,17 @@ func (s *Server) cancelRequest(id jsonrpc.RequestID) {
 	}
 }
 
-// requestIDKey builds a map key from a JSON-RPC request ID.
+// requestIDKey builds a map key from a JSON-RPC request ID. The namespaces
+// must be injective: id null (non-conformant JSON-RPC, but it decodes into a
+// non-nil Message.ID and reaches the scheduler) used to fold into "n:0"
+// together with the numeric id 0 because IsNull leaves Num at its zero value,
+// letting two concurrent in-flight requests overwrite each other's inflight
+// entry, misrouting $/cancelRequest and undercounting drainInflight
+// (bug round 20 A#7, 圈 3).
 func requestIDKey(id jsonrpc.RequestID) string {
+	if id.IsNull {
+		return "z:null"
+	}
 	if id.IsStr {
 		return "s:" + id.Str
 	}
