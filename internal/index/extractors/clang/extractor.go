@@ -1663,12 +1663,21 @@ func convertPosition(workspace *workspace, file model.File, line, column, endLin
 	if endLine == 0 {
 		endLine = line
 	}
-	return model.Position{
+	position := model.Position{
 		StartLine: line - 1,
 		StartChar: sourcePosition(data, line, column),
 		EndLine:   maxU32(line-1, endLine-1),
 		EndChar:   sourcePosition(data, endLine, endColumn),
 	}
+	// Helper events may omit the end column entirely (type-relation and
+	// implementation edges, declarations whose extent end is a null location):
+	// sourcePosition then decodes EndChar=0 on the start line, which the
+	// validated semantic sink rejects. A missing end clamps to a zero-width
+	// range at the start rather than an invalid record.
+	if position.EndLine == position.StartLine && position.EndChar < position.StartChar {
+		position.EndChar = position.StartChar
+	}
+	return position
 }
 
 func approximatePosition(line, column, endLine, endColumn uint32) model.Position {
@@ -1678,12 +1687,16 @@ func approximatePosition(line, column, endLine, endColumn uint32) model.Position
 	if endLine == 0 {
 		endLine = line
 	}
-	return model.Position{
+	position := model.Position{
 		StartLine: line - 1,
 		StartChar: maxU32(column, 1) - 1,
 		EndLine:   maxU32(line-1, endLine-1),
 		EndChar:   maxU32(endColumn, 1) - 1,
 	}
+	if position.EndLine == position.StartLine && position.EndChar < position.StartChar {
+		position.EndChar = position.StartChar
+	}
+	return position
 }
 
 func maxU32(a, b uint32) uint32 {
