@@ -434,8 +434,11 @@ func (s *FileStore) readQuarantined() []SegmentID {
 // re-partitions batch envelopes instead of merging payloads into one
 // physical segment, which the live semantic format cannot read back.
 
-func (s *FileStore) pruneHistoryGeneration(genID uint64) error {
-	writerLock, err := acquireWriterLock(context.Background(), s.root)
+func (s *FileStore) pruneHistoryGeneration(ctx context.Context, genID uint64) error {
+	// The caller's context gates the cross-process writer lock: a cancelled
+	// Compact must not wait forever behind another process's reindex or long
+	// Commit (same bound NewFileStoreContext gives construction).
+	writerLock, err := acquireWriterLock(ctx, s.root)
 	if err != nil {
 		return err
 	}

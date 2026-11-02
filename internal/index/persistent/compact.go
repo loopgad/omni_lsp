@@ -362,5 +362,5 @@ func (s *FileStore) Compact(ctx context.Context) error {
 	_ = lease.Close()
 	// The previous generation is retained in history for fallback. Retire it
 	// from that chain durably before deleting its segments; older fallbacks stay.
-	return s.pruneHistoryGeneration(view.ID)
+	return s.pruneHistoryGeneration(ctx, view.ID)
 }
