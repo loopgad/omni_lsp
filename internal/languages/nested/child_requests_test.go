@@ -184,3 +184,71 @@ func TestReadLoopStillDropsChildNotificationsSilently(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 }
+
+// TestReadLoopReplyNeverStallsStdoutDrain 钉住 round20 第 2 圈修复：stdin 被
+// 子进程灌满不排空时，MethodNotFound 回写绝不能把 readLoop 拖离 stdout——
+// 修复前回写走 writeFrameBounded（全额 RequestTimeout 的阻塞写+超时 retire），
+// readLoop 停读 stdout 长达 RequestTimeout，随后从读循环内部 retire 强撕管道
+// （实测 256KB stdout 写在 ~RequestTimeout-50ms 后以 broken pipe 失败）。
+// 修复后回写是旁路尽力而为：stdout 持续被排空（256KB 帧照常消化），管道
+// 不被回写路径撕毁，epoch 不被 retire。
+func TestReadLoopReplyNeverStallsStdoutDrain(t *testing.T) {
+	conn := New(Config{Name: "fake-lsp", Lang: "test", WorkDir: t.TempDir(), RequestTimeout: 300 * time.Millisecond})
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	conn.Attach(nil, stdinW, stdoutR)
+	t.Cleanup(func() {
+		_ = conn.Close()
+		_ = stdoutW.Close()
+		_ = stdinR.Close()
+	})
+
+	// 灌满 stdin：后台写 8MB，缓冲填满后永久阻塞（子进程停止排空 stdin）。
+	stuckDone := make(chan error, 1)
+	go func() {
+		_, err := stdinW.Write(make([]byte, 8<<20))
+		stuckDone <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // 让管道缓冲填满、写入阻塞
+	select {
+	case err := <-stuckDone:
+		t.Fatalf("setup: 8MB stdin write completed unexpectedly (%v) — pipe buffer larger than assumed, test shape broken", err)
+	default:
+	}
+
+	// 子进程 client-bound 请求 → 触发 MethodNotFound 回写路径。
+	childReq := `{"jsonrpc":"2.0","id":1,"method":"workspace/configuration","params":{"items":[]}}`
+	if _, err := io.WriteString(stdoutW, lspFrame(childReq)); err != nil {
+		t.Fatalf("write child request: %v", err)
+	}
+
+	// 回写卡死期间 readLoop 必须继续排空 stdout：256KB 的合法通知帧必须能
+	// 完整写入（readLoop 消费 body 后写才算完成）。
+	big := `{"jsonrpc":"2.0","method":"$/big","params":{"pad":"` + strings.Repeat("x", 256<<10) + `"}}`
+	started := time.Now()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(stdoutW, lspFrame(big))
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("256KB stdout write failed after %v: %v (the reply path tore the pipes / stopped the drain)", time.Since(started), err)
+		}
+		t.Logf("256KB stdout frame consumed in %v while the reply write is stuck", time.Since(started))
+	case <-time.After(3 * time.Second):
+		t.Fatalf("256KB stdout write did not complete within 3s: readLoop stalled on the MethodNotFound reply (RequestTimeout-bounded write runs on the read loop)")
+	}
+
+	// 回写路径不得 retire：epoch 不变、stdin 不被它关闭。
+	if got := conn.readerEpoch.Load(); got != 1 {
+		t.Fatalf("readerEpoch = %d, want 1: a failing courtesy reply must not retire the child from inside the read loop", got)
+	}
+}

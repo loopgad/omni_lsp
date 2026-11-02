@@ -73,6 +73,17 @@ const shutdownGracePeriod = 5 * time.Second
 const forcedExitWait = 1 * time.Second
 const closeLeaseWait = 1 * time.Second
 
+// replyTurnWait bounds how long a courtesy MethodNotFound reply waits for the
+// shared write turn (round20 第 2 圈). The reply itself has no deadline — it
+// completes, errors, or parks until the captured pipe is closed by the
+// connection's normal lifecycle.
+const replyTurnWait = time.Second
+
+// maxPendingChildReplies bounds the in-flight courtesy replies. Overflowing
+// requests are dropped unanswered: a missing MethodNotFound is exactly the
+// pre-573d369 behavior and harmless to a real server.
+const maxPendingChildReplies = 8
+
 // Config wires a concrete language server into the shared bridge. Start is
 // injectable so supervision can be tested without a real toolchain.
 type Config struct {
@@ -187,6 +198,12 @@ type Conn struct {
 	nextID atomic.Int64
 	closed atomic.Bool
 
+	// clientReplySlots bounds the in-flight MethodNotFound replies the
+	// readLoop fires at the child (round20 第 2 圈): a child that stopped
+	// draining stdin must never park more than maxPendingChildReplies reply
+	// goroutines, and the readLoop itself must never wait on a reply.
+	clientReplySlots chan struct{}
+
 	// lastActivity (unix nanos) feeds the hung-worker watchdog (G5): a
 	// process with in-flight requests but no traffic for HungGrace is
 	// presumed wedged and restarted instead of waiting out full timeouts.
@@ -229,13 +246,14 @@ func New(cfg Config) *Conn {
 		cfg.RequestTimeout = defaultRequestTimeout
 	}
 	return &Conn{
-		cfg:            cfg,
-		pending:        make(map[int64]chan *jsonrpc.Message),
-		documents:      make(map[string]*documentState),
-		workspaceLease: newWorkspaceLeaseGate(),
-		requestTiming:  newRequestTimingRecorder(cfg.Lang),
-		processWaits:   make(map[*exec.Cmd]*processWaitState),
-		closeDone:      make(chan struct{}),
+		cfg:              cfg,
+		pending:          make(map[int64]chan *jsonrpc.Message),
+		documents:        make(map[string]*documentState),
+		workspaceLease:   newWorkspaceLeaseGate(),
+		requestTiming:    newRequestTimingRecorder(cfg.Lang),
+		processWaits:     make(map[*exec.Cmd]*processWaitState),
+		closeDone:        make(chan struct{}),
+		clientReplySlots: make(chan struct{}, maxPendingChildReplies),
 	}
 }
 
@@ -676,14 +694,7 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 		// minimal honest one is MethodNotFound under the same id, which real
 		// servers treat as the capability being unsupported.
 		if !msg.IsResponse() {
-			c.mu.Lock()
-			current := c.readerEpoch.Load() == epoch && !c.closed.Load()
-			c.mu.Unlock()
-			if !current {
-				return // epoch replaced: never write toward a replacement child
-			}
-			_ = c.writeMessage(jsonrpc.NewErrorResponse(*msg.ID, jsonrpc.MethodNotFound,
-				fmt.Sprintf("%s does not support client-bound method %q", c.cfg.Name, msg.Method), nil))
+			c.answerChildRequest(*msg.ID, msg.Method, epoch)
 			continue
 		}
 		if msg.ID.IsStr {
@@ -714,6 +725,65 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 
 func (c *Conn) writeMessage(msg *jsonrpc.Message) error {
 	return c.writeMessageDuringClose(msg, false)
+}
+
+// answerChildRequest replies MethodNotFound to a child→client request without
+// ever stalling the readLoop (round20 第 2 圈: 573d369's synchronous
+// writeFrameBounded reply parked the read loop for up to a full RequestTimeout
+// when the child stopped draining stdin, freezing its stdout output, and its
+// timeout path retired the child from inside the read loop — including the
+// self-referencing outputDone wait). The reply is fire-and-forget on a bounded
+// goroutine: a courtesy reply is best-effort by definition, so an overflowing
+// or failing reply is dropped, never allowed to tear the connection.
+func (c *Conn) answerChildRequest(id jsonrpc.RequestID, method string, loopEpoch uint64) {
+	data, err := json.Marshal(jsonrpc.NewErrorResponse(id, jsonrpc.MethodNotFound,
+		fmt.Sprintf("%s does not support client-bound method %q", c.cfg.Name, method), nil))
+	if err != nil {
+		return
+	}
+	select {
+	case c.clientReplySlots <- struct{}{}:
+	default:
+		return // reply overflow: drop unanswered (the pre-573d369 behavior)
+	}
+	go func() {
+		defer func() { <-c.clientReplySlots }()
+		c.writeReplyBounded(data, loopEpoch)
+	}()
+}
+
+// writeReplyBounded performs one courtesy reply write under the shared write
+// turn, waiting at most replyTurnWait for the turn itself. The write body has
+// no deadline of its own: it completes, errors, or parks until the captured
+// pipe is closed by the connection's normal lifecycle (a writer-timeout
+// retire, a restart, or Close) — never by this path, which must not retire
+// anything on behalf of a best-effort reply. The epoch check and the stdin
+// capture share one critical section, so a replacement child's stream can
+// never be captured (the pre-fix two-step fence's TOCTOU is closed here; the
+// writer cannot interleave frames because the turn is held for the whole
+// write).
+func (c *Conn) writeReplyBounded(data []byte, loopEpoch uint64) {
+	wait := c.cfg.RequestTimeout
+	if wait <= 0 || wait > replyTurnWait {
+		wait = replyTurnWait
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	if err := c.writeMu.LockContext(ctx); err != nil {
+		return // turn busy: drop the courtesy reply
+	}
+	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	if c.closed.Load() || c.readerEpoch.Load() != loopEpoch {
+		c.mu.Unlock()
+		return // epoch replaced or closing: never write toward a replacement child
+	}
+	stdin := c.stdin
+	c.mu.Unlock()
+	if stdin == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
 }
 
 func (c *Conn) writeMessageDuringClose(msg *jsonrpc.Message, duringClose bool) error {
