@@ -448,15 +448,25 @@ func (r *DirectPyrightRunner) runScript(ctx context.Context, nodePath string, pa
 			return PyrightSemanticResult{}, fmt.Errorf("Pyright exporter emitted unknown message %q", message.Type)
 		}
 	}
-	// round20 第 3 圈: drain stderr BEFORE Wait. os/exec's StdoutPipe/
-	// StderrPipe contract: it is incorrect to call Wait before all reads
-	// from the pipe have completed — Wait closes the read end after the
-	// process exits, discarding whatever the capture goroutine had not yet
-	// drained (including bytes a late handle-inheriting descendant writes
-	// after exit). The stdout decode loop above has already left on EOF, so
-	// waiting here has no deadlock face: stderr's EOF comes from the child
-	// (and any handle-inheriting descendant) closing its write end.
-	stderrOutput := <-stderrDone
+	// round20 第 3 圈 + 第 4 圈: drain stderr BEFORE Wait, bounded by the
+	// caller's ctx. stderr EOF requires every write end closed — a
+	// handle-inheriting descendant can defer that indefinitely, and
+	// CommandContext only governs the direct child (which has already exited
+	// by the time the decode loop saw EOF), so a bare <-stderrDone can
+	// outlive the deadline: the 2s-ctx probe returned at 11.26s against an
+	// ~11s grandchild. On ctx.Done, close the parent-side read end to unstick
+	// the capture goroutine — its ReadBudgetedAll releases the staged bytes
+	// on the read error, and the undrained tail is abandoned with the
+	// canceled call (the pre-942b3cf behavior likewise returned without the
+	// tail). exec's own Wait-side close of the same fd tolerates the earlier
+	// close.
+	var stderrOutput []byte
+	select {
+	case stderrOutput = <-stderrDone:
+	case <-ctx.Done():
+		_ = stderr.Close()
+		stderrOutput = <-stderrDone
+	}
 	waitErr := cmd.Wait()
 	if err := ctx.Err(); err != nil {
 		return PyrightSemanticResult{}, err
