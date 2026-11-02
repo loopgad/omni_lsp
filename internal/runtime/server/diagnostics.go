@@ -480,7 +480,15 @@ func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []langu
 	// 替换）。快照在 d.mu 临界区内拍平（发布读侧绝不见 live inner map）；
 	// marshal 慢段内插件再 emit 的增量由插件车道的下一次去抖推送收敛。
 	pluginSnap := d.pluginSetsSnapshotLocked(uri)
+	closed := d.closed
 	d.mu.Unlock()
+	// 关闭态发布收窄（bug round 20 A#3）：publishComputed 的调用点（去抖
+	// timer 回调、computeAndPush）在 ctx 检查之后不再复查 d.closed，而
+	// notifyClient 最终落到可能已 Close 的 transport 上。发布前先退，收窄
+	// 会话收尾段与上线段的竞态窗口。
+	if closed {
+		return
+	}
 	if !ok || cached.key != key {
 		// The cache no longer holds this run's entry: a newer generation has
 		// overwritten it (or didClose/FIFO eviction removed it). version and
@@ -507,8 +515,9 @@ func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []langu
 	}
 	d.mu.Lock()
 	cached, ok = d.cache[uri]
+	closed = d.closed
 	d.mu.Unlock()
-	if !ok || cached.key != key {
+	if !ok || cached.key != key || closed {
 		return
 	}
 	// 上线前复查的廉价化（复证圈 2 审计发现 12）：此处只比较身份字段，不再
