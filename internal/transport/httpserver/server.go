@@ -15,6 +15,7 @@ package httpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -179,9 +180,22 @@ type positionRequest struct {
 	IncludeDeclaration bool   `json:"includeDeclaration"`
 }
 
+// maxProbeBodyBytes bounds the POST body the position endpoints decode: they
+// need a URI plus two small integers, so 1 MiB is orders of magnitude above
+// any legitimate request, and without the cap json.Decoder would materialize
+// one huge string value ({"uri":"<gigabytes>"}) whole (bug round 20 A#16,
+// 圈 5). Loopback-only binding (N8) bounds who can send it, not what it costs.
+const maxProbeBodyBytes = 1 << 20
+
 func decodePosition(w http.ResponseWriter, r *http.Request) (positionRequest, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxProbeBodyBytes)
 	var req positionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, fmt.Sprintf("request body too large (max %d bytes)", mbe.Limit), http.StatusRequestEntityTooLarge)
+			return req, false
+		}
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return req, false
 	}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -32,6 +33,12 @@ type RecorderTransport struct {
 	identities      map[string]SemanticIdentity
 	requestIdentity map[string]SemanticIdentity
 }
+
+// errRecorderClosed is the recording-leg failure reported when an operation
+// arrives after Close: the wrapped transport is untouched and the live
+// message still flows, but the recording can no longer capture it. Surfaced
+// through Err() so callers can detect the partial recording.
+var errRecorderClosed = errors.New("replay: recorder is closed")
 
 // NewRecorder opens path for writing, emits the meta header, and returns the
 // wrapping transport. Close the recorder (not just the inner transport) when
@@ -175,6 +182,22 @@ func (r *RecorderTransport) logOutbound(msg *jsonrpc.Message) error {
 }
 
 func (r *RecorderTransport) logLocked(dir string, payload json.RawMessage, binding *SemanticResponseBinding) error {
+	// Closed recorder (bug round 20 A#3): Close flushes and nils the writer,
+	// but late writes are reachable — drainResult releases srv.Run after the
+	// drain window while a backend request can still complete, and the diag
+	// debounce callback has no recover. The encoder used to dereference the
+	// nil bufio.Writer and panic the whole process. The contract cut is that
+	// a closed transport returns errors on all subsequent operations: keep
+	// the live message flowing (callers of log discard the recording error
+	// by design) and retain the gap in firstErr so Err() can report the
+	// partial recording. Sequence numbers stop at the close — no entry exists
+	// for a message that was never recorded.
+	if r.w == nil {
+		if r.firstErr == nil {
+			r.firstErr = errRecorderClosed
+		}
+		return errRecorderClosed
+	}
 	r.seq++
 	var rev uint64
 	if r.revFn != nil {

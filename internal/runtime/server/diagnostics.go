@@ -286,6 +286,17 @@ func (d *diagCoordinator) publishPluginDiagnostics(uri string, sets map[string]p
 	if file := d.server.vfs.Get(uri); file != nil {
 		displayURI = file.URI
 	}
+	// Bug round 20 A#12（圈 4）：上线前代次复查（publishComputed 的
+	// currentKeyIdentity 纪律）。条目已非当前代（后端重算在飞/失败，或键来自
+	// 旧代）时省略 version 字段——items 照发以保收敛语义（两车道下一次推送
+	// 兜底），但全量替换频道不得以新代 version 冒旧代 items 上线。be 缺席时
+	// 同样无法证同代，保守省略（与后端集缺席的既有 payload 形状一致）。
+	if hasBackend {
+		if be := d.server.findWorkspaceBackendFor(uri); be == nil ||
+			!sameKeyIdentity(d.currentKeyIdentity(uri, be), en.key) {
+			hasBackend = false
+		}
+	}
 	params := map[string]any{
 		"uri":         displayURI,
 		"diagnostics": projectDiagnostics(items),
@@ -480,7 +491,15 @@ func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []langu
 	// 替换）。快照在 d.mu 临界区内拍平（发布读侧绝不见 live inner map）；
 	// marshal 慢段内插件再 emit 的增量由插件车道的下一次去抖推送收敛。
 	pluginSnap := d.pluginSetsSnapshotLocked(uri)
+	closed := d.closed
 	d.mu.Unlock()
+	// 关闭态发布收窄（bug round 20 A#3）：publishComputed 的调用点（去抖
+	// timer 回调、computeAndPush）在 ctx 检查之后不再复查 d.closed，而
+	// notifyClient 最终落到可能已 Close 的 transport 上。发布前先退，收窄
+	// 会话收尾段与上线段的竞态窗口。
+	if closed {
+		return
+	}
 	if !ok || cached.key != key {
 		// The cache no longer holds this run's entry: a newer generation has
 		// overwritten it (or didClose/FIFO eviction removed it). version and
@@ -507,8 +526,9 @@ func (d *diagCoordinator) publishComputed(uri string, key diagKey, items []langu
 	}
 	d.mu.Lock()
 	cached, ok = d.cache[uri]
+	closed = d.closed
 	d.mu.Unlock()
-	if !ok || cached.key != key {
+	if !ok || cached.key != key || closed {
 		return
 	}
 	// 上线前复查的廉价化（复证圈 2 审计发现 12）：此处只比较身份字段，不再
@@ -694,8 +714,15 @@ func (d *diagCoordinator) compute(ctx context.Context, uri string) (pushKey diag
 				delete(d.cache, old)
 			}
 		}
+		// Bug round 20 A#12（圈 4）：version 必须与 src/snapRev 同源——取本 run
+		// 捕获的快照（599-614 处的 captured），而不是按 ctx 重取（push 车道
+		// ctx 是 context.Background，重取必为 nil → 落到 live VFS）。编辑落在
+		// 「后端返回之后、提交之前」的窗口时，旧实现把新代 version 绑进旧代
+		// key 的缓存条目，publishPluginDiagnostics 再把它当全量替换上线。
+		// captured 非空时 Document(uri) 已在 607-611 校验过非 nil，nil 分支仅
+		// 保守兜底。
 		version := int64(0)
-		if captured := snapshotFromCtx(ctx); captured != nil {
+		if captured != nil {
 			if doc := captured.Document(uri); doc != nil {
 				version = doc.Version
 			}

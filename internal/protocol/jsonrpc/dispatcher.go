@@ -79,8 +79,18 @@ func (d *Dispatcher) Dispatch(ctx context.Context, msg *Message) (resp *Message)
 	if msg.IsRequest() {
 		return d.dispatchRequest(ctx, msg)
 	}
-	// Response messages are not dispatched — they should be handled by the caller.
-	return nil
+	if msg.IsResponse() {
+		// Response messages are not dispatched — they should be handled by the caller.
+		return nil
+	}
+	// Bug round 20 A#15 (圈 5): a message that is neither request,
+	// notification nor response (a literal null body or empty object decoded
+	// into the zero Message) used to fall into the same silent nil as a
+	// response — the sender got no terminal outcome. It is valid JSON that
+	// is not a valid message: answer InvalidRequest with a null id (§4.2,
+	// the id is undetectable), exactly like an invalid batch element.
+	return NewErrorResponse(RequestID{IsNull: true}, InvalidRequest,
+		"invalid request: message is neither request, notification nor response", nil)
 }
 
 func (d *Dispatcher) dispatchRequest(ctx context.Context, msg *Message) *Message {

@@ -1,13 +1,51 @@
 package watch
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
+
+// windowsErrSharingViolation reports whether err is the Windows
+// ERROR_SHARING_VIOLATION (32) — the signature error when an AV/indexer
+// process holds a directory handle without delete sharing. On other
+// platforms holding an open handle never blocks removal, so the answer is
+// always false.
+func windowsErrSharingViolation(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	return errno == 32
+}
+
+// removeRetryBudget bounds the recovery step's tolerance for environmental
+// handle interference: an AV/indexer that grabbed the freshly created
+// directory can make RemoveAll fail for as long as it holds the handle.
+const removeRetryBudget = 5
+
+// removeAllToleratingHostHandles retries a RemoveAll a few times (transient
+// interference clears quickly) and reports the error for the caller to
+// classify.
+func removeAllToleratingHostHandles(path string) error {
+	var err error
+	for retry := 0; retry < removeRetryBudget; retry++ {
+		if err = os.RemoveAll(path); err == nil {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return err
+}
 
 func TestWatcherDetectsCreateModifyDelete(t *testing.T) {
 	root := t.TempDir()
@@ -173,7 +211,11 @@ func TestIncompleteScanKeepsPreviousBaseline(t *testing.T) {
 	if err := os.Rename(movedRoot, root); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+	// Same-tick guard (round 20 A#2 bug): the rewrite must differ in length
+	// from the baseline's "old" (3 bytes) — equal-length rewrites can share
+	// the baseline's mtime tick and the short-circuit then treats them as
+	// quiet by contract.
+	if err := os.WriteFile(path, []byte("new-state"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) || has(evs, "existing.txt", Created) {
@@ -211,11 +253,19 @@ func TestSizeLimitsReportIncompleteAndPreserveBaseline(t *testing.T) {
 	if err := os.Remove(oversized); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+	// "new!" and not "new": the 4-byte length must differ from the
+	// baseline's "old" (3 bytes) so a same-timestamp-tick rewrite cannot be
+	// treated as quiet by the (mtime,size)+identity short-circuit, and from
+	// the later "end" (3 bytes) for the same reason; 4 bytes also stays
+	// within maxFileBytes/maxTreeBytes, whose limits this test manipulates.
+	if err := os.WriteFile(path, []byte("new!"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) {
 		t.Fatalf("file-limit recovery lost the valid baseline: %+v", evs)
+	}
+	if err := p.LastScanError(); err != nil {
+		t.Fatalf("file-limit recovery scan was incomplete: %v", err)
 	}
 
 	p.maxTreeBytes = 4
@@ -238,6 +288,9 @@ func TestSizeLimitsReportIncompleteAndPreserveBaseline(t *testing.T) {
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) {
 		t.Fatalf("tree-limit recovery lost the valid baseline: %+v", evs)
 	}
+	if err := p.LastScanError(); err != nil {
+		t.Fatalf("tree-limit recovery scan was incomplete: %v", err)
+	}
 }
 
 func TestDepthLimitReportsIncompleteScan(t *testing.T) {
@@ -257,7 +310,13 @@ func TestDepthLimitReportsIncompleteScan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+	// Probe content must differ in LENGTH from the baseline's "old": two
+	// equal-length writes can land on the same kernel timestamp tick (26%
+	// back-to-back on the bug host), and the (mtime,size)+identity
+	// short-circuit then correctly treats the rewrite as quiet — a documented
+	// cut line (TestWatcherSkipsRereadForUnchangedStatSignature), not a
+	// watcher fault. Unequal length keeps the probe off that cut line.
+	if err := os.WriteFile(path, []byte("new-content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if evs := p.Scan(); len(evs) != 0 {
@@ -266,11 +325,52 @@ func TestDepthLimitReportsIncompleteScan(t *testing.T) {
 	if err := p.LastScanError(); err == nil {
 		t.Fatal("depth-limited scan did not report an error")
 	}
-	if err := os.RemoveAll(filepath.Join(root, "level")); err != nil {
-		t.Fatal(err)
+	// The recovery step's RemoveAll is exposed to environmental handle
+	// interference (bug round 20 A#13, 圈 5): an AV/indexer holding the fresh
+	// directory handle makes unlinkat fail with ERROR_SHARING_VIOLATION, the
+	// scan then stays depth-error and the baseline assertion fails with the
+	// exact intermittent shape. Retry briefly for transients; a persistent
+	// sharing violation is HOST interference, not a watcher fault — skip with
+	// the evidence instead of failing the battery.
+	if rerr := removeAllToleratingHostHandles(filepath.Join(root, "level")); rerr != nil {
+		if windowsErrSharingViolation(rerr) {
+			t.Skipf("host process holds a directory handle (AV/indexer interference), RemoveAll unreachable: %v", rerr)
+		}
+		t.Fatal(rerr)
 	}
 	if evs := p.Scan(); !has(evs, "existing.txt", Modified) {
 		t.Fatalf("depth-limited scan lost the valid baseline: %+v", evs)
+	}
+	// A transiently incomplete recovery scan also returns no events; pin its
+	// completeness so that failure shape can never masquerade as the swallow.
+	if err := p.LastScanError(); err != nil {
+		t.Fatalf("recovery scan was incomplete: %v", err)
+	}
+}
+
+// TestWindowsErrSharingViolationClassifier pins the classifier the recovery
+// step relies on against the REAL error a held directory handle produces
+// (os.Open does not take delete sharing, so RemoveAll must fail with
+// ERROR_SHARING_VIOLATION), plus its negative case.
+func TestWindowsErrSharingViolationClassifier(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("handle-based sharing violations are a Windows behavior")
+	}
+	dir := t.TempDir()
+	handle, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	removeErr := os.RemoveAll(dir)
+	if removeErr == nil {
+		t.Skip("RemoveAll tolerated the held handle on this host; nothing to classify")
+	}
+	if !windowsErrSharingViolation(removeErr) {
+		t.Fatalf("held-handle RemoveAll error not classified as sharing violation: %v (%T)", removeErr, removeErr)
+	}
+	if windowsErrSharingViolation(errors.New("some other failure")) {
+		t.Fatal("classifier marked a plain error as sharing violation")
 	}
 }
 

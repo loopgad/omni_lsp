@@ -50,6 +50,14 @@ type StdioTransport struct {
 	stdout io.Writer
 	codec  *jsonrpc.Codec
 
+	// stdinCloser is the underlying stdin when it can be closed. Closing it
+	// in Close is what unblocks a readLoop parked in ReadFrame — without it,
+	// Close only flipped the flag while the parked Read waited on done,
+	// which closes only when readLoop exits (bug round 20 A#8, 圈 3). nil
+	// when the reader cannot close (pre-scripted test streams); those end
+	// through EOF as before.
+	stdinCloser io.Closer
+
 	msgCh     chan *jsonrpc.Message
 	errCh     chan error
 	closed    atomic.Bool
@@ -69,6 +77,9 @@ func NewStdioTransport(stdin io.Reader, stdout io.Writer) *StdioTransport {
 		msgCh:  make(chan *jsonrpc.Message, 32),
 		errCh:  make(chan error, 1),
 		done:   make(chan struct{}),
+	}
+	if closer, ok := stdin.(io.Closer); ok {
+		t.stdinCloser = closer
 	}
 	go t.readLoop()
 	return t
@@ -186,6 +197,15 @@ func (t *StdioTransport) Write(ctx context.Context, msg *jsonrpc.Message) error 
 func (t *StdioTransport) Close() error {
 	t.closeOnce.Do(func() {
 		t.closed.Store(true)
+		// Bug round 20 A#8（圈 3）：仅置 closed 解除不了已阻塞的 Read——
+		// readLoop 卡在 codec.ReadFrame(stdin)，done 只在 readLoop 退出时
+		// 关闭，handleExit「close transport → Run 返回」（C2）的握手在
+		// stdio 上失效。关闭底层 stdin 读端（可关闭时）：ReadFrame 以错误
+		// 返回 → errCh + close(done) → parked Read 解阻塞，与
+		// TCPTransport.Close 关 conn 的语义对齐。
+		if t.stdinCloser != nil {
+			_ = t.stdinCloser.Close()
+		}
 		// readLoop will close(t.done) when it exits, which unblocks Read().
 	})
 	return nil

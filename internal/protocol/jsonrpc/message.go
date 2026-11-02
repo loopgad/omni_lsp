@@ -52,7 +52,14 @@ func (id RequestID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(id.Num)
 }
 
-// UnmarshalJSON implements json.Unmarshaler.
+// UnmarshalJSON implements json.Unmarshaler. Type fidelity matters: JSON-RPC
+// 2.0 requires the response id to be the same value AND type as the request
+// id, so a quoted id ("7") must decode as a string id even when its content
+// is numeric — encoding/json accepts quoted numbers for a json.Number
+// target, and the number-first probe used to erase IsStr, making the
+// response echo a numeric id onto the wire (bug round 20 A#14, 圈 5: strict
+// id-matching clients — vscode-jsonrpc, LSP4J, Emacs lsp-mode — can never
+// pair the type-changed id, so the request never terminates).
 func (id *RequestID) UnmarshalJSON(data []byte) error {
 	id.IsNull = false
 	id.IsStr = false
@@ -60,7 +67,19 @@ func (id *RequestID) UnmarshalJSON(data []byte) error {
 		id.IsNull = true
 		return nil
 	}
-	// Try number first.
+	// A quoted id is a string id by TYPE, whatever its content — probe the
+	// leading quote before the number branch, whose json.Number target would
+	// otherwise swallow quoted numeric strings.
+	if len(data) > 0 && data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return fmt.Errorf("jsonrpc: invalid request id: %s", string(data))
+		}
+		id.Str = s
+		id.IsStr = true
+		return nil
+	}
+	// Try number.
 	var n json.Number
 	if err := json.Unmarshal(data, &n); err == nil {
 		i, err := n.Int64()

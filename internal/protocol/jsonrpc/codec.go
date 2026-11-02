@@ -92,7 +92,9 @@ func (c *Codec) ReadMessage(r io.Reader) (*Message, error) {
 			Message: fmt.Sprintf("parse error: %v", err),
 		}
 	}
-
+	// Frame-layer note (bug round 20 A#15, 圈 5): payload-agnostic by the
+	// ruling's two-layer split — tri-state-none bodies get their terminal
+	// InvalidRequest outcome from Dispatcher.Dispatch, not here.
 	return &msg, nil
 }
 

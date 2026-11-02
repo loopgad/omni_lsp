@@ -70,7 +70,39 @@ type Poller struct {
 type finger struct {
 	mtime  int64
 	size   int64
+	ident  fileID
 	digest [32]byte
+}
+
+// fileID is the kernel identity of one file: volume serial + file index on
+// Windows, device + inode on Unix. It is what an atomic replace provably
+// changes even when timestamp coalescing leaves the (mtime,size) signature
+// untouched. valid=false means "identity unavailable" (platform support or a
+// failed probe) and disables discrimination for that fingerprint rather than
+// guessing.
+type fileID struct {
+	valid bool
+	vol   uint64
+	index uint64
+}
+
+// identityStable reports whether the file behind an unchanged (mtime,size)
+// stat signature is still the same file the baseline fingerprinted. Only a
+// provably different identity (an atomic replace whose replacement timestamps
+// were coalesced onto the baseline's tick) may un-short-circuit the scan;
+// anything undecidable — identity unavailable on this platform, a failed
+// probe, a non-regular file that must not be opened (a FIFO could block) —
+// degrades to the legacy stat-signature-only behavior rather than turning a
+// quiet file into churn.
+func identityStable(path string, info os.FileInfo, old fileID) bool {
+	if !old.valid || !info.Mode().IsRegular() {
+		return true
+	}
+	id, ok := statIdentity(path, info)
+	if !ok {
+		return true
+	}
+	return id == old
 }
 
 func New(root string, interval time.Duration, onChange func([]Event)) *Poller {
@@ -239,19 +271,31 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 		// (mtime,size) short-circuit (audit circle 2, finding 5): reuse the
 		// previous digest whenever the stat signature is unchanged, so a
 		// quiet tree costs a stat pass instead of a full read+hash every
-		// interval. Contract cut line: the stat signature IS the change
-		// signal — a content edit that preserves BOTH mtime and size is
-		// invisible to the poller, the same tradeoff every stat-based
-		// poller makes (editors and atomic replaces move mtime). prev is
-		// only ever replaced (never mutated) under scanMu, which this walk
-		// already holds.
+		// interval. Contract cut line, amended by bug round 20 A#1: the
+		// stat signature IS the change signal for an edit that keeps the
+		// SAME file (a content edit preserving BOTH mtime and size stays
+		// invisible — TestWatcherSkipsRereadForUnchangedStatSignature pins
+		// that) — but it is NOT sufficient across a replace: Windows
+		// timestamp coalescing empirically merges writes milliseconds apart
+		// onto the same tick, so an atomic replace can land with mtime and
+		// size equal to the baseline and the old "editors and atomic
+		// replaces move mtime" cut line was falsified on that host (19% of
+		// replaces; the change was then permanently swallowed because the
+		// reused fingerprint kept the stale signature). The short-circuit
+		// therefore also requires the kernel file identity (volume+index on
+		// Windows, inode on Unix) to match; a provably different identity
+		// falls through to the re-hash below. prev is only ever replaced
+		// (never mutated) under scanMu, which this walk already holds.
 		if prev != nil {
 			if old, ok := prev[key]; ok && old.mtime == info.ModTime().UnixNano() && old.size == info.Size() {
-				out[key] = old
-				return nil
+				if identityStable(path, info, old.ident) {
+					out[key] = old
+					return nil
+				}
 			}
 		}
 		var digest [32]byte
+		var ident fileID
 		if info.Mode().IsRegular() {
 			file, openErr := openReadShared(path)
 			if openErr != nil {
@@ -271,8 +315,13 @@ func (p *Poller) fingerprint() (map[string]finger, error) {
 				return nil
 			}
 			copy(digest[:], hasher.Sum(nil))
+			// Identity rides along with the digest so later rounds can
+			// un-short-circuit a coalesced-timestamp replace. A failed probe
+			// leaves ident invalid, degrading this file to legacy
+			// stat-signature behavior instead of failing the scan.
+			ident, _ = statIdentity(path, info)
 		}
-		out[key] = finger{mtime: info.ModTime().UnixNano(), size: info.Size(), digest: digest}
+		out[key] = finger{mtime: info.ModTime().UnixNano(), size: info.Size(), ident: ident, digest: digest}
 		return nil
 	})
 	if walkErr != nil {

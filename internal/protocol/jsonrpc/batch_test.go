@@ -90,11 +90,18 @@ func TestReadFrameClassifiesBatchElements(t *testing.T) {
 		}
 	}
 
-	// `null` decodes into a Message the same way a standalone `null` body
-	// always has — it is delivered, not answered. Consistency with the
-	// single-message path, not a special case.
-	if fr.Elements[5].Msg == nil || fr.Elements[5].Reply != nil {
-		t.Errorf("element 5 (null) = msg %v reply %v, want delivered like any standalone null body", fr.Elements[5].Msg, fr.Elements[5].Reply)
+	// `null` decodes into the zero Message — valid JSON that is not a valid
+	// message. Bug round 20 A#15 (圈 5) replaced the old "delivered like any
+	// standalone null body" ruling with the element-isolation contract the
+	// BatchElement.Reply declaration always stated: an invalid element gets
+	// exactly one InvalidRequest reply (id null — nothing detectable), the
+	// same outcome Dispatcher.Dispatch now gives a standalone tri-state-none
+	// message.
+	if fr.Elements[5].Msg != nil || fr.Elements[5].Reply == nil {
+		t.Errorf("element 5 (null) = msg %v reply %v, want one InvalidRequest reply and no delivery", fr.Elements[5].Msg, fr.Elements[5].Reply)
+	}
+	if fr.Elements[5].Reply.Error == nil || fr.Elements[5].Reply.Error.Code != InvalidRequest {
+		t.Errorf("element 5 (null) reply = %+v, want InvalidRequest", fr.Elements[5].Reply)
 	}
 }
 

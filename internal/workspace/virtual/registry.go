@@ -154,6 +154,17 @@ func (r *Registry) UnregisterHost(hostURI string) {
 	}
 }
 
+// UnregisterAll drops every host↔virtual mapping — the CloseSession
+// backstop: with no in-process producer today (the registry is an embedder
+// API), a full sweep at session teardown guarantees no stale mapping
+// survives into the next session even if a close/rename notification was
+// missed (bug round 20 A#11, 圈 4).
+func (r *Registry) UnregisterAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.virtual = make(map[string]*virtualDoc)
+}
+
 // doc acquires the immutable record pointer; segs are read-only afterwards.
 func (r *Registry) doc(virtualURI string) (*virtualDoc, bool) {
 	r.mu.RLock()

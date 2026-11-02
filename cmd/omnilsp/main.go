@@ -117,12 +117,14 @@ func usage() {
 // the semantic-response observer, so recording covers whichever transport the
 // session runs on (§P9: "wraps whichever transport was selected"). Returns nil
 // when recording is disabled (empty path). The caller owns closing the
-// recorder when its session ends.
-func startSessionRecorder(srv *server.Server, cfg config.Config, inner transport.Transport, recordPath string) *replay.RecorderTransport {
+// recorder when its session ends. ctx bounds the startup toolchain probes
+// inside sessionMeta — signal cancellation must stay able to interrupt the
+// pre-Run window it already owns (bug round 20 A#10, 圈 4).
+func startSessionRecorder(ctx context.Context, srv *server.Server, cfg config.Config, inner transport.Transport, recordPath string) *replay.RecorderTransport {
 	if recordPath == "" {
 		return nil
 	}
-	rec, err := replay.NewRecorder(inner, recordPath, sessionMeta(cfg, srv), srv.SnapshotRevision)
+	rec, err := replay.NewRecorder(inner, recordPath, sessionMeta(ctx, cfg, srv), srv.SnapshotRevision)
 	if err != nil {
 		fatal("record: %v", err)
 	}
@@ -186,6 +188,12 @@ func cmdServe(args []string) {
 
 	registerBackends(srv, cfg)
 
+	// Signal ownership starts before any listener is created (bug round 20
+	// A#2): every listener created below must be reachable from this ctx so
+	// SIGINT/SIGTERM can release it instead of leaving the process wedged.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// §X6: optional read-only HTTP API alongside the main transport. Loopback
 	// enforced by ValidateAddr (N8 v1); mutating endpoints do not exist.
 	if *httpAddr != "" {
@@ -209,6 +217,13 @@ func cmdServe(args []string) {
 			info("read-only http api on http://%s", ln.Addr())
 			_ = http.Serve(ln, hs)
 		}()
+		// Release the read-API port on shutdown (bug round 20 A#2, minor
+		// leg): the serve goroutine does not block process exit, but the
+		// listener used to stay bound forever after ctx cancellation.
+		go func() {
+			<-ctx.Done()
+			_ = ln.Close()
+		}()
 	}
 
 	// §P6: optional debug/pprof endpoint. Loopback-only by ValidateAddr
@@ -222,9 +237,6 @@ func cmdServe(args []string) {
 			_ = http.ListenAndServe(*debugAddr, nil) // DefaultServeMux carries pprof via the import below
 		}()
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	var tr transport.Transport
 	switch cfg.Transport {
@@ -265,21 +277,14 @@ func cmdServe(args []string) {
 		// re-registered backends while the process, HTTP API and debug ports
 		// stay warm. One session at a time (v1 semantics preserved); X10 may
 		// later multiplex concurrent sessions over this loop.
-		for session := 0; ; session++ {
-			conn, aerr := ln.Accept()
-			if aerr != nil {
-				if errors.Is(aerr, net.ErrClosed) {
-					return // listener shut down with the process
-				}
-				fmt.Fprintf(os.Stderr, "omnilsp: tcp accept: %v\n", aerr)
-				continue
-			}
+		runSession := func(session int, conn net.Conn) {
 			sessionSrv := server.New(serveConfig(cfg, *pluginsDir))
 			registerBackends(sessionSrv, cfg)
 			sharedCore.srv.Store(sessionSrv)
 			runTCPSession(ctx, session, conn, sessionSrv, cfg, *recordPath)
-			fmt.Fprintln(os.Stderr, "omnilsp: client disconnected; waiting for reconnect")
 		}
+		tcpAcceptLoop(ctx, ln, runSession)
+		return
 	default:
 		tr = transport.NewStdioTransportFromOS()
 	}
@@ -287,7 +292,7 @@ func cmdServe(args []string) {
 	// §P9 session recording wraps whichever transport was selected. This path
 	// serves the stdio transport; the tcp branch wraps its own per-session
 	// transport above, and the mcp branch warns that recording is unsupported.
-	if rec := startSessionRecorder(srv, cfg, tr, *recordPath); rec != nil {
+	if rec := startSessionRecorder(ctx, srv, cfg, tr, *recordPath); rec != nil {
 		defer rec.Close()
 		tr = rec
 	}
@@ -306,7 +311,24 @@ func cmdServe(args []string) {
 // 收尾错误并入返回值，与 Run 路径把 closeBackends 错误并入 runErr 的既有
 // 语义一致。
 func serveMCP(ctx context.Context, srv *server.Server, in io.Reader, out io.Writer) error {
-	err := mcpserver.Serve(ctx, in, out, mcpCore{srv: srv})
+	// Bug round 20 A#6（圈 3）：mcpserver.Serve 的 ctx 检查只在每行 Scan
+	// 返回之后执行——空闲 stdin 上 scanner 永久阻塞，signal.NotifyContext
+	// 的取消永远到不了 Serve，进程挂死且 serveMCP 的 CloseSession 收尾
+	// （closeBackends/diag.Close/scheduler.Shutdown/ClosePlugins）整体不可
+	// 达——与 3f32aa0 给 TCP accept loop / HTTP listener 修的是同族故障的第
+	// 三条腿。把 Serve 挪进 goroutine，select 监听 ctx.Done()：取消即返回
+	// 并照常走幂等的 srv.CloseSession()；仍阻塞在 stdin 上的 scanner
+	// goroutine 在 main 返回、进程退出时随之消亡（此路径返回即退出）。
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- mcpserver.Serve(ctx, in, out, mcpCore{srv: srv})
+	}()
+	var err error
+	select {
+	case err = <-serveDone:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
 	return errors.Join(err, srv.CloseSession())
 }
 
@@ -319,7 +341,7 @@ func runTCPSession(ctx context.Context, session int, conn net.Conn, srv *server.
 	tr := transport.NewTCPTransport(conn)
 	var sessionTr transport.Transport = tr
 	var rec *replay.RecorderTransport
-	if rec = startSessionRecorder(srv, cfg, tr, recordPath); rec != nil {
+	if rec = startSessionRecorder(ctx, srv, cfg, tr, recordPath); rec != nil {
 		sessionTr = rec
 	}
 	if rerr := srv.Run(ctx, sessionTr); rerr != nil && ctx.Err() == nil {
@@ -336,6 +358,60 @@ func runTCPSession(ctx context.Context, session int, conn net.Conn, srv *server.
 	// Close is idempotent (closeOnce), and it unblocks readLoop, which then
 	// exits through its own done channel.
 	_ = tr.Close()
+}
+
+// tcpAcceptLoop accepts clients one at a time until the process stops,
+// handing each connection to runSession. A dropped client returns the
+// listener to Ready instead of killing the process — reconnect gets a fresh
+// session server with re-registered backends while the process, HTTP API and
+// debug ports stay warm.
+//
+// The loop must also observe ctx (bug round 20 A#2): cmdServe installs
+// signal.NotifyContext, so SIGINT/SIGTERM arrive as cancellation rather than
+// default termination, and a bare Accept would block forever — the process
+// would neither exit nor run teardown until killed. Accept cannot be selected
+// on directly, so a bridge goroutine feeds accept results through a channel
+// and exits on cancellation, and the ctx.Done branch closes the listener so
+// both ends wind down.
+func tcpAcceptLoop(ctx context.Context, ln net.Listener, runSession func(session int, conn net.Conn)) {
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan acceptResult, 1)
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			select {
+			case results <- acceptResult{conn: conn, err: aerr}:
+			case <-ctx.Done():
+				if conn != nil {
+					conn.Close()
+				}
+				return
+			}
+		}
+	}()
+	for session := 0; ; session++ {
+		select {
+		case <-ctx.Done():
+			// Any running session already wound down inside runTCPSession
+			// through the same ctx; releasing the listener here unblocks the
+			// bridge and returns the port, letting the process exit.
+			ln.Close()
+			return
+		case res := <-results:
+			if res.err != nil {
+				if errors.Is(res.err, net.ErrClosed) {
+					return // listener shut down with the process
+				}
+				fmt.Fprintf(os.Stderr, "omnilsp: tcp accept: %v\n", res.err)
+				continue
+			}
+			runSession(session, res.conn)
+			fmt.Fprintln(os.Stderr, "omnilsp: client disconnected; waiting for reconnect")
+		}
+	}
 }
 
 // registerBackends discovers available language toolchains and registers the
@@ -532,6 +608,14 @@ const (
 	toolchainPinTimeout = 2 * time.Minute
 )
 
+// versionProbeTimeout bounds ONE toolchain version probe on the serve
+// --record startup path (sessionMeta) and in doctor. A var, not a const, so
+// the boundedness pin can shrink it; both paths previously called
+// exec.Command().Output() bare — a hung toolchain stalled serve startup
+// indefinitely with SIGINT already owned by signal.NotifyContext (bug round
+// 20 A#10, 圈 4).
+var versionProbeTimeout = toolchainProbeTimeout
+
 // runProbe executes name/args under a hard deadline: a hung toolchain is
 // killed and surfaces as a context error (the same warn-and-degrade path as a
 // missing toolchain), never as an unbounded wait.
@@ -539,6 +623,21 @@ func runProbe(ctx context.Context, timeout time.Duration, name string, args ...s
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out, err := exec.CommandContext(probeCtx, name, args...).Output()
+	if err != nil {
+		if perr := probeCtx.Err(); perr != nil {
+			return out, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), perr)
+		}
+		return out, err
+	}
+	return out, nil
+}
+
+// runProbeCombined is runProbe for probes whose version banner lands on
+// stderr (python/tsc on some distros): same hard deadline, stderr merged.
+func runProbeCombined(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, name, args...).CombinedOutput()
 	if err != nil {
 		if perr := probeCtx.Err(); perr != nil {
 			return out, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), perr)
@@ -678,14 +777,22 @@ func exitFatal(code int, f string, args ...any) {
 }
 
 // sessionMeta assembles the §P9 header record: config digest plus the
-// backend/toolchain inventory discovered at serve time.
-func sessionMeta(cfg config.Config, srv *server.Server) replay.Meta {
+// backend/toolchain inventory discovered at serve time. Version probes run
+// through runProbe with a hard deadline and the caller's ctx (the signal ctx
+// on the serve path): a hung toolchain degrades to a missing entry — the same
+// shape as a missing toolchain — instead of stalling startup indefinitely
+// with SIGINT already owned by signal.NotifyContext (bug round 20 A#10, 圈 4).
+func sessionMeta(ctx context.Context, cfg config.Config, srv *server.Server) replay.Meta {
 	tool := map[string]string{}
-	if out, err := exec.Command("go", "version").Output(); err == nil {
+	if out, err := runProbe(ctx, versionProbeTimeout, "go", "version"); err == nil {
 		tool["go"] = firstLine(string(out))
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		warn("recording: go version probe exceeded %s: %v", versionProbeTimeout, err)
 	}
-	if out, err := exec.Command("clangd", "--version").Output(); err == nil {
+	if out, err := runProbe(ctx, versionProbeTimeout, "clangd", "--version"); err == nil {
 		tool["clangd"] = firstLine(string(out))
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		warn("recording: clangd version probe exceeded %s: %v", versionProbeTimeout, err)
 	}
 	backends := map[string]string{}
 	for _, b := range cfg.Backends {

@@ -604,6 +604,11 @@ func (s *Server) handleDidClose(ctx context.Context, msg *jsonrpc.Message) (json
 	} else {
 		s.vfs.Close(uri)
 	}
+	// Bug round 20 A#11 (圈 4): the virtual registry's UnregisterHost was
+	// documented as the didClose cleanup hook but never wired — host mappings
+	// accumulated forever, and once a §D12 producer lands, ResolveHost would
+	// serve a dead host. Release them with the host document.
+	s.virtualReg.UnregisterHost(canonicalDocumentURI(uri))
 	s.publishSnapshot()
 	return nil, closeErr
 }
@@ -1877,7 +1882,16 @@ func (s *Server) handleDidRenameFiles(ctx context.Context, msg *jsonrpc.Message)
 			languages.SourceChange{URI: canonicalDocumentURI(file.OldURI), Kind: languages.SourceChangeDeleted},
 			languages.SourceChange{URI: canonicalDocumentURI(file.NewURI), Kind: languages.SourceChangeCreated})
 	}
-	return nil, s.applyExternalSourceChanges(ctx, changes)
+	err := s.applyExternalSourceChanges(ctx, changes)
+	if err == nil {
+		// Same cleanup contract as didClose, for the old side of a rename
+		// (bug round 20 A#11, 圈 4); only on success — a failed apply means
+		// the rename did not take effect and the old mappings still hold.
+		for _, file := range params.Files {
+			s.virtualReg.UnregisterHost(canonicalDocumentURI(file.OldURI))
+		}
+	}
+	return nil, err
 }
 
 func (s *Server) handleDidDeleteFiles(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
