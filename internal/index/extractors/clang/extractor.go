@@ -1397,13 +1397,31 @@ type analyzeState struct {
 	declaredFiles   map[string]bool
 }
 
+// sanitizeIssueText normalizes diagnostic text on its way into
+// model.Coverage.Reason. The validated sink requires every stored string to
+// be valid UTF-8 (semantic.allStringsValid → ErrMalformedPayload fails the
+// whole Finalize), while byte truncation splits multi-byte characters and raw
+// helper stderr can carry invalid sequences. Replace invalid sequences first,
+// then truncate on a rune boundary under the same byte budget.
+func sanitizeIssueText(reason string) string {
+	if !utf8.ValidString(reason) {
+		reason = strings.ToValidUTF8(reason, "\uFFFD")
+	}
+	if len(reason) > maxIssueBytes {
+		cut := maxIssueBytes - 3
+		for cut > 0 && !utf8.RuneStart(reason[cut]) {
+			cut--
+		}
+		reason = reason[:cut] + "..."
+	}
+	return reason
+}
+
 func (a *analyzeState) addContextIssue(reason string) {
 	if reason == "" {
 		return
 	}
-	if len(reason) > maxIssueBytes {
-		reason = reason[:maxIssueBytes-3] + "..."
-	}
+	reason = sanitizeIssueText(reason)
 	if len(a.issues) < maxContextIssues {
 		a.issues = append(a.issues, reason)
 	} else if len(a.issues) == maxContextIssues {
@@ -1969,6 +1987,7 @@ func (c *coverageBuilder) set(fact model.FactKind, state model.Completeness, rea
 	}
 	c.states[fact] = state
 	if reason != "" {
+		reason = sanitizeIssueText(reason)
 		reasons := c.reasons[fact]
 		for _, existing := range reasons {
 			if existing == reason {
