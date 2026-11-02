@@ -101,21 +101,46 @@ func (s *FileStore) recover() error {
 		// open — the retry budget below absorbs AV locks and sharing
 		// violations, and the on-disk history is left untouched so the
 		// next recover reconsiders it (nothing is quarantined here).
-		for len(s.history) > 0 {
-			cand := s.history[0]
+		var promoted *Generation
+		kept := make([]*Generation, 0, len(s.history))
+		for _, cand := range s.history {
+			if promoted != nil {
+				kept = append(kept, cand)
+				continue
+			}
 			view := GenerationView{Generation: *cand, dir: s.root}
 			ok := true
+			transient := false
 			for _, seg := range cand.Segments {
 				if _, err := view.readSegmentWithIORetry(seg.ID); err != nil {
 					ok = false
+					transient = isSegmentIOError(err)
 					break
 				}
 			}
-			s.history = s.history[1:]
 			if ok {
-				s.current = cand
-				break
+				promoted = cand
+				continue
 			}
+			if !transient {
+				// Integrity failure: the candidate is corrupt for good,
+				// hide it for this open (unchanged semantics).
+				continue
+			}
+			// Transient I/O failure: the retry budget is spent, but the
+			// failure is the filesystem's, not the content's. Keep the
+			// candidate in the in-memory history — the on-disk history was
+			// never rewritten, and cleanupOrphanSegments derives its
+			// "referenced" set from this very list, so dropping the
+			// candidate here would let the sweep delete its healthy
+			// segments as orphans within this same open, permanently
+			// destroying a generation the next recover would otherwise
+			// reconsider.
+			kept = append(kept, cand)
+		}
+		s.history = kept
+		if promoted != nil {
+			s.current = promoted
 		}
 	}
 	if s.current != nil && s.current.ID > s.nextGenID {
