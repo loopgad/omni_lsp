@@ -29,6 +29,11 @@ type fileBuild struct {
 	state    buildState
 	result   error
 
+	// owner holds the staging directory's owner.lock byte-range lock for the
+	// session's whole lifetime: orphan reclamation acquires it to tell a
+	// dead session (lock free) from a live one (lock busy).
+	owner *writerLock
+
 	// §L17 budget-walk cache (audit circle 2, finding 6): the live-store
 	// walk costs O(files under root) and used to run on EVERY WriteSegment,
 	// making an export O(segments × store files). The first budgeted
@@ -198,6 +203,19 @@ func (b *fileBuild) writeSegmentUnchecked(payload []byte) (SegmentID, error) {
 	return id, nil
 }
 
+// releaseOwner drops the staging owner marker's byte-range lock. Idempotent.
+// Callers release BEFORE removing the staging directory so the RemoveAll can
+// unlink the marker file (Windows refuses to delete the file behind an open
+// handle). Safe against concurrent reclamation: Commit holds the writer lock,
+// and a reclaimer that wins the race against Abort merely completes the same
+// removal.
+func (b *fileBuild) releaseOwner() {
+	if b.owner != nil {
+		b.owner.release()
+		b.owner = nil
+	}
+}
+
 func (b *fileBuild) GenerationID() uint64 { return b.genID }
 
 // Commit publishes the staged generation: move segments into the store root,
@@ -267,6 +285,7 @@ func (b *fileBuild) commitWithWriterLock(ctx context.Context) (retErr error) {
 		if published {
 			return
 		}
+		b.releaseOwner()
 		var cleanupErrs []error
 		if historyUpdated {
 			if err := writeHistoryAtomic(b.store.historyPath(), rollbackHistory); err != nil {
@@ -294,7 +313,10 @@ func (b *fileBuild) commitWithWriterLock(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	// Stage → root segment placement.
+	// Stage → root segment placement. Drop the owner marker lock first so
+	// the RemoveAll can unlink it (this path holds the writer lock, so no
+	// reclaimer can race the window between release and removal).
+	b.releaseOwner()
 	for _, seg := range b.segments {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -374,6 +396,7 @@ func (b *fileBuild) Abort() error {
 	}
 	b.state = buildAborted
 	b.result = ErrBuildAborted
+	b.releaseOwner()
 	if err := os.RemoveAll(b.stageDir); err != nil {
 		b.result = errors.Join(b.result, err)
 		return err
@@ -384,6 +407,7 @@ func (b *fileBuild) Abort() error {
 func (b *fileBuild) finishAbort(err error) error {
 	b.state = buildAborted
 	b.result = err
+	b.releaseOwner()
 	if cleanupErr := os.RemoveAll(b.stageDir); cleanupErr != nil {
 		b.result = errors.Join(b.result, fmt.Errorf("persistent: remove staging directory: %w", cleanupErr))
 	}

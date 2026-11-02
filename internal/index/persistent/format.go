@@ -46,6 +46,13 @@ const (
 	fileHistory   = "history.json"
 	fileGenSeq    = "generation.seq"
 	dirQuarantine = "quarantine"
+
+	// stagingOwnerLock is the byte-range-locked marker file inside a staging
+	// directory: held by the building process for the session's whole
+	// lifetime (created in BeginBuild's writer-lock critical section, freed
+	// by the OS on death), so orphan reclamation can tell crash residue from
+	// a live build between segments.
+	stagingOwnerLock = "owner.lock"
 )
 
 // SegmentID names an immutable segment file inside a generation directory.

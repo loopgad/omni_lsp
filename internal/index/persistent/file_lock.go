@@ -81,3 +81,20 @@ func tryAcquireWriterLock(root string) (*writerLock, error) {
 	}
 	return &writerLock{file: f, unlock: unlock}, nil
 }
+
+// tryAcquireFileLockExclusive takes a non-blocking exclusive advisory lock
+// on path, creating the file when missing. errWriterLockBusy reports a live
+// holder; any other error is a real filesystem failure. The caller releases
+// (unlock + close) the returned lock when done.
+func tryAcquireFileLockExclusive(path string) (*writerLock, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("persistent: open %s: %w", filepath.Base(path), err)
+	}
+	unlock, lockErr := tryGenerationLock(f, true)
+	if lockErr != nil {
+		_ = f.Close()
+		return nil, lockErr
+	}
+	return &writerLock{file: f, unlock: unlock}, nil
+}

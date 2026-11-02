@@ -267,7 +267,59 @@ func (s *FileStore) cleanupOrphanSegments() {
 	for _, gen := range retired {
 		_ = s.removeGenerationSegments(gen)
 	}
+	s.reclaimOrphanStaging()
 	s.recycleQuarantine()
+}
+
+// reclaimOrphanStaging removes staging-<id> directories whose build session
+// died between BeginBuild and Commit/Abort (process kill, power loss).
+// Caller holds the writer lock (cleanupOrphanSegments contract).
+//
+// Liveness: every staging directory carries an owner.lock byte-range lock
+// held by its building process for the session's whole lifetime (created
+// inside BeginBuild's writer-lock critical section, released by Commit and
+// Abort, freed by the OS on death) — and builders do not hold the writer
+// lock across WriteSegment, so directory age alone cannot distinguish crash
+// residue from a live build between segments. A marker whose lock can still
+// be acquired therefore has no live owner: its staged bytes would otherwise
+// be billed against every later §L17 budget walk forever (walkLiveBytes
+// skips only quarantine), so one crashed build permanently shrank
+// publishable capacity on a budgeted store. A busy marker is a live build —
+// leave it alone. A missing marker (pre-marker residue, or a death inside
+// the creation window) is reclaimed only below the reserved generation
+// sequence: under the writer lock a current-binary build cannot be
+// marker-less, but a concurrent build from an older binary could be.
+func (s *FileStore) reclaimOrphanStaging() {
+	s.mu.Lock()
+	reserved := s.nextGenID
+	s.mu.Unlock()
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "staging-") {
+			continue
+		}
+		text := strings.TrimPrefix(entry.Name(), "staging-")
+		id, perr := strconv.ParseUint(text, 10, 64)
+		if perr != nil || id == 0 || strconv.FormatUint(id, 10) != text {
+			continue // not a canonical staging name: leave unknown residue alone
+		}
+		ownerPath := filepath.Join(s.root, entry.Name(), stagingOwnerLock)
+		if _, statErr := os.Stat(ownerPath); statErr == nil {
+			owner, lockErr := tryAcquireFileLockExclusive(ownerPath)
+			if lockErr != nil {
+				continue // lock busy: a live build between segments — keep
+			}
+			owner.release() // drop our handle so RemoveAll can unlink the marker
+		} else {
+			if !os.IsNotExist(statErr) || id >= reserved {
+				continue // unreadable marker or the newest reservation window: keep
+			}
+		}
+		_ = os.RemoveAll(filepath.Join(s.root, entry.Name()))
+	}
 }
 
 // quarantineBudgetDivisor bounds quarantined forensic files at

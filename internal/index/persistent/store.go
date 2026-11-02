@@ -347,12 +347,26 @@ func (s *FileStore) beginBuildWithWriterLock(ctx context.Context, writerLock *wr
 	if err := os.Mkdir(stage, 0o700); err != nil {
 		return nil, fmt.Errorf("persistent: staging: %w", err)
 	}
+	// Owner marker: an exclusive byte-range lock held by this process for
+	// the session's whole lifetime. Orphan reclamation (holding the writer
+	// lock) can then tell crash residue — marker acquirable, the OS freed
+	// the lock on death — from a live build between segments — marker busy —
+	// instead of letting the residue's bytes starve the §L17 budget forever
+	// or deleting a concurrent build's staging directory. The marker is
+	// created inside this writer-lock critical section, so a concurrent
+	// cleanup can never observe a live build without its marker.
+	owner, err := tryAcquireFileLockExclusive(filepath.Join(stage, stagingOwnerLock))
+	if err != nil {
+		_ = os.RemoveAll(stage)
+		return nil, fmt.Errorf("persistent: reserve generation %d staging owner: %w", genID, err)
+	}
 	if err := writeGenerationSequence(s.root, genID); err != nil {
+		owner.release()
 		_ = os.RemoveAll(stage)
 		return nil, fmt.Errorf("persistent: reserve generation %d: %w", genID, err)
 	}
 	s.nextGenID = genID
-	return &fileBuild{store: s, ctx: ctx, genID: genID, stageDir: stage}, nil
+	return &fileBuild{store: s, ctx: ctx, genID: genID, stageDir: stage, owner: owner}, nil
 }
 
 func (s *FileStore) quarantineSegsLocked(segs []SegmentID) error {
