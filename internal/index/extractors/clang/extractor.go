@@ -287,6 +287,14 @@ func Extract(ctx context.Context, request model.Request, sink model.Sink) (repor
 		}
 	}()
 	filesByRoot := make(map[string][]model.File)
+	// File-level symbols are properties of the immutable workspace files, not
+	// of one compile context: the same header can be included from translation
+	// units in several scopes. Declare each file symbol exactly once for the
+	// whole export (first referencing scope wins); the §L5 ledger resolves
+	// references from the other scopes to that single declaration, while a
+	// second declaration in a different scope would be rejected as a duplicate
+	// symbol.
+	declaredFileSymbols := make(map[string]bool)
 
 	for _, scope := range request.Scopes {
 		coverage := newCoverage(scope.ID)
@@ -485,7 +493,7 @@ func Extract(ctx context.Context, request model.Request, sink model.Sink) (repor
 			verifiedHelper[key] = true
 		}
 		writer := newFactWriter(ctx, sink, scope)
-		analysis := analyzeState{coverage: coverage, files: files, workspace: workspace, seenSource: make(map[string]bool), packagePatterns: scope.Build.PackagePatterns}
+		analysis := analyzeState{coverage: coverage, files: files, workspace: workspace, seenSource: make(map[string]bool), packagePatterns: scope.Build.PackagePatterns, declaredFiles: declaredFileSymbols}
 		for _, command := range commands {
 			if err := ctx.Err(); err != nil {
 				return report, err
@@ -536,6 +544,12 @@ func Extract(ctx context.Context, request model.Request, sink model.Sink) (repor
 				if mapping.SourceURI == "" || !containsFileURI(files, mapping.SourceURI) {
 					coverage.partial(model.FactGenerated, "generated source range maps outside the captured workspace: "+generated.URI)
 					continue
+				}
+				if err := analysis.declareFileSymbol(writer, scope, generated.URI); err != nil {
+					return report, err
+				}
+				if err := analysis.declareFileSymbol(writer, scope, mapping.SourceURI); err != nil {
+					return report, err
 				}
 				if err := writer.edge(model.Edge{
 					From:         fileSymbolID(generated.URI),
@@ -1380,6 +1394,7 @@ type analyzeState struct {
 	packagePatterns []string
 	issues          []string
 	processed       int
+	declaredFiles   map[string]bool
 }
 
 func (a *analyzeState) addContextIssue(reason string) {
@@ -1394,6 +1409,25 @@ func (a *analyzeState) addContextIssue(reason string) {
 	} else if len(a.issues) == maxContextIssues {
 		a.issues = append(a.issues, "additional semantic context issues omitted")
 	}
+}
+
+// declareFileSymbol emits the symbol declaration for a file-level symbol
+// (fileSymbolID) before any edge references it. The §L5 ledger rejects a
+// referenced-but-undeclared symbol ID at Finalize whenever the referencing
+// scope's coverage for the fact kind is Complete, so include/call/generated
+// edges anchored on file symbols must carry their declaration.
+func (a *analyzeState) declareFileSymbol(writer *factWriter, scope model.Scope, uri string) error {
+	id := fileSymbolID(uri)
+	if a.declaredFiles[string(id)] {
+		return nil
+	}
+	a.declaredFiles[string(id)] = true
+	return writer.symbol(model.Symbol{
+		ID:      id,
+		ScopeID: scope.ID,
+		Name:    uri,
+		Kind:    "file",
+	})
 }
 
 func (a *analyzeState) addEvent(event rawEvent, scope model.Scope, writer *factWriter) error {
@@ -1471,6 +1505,12 @@ func (a *analyzeState) addEvent(event rawEvent, scope model.Scope, writer *factW
 			return nil
 		}
 		a.seenSource[normalizeRel(event.TargetPath)] = true
+		if err := a.declareFileSymbol(writer, scope, sourceFile.URI); err != nil {
+			return err
+		}
+		if err := a.declareFileSymbol(writer, scope, targetFile.URI); err != nil {
+			return err
+		}
 		return writer.edge(model.Edge{
 			From:         fileSymbolID(sourceFile.URI),
 			To:           fileSymbolID(targetFile.URI),
@@ -1542,6 +1582,9 @@ func (a *analyzeState) addEvent(event rawEvent, scope model.Scope, writer *factW
 		position := convertPosition(a.workspace, file, event.Line, event.Column, event.EndLine, event.EndColumn)
 		if strings.HasPrefix(event.USR, "file:") {
 			from = fileSymbolID(file.URI)
+			if err := a.declareFileSymbol(writer, scope, file.URI); err != nil {
+				return err
+			}
 		}
 		return writer.edge(model.Edge{
 			From:         from,
