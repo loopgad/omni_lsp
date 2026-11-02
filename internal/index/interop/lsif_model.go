@@ -32,6 +32,14 @@ func ImportLSIFToModel(ctx context.Context, data []byte, req model.Request, sink
 	if err := validateLSIFSourceIdentity(parsed, req.View.Identity(), scope.RootURI); err != nil {
 		return model.Report{}, err
 	}
+	// The declared positionEncoding governs how every range column is
+	// interpreted (LSIF 0.5 requires the field; utf-8 and utf-32 are legal).
+	// The old import ignored the declaration and read every column as
+	// UTF-16, silently mis-decoding positions after any multi-byte character.
+	positionEncoding, err := lsifStreamPositionEncoding(parsed)
+	if err != nil {
+		return model.Report{}, err
+	}
 	prov, ok := req.Provenance[scope.ID]
 	if !ok || !reflect.DeepEqual(prov.Scope, scope) || prov.Identity != req.View.Identity() {
 		return model.Report{}, fmt.Errorf("%w: request provenance mismatch", errInvalidLSIF)
@@ -148,10 +156,18 @@ func ImportLSIFToModel(ctx context.Context, data []byte, req model.Request, sink
 			if readErr != nil {
 				return model.Report{}, readErr
 			}
-			validateErr := validateUTF16Ranges(ctx, reader, doc.ranges)
+			var rangeErr error
+			switch positionEncoding {
+			case "utf-8":
+				doc.ranges, rangeErr = utf8RangesToUTF16(ctx, reader, doc.ranges)
+			case "utf-32":
+				doc.ranges, rangeErr = utf32RangesToUTF16(ctx, reader, doc.ranges)
+			default: // "utf-16": columns are already UTF-16; validate bounds.
+				rangeErr = validateUTF16Ranges(ctx, reader, doc.ranges)
+			}
 			closeErr := reader.Close()
-			if validateErr != nil {
-				return model.Report{}, validateErr
+			if rangeErr != nil {
+				return model.Report{}, rangeErr
 			}
 			if closeErr != nil {
 				return model.Report{}, closeErr
@@ -193,6 +209,24 @@ func ImportLSIFToModel(ctx context.Context, data []byte, req model.Request, sink
 		return model.Report{}, err
 	}
 	return report, nil
+}
+
+// lsifStreamPositionEncoding resolves the metaData positionEncoding
+// declaration. LSIF 0.5 makes the field required and utf-8/utf-32 are legal
+// values; a missing or unknown declaration is rejected instead of silently
+// interpreted as UTF-16 — the same fail-closed policy the SCIP importer
+// applies to TextDocumentEncoding.
+func lsifStreamPositionEncoding(parsed lsifParsed) (string, error) {
+	meta, ok := parsed.lsifMetaData()
+	if !ok {
+		return "", fmt.Errorf("%w: LSIF metaData vertex is required", errInvalidLSIF)
+	}
+	switch meta.PositionEncoding {
+	case "utf-16", "utf-8", "utf-32":
+		return meta.PositionEncoding, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported LSIF positionEncoding %q", errInvalidLSIF, meta.PositionEncoding)
+	}
 }
 
 // validateLSIFSourceIdentity mirrors validateSCIPSourceIdentity: the stream's
