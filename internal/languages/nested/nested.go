@@ -755,9 +755,11 @@ func (c *Conn) answerChildRequest(id jsonrpc.RequestID, method string, loopEpoch
 // writeReplyBounded performs one courtesy reply write under the shared write
 // turn, waiting at most replyTurnWait for the turn itself. The write body has
 // no deadline of its own: it completes, errors, or parks until the captured
-// pipe is closed by the connection's normal lifecycle (a writer-timeout
-// retire, a restart, or Close) — never by this path, which must not retire
-// anything on behalf of a best-effort reply. The epoch check and the stdin
+// pipe is closed by the connection's normal lifecycle — a restart, Close, or
+// the turn-timeout escape in writeFrameBounded/writeMessageWithContext
+// (round20 第 3 圈: a parked reply must never retire on its own, but the next
+// user request that times out waiting for the turn retires the exact child,
+// releasing this writer). The epoch check and the stdin
 // capture share one critical section, so a replacement child's stream can
 // never be captured (the pre-fix two-step fence's TOCTOU is closed here; the
 // writer cannot interleave frames because the turn is held for the whole
@@ -833,7 +835,26 @@ func (c *Conn) writeFrameAtClose(data []byte) error {
 func (c *Conn) writeFrameBounded(data []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.RequestTimeout)
 	defer cancel()
+	// Pre-wait snapshot (round20 第 3 圈): if the turn never frees within the
+	// budget, its holder is a writer parked on a full pipe, and the only
+	// release is retiring that exact child — the retire needs c.mu only,
+	// never the turn itself, and closing the captured stdin releases the
+	// parked writer (which returns the turn via its own defer). Without this
+	// escape the connection wedges: every later request burns the full
+	// RequestTimeout on the turn wait and nothing ever retires, while the §G5
+	// watchdog stays silent because the read loop keeps refreshing
+	// lastActivity from the child's stdout traffic. retireProcessEpoch's
+	// epoch fence makes a stale snapshot a no-op.
+	c.mu.Lock()
+	preStdin, preStdout, preCmd := c.stdin, c.stdout, c.cmd
+	preEpoch := c.readerEpoch.Load()
+	c.mu.Unlock()
 	if err := c.writeMu.LockContext(ctx); err != nil {
+		if ctx.Err() != nil && !c.closed.Load() && preStdin != nil {
+			_ = c.retireProcessEpoch(preEpoch, preStdin, preStdout, preCmd,
+				fmt.Errorf("%s write turn was held beyond %s while the worker was not draining stdin",
+					c.cfg.Name, c.cfg.RequestTimeout))
+		}
 		return err
 	}
 	defer c.writeMu.Unlock()
@@ -897,7 +918,21 @@ func (c *Conn) writeMessageWithContext(ctx context.Context, msg *jsonrpc.Message
 	if err != nil {
 		return err
 	}
+	// Pre-wait snapshot (round20 第 3 圈, same escape as writeFrameBounded):
+	// a DEADLINE-burned wait means the turn's holder is parked on a full pipe
+	// and only retiring that exact child releases it. A plain cancellation
+	// (the caller dropped the source change) must NOT retire — the child may
+	// be healthy; this mirrors the post-start behavior, which retires on
+	// deadline but not on bare cancellation.
+	c.mu.Lock()
+	preStdin, preStdout, preCmd := c.stdin, c.stdout, c.cmd
+	preEpoch := c.readerEpoch.Load()
+	c.mu.Unlock()
 	if err := c.writeMu.LockContext(ctx); err != nil {
+		if ctx.Err() == context.DeadlineExceeded && !c.closed.Load() && preStdin != nil {
+			_ = c.retireProcessEpoch(preEpoch, preStdin, preStdout, preCmd,
+				fmt.Errorf("%s source write turn was held past its deadline while the worker was not draining stdin", c.cfg.Name))
+		}
 		return err
 	}
 	defer c.writeMu.Unlock()
