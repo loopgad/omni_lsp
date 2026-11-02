@@ -1797,7 +1797,15 @@ func sourcePosition(data []byte, line, column uint32) uint32 {
 			start = i + 1
 		}
 	}
-	end := start + int(column-1)
+	// end = start + (column-1), clamped to the buffer with 64-bit math: the
+	// column arrives from untrusted helper event JSON, and on 32-bit GOARCH
+	// int(column-1) wraps negative for huge values (slice panic), while on
+	// 64-bit the unclamped end silently measured the whole remaining file.
+	delta := uint64(column - 1)
+	if over := uint64(len(data) - start); delta > over {
+		delta = over
+	}
+	end := start + int(delta)
 	for end < len(data) && end > start && !utf8.RuneStart(data[end]) {
 		end++
 	}
