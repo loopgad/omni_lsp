@@ -199,6 +199,34 @@ func LaunchWithSink(ctx context.Context, dir string, m Manifest, grant Grant, on
 	return launch(ctx, dir, m, grant, onExit, trust, sink)
 }
 
+// pipeOpener 抽出 *exec.Cmd 的管道装配面（StdinPipe/StdoutPipe 签名隐式
+// 满足），使「StdinPipe 成功、StdoutPipe 失败」这一 exec 包内部错误路径
+// 可被注入断言——生产 *exec.Cmd 的 StdoutPipe 只有预置 c.Stdout 才会失败，
+// launch 层无法自然触发。
+type pipeOpener interface {
+	StdinPipe() (io.WriteCloser, error)
+	StdoutPipe() (io.ReadCloser, error)
+}
+
+// pluginPipes 装配子进程 stdio 管道。任何一腿失败时，本函数对已经到手的
+// 管道端负责收口后返回 nil——错误路径上的 fd 不得悬挂等待 GC 终结器
+// （该路径仅在 fd 压力下可达，泄漏要累积到耗尽才显现）。
+func pluginPipes(cmd pipeOpener) (io.WriteCloser, io.ReadCloser, error) {
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("plugin: stdin 管道: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		// 写端确定性收口；cmd 内部读端由 exec.Cmd 私有持有（无导出收口面，
+		// 仅 Start 可达，而本路径 Start 不可达），随 cmd 被 GC 终结——与本
+		// 收口互补，见 executor_pipes_pin_test.go 的契约注释。
+		_ = stdin.Close()
+		return nil, nil, fmt.Errorf("plugin: stdout 管道: %w", err)
+	}
+	return stdin, stdout, nil
+}
+
 func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit func(error), trust func() error, sink func(method string, params json.RawMessage)) (*Process, error) {
 	if err := m.Validate(); err != nil {
 		return nil, fmt.Errorf("plugin: launch 前置完整性校验: %w", err)
@@ -255,15 +283,10 @@ func launch(ctx context.Context, dir string, m Manifest, grant Grant, onExit fun
 	// 绝对路径启动：exec.Command 对含路径分隔符的名字不再走 LookPath，
 	// PATH 解析（及其影子命中）从执行路径上整体移除。
 	cmd := exec.CommandContext(ctx, exe)
-	stdin, err := cmd.StdinPipe()
+	stdin, stdout, err := pluginPipes(cmd)
 	if err != nil {
 		vf.Close()
-		return nil, fmt.Errorf("plugin: stdin 管道: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		vf.Close()
-		return nil, fmt.Errorf("plugin: stdout 管道: %w", err)
+		return nil, err
 	}
 	// 复证圈 5 sweep 发现 5：插件 stderr 不再直通宿主 stderr——子进程可向
 	// 操作日志流写入任意字节（伪造 'omnilsp: …' 前缀行、凭据形态文本），
