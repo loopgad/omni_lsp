@@ -1203,3 +1203,77 @@ offset debt on file in `freeze-record.txt`):
   对账、MaxPluginFrameSize 导出 + 跨包镜像钉、StateInstalled reserved 标注
   （可执行文档钉沿全生命周期驱走）；段ID白名单负结果核验（12 类敌意探针
   全拒，探针跑毕即删，不改码）。
+
+## Evidence record — 2026-11-04 第二十轮集成（bugB 合并 + DEF-IDXWIRE 七语言链闭合 promote）
+
+- 性质：第二十轮集成轮（记账员域）。将 round20/bugB（13 笔：clang EndChar
+  族 6 笔 + persistent 4 笔 + replay 2 笔 + interop 1 笔）并入 main（bugA
+  15 笔、bugC 13 笔此前已在 main），随后按第七轮登记的解除条件对
+  DEF-IDXWIRE 再评估并 promote。改动文件：internal/conformance/registry.go、
+  docs/conformance.md（再生投影）、test/conformance/testdata/baseline.json
+  （本轮字节级零 diff）、docs/acceptance.md（本节）。合并全程只在同仓库
+  worktree `out/wt-integration` 操作（主树 internal/index/extractors/**
+  ACL 受限，见 selfCheck①；worktree 惯例沿 out/wt-bugA/B/C 先例）。
+- 合并（一笔 merge commit `1196b88`）：merge --no-ff round20/bugB 出现
+  一处冲突（与「互斥设计预期为零」不符，如实诊断）：internal/replay/
+  recorder.go 的 logLocked nil-writer 守卫被两支狩猎独立修复——main 侧
+  hunt A#3（`7d71235`，errRecorderClosed 契约）与 bugB 侧（`3bdb5b2`，
+  ErrRecordedAfterClose 降级语义）同点位重叠。解法：bugB 导出哨兵
+  ErrRecordedAfterClose 为唯一正身（firstErr 保留方向+序号包装，超集）、
+  errRecorderClosed 别名指向它，注释并陈两方契约（live 流不断、firstErr
+  可见、序号停在 close）；两侧 pin 测试（TestRecorderOperationsAfterClose
+  ReturnNotPanic / TestRecorderLateMessagesAfterCloseDegradeWithoutPanic）
+  均未改动，合并树上先跑后提交，双绿（0.00s/0.00s）。
+- 七语言链测试实跑（本 session 全部实跑，非转抄；worktree 的
+  test/acceptance/tools/node_modules 为指向主仓库 bundle 的 junction，
+  只读使用）：`go test ./internal/index/persistent/ -run
+  TestSevenLanguageTypedFactExportPersistsWithStableIdentity -count=1 -v`
+  PASS 40.47s，go 1.47s / rust 12.86s / typescript 3.58s / python 6.50s /
+  **cpp 7.66s / c 6.65s** / javascript 1.74s 全 PASS；`go test
+  ./internal/replay/ -run
+  TestSevenLanguageTypedGenerationsReplayFreshOnlyAcrossStoreReopen
+  -count=1 -v` PASS 70.47s，同七语言全 PASS（cpp 13.00s / c 14.29s）。
+  第七轮登记的 cpp/c 自愈 skip 解除条件兑现：clang EndChar 族修复后，
+  两条链测试的 cpp/c 子测由哨兵 SKIP 转为全链 PASS。首次实跑时
+  typescript/python/javascript 因 worktree 无未入库的 node_modules 而
+  工具链不可用 SKIP（0.26-0.28s），junction 补齐后三语言同绿——skip 全程
+  系环境性，非代码性。
+- promote（本轮唯一）：DEF-IDXWIRE（post-x9/INDEX）PARTIAL→AUTO，提交
+  `26b133e`。判定链：cpp/c 链通 + 七语言链实跑全绿（不止既有五语言证据
+  齐），第七轮登记的开口由 1196b88 的 EndChar 族修复闭合。按体例删
+  Reason（Milestone 本就无）、Text 扩写证据叙事并保留两条诚实注记——
+  ccls libclang 导出面 8/11 fact kinds 的诚实不完全照旧在案；replay
+  半边仍是 X5-7 单进程 store 重开模拟，真实双 OS 进程跨进程验收归
+  S21/acceptance 门禁，本轮 AUTO 站在进程内链上。Probe 五组不动（两个
+  七语言载体测试第十九轮已在）。
+- 分数核验（先预测后断言，TOL 1e-9）：编辑前实跑 `go run ./cmd/omnilsp
+  verify -json`（out/ledger-r20/verify-before.json）→ coreScore
+  98.45959595959597、post-x9 0.13333333333333333（4.0/30）、INDEX
+  0.125。预测：INDEX (0+0+1+0)/4=0.25；post-x9 (4.0+0.5)/30=0.15；
+  coreScore 零位移；baseline.json 零 diff。promote 后实跑（verify-after
+  .json）→ 三项与预测逐位相符（断言脚本 TOL 1e-9 全过，coreScore delta
+  0.0），baseline.json `git diff --quiet` 零 diff 实证（post-x9 为非
+  gated 延迟域，不入 core baseline）。
+- 门禁（本轮实跑）：`go run ./cmd/omnilsp verify --min 90` → floor 90.0%
+  PASS、exit 0；`go test ./test/conformance/ -count=1 -run
+  TestConformanceNoRegression -v` PASS 307.64s（AUTO 探针真实执行，含
+  七语言链/replay 七腿无 skip）；`go test ./internal/conformance/
+  -count=1` ok 6.702s（TestRegistry_DataShape 形状门：AUTO 带 Probe 无
+  Reason）；gofmt -l 全树零输出（合并与记账均零格式债务，无清账笔）；
+  OMNISP_UPDATE_CONFORMANCE=1 TestGenerateDocs 再生投影。未 push、未
+  git add -A、ACL 锁定区（test/acceptance/evidence/**、tools/.npm-cache）
+  零触碰。
+- selfCheck（信息性，非阻塞）：① 主树 `internal/index/extractors/**`
+  目录 ACL 对本账户不可写（owner CodexSandboxOffline，含新建文件即拒；
+  不在本轮登记的锁定区清单内），且主工作树在 session 起始即缺
+  build_request.go/extractor.go 两笔未提交删除（clang 包无法编译）——
+  本轮另有一笔 extractor_test.go 因 git checkout 先删后建失败而缺失，
+  共三笔工作树删除待 ACL 有权方恢复，恢复后 checkout/gofmt 自会闭合；
+  main ref 已自 f09f857 前移至本轮末笔，主工作树与 HEAD 的此三笔删除
+  即上述脏状态的全部来源；② 「合并 48 只修复」口径与实测不符：三分支
+  提交实测 41 笔（15+13+13）已全部入 main，三份战果清单确认合计 46 条
+  （bugB 17 条去重为 13 独立缺陷、bugC 14 只中 1 只证伪不修），如实登记；
+  ③ 真实双 OS 进程跨进程 replay 验收仍归 S21/acceptance 门禁（Text 已
+  如实措辞，本轮 AUTO 不含该半边）；④ NoRegression 耗时 307.64s（七
+  语言七腿全执行），第十九轮为 243.49s（cpp/c 当时 SKIP），增量系 cpp/c
+  两腿真实执行的预期代价。
