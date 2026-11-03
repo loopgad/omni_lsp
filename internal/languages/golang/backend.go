@@ -47,6 +47,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -145,9 +146,21 @@ func (b *Backend) BuildContextID() identity.BuildContextID {
 	return b.buildCtxID
 }
 
+// buildContextProbeTimeout bounds the one-shot `go env` probe (round20 第 3
+// 圈): the derivation sits on the request path behind buildCtxOnce, so a hung
+// probe — a GOWORK pointing at a stalled network mount, an antivirus scan
+// stall — would park every later build-context-dependent request on the Once
+// forever, with no deadline escape. A one-shot derivation can tolerate
+// failure (the "unavailable" fallback exists for exactly that), never a
+// hang. Var so a test can shorten it against a fake hung `go`.
+var buildContextProbeTimeout = 10 * time.Second
+
 func (b *Backend) deriveBuildContext() {
 	b.buildCtxID = "go:sha256:unavailable"
-	command := exec.Command("go", "env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS", "GOWORK")
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), buildContextProbeTimeout)
+	defer cancel()
+	command := exec.CommandContext(probeCtx, "go", "env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS", "GOWORK")
 	command.Dir = b.workDir
 	out, err := command.Output()
 	if err != nil {

@@ -367,7 +367,7 @@ type Config struct {
 	MaxConcurrent   int
 	MaxQueueSize    int // per-priority, total max = MaxQueueSize * numPriorities
 	MaxInFlight     int // global in-flight cap (admission control)
-	PriorityAgingMs int // after this many ms, boost a queued request by one priority
+	PriorityAgingMs int // milliseconds; after this long queued, boost a request one priority (consumed as time.Duration(x)*time.Millisecond)
 
 	// ClassCaps optionally overrides the per-class concurrency caps (§F8).
 	// Indexed by CostClass value; the CostUnset slot is ignored. A nil map or
@@ -775,7 +775,11 @@ func (s *Scheduler) pickClassAware() *Request {
 
 // agingLoop boosts priorities of long-queued requests to prevent starvation (F7).
 func (s *Scheduler) agingLoop(ctx context.Context) {
-	interval := time.Duration(s.config.PriorityAgingMs) / 2
+	// PriorityAgingMs is documented in milliseconds (round20/bugC): read it
+	// as time.Duration(x)*time.Millisecond, never bare time.Duration(x) —
+	// the latter made the production default 5000 a 5µs threshold, boosting
+	// every queued request each tick and flooding the P0 lane with P5 work.
+	interval := time.Duration(s.config.PriorityAgingMs) * time.Millisecond / 2
 	if interval < 100*time.Millisecond {
 		interval = 100 * time.Millisecond // minimum sane interval
 	}
@@ -856,7 +860,7 @@ func (s *Scheduler) boostStaleRequests(ctx context.Context) {
 				if !ok || req == nil {
 					continue
 				}
-				if time.Since(req.EnqueuedAt) <= time.Duration(s.config.PriorityAgingMs) {
+				if time.Since(req.EnqueuedAt) <= time.Duration(s.config.PriorityAgingMs)*time.Millisecond {
 					// Not stale yet, put back; never drop silently.
 					if s.requeueAged(c, int(pq), int(pq), req) < 0 {
 						s.rejectDropped(req, "scheduler: priority aging could not return the request; every lane of its class is full")

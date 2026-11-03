@@ -53,7 +53,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +72,17 @@ const shutdownWriteTimeout = 100 * time.Millisecond
 const shutdownGracePeriod = 5 * time.Second
 const forcedExitWait = 1 * time.Second
 const closeLeaseWait = 1 * time.Second
+
+// replyTurnWait bounds how long a courtesy MethodNotFound reply waits for the
+// shared write turn (round20 第 2 圈). The reply itself has no deadline — it
+// completes, errors, or parks until the captured pipe is closed by the
+// connection's normal lifecycle.
+const replyTurnWait = time.Second
+
+// maxPendingChildReplies bounds the in-flight courtesy replies. Overflowing
+// requests are dropped unanswered: a missing MethodNotFound is exactly the
+// pre-573d369 behavior and harmless to a real server.
+const maxPendingChildReplies = 8
 
 // Config wires a concrete language server into the shared bridge. Start is
 // injectable so supervision can be tested without a real toolchain.
@@ -188,6 +198,12 @@ type Conn struct {
 	nextID atomic.Int64
 	closed atomic.Bool
 
+	// clientReplySlots bounds the in-flight MethodNotFound replies the
+	// readLoop fires at the child (round20 第 2 圈): a child that stopped
+	// draining stdin must never park more than maxPendingChildReplies reply
+	// goroutines, and the readLoop itself must never wait on a reply.
+	clientReplySlots chan struct{}
+
 	// lastActivity (unix nanos) feeds the hung-worker watchdog (G5): a
 	// process with in-flight requests but no traffic for HungGrace is
 	// presumed wedged and restarted instead of waiting out full timeouts.
@@ -230,13 +246,14 @@ func New(cfg Config) *Conn {
 		cfg.RequestTimeout = defaultRequestTimeout
 	}
 	return &Conn{
-		cfg:            cfg,
-		pending:        make(map[int64]chan *jsonrpc.Message),
-		documents:      make(map[string]*documentState),
-		workspaceLease: newWorkspaceLeaseGate(),
-		requestTiming:  newRequestTimingRecorder(cfg.Lang),
-		processWaits:   make(map[*exec.Cmd]*processWaitState),
-		closeDone:      make(chan struct{}),
+		cfg:              cfg,
+		pending:          make(map[int64]chan *jsonrpc.Message),
+		documents:        make(map[string]*documentState),
+		workspaceLease:   newWorkspaceLeaseGate(),
+		requestTiming:    newRequestTimingRecorder(cfg.Lang),
+		processWaits:     make(map[*exec.Cmd]*processWaitState),
+		closeDone:        make(chan struct{}),
+		clientReplySlots: make(chan struct{}, maxPendingChildReplies),
 	}
 }
 
@@ -552,6 +569,23 @@ func (c *Conn) failPending(msg string) {
 	failAll(pending, msg)
 }
 
+// failPendingIfEpoch fails every parked request only when the reader epoch
+// still matches (round20 第 4 圈): the watchdog's cancel half obeys the same
+// fence as its kill half — a full restart cycle between the hung judgment and
+// this delivery must not stamp "worker hung" onto the replacement epoch's
+// pending table and drop its real responses.
+func (c *Conn) failPendingIfEpoch(epoch uint64, msg string) {
+	c.mu.Lock()
+	if c.readerEpoch.Load() != epoch {
+		c.mu.Unlock()
+		return
+	}
+	pending := c.pending
+	c.pending = make(map[int64]chan *jsonrpc.Message)
+	c.mu.Unlock()
+	failAll(pending, msg)
+}
+
 // failAll delivers a fast-fail error to every parked response channel.
 // Non-blocking send: senders that already timed out must not be blocked.
 func failAll(pending map[int64]chan *jsonrpc.Message, msg string) {
@@ -649,8 +683,12 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 			// retirement below is already visible through supervision. The
 			// note is gated on a configured budget so the unconfigured
 			// default path (the §C1 static cap refusing a pathological
-			// frame) stays zero-change (X10).
-			if strings.HasPrefix(err.Error(), "jsonrpc: message too large") && languages.BackendBudget() != nil {
+			// frame) stays zero-change (X10). round20/bugC: classification
+			// is structural (errors.As on the codec's typed carrier), never
+			// a message-text prefix — the counter must survive protocol-side
+			// wording changes.
+			var tooLarge *jsonrpc.MessageTooLargeError
+			if stderrors.As(err, &tooLarge) && languages.BackendBudget() != nil {
 				languages.NoteBackendBufferRefusal(c.cfg.Name)
 			}
 			break
@@ -659,8 +697,25 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 		if !c.closed.Load() && c.cfg.CaptureDiagnostics && msg.Method == "textDocument/publishDiagnostics" {
 			c.receiveDiagnostics(epoch, msg.Params)
 		}
-		if msg.ID == nil || msg.ID.IsStr {
-			continue // server notifications are handled above; string IDs are unsupported
+		if msg.ID == nil {
+			continue // server notifications are handled above; nothing to answer
+		}
+		// round20/bugC: only a genuine response may enter the pending table.
+		// A message with an id AND a method is the child requesting something
+		// of us (workspace/configuration, client/registerCapability,
+		// window/workDoneProgress/create). Pre-fix it was fed to the pending
+		// table as if it were our response: with a colliding id the in-flight
+		// request "succeeded" with a nil result (a faked handshake success),
+		// without one it was silently dropped — leaving a real server
+		// hanging on its own request. JSON-RPC requires an answer; the
+		// minimal honest one is MethodNotFound under the same id, which real
+		// servers treat as the capability being unsupported.
+		if !msg.IsResponse() {
+			c.answerChildRequest(*msg.ID, msg.Method, epoch)
+			continue
+		}
+		if msg.ID.IsStr {
+			continue // responses with string ids: we never issue string ids
 		}
 		c.mu.Lock()
 		if c.readerEpoch.Load() != epoch {
@@ -687,6 +742,67 @@ func (c *Conn) readLoop(stdout io.ReadCloser, epoch uint64, done chan<- struct{}
 
 func (c *Conn) writeMessage(msg *jsonrpc.Message) error {
 	return c.writeMessageDuringClose(msg, false)
+}
+
+// answerChildRequest replies MethodNotFound to a child→client request without
+// ever stalling the readLoop (round20 第 2 圈: 573d369's synchronous
+// writeFrameBounded reply parked the read loop for up to a full RequestTimeout
+// when the child stopped draining stdin, freezing its stdout output, and its
+// timeout path retired the child from inside the read loop — including the
+// self-referencing outputDone wait). The reply is fire-and-forget on a bounded
+// goroutine: a courtesy reply is best-effort by definition, so an overflowing
+// or failing reply is dropped, never allowed to tear the connection.
+func (c *Conn) answerChildRequest(id jsonrpc.RequestID, method string, loopEpoch uint64) {
+	data, err := json.Marshal(jsonrpc.NewErrorResponse(id, jsonrpc.MethodNotFound,
+		fmt.Sprintf("%s does not support client-bound method %q", c.cfg.Name, method), nil))
+	if err != nil {
+		return
+	}
+	select {
+	case c.clientReplySlots <- struct{}{}:
+	default:
+		return // reply overflow: drop unanswered (the pre-573d369 behavior)
+	}
+	go func() {
+		defer func() { <-c.clientReplySlots }()
+		c.writeReplyBounded(data, loopEpoch)
+	}()
+}
+
+// writeReplyBounded performs one courtesy reply write under the shared write
+// turn, waiting at most replyTurnWait for the turn itself. The write body has
+// no deadline of its own: it completes, errors, or parks until the captured
+// pipe is closed by the connection's normal lifecycle — a restart, Close, or
+// the turn-timeout escape in writeFrameBounded/writeMessageWithContext
+// (round20 第 3 圈: a parked reply must never retire on its own, but the next
+// user request that times out waiting for the turn retires the exact child,
+// releasing this writer). The epoch check and the stdin
+// capture share one critical section, so a replacement child's stream can
+// never be captured (the pre-fix two-step fence's TOCTOU is closed here; the
+// writer cannot interleave frames because the turn is held for the whole
+// write).
+func (c *Conn) writeReplyBounded(data []byte, loopEpoch uint64) {
+	wait := c.cfg.RequestTimeout
+	if wait <= 0 || wait > replyTurnWait {
+		wait = replyTurnWait
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	if err := c.writeMu.LockContext(ctx); err != nil {
+		return // turn busy: drop the courtesy reply
+	}
+	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	if c.closed.Load() || c.readerEpoch.Load() != loopEpoch {
+		c.mu.Unlock()
+		return // epoch replaced or closing: never write toward a replacement child
+	}
+	stdin := c.stdin
+	c.mu.Unlock()
+	if stdin == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
 }
 
 func (c *Conn) writeMessageDuringClose(msg *jsonrpc.Message, duringClose bool) error {
@@ -736,7 +852,26 @@ func (c *Conn) writeFrameAtClose(data []byte) error {
 func (c *Conn) writeFrameBounded(data []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.RequestTimeout)
 	defer cancel()
+	// Pre-wait snapshot (round20 第 3 圈): if the turn never frees within the
+	// budget, its holder is a writer parked on a full pipe, and the only
+	// release is retiring that exact child — the retire needs c.mu only,
+	// never the turn itself, and closing the captured stdin releases the
+	// parked writer (which returns the turn via its own defer). Without this
+	// escape the connection wedges: every later request burns the full
+	// RequestTimeout on the turn wait and nothing ever retires, while the §G5
+	// watchdog stays silent because the read loop keeps refreshing
+	// lastActivity from the child's stdout traffic. retireProcessEpoch's
+	// epoch fence makes a stale snapshot a no-op.
+	c.mu.Lock()
+	preStdin, preStdout, preCmd := c.stdin, c.stdout, c.cmd
+	preEpoch := c.readerEpoch.Load()
+	c.mu.Unlock()
 	if err := c.writeMu.LockContext(ctx); err != nil {
+		if ctx.Err() != nil && !c.closed.Load() && preStdin != nil {
+			_ = c.retireProcessEpoch(preEpoch, preStdin, preStdout, preCmd,
+				fmt.Errorf("%s write turn was held beyond %s while the worker was not draining stdin",
+					c.cfg.Name, c.cfg.RequestTimeout))
+		}
 		return err
 	}
 	defer c.writeMu.Unlock()
@@ -800,7 +935,21 @@ func (c *Conn) writeMessageWithContext(ctx context.Context, msg *jsonrpc.Message
 	if err != nil {
 		return err
 	}
+	// Pre-wait snapshot (round20 第 3 圈, same escape as writeFrameBounded):
+	// a DEADLINE-burned wait means the turn's holder is parked on a full pipe
+	// and only retiring that exact child releases it. A plain cancellation
+	// (the caller dropped the source change) must NOT retire — the child may
+	// be healthy; this mirrors the post-start behavior, which retires on
+	// deadline but not on bare cancellation.
+	c.mu.Lock()
+	preStdin, preStdout, preCmd := c.stdin, c.stdout, c.cmd
+	preEpoch := c.readerEpoch.Load()
+	c.mu.Unlock()
 	if err := c.writeMu.LockContext(ctx); err != nil {
+		if ctx.Err() == context.DeadlineExceeded && !c.closed.Load() && preStdin != nil {
+			_ = c.retireProcessEpoch(preEpoch, preStdin, preStdout, preCmd,
+				fmt.Errorf("%s source write turn was held past its deadline while the worker was not draining stdin", c.cfg.Name))
+		}
 		return err
 	}
 	defer c.writeMu.Unlock()
@@ -1106,8 +1255,16 @@ func (c *Conn) startWatchdog(grace time.Duration) {
 			}
 			go func() {
 				sup.HandleHungWorker(
-					func() { c.failPending(c.cfg.Name + " worker hung; requests failed") },
-					c.killProcess,
+					// The cancel half carries the same epoch fence as the
+					// kill half (round20 第 4 圈, closing what 4eeea22 left
+					// half-open): failPending swaps the whole pending table,
+					// and a full restart cycle between judgment and delivery
+					// must not stamp "worker hung" on the replacement's
+					// requests — the fenced kill correctly no-ops, so the
+					// healthy child would live on with its in-flight requests
+					// mislabeled as hung and their real responses dropped.
+					func() { c.failPendingIfEpoch(epoch, c.cfg.Name+" worker hung; requests failed") },
+					func() { c.killProcess(epoch) },
 				)
 			}()
 			return // process death routes through HandleProcessExit → restart;
@@ -1172,11 +1329,20 @@ func (c *Conn) BuildContextID() identity.BuildContextID {
 
 // killProcess terminates the worker without marking the Conn permanently
 // closed: unlike Close (manual shutdown), a watchdog kill must let the read
-// loop observe EOF so the supervisor's crash/restart cycle engages.
-func (c *Conn) killProcess() {
+// loop observe EOF so the supervisor's crash/restart cycle engages. epoch is
+// the reader epoch the hung judgment was made on (round20 第 3 圈): the kill
+// is fenced like every other termination path (retireProcessEpoch's
+// `current` check) — if a full restart cycle completed between judgment and
+// kill, the healthy replacement child must not be murdered and its pending
+// table must not be failed as "worker hung".
+func (c *Conn) killProcess(epoch uint64) {
 	c.mu.Lock()
+	current := c.readerEpoch.Load() == epoch
 	stdin, stdout, cmd := c.stdin, c.stdout, c.cmd
 	c.mu.Unlock()
+	if !current {
+		return
+	}
 	_ = c.stopProcessNow(stdin, stdout, cmd)
 }
 

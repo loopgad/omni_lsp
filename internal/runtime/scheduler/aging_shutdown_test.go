@@ -24,9 +24,9 @@ func runAgingShutdownRound(t *testing.T, round int) {
 	// PriorityAgingMs is huge on purpose: the parked requests must stay NOT
 	// stale for the whole round so the extract→put-back branch keeps the high
 	// lanes populated through the shutdown close (the pseudo-rejection and
-	// nil-receive window) instead of cascading to the scan floor. Note the
-	// field is consumed as time.Duration(x), i.e. nanoseconds — 10^10 reads
-	// as ~10s, far beyond this round.
+	// nil-receive window) instead of cascading to the scan floor. The field
+	// is consumed in milliseconds (round20/bugC unit fix) — 10^10 reads as
+	// ~115 days, far beyond this round.
 	s := New(Config{MaxConcurrent: 1, MaxQueueSize: 256, MaxInFlight: 256, PriorityAgingMs: 10_000_000_000})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -383,8 +383,26 @@ func (r *DirectCompilerRunner) runScript(ctx context.Context, nodePath string, p
 			return SCIPResult{}, fmt.Errorf("TypeScript exporter emitted unknown message %q", message.Type)
 		}
 	}
+	// round20 第 3 圈 + 第 4 圈: drain stderr BEFORE Wait, bounded by the
+	// caller's ctx. stderr EOF requires every write end closed — a
+	// handle-inheriting descendant can defer that indefinitely, and
+	// CommandContext only governs the direct child (which has already exited
+	// by the time the decode loop saw EOF), so a bare <-stderrDone can
+	// outlive the deadline (2s-ctx probe returned at 2.30s against an ~2s
+	// grandchild; 11.26s against an ~11s one upstream). On ctx.Done, close
+	// the parent-side read end to unstick the capture goroutine — its
+	// ReadBudgetedAll releases the staged bytes on the read error, and the
+	// undrained tail is abandoned with the canceled call (the pre-942b3cf
+	// behavior likewise returned without the tail). exec's own Wait-side
+	// close of the same fd tolerates the earlier close.
+	var stderrOutput []byte
+	select {
+	case stderrOutput = <-stderrDone:
+	case <-ctx.Done():
+		_ = stderr.Close()
+		stderrOutput = <-stderrDone
+	}
 	waitErr := cmd.Wait()
-	stderrOutput := <-stderrDone
 	if err := ctx.Err(); err != nil {
 		return SCIPResult{}, err
 	}

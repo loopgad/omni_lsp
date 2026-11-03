@@ -337,34 +337,50 @@ func TestMemoCompletionConfirmsAcrossTieReorder(t *testing.T) {
 // instead.
 func TestMemoCompletionRealDifferenceResetsQuietWindow(t *testing.T) {
 	b, stdin, child := newCclsProtocolBackend(t)
-	memoQuiet(b, 300*time.Millisecond)
+	// round20 第 3 圈 flake 修复：探针必须落在「重启后的静默窗口内」（变更
+	// 时刻起算），同时落在「首次观察起算的窗口外」。quiet=300ms 时该合法
+	// 区间只有 ~90ms 宽（changed+210ms vs changed+300ms），并行包执行下的
+	// sleep/调度过冲越窗后 memo 按声明语义合法命中（served）、不转发，
+	// forwardedCompletion 就会在 bridge_test 的 1s 等待上报
+	// "timed out waiting for child request"（全 territory 回归实跑出现过一
+	// 次）。把 quiet 与睡眠同比例放大到 1s：合法区间下限 = min(300ms,
+	// changed-start)——正常时 ~300ms 宽，负载越重 changed-start 越大、区间
+	// 反而越宽，调度噪声不再能吃穿边距。
+	memoQuiet(b, time.Second)
 	const uri = "file:///x/main.cpp"
 	content := []byte("int target(void);\n")
 
 	start := time.Now()
 	forwardedCompletion(t, b, stdin, child, uri, content, 2, memoDetailCompletionReply("early index state"))
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	// Real change: admission must restart around the settled value, with the
 	// quiet window counting from this change, not from the first reply.
 	settled := forwardedCompletion(t, b, stdin, child, uri, content, 2, memoDetailCompletionReply("settled index"))
 	changed := time.Now()
 	forwardedCompletion(t, b, stdin, child, uri, content, 2, memoDetailCompletionReply("settled index"))
 
-	// 210ms after the change (inside the 300ms restarted window) and ~360ms
-	// after the first observation (outside the window an over-eager
-	// comparator would still be counting from): must forward, not serve.
-	if wait := time.Until(changed.Add(210 * time.Millisecond)); wait > 0 {
+	// Probe: past the quiet window measured from the very first observation
+	// (an over-eager comparator would be able to serve here) but inside the
+	// window measured from the change (the correct implementation must
+	// forward). Sleep to changed+700ms and top up to start+quiet, whichever
+	// is later; the margin to the window's end is then min(300ms,
+	// changed-start) — wide against scheduler noise, and wider the slower
+	// the forwards were.
+	if wait := time.Until(changed.Add(700 * time.Millisecond)); wait > 0 {
 		time.Sleep(wait)
 	}
-	if time.Since(start) < 300*time.Millisecond {
-		// The probe must be past the quiet window measured from the very
-		// first observation for the over-eager variant to even be able to
-		// serve; make that certain rather than incidental.
-		time.Sleep(300*time.Millisecond - time.Since(start))
+	if wait := time.Until(start.Add(time.Second)); wait > 0 {
+		time.Sleep(wait)
 	}
 	forwardedCompletion(t, b, stdin, child, uri, content, 2, memoDetailCompletionReply("settled index"))
 
-	time.Sleep(310 * time.Millisecond)
+	// The restarted window from the change has now passed: the memo must
+	// serve. changed+1.3s clears the window by ≥300ms measured from the
+	// probe side as well, so the assertion does not depend on the probe
+	// landing exactly at changed+700ms.
+	if wait := time.Until(changed.Add(1300 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
 	if list := servedCompletion(t, b, uri, content, 2); !reflect.DeepEqual(list, settled) {
 		t.Fatalf("memo-served completion = %+v, want the latest settled answer %+v", list, settled)
 	}
