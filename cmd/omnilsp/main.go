@@ -347,6 +347,13 @@ func runTCPSession(ctx context.Context, session int, conn net.Conn, srv *server.
 	if rerr := srv.Run(ctx, sessionTr); rerr != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "omnilsp: session %d ended: %v\n", session, rerr)
 	}
+	// 会话终局统一摘除共享核心：Run 返回即会话已死，HTTP read API 的空窗
+	// 必须 fail-closed（/ready=false、查询报会话空闲错），而不是继续指向死
+	// 会话直到下一次 accept 的 Store 覆盖。exit 握手路径已由 StateExited 让
+	// Ready 变 false，这里的 Store(nil) 对其幂等（双保险）；EOF/传输故障/取消
+	// 这类非 exit 收尾没有状态转移，此前死核心会一直保持假 Running。TCP 一次
+	// 一会话（v1），摘除与下一次 accept 的 Store 之间无并发竞争。
+	sharedCore.srv.Store(nil)
 	if rec != nil {
 		_ = rec.Close()
 	}

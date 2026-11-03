@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync/atomic"
 
 	"github.com/omnilsp/omni/internal/identity"
@@ -89,20 +90,38 @@ type httpCore struct {
 	srv atomic.Pointer[server.Server]
 }
 
+// errSessionIdle 报告无活跃会话持有共享核心的空窗：首个 TCP 会话被接受之前、
+// 以及 runTCPSession 收尾 Store(nil) 之后。/ready 据此映射 503，查询端点据此
+// fail-closed——而不是在缺失（或已被摘除）的会话核心上 nil 解引用 panic。
+var errSessionIdle = errors.New("omnilsp: no active session (read API idle)")
+
 func (c *httpCore) Hover(ctx context.Context, uri string, line, column uint32) (identity.SemanticResult[*languages.HoverResult], error) {
-	return c.srv.Load().HoverEnvelope(ctx, uri, line, column)
+	if srv := c.srv.Load(); srv != nil {
+		return srv.HoverEnvelope(ctx, uri, line, column)
+	}
+	return identity.SemanticResult[*languages.HoverResult]{}, errSessionIdle
 }
 
 func (c *httpCore) Definition(ctx context.Context, uri string, line, column uint32) (identity.SemanticResult[[]languages.Location], error) {
-	return c.srv.Load().DefinitionEnvelope(ctx, uri, line, column)
+	if srv := c.srv.Load(); srv != nil {
+		return srv.DefinitionEnvelope(ctx, uri, line, column)
+	}
+	return identity.SemanticResult[[]languages.Location]{}, errSessionIdle
 }
 
 func (c *httpCore) References(ctx context.Context, uri string, line, column uint32, includeDeclaration bool) (identity.SemanticResult[[]languages.Location], error) {
-	return c.srv.Load().ReferencesEnvelope(ctx, uri, line, column, includeDeclaration)
+	if srv := c.srv.Load(); srv != nil {
+		return srv.ReferencesEnvelope(ctx, uri, line, column, includeDeclaration)
+	}
+	return identity.SemanticResult[[]languages.Location]{}, errSessionIdle
 }
 
 func (c *httpCore) Status() map[string]any {
-	raw, err := c.srv.Load().CallMethod(context.Background(), "omnilsp/status", map[string]any{})
+	srv := c.srv.Load()
+	if srv == nil {
+		return map[string]any{"error": errSessionIdle.Error()}
+	}
+	raw, err := srv.CallMethod(context.Background(), "omnilsp/status", map[string]any{})
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -111,7 +130,12 @@ func (c *httpCore) Status() map[string]any {
 	return out
 }
 
-func (c *httpCore) Ready() bool { return c.srv.Load().State() == server.StateRunning }
+func (c *httpCore) Ready() bool {
+	if srv := c.srv.Load(); srv != nil && srv.State() == server.StateRunning {
+		return true
+	}
+	return false
+}
 
 var (
 	_ mcpserver.Core  = mcpCore{}
