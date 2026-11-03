@@ -1277,3 +1277,66 @@ offset debt on file in `freeze-record.txt`):
   如实措辞，本轮 AUTO 不含该半边）；④ NoRegression 耗时 307.64s（七
   语言七腿全执行），第十九轮为 243.49s（cpp/c 当时 SKIP），增量系 cpp/c
   两腿真实执行的预期代价。
+
+## Evidence record — 2026-11-04 台账闭环核对（三方对账 + 运行记录齐备检查 + 开口四态清单）
+
+- 性质：本轮为台账闭环核对轮（闭环员域）。零代码改动；改动仅
+  docs/acceptance.md（本节）与 docs/audit-longterm-spec.md（五处勘误注：
+  文首 registry 计数条、域分数条、PARTIAL 收口台账条、§8 ACL 条、watch
+  留观销案节——另加文末新节「2026-11-04 台账闭环对齐」）与 out/ 证据
+  （out/ 不入 git）；历史原文一律未改写（追加式）。
+- 任务 1 三方对账（静态全绿；依赖编译的检查因 ACL 未跑，见门禁段）：
+  ① registry（internal/conformance/registry.go，容忍空白 grep 实测）：
+  **AUTO 93 / PARTIAL 4 / DEFERRED 26 / GATE 2 = 125 条**（四态合计与
+  `grep -c 'ID: "'` = 125 闭合）；② docs/conformance.md 投影 125 行，ID
+  集合与 registry 逐一对应（脚本 diff 为空）、逐行状态串与 registry
+  Status 前缀逐一匹配（125/125，awk 比对）；域行数 core 78 / X5 7 /
+  X7 4 / X8 3 / X9 2 / POST-X8 1 / POST-X9 30；③ baseline.json
+  coreScore 98.45959595959597 与权重式重算（Y1=10.5/11——Y1-10 GATE 按
+  creditGateFast=0.5、Y2=8.5/9——Y2-5 PARTIAL 按 creditPartial=0.5，
+  credit 常量 internal/conformance/report.go:27-28 实证）吻合至
+  delta −2.8e-14（浮点阶位内，历轮机器断言口径 TOL 1e-9）；testdata 与
+  out/wt-integration 两份 baseline.json `diff` 为空。任务书「PARTIAL 5 条」
+  锚点过时：实测 4 条，第五条 DEF-IDXWIRE 已随 26b133e promote。
+- 任务 2 运行记录检查：第十六~二十轮每轮一节齐备，无需补——第十六轮
+  （:759，九项裁决落档）、第十七轮（:797，五项工程落地 + codeAction）、
+  第十八轮（:1020，五车道评估）、第十九轮（:1096，四车道评估）、第二十
+  轮（:1182 记账 + :1207 集成）；各节均含「门禁（本轮实跑）」或「验收
+  证据（本轮实跑）」运行记录行。
+- 任务 3 spec 对齐：X10 落地增量（DEF-PLUGMOUNT 9d24c40 / DEF-BUDWIRE
+  433f092 / DEF-IDXWIRE 26b133e 三 promote + DEF-COMPACT 结构半边落地、
+  background-triggered 半边仍缺）与二十轮战果增量（41 笔提交 git 实证、
+  clang EndChar 族解除第十九轮 cpp/c 阻断、watch 短路留观项复发并收口
+  01154c9）落 spec 文末新节；PARTIAL 收口台账收缩为四条（X5-4、Y2-5、
+  DEF-EDITORS、X8-2）。
+- 任务 4 开口四态清单：13 项开口全部落四态——**fixed+verified 1**
+  （DEF-IDXWIRE cpp/c 半边）、**deferred+reason 8**（Y2-5/X5-4/
+  DEF-EDITORS/X8-2 剩余半边、Y1-10 真 stdio soak GATE、DEF-S21CORPUS、
+  跨进程 replay 验收、净化员在制品）、**user-action 4**（extractors/**
+  ACL 提权、锁定区与编辑器环境、X10 范围拍板、push 授权）、
+  **disproven 0**（本轮无新增；bugC Bug5 证伪已由第二十轮战果在案）；
+  **静默 0**。全表见 spec 文末 2026-11-04 节 §4。
+- ACL 探测（本轮唯一一次撞墙）：`icacls internal/index/extractors/clang`
+  勘验——ACE 三个 (M) 均绑定具体 SID（含 CodexSandboxUsers），无
+  Authenticated Users:(M)；`touch` 写探针单次即拒（Permission denied，
+  WRITE-DENIED），按纪律不再重试。依赖编译的检查（go test 全套、
+  `go run ./cmd/omnilsp verify`、OMNISP_UPDATE_CONFORMANCE=1
+  TestGenerateDocs 再生）一律标 acl-blocked 未跑、不算失败；三方对账
+  全部走静态读码与脚本比对（投影由 TestGenerateDocs 防漂移门背书，
+  本轮静态比对与其等价面见上）。
+- 证据：out/ledger-closure-20261104/（closure-report.md 汇总 +
+  raw-checks.txt 原始输出；out/ 不入 git）。
+- 门禁（诚实归因）：本轮静态检查实跑清单——registry 状态计数 grep ×5、
+  ID 集合 diff、状态串逐行比对（awk）、baseline 两份 diff、coreScore
+  awk 重算、Milestone 资格面 grep ×4、`git log --merges` +
+  `git rev-list --count` ×3（bugA/B/C = 15+13+13 = 41 笔实证）、
+  `git diff --stat`（在制品 29 文件定性）、icacls + touch 探针 ×1。
+  docs-only、零 Go 改动；包级 `go build`/`go test` 未跑（acl-blocked，
+  与第十六轮 docs-only 先例的差异在于该轮 build 实跑通过，本轮按
+  aclFixed=false 口径如实登记为未跑）。工作树在制品 29 文件（14 M +
+  15 D；任务书锚点「3M+3D」已过时——3 笔 D 为 ACL 待恢复删除，另 12 笔
+  D 为 *_pin_test.go 删除、14 M 为 interop/persistent/replay 修改，均
+  待净化员处置）零触碰。
+- 提交：本节与 spec 勘误一笔 docs 提交；未 push、未 git add -A、未触碰
+  ACL 锁定区（test/acceptance/evidence/**、tools/.npm-cache、
+  internal/index/extractors/**）。

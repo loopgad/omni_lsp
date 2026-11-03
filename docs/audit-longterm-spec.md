@@ -43,6 +43,17 @@
   空格）；复计数须用容忍空白的 `grep -cE "Status:\s+Status"`（实测 = 125）。
   PARTIAL 收口台账相应收缩为五条：X5-4、Y2-5、DEF-EDITORS、DEF-IDXWIRE、
   X8-2（grep 实测），X9-1 已移出（见下条勘误注）。
+  **勘误注（2026-11-04，台账闭环员）**：第十八~二十轮三次 promote 使计数
+  再度前移——DEF-PLUGMOUNT（9d24c40，DEFERRED→AUTO）、DEF-BUDWIRE
+  （433f092，DEFERRED→AUTO）、DEF-IDXWIRE（26b133e，PARTIAL→AUTO，
+  round-20 集成七语言链闭合）。本轮静态实测（容忍空白 grep，HEAD a23d5f2）：
+  `grep -cE "Status:\s+StatusAuto"` = 93、`StatusPartial` = 4、
+  `StatusDeferred` = 26、`StatusGate` = 2，与 `grep -c 'ID: "'` = 125 闭合
+  ——现行计数 **AUTO 93 / PARTIAL 4 / DEFERRED 26 / GATE 2，共 125 条**。
+  PARTIAL 收口台账相应收缩为四条：X5-4、Y2-5、DEF-EDITORS、X8-2（grep
+  实测），DEF-IDXWIRE 已移出。registry↔docs/conformance.md↔baseline.json
+  三方对账本轮静态全绿（125 行 ID 集合逐一对应、逐行状态串匹配、
+  coreScore 重算吻合至浮点阶位），见文末「2026-11-04 台账闭环对齐」§1。
 - **域分数（本轮实测 `go run ./cmd/omnilsp verify --json`）**：core
   0.9845959595959597、x5 **0.9285714285714286**（= 6.5/7：INDEX 100%——
   X5-1/X5-6/X5-7 全 AUTO，INTEROP/QUERY/CACHE 满，GRAPH 50%——X5-4
@@ -59,6 +70,15 @@
   逐位不变（x9 为非 core 延迟域，不入 baseline，见 docs/acceptance.md
   2026-10-29 记账轮）。行内 x9 0.75 与 post-x9 0.0689… 均为升格/增条前
   旧值；JSON 存 out/ledger-align-20261030/verify-fast-20261030.json。
+  **勘误注（2026-11-04，台账闭环员）**：本条域分数再度过时——第十八~
+  二十轮 post-x9 三次前移：DEF-PLUGMOUNT 升 AUTO 后 **0.1**（9d24c40，
+  第十八轮分数核验）、DEF-BUDWIRE 升 AUTO 后 **0.13333333333333333**
+  （433f092，第十九轮）、DEF-IDXWIRE 升 AUTO 后 **0.15**（=4.5/30，
+  26b133e，第二十轮集成）；x5/x7/x8/x9 与 coreScore 98.45959595959597
+  均逐位不变（三轮均为非 core 延迟域，不入 baseline）。数值引
+  docs/acceptance.md 第十八/十九/二十轮分数核验节（out/verify-*.json、
+  out/ledger-r19/、out/ledger-r20/ 逐位断言在案）；本轮因 ACL 未复跑
+  verify（acl-blocked），静态对账见文末「2026-11-04 台账闭环对齐」。
 - **剩余台账分类**：
   - **已拍板并落地（5，2026-10-25 终局裁决；2026-10-26 工程落地）**：
     §7.2 fast 探针执行——`FastProbeReport` 真跑 AUTO 探针，
@@ -87,6 +107,12 @@
     8 个 soak form 测试 + TestRustAnalyzerLockedSCIPDifferential。行内
     「1h 连续档证据仍缺席」「尚无绿色 10m/1h 复跑」自 promote 起失效，
     原文保留为升格前记录。
+    **勘误注（2026-11-04，台账闭环员）**：DEF-IDXWIRE 已随 26b133e
+    （2026-11-04 第二十轮集成）升 AUTO、移出本台账——第七轮登记的解除
+    条件（clang EndChar 族修复后 cpp/c 链通）兑现，七语言双载体测试实跑
+    全绿（acceptance.md 第二十轮集成节：persistent PASS 40.47s、replay
+    PASS 70.47s，七腿无 skip）。本台账现四条：X5-4、Y2-5、DEF-EDITORS、
+    X8-2（grep 实测）；各条剩余半边的四态归类见文末 2026-11-04 节 §4。
   - **GATE（2）**：Y1-10（soak 长跑闸门）、X8-1（multiplatform 发布门禁）。
   - **DEFERRED（27；勘误注 2026-10-29：现 28——d4b3635 新增 DEF-BUDWIRE，
     见上方 registry 计数条勘误）**：结构性缓期、probe-less 不计分（含
@@ -787,6 +813,14 @@ D 结构性）标注；凡属语义变更的落地轮须遵守「语义变更先
   `executable_test.go`、`request_timing.go`、`source_changes.go`、
   `source_changes_test.go`、`workspace_snapshot.go`、`workspace_snapshot_test.go`）
   —— 绕过办法是**改可写的上游文件做等价变异验证**（本会话已用此法成功三次）。
+  **勘误注（2026-11-04，台账闭环员）**：ACL 现状复勘——
+  internal/index/extractors/clang 经 icacls 勘验无 `Authenticated
+  Users:(M)`（现有三个 (M) ACE 均绑定具体 SID，含 CodexSandboxUsers），
+  当前账户写探针单次即拒（Permission denied）；提权命令（
+  `icacls <path> /grant '*S-1-5-11:(M)'`，须经 PowerShell 传参）仍待有权方
+  执行。aclFixed=false 语境下依赖编译的检查（go test / go build /
+  `go run verify`）一律标 acl-blocked（不算失败），静态可做的全做——本轮
+  对账即按此口径执行，见文末 2026-11-04 节。
 
 ### 纪律
 
@@ -1065,3 +1099,122 @@ re-reading every file」引入的 (mtime,size) 短路复用路径）。本轮三
 **处置**：留观销案——三路静态结论落档，此留观项关闭；若后续轮次在该
 路径复发同类疑点（深度/失败趟交互、短路并发、粒度契约漂移），以本节为
 基准重启留观。
+**勘误注（2026-11-04，台账闭环员）**：本节销案后该短路路径确曾复发一例
+真实缺陷并已收口——round-20 bugA Bug1（01154c9）：同尺寸共时戳的原子
+替换被 (mtime,size) 短路吞掉（自然概率红 `TestWatcherAtomicReplace
+-count=300` 两败 + os.Chtimes 强制共时戳形态确定性红 `-count=20` 全败，
+out/bugA_watch_natural_red.log、out/bugA_watch_deterministic_red.log）。
+修法以内核文件身份判别（Windows volume serial+file index / Unix
+dev+inode，无新依赖；身份不一致落回重读哈希 → Modified）。销案 #3 钉住
+的 NTFS 粒度契约半边（TestWatcherSkipsRereadForUnchangedStatSignature
+「同文件同签名不可见」）保持绿——本修复只新增「换了文件对象必报
+  Modified」半边，未推翻三路静态结论；销案基准维持「留观销案」，
+  复发处置以本注为准。
+
+---
+
+## 2026-11-04 台账闭环对齐（X10 落地增量、二十轮战果增量与开口四态清单）
+
+本节由台账闭环员于 2026-11-04 落账（HEAD a23d5f2）。口径沿 2026-10-30 节：
+正文各处原值一律保留，以本节与各处「勘误注」为准；本轮零代码改动，改动仅
+docs/audit-longterm-spec.md（本节与五处勘误注）与 docs/acceptance.md（本轮
+运行记录）。ACL 实况：internal/index/extractors/** 对当前账户不可写
+（icacls 勘验无 Authenticated Users:(M)，写探针单次即拒 Permission
+denied），依赖编译的检查（go test / go build / `go run verify`）本轮一律
+未跑、标 acl-blocked，对账全部走静态读码与脚本比对；任务书锚点过时处
+以下述实况为准。
+
+### 1. registry 计数与三方对账（静态全绿）
+
+- **registry**（internal/conformance/registry.go，容忍空白 grep 实测）：
+  **AUTO 93 / PARTIAL 4 / DEFERRED 26 / GATE 2 = 125 条**（四态合计与
+  `grep -c 'ID: "'` = 125 闭合）。PARTIAL 四条：X5-4、Y2-5、DEF-EDITORS、
+  X8-2；GATE 两条：Y1-10（soak）、X8-1（multiplatform）。
+- **docs/conformance.md 投影**：125 行，ID 集合与 registry 逐一对应
+  （脚本 diff 为空），逐行状态串与 registry Status 前缀逐一匹配
+  （125/125，awk 比对）；域行数 core 78 / X5 7 / X7 4 / X8 3 / X9 2 /
+  POST-X8 1 / POST-X9 30（合计 125）。
+- **baseline.json**：coreScore 98.45959595959597 与权重式
+  0.24·Y0+0.18·Y3+0.18·Y1+0.13·Y2+0.09·Y4+0.09·Y5+0.09·PERF 代入重算
+  （Y1=10.5/11——Y1-10 GATE 按 creditGateFast=0.5 折算，report.go:28；
+  Y2=8.5/9——Y2-5 PARTIAL 按 creditPartial=0.5，report.go:27）吻合至
+  delta −2.8e-14（浮点阶位内；历轮机器断言口径 TOL 1e-9）。testdata 与
+  out/wt-integration 两份 baseline.json `diff` 为空。
+- **任务书锚点勘误**：任务书称「PARTIAL 5 条」——实测 4 条，第五条
+  DEF-IDXWIRE 已随 26b133e promote（任务书成文于 promote 前）。
+- **资格面现值**（grep 实测）：Milestone "X10" ×3（DEF-REMOTEIDX、
+  DEF-W7UPD、DEF-COMPACT；DEF-BUDWIRE 已 promote 删字段）、
+  "post-X9" ×19（DEF-PLUGMOUNT 已 promote 删字段）、"X3" ×3、
+  "post-X8" ×1。
+
+### 2. X10 落地增量（第十八轮后）
+
+X10 资格 2026-10-30 登记后（范围层级待用户拍板、未立项），四条
+post-X9/X10 相关条目经各自车道按自带 Reason 的解除条件落地并记账——
+均为条目级 promote/维持，非 X10 立项动作；正式 X10 OPTIONAL 档
+（goal.md:5379-5388 remote index service / remote semantic workers /
+distributed indexing / multi-tenant hosted service / advanced
+cross-language graph / DAP integration）仍未启动：
+
+- **DEF-PLUGMOUNT DEFERRED→AUTO**（9d24c40，第十八轮）：插件 API 面
+  （X10 scope 半边）随 48a67f7 落地，emit 挂载点被清单声明能力门控
+  （default deny 实证点 internal/runtime/server/server.go:537）。
+- **DEF-BUDWIRE DEFERRED→AUTO**（433f092，第十九轮）：F14 后端缓冲配额
+  锁存 internal/languages/budget.go:90（env 未设返回 nil 短路，默认关沿
+  X10 红线）+ 五个真实分配点 fail-closed 拒绝与计数；F13 ladder
+  （index.go:188/192）第十八轮已在。
+- **DEF-COMPACT 维持 DEFERRED，结构半边落地**（第十八轮 Reason 更新）：
+  compact.go 有界重分区（语义格式逐位保持、staged build + 原子 manifest
+  commit + abort 回滚）；「background-triggered」半边仍缺（Compact() 零
+  非测试调用者，默认接线违 X10 红线，Reason 如实保留）。
+- **DEF-IDXWIRE PARTIAL→AUTO**（26b133e，第二十轮集成）：见下节战果；
+  两条诚实注记维持——ccls libclang 导出面 8/11 fact kinds 的诚实不完全
+  照旧在案，真实双 OS 进程跨进程 replay 验收仍归 S21/acceptance 门禁。
+
+### 3. 二十轮战果增量
+
+三条狩猎分支并入 main（git rev-list 实证 41 笔提交——上游「合并 48 只
+修复」口径已由第二十轮集成 selfCheck② 勘误为 41）：bugA 15 笔
+（merge 1b40cc7）、bugB 13 笔（1196b88）、bugC 13 笔（f09f857）；三份
+战果清单合计 46 条（bugB 17 条去重为 13 独立缺陷；bugC 14 条中 1 条
+证伪不修——out/bugC-round20-evidence.md §5 Bug5）。与本文档直接相关的
+增量两笔：
+
+- **clang EndChar 族（bugB 6 笔）解除第十九轮登记的 cpp/c 阻断**：
+  extractor.go convertPosition 对缺 end 列的边事件产出 EndChar=0 无 clamp
+  （DEF-IDXWIRE 的 PARTIAL Reason 曾如实登记该上游阻塞），修复后七语言
+  双载体测试（TestSevenLanguageTypedFactExportPersistsWithStableIdentity、
+  TestSevenLanguageTypedGenerationsReplayFreshOnlyAcrossStoreReopen）的
+  cpp/c 子测由哨兵 SKIP 转全链 PASS（acceptance.md 第二十轮集成节实跑：
+  persistent PASS 40.47s、replay PASS 70.47s，go/rust/typescript/python/
+  cpp/c/javascript 全绿）。
+- **watch (mtime,size) 短路留观项的复发与收口**：bugA Bug1 证明该路径
+  在销案后确曾藏有一例真实缺陷（同尺寸共时戳原子替换被吞），以内核文件
+  身份判别收口（01154c9）；2026-10-30 销案 #3 的 NTFS 粒度契约半边保持
+  绿，销案基准维持（详见该节勘误注）。
+
+### 4. 开口四态清单（闭环度量）
+
+当前账面开口逐条归类（四态 = fixed+verified / deferred+reason /
+user-action / disproven；证据针见 acceptance.md 2026-11-04 台账闭环核对
+节）：
+
+| # | 开口 | 四态归类 | 依据 |
+|---|---|---|---|
+| 1 | DEF-IDXWIRE 七语言链 cpp/c 半边 | **fixed+verified** | round-20 EndChar 族修复 + 双载体测试实跑全绿 + promote 26b133e（acceptance.md 第二十轮集成节） |
+| 2 | Y2-5 剩余半边（完整原生操作证据；42 格对冻结候选复核） | deferred+reason | registry Reason 在案（投影 docs/conformance.md:123）；证据面由 X8-2 车道承担 |
+| 3 | X5-4 剩余半边（依赖图条款零实现） | deferred+reason | 死码整包已删、ADR-0008 D5 缓期选择性失效；复活条件=接线 X10 index service + 新证据（registry Reason 在案） |
+| 4 | DEF-EDITORS 剩余半边（Emacs/Eglot 完整原生证据、Zed/Sublime 原生证据） | deferred+reason | Milestone x9 准入闸按设计工作（registry Reason 在案）；环境面见 #10 |
+| 5 | X8-2 剩余半边（42 格冻结候选矩阵未全过；rust 格败于后端 warmup race 且失败集逐轮漂移） | deferred+reason | 2026-10-27 复跑 12/14 runnable 格过（registry Text 在案，docs/conformance.md:228） |
+| 6 | Y1-10 真实 stdio RC opt-in soak GATE | deferred+reason | 加速门绿；真 stdio 门为发布侧证据，本机 30s 预检追不上固定 30s initial-query 预算（registry Text 在案）；完整 wrapper 链（Fast 门 + 30s/10m 预检 + pre-soak-review.json）本树无前置证据（acceptance.md 2026-10-29 范围限定） |
+| 7 | DEF-S21CORPUS 冻结候选语料分类 | deferred+reason | 机器依赖证据不入计分探针（registry Reason 在案） |
+| 8 | 真实双 OS 进程跨进程 replay 验收 | deferred+reason | 归 S21/acceptance 门禁（DEF-IDXWIRE Text 诚实注记在案，docs/conformance.md:292） |
+| 9 | ACL：internal/index/extractors/** 不可写（含主树 3 笔待恢复删除 build_request.go/extractor.go/extractor_test.go） | user-action | icacls 勘验无 Authenticated Users:(M)、写探针单次即拒；提权命令 `icacls <path> /grant '*S-1-5-11:(M)'`（PowerShell 传参）待有权方执行（§8 环境约束条勘误注） |
+| 10 | ACL：锁定区（test/acceptance/evidence/**、tools/.npm-cache、emacs-30.2 外来空目录）与编辑器环境供给 | user-action | touch/mkdir/rmdir 全拒（X8-2 Text 与 acceptance.md 在案）；Emacs 7 格与 Zed 的 not_verified 环境恢复属用户侧 |
+| 11 | 净化员在制品（主树 29 文件未提交：14 M + 15 D，+35/−5191） | deferred+reason | 他人边界；3 笔 D 为 ACL 待恢复删除、12 笔 D 为 *_pin_test.go 删除、14 M 为 interop/persistent/replay 修改——登记不动，待处置方收束 |
+| 12 | X10 范围层级拍板 | user-action | 资格已到、OPTIONAL 档未立项（2026-10-30 节 §1）；无实现动作 |
+| 13 | push 授权 | user-action | 纪律禁止本轮 push；发布属用户侧动作 |
+
+**闭环度量：开口 13 项全部落四态——fixed+verified 1、deferred+reason 8、
+user-action 4、disproven 0（本轮无新增证伪；bugC Bug5 证伪已由第二十轮
+战果在案）；静默 0。**
