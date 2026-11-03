@@ -81,6 +81,11 @@ type lsifNodeRaw struct {
 	Root   string        `json:"projectRoot"`
 	Commit string        `json:"commitId"`
 	Tool   *lsifToolInfo `json:"toolInfo"`
+
+	// metaData 顶点的 positionEncoding 声明（LSIF 0.5 必填；utf-8/utf-32 为
+	// 合法值）：流内所有 range 列值的解释口径。缺失或未知值由导入入口
+	// fail-closed 拒绝，不再默认按 UTF-16 解读。
+	PositionEncoding string `json:"positionEncoding"`
 }
 
 // lsifItemEdge 是一条 item 边的精简记录（range→role 归属）。

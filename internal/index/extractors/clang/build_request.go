@@ -408,9 +408,7 @@ func readRawCommands(ctx context.Context, view model.WorkspaceView, files []mode
 }
 
 func appendDiscoveryProblem(problems *[]string, reason string) {
-	if len(reason) > maxIssueBytes {
-		reason = reason[:maxIssueBytes-3] + "..."
-	}
+	reason = sanitizeIssueText(reason)
 	if len(*problems) < maxContextIssues {
 		*problems = append(*problems, reason)
 	} else if len(*problems) == maxContextIssues {

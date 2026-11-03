@@ -124,9 +124,30 @@ func ConvertLSIFToSCIP(data []byte) ([]byte, error) {
 		revision = meta.Commit
 	}
 
+	// The converted index must declare the encoding its columns actually use.
+	// The conversion carries columns verbatim (it has no source access to
+	// re-encode them), so the declaration has to follow the stream's
+	// positionEncoding instead of the old hard-coded UTF-16: a utf-8 stream
+	// previously converted with a UTF-16 declaration, silently mis-decoding
+	// every position after a multi-byte character downstream. UTF-8 streams
+	// re-import through ImportSCIPToModel, which converts UTF-8 columns on
+	// the way in. A utf-32 stream can neither keep an honest declaration
+	// (the SCIP TextEncoding enum has no UTF-32) nor be re-encoded without
+	// source content, so it is rejected; the model import path
+	// (ImportLSIFToModel) does have source access and converts utf-32 there.
+	// An undeclared or unknown encoding is rejected as well.
+	var encoding scip.TextEncoding
+	switch meta.PositionEncoding {
+	case "utf-16":
+		encoding = scip.TextEncoding_UTF16
+	case "utf-8":
+		encoding = scip.TextEncoding_UTF8
+	default:
+		return nil, fmt.Errorf("%w: LSIF positionEncoding %q cannot be carried into SCIP without source access", errInvalidLSIF, meta.PositionEncoding)
+	}
 	index := &scip.Index{Metadata: &scip.Metadata{
 		ProjectRoot:          root,
-		TextDocumentEncoding: scip.TextEncoding_UTF16,
+		TextDocumentEncoding: encoding,
 		ToolInfo:             &scip.ToolInfo{Name: scipToolName, Version: toolVersion(meta)},
 	}}
 	if repository != "" {

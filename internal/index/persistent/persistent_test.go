@@ -329,6 +329,10 @@ func TestWriteSegmentRespondsToCancelledBuildContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The session still owns its staging owner marker until it terminates;
+	// abandon it the way production does so TempDir cleanup can remove the
+	// staging directory (the marker handle must be released first).
+	defer func() { _ = build.Abort() }()
 	// Hold the cross-process writer lock the way another process would.
 	holder, err := acquireWriterLock(context.Background(), s.root)
 	if err != nil {

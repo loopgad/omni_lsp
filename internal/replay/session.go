@@ -26,6 +26,13 @@ import (
 // FormatVersion guards the on-disk shape of replay files.
 const FormatVersion = 2
 
+// maxSessionLine bounds one JSONL line on load. It derives from the
+// transport's inbound message cap (internal/protocol/jsonrpc
+// DefaultMaxMessageSize) plus wrapping headroom for the Entry envelope, so
+// the two bounds cannot drift apart again: anything the codec lets through
+// to the recorder must be loadable back.
+const maxSessionLine = jsonrpc.DefaultMaxMessageSize + 64*1024
+
 const legacyFormatVersion = 1
 
 // Meta is the P9 header record. Version 1 recordings remain readable, but they
@@ -653,7 +660,12 @@ func LoadSession(path string) (*Session, error) {
 
 	s := &Session{}
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // large didChange payloads
+	// The line cap must sit at or above the transport's inbound message cap
+	// (internal/protocol/jsonrpc.DefaultMaxMessageSize) plus the JSONL entry
+	// wrapping overhead: the recorder and Save accept any payload the codec
+	// does, so a scanner cap below that bound turns a legal recording — e.g.
+	// one full-file didChange — into a dead archive that can never load.
+	sc.Buffer(make([]byte, 0, 64*1024), maxSessionLine)
 	line := 0
 	metaSeen := false
 	for sc.Scan() {

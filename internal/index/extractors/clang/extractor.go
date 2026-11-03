@@ -287,6 +287,14 @@ func Extract(ctx context.Context, request model.Request, sink model.Sink) (repor
 		}
 	}()
 	filesByRoot := make(map[string][]model.File)
+	// File-level symbols are properties of the immutable workspace files, not
+	// of one compile context: the same header can be included from translation
+	// units in several scopes. Declare each file symbol exactly once for the
+	// whole export (first referencing scope wins); the §L5 ledger resolves
+	// references from the other scopes to that single declaration, while a
+	// second declaration in a different scope would be rejected as a duplicate
+	// symbol.
+	declaredFileSymbols := make(map[string]bool)
 
 	for _, scope := range request.Scopes {
 		coverage := newCoverage(scope.ID)
@@ -485,7 +493,7 @@ func Extract(ctx context.Context, request model.Request, sink model.Sink) (repor
 			verifiedHelper[key] = true
 		}
 		writer := newFactWriter(ctx, sink, scope)
-		analysis := analyzeState{coverage: coverage, files: files, workspace: workspace, seenSource: make(map[string]bool), packagePatterns: scope.Build.PackagePatterns}
+		analysis := analyzeState{coverage: coverage, files: files, workspace: workspace, seenSource: make(map[string]bool), packagePatterns: scope.Build.PackagePatterns, declaredFiles: declaredFileSymbols}
 		for _, command := range commands {
 			if err := ctx.Err(); err != nil {
 				return report, err
@@ -536,6 +544,12 @@ func Extract(ctx context.Context, request model.Request, sink model.Sink) (repor
 				if mapping.SourceURI == "" || !containsFileURI(files, mapping.SourceURI) {
 					coverage.partial(model.FactGenerated, "generated source range maps outside the captured workspace: "+generated.URI)
 					continue
+				}
+				if err := analysis.declareFileSymbol(writer, scope, generated.URI); err != nil {
+					return report, err
+				}
+				if err := analysis.declareFileSymbol(writer, scope, mapping.SourceURI); err != nil {
+					return report, err
 				}
 				if err := writer.edge(model.Edge{
 					From:         fileSymbolID(generated.URI),
@@ -1380,20 +1394,58 @@ type analyzeState struct {
 	packagePatterns []string
 	issues          []string
 	processed       int
+	declaredFiles   map[string]bool
+}
+
+// sanitizeIssueText normalizes diagnostic text on its way into
+// model.Coverage.Reason. The validated sink requires every stored string to
+// be valid UTF-8 (semantic.allStringsValid → ErrMalformedPayload fails the
+// whole Finalize), while byte truncation splits multi-byte characters and raw
+// helper stderr can carry invalid sequences. Replace invalid sequences first,
+// then truncate on a rune boundary under the same byte budget.
+func sanitizeIssueText(reason string) string {
+	if !utf8.ValidString(reason) {
+		reason = strings.ToValidUTF8(reason, "\uFFFD")
+	}
+	if len(reason) > maxIssueBytes {
+		cut := maxIssueBytes - 3
+		for cut > 0 && !utf8.RuneStart(reason[cut]) {
+			cut--
+		}
+		reason = reason[:cut] + "..."
+	}
+	return reason
 }
 
 func (a *analyzeState) addContextIssue(reason string) {
 	if reason == "" {
 		return
 	}
-	if len(reason) > maxIssueBytes {
-		reason = reason[:maxIssueBytes-3] + "..."
-	}
+	reason = sanitizeIssueText(reason)
 	if len(a.issues) < maxContextIssues {
 		a.issues = append(a.issues, reason)
 	} else if len(a.issues) == maxContextIssues {
 		a.issues = append(a.issues, "additional semantic context issues omitted")
 	}
+}
+
+// declareFileSymbol emits the symbol declaration for a file-level symbol
+// (fileSymbolID) before any edge references it. The §L5 ledger rejects a
+// referenced-but-undeclared symbol ID at Finalize whenever the referencing
+// scope's coverage for the fact kind is Complete, so include/call/generated
+// edges anchored on file symbols must carry their declaration.
+func (a *analyzeState) declareFileSymbol(writer *factWriter, scope model.Scope, uri string) error {
+	id := fileSymbolID(uri)
+	if a.declaredFiles[string(id)] {
+		return nil
+	}
+	a.declaredFiles[string(id)] = true
+	return writer.symbol(model.Symbol{
+		ID:      id,
+		ScopeID: scope.ID,
+		Name:    uri,
+		Kind:    "file",
+	})
 }
 
 func (a *analyzeState) addEvent(event rawEvent, scope model.Scope, writer *factWriter) error {
@@ -1471,6 +1523,12 @@ func (a *analyzeState) addEvent(event rawEvent, scope model.Scope, writer *factW
 			return nil
 		}
 		a.seenSource[normalizeRel(event.TargetPath)] = true
+		if err := a.declareFileSymbol(writer, scope, sourceFile.URI); err != nil {
+			return err
+		}
+		if err := a.declareFileSymbol(writer, scope, targetFile.URI); err != nil {
+			return err
+		}
 		return writer.edge(model.Edge{
 			From:         fileSymbolID(sourceFile.URI),
 			To:           fileSymbolID(targetFile.URI),
@@ -1542,6 +1600,9 @@ func (a *analyzeState) addEvent(event rawEvent, scope model.Scope, writer *factW
 		position := convertPosition(a.workspace, file, event.Line, event.Column, event.EndLine, event.EndColumn)
 		if strings.HasPrefix(event.USR, "file:") {
 			from = fileSymbolID(file.URI)
+			if err := a.declareFileSymbol(writer, scope, file.URI); err != nil {
+				return err
+			}
 		}
 		return writer.edge(model.Edge{
 			From:         from,
@@ -1663,12 +1724,21 @@ func convertPosition(workspace *workspace, file model.File, line, column, endLin
 	if endLine == 0 {
 		endLine = line
 	}
-	return model.Position{
+	position := model.Position{
 		StartLine: line - 1,
 		StartChar: sourcePosition(data, line, column),
 		EndLine:   maxU32(line-1, endLine-1),
 		EndChar:   sourcePosition(data, endLine, endColumn),
 	}
+	// Helper events may omit the end column entirely (type-relation and
+	// implementation edges, declarations whose extent end is a null location):
+	// sourcePosition then decodes EndChar=0 on the start line, which the
+	// validated semantic sink rejects. A missing end clamps to a zero-width
+	// range at the start rather than an invalid record.
+	if position.EndLine == position.StartLine && position.EndChar < position.StartChar {
+		position.EndChar = position.StartChar
+	}
+	return position
 }
 
 func approximatePosition(line, column, endLine, endColumn uint32) model.Position {
@@ -1678,12 +1748,16 @@ func approximatePosition(line, column, endLine, endColumn uint32) model.Position
 	if endLine == 0 {
 		endLine = line
 	}
-	return model.Position{
+	position := model.Position{
 		StartLine: line - 1,
 		StartChar: maxU32(column, 1) - 1,
 		EndLine:   maxU32(line-1, endLine-1),
 		EndChar:   maxU32(endColumn, 1) - 1,
 	}
+	if position.EndLine == position.StartLine && position.EndChar < position.StartChar {
+		position.EndChar = position.StartChar
+	}
+	return position
 }
 
 func maxU32(a, b uint32) uint32 {
@@ -1704,12 +1778,46 @@ func sourcePosition(data []byte, line, column uint32) uint32 {
 			start = i
 			break
 		}
-		if b == '\n' {
+		// Line boundaries follow the canonical position engine
+		// (internal/workspace/position lineSpan): LF, CR, and CRLF each end a
+		// line. libclang reports CR-only and CRLF sources with line numbers
+		// on that model, so measuring columns against line 1's byte prefix
+		// silently misplaced every position on lines ≥ 2 of a CR-only file.
+		// Multi-byte UTF-8 sequences never contain 0x0A or 0x0D bytes, so the
+		// byte-wise scan is encoding-safe.
+		if b == '\r' {
 			current++
+			start = i + 1
+			continue
+		}
+		if b == '\n' {
+			if i == 0 || data[i-1] != '\r' {
+				current++
+			}
 			start = i + 1
 		}
 	}
-	end := start + int(column-1)
+	// A line number beyond the file's content has no byte offset, so pin it
+	// to EOF. Without this, a trailing newline already left start past the
+	// final break (a zero-width position at EOF) while a file without one
+	// kept the last line's start — the same out-of-range event then decoded
+	// different columns depending on the file's final byte, and the
+	// no-newline shape silently reused the last line's content for a line
+	// that does not exist. The strict comparison keeps the phantom EOF line
+	// of a trailing-newline file (current == line) at its zero-width
+	// position.
+	if current < line {
+		start = len(data)
+	}
+	// end = start + (column-1), clamped to the buffer with 64-bit math: the
+	// column arrives from untrusted helper event JSON, and on 32-bit GOARCH
+	// int(column-1) wraps negative for huge values (slice panic), while on
+	// 64-bit the unclamped end silently measured the whole remaining file.
+	delta := uint64(column - 1)
+	if over := uint64(len(data) - start); delta > over {
+		delta = over
+	}
+	end := start + int(delta)
 	for end < len(data) && end > start && !utf8.RuneStart(data[end]) {
 		end++
 	}
@@ -1913,6 +2021,7 @@ func (c *coverageBuilder) set(fact model.FactKind, state model.Completeness, rea
 	}
 	c.states[fact] = state
 	if reason != "" {
+		reason = sanitizeIssueText(reason)
 		reasons := c.reasons[fact]
 		for _, existing := range reasons {
 			if existing == reason {

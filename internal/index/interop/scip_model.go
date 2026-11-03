@@ -378,6 +378,43 @@ func scipRange(occurrence *scip.Occurrence) (model.Position, error) {
 }
 
 func utf8RangesToUTF16(ctx context.Context, reader io.Reader, ranges []model.Position) ([]model.Position, error) {
+	return convertSourceLineRanges(ctx, reader, ranges, utf8ByteColumnToUTF16, errInvalidSCIP)
+}
+
+// utf32RangesToUTF16 maps UTF-32 code point columns to UTF-16 columns, the
+// LSIF-side counterpart of utf8RangesToUTF16 for streams that declare
+// "positionEncoding":"utf-32".
+func utf32RangesToUTF16(ctx context.Context, reader io.Reader, ranges []model.Position) ([]model.Position, error) {
+	return convertSourceLineRanges(ctx, reader, ranges, utf32ColumnToUTF16, errInvalidLSIF)
+}
+
+// utf32ColumnToUTF16 maps a UTF-32 code point column to its UTF-16 column.
+// The end-of-line position (column == code point count) is valid.
+func utf32ColumnToUTF16(line []byte, codePointColumn uint32) (uint32, error) {
+	units := uint32(0)
+	seen := uint32(0)
+	for _, r := range string(line) {
+		if seen == codePointColumn {
+			return units, nil
+		}
+		seen++
+		if r > 0xFFFF {
+			units += 2
+		} else {
+			units++
+		}
+	}
+	if seen == codePointColumn {
+		return units, nil
+	}
+	return 0, fmt.Errorf("utf-32 column %d exceeds the line's %d code points", codePointColumn, seen)
+}
+
+// convertSourceLineRanges is the shared single-pass line walker behind the
+// column converters: it collects the lines/columns the ranges touch, reads
+// them once via readSemanticSourceLine, maps every wanted column through
+// convert, and substitutes the converted columns into a copy of the ranges.
+func convertSourceLineRanges(ctx context.Context, reader io.Reader, ranges []model.Position, convert func(line []byte, column uint32) (uint32, error), errTag error) ([]model.Position, error) {
 	wanted := make(map[uint32]map[uint32]struct{})
 	for _, r := range ranges {
 		for _, p := range []struct{ line, column uint32 }{{r.StartLine, r.StartChar}, {r.EndLine, r.EndChar}} {
@@ -410,10 +447,10 @@ func utf8RangesToUTF16(ctx context.Context, reader io.Reader, ranges []model.Pos
 					lineNo++
 					break
 				}
-				return nil, fmt.Errorf("%w: source line %d unavailable for UTF-8 range conversion", errInvalidSCIP, target)
+				return nil, fmt.Errorf("%w: source line %d unavailable for position conversion", errTag, target)
 			}
 			if err != nil && !(errors.Is(err, io.EOF) && len(line) > 0) {
-				return nil, fmt.Errorf("%w: source line %d unavailable for UTF-8 range conversion", errInvalidSCIP, target)
+				return nil, fmt.Errorf("%w: source line %d unavailable for position conversion", errTag, target)
 			}
 			if lineNo == target {
 				converted[target] = make(map[uint32]uint32, len(wanted[target]))
@@ -423,9 +460,9 @@ func utf8RangesToUTF16(ctx context.Context, reader io.Reader, ranges []model.Pos
 				}
 				sort.Slice(columns, func(i, j int) bool { return columns[i] < columns[j] })
 				for _, column := range columns {
-					value, err := utf8ByteColumnToUTF16(line, column)
+					value, err := convert(line, column)
 					if err != nil {
-						return nil, fmt.Errorf("%w: line %d column %d: %v", errInvalidSCIP, target, column, err)
+						return nil, fmt.Errorf("%w: line %d column %d: %v", errTag, target, column, err)
 					}
 					converted[target][column] = value
 				}

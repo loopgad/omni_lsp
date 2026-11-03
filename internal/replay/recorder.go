@@ -13,6 +13,11 @@ import (
 	"github.com/omnilsp/omni/internal/transport"
 )
 
+// ErrRecordedAfterClose reports that a message arrived after the recorder
+// was closed (a worker still in flight when the session ended): the live
+// session kept flowing, but the entry is not in the recording.
+var ErrRecordedAfterClose = errors.New("replay: recorder closed")
+
 // RecorderTransport wraps a Transport and records every message in both
 // directions to a JSONL session file (§P9). revFn samples the server's
 // snapshot revision at capture time for the SnapRev column.
@@ -37,8 +42,11 @@ type RecorderTransport struct {
 // errRecorderClosed is the recording-leg failure reported when an operation
 // arrives after Close: the wrapped transport is untouched and the live
 // message still flows, but the recording can no longer capture it. Surfaced
-// through Err() so callers can detect the partial recording.
-var errRecorderClosed = errors.New("replay: recorder is closed")
+// through Err() so callers can detect the partial recording. Round 20 pinned
+// this gap twice (hunt A#3 7d71235, hunt B 3bdb5b2) with one sentinel each;
+// the merge keeps both names pointing at the single exported sentinel so
+// both pin contracts hold on one canonical error.
+var errRecorderClosed = ErrRecordedAfterClose
 
 // NewRecorder opens path for writing, emits the meta header, and returns the
 // wrapping transport. Close the recorder (not just the inner transport) when
@@ -182,21 +190,25 @@ func (r *RecorderTransport) logOutbound(msg *jsonrpc.Message) error {
 }
 
 func (r *RecorderTransport) logLocked(dir string, payload json.RawMessage, binding *SemanticResponseBinding) error {
-	// Closed recorder (bug round 20 A#3): Close flushes and nils the writer,
-	// but late writes are reachable — drainResult releases srv.Run after the
-	// drain window while a backend request can still complete, and the diag
-	// debounce callback has no recover. The encoder used to dereference the
-	// nil bufio.Writer and panic the whole process. The contract cut is that
-	// a closed transport returns errors on all subsequent operations: keep
-	// the live message flowing (callers of log discard the recording error
-	// by design) and retain the gap in firstErr so Err() can report the
-	// partial recording. Sequence numbers stop at the close — no entry exists
-	// for a message that was never recorded.
+	// Closed recorder — the same gap round 20 pinned twice, from hunt A (A#3,
+	// 7d71235) and hunt B (3bdb5b2) independently: Close flushes and nils the
+	// writer, but late Write/Read/identity registrations are reachable
+	// (drainResult releases srv.Run after the drain window while a backend
+	// request can still complete, the diag debounce callback has no recover,
+	// and Shutdown does not join admitted workers). The encoder used to
+	// dereference the nil bufio.Writer and panic the whole process. The
+	// merged contract keeps both cuts: a closed transport returns errors on
+	// all subsequent operations, the live message still flows (callers of log
+	// discard the recording error by design; a recording lifecycle problem
+	// never aborts or corrupts the live session per §P9), the gap is retained
+	// in firstErr with the offending direction and sequence number so Err()
+	// reports the partial recording, and sequence numbers stop at the close —
+	// no entry exists for a message that was never recorded.
 	if r.w == nil {
 		if r.firstErr == nil {
-			r.firstErr = errRecorderClosed
+			r.firstErr = fmt.Errorf("replay: record %s #%d after close: %w", dir, r.seq+1, ErrRecordedAfterClose)
 		}
-		return errRecorderClosed
+		return ErrRecordedAfterClose
 	}
 	r.seq++
 	var rev uint64
