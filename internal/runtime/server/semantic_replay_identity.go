@@ -8,6 +8,7 @@ import (
 	"errors"
 	"hash"
 	"sort"
+	"sync"
 
 	"github.com/omnilsp/omni/internal/index/model"
 	"github.com/omnilsp/omni/internal/index/persistent"
@@ -23,9 +24,57 @@ type SemanticIndexIdentity struct {
 	Tools              []model.ToolIdentity
 }
 
+// semanticIndexIdentityMemo caches the last verified SemanticIndexIdentity per
+// (index service, committed generation). Round-23 OPT-2: the semantic response
+// observer called CurrentSemanticIndexIdentity on EVERY evidence-indexed
+// response, and each call re-derived the whole identity — full-tree
+// captureSemanticView (~0.65-1.6s on a 7MB workspace), every pinned tool
+// re-hashed, every store segment re-read and re-hashed — although one
+// generation's identity is invariant for that generation's lifetime. The memo
+// is bound to the index-service pointer, so a workspace rebind (new idx) never
+// serves a stale identity; a new generation has a new view.ID and misses.
+// Errors are never cached: a transient lease failure must stay retryable and
+// must not poison later responses.
+type semanticIndexIdentityMemo struct {
+	mu    sync.Mutex
+	owner *indexService
+	gen   uint64
+	value SemanticIndexIdentity
+}
+
+func newSemanticIndexIdentityMemo() *semanticIndexIdentityMemo {
+	return &semanticIndexIdentityMemo{}
+}
+
+func (s *Server) cachedSemanticIndexIdentity(idx *indexService, generation uint64) (SemanticIndexIdentity, bool) {
+	memo := s.semanticIdentityMemo
+	if memo == nil {
+		return SemanticIndexIdentity{}, false
+	}
+	memo.mu.Lock()
+	defer memo.mu.Unlock()
+	if memo.owner == idx && memo.gen == generation {
+		return memo.value, true
+	}
+	return SemanticIndexIdentity{}, false
+}
+
+func (s *Server) storeSemanticIndexIdentity(idx *indexService, generation uint64, value SemanticIndexIdentity) {
+	memo := s.semanticIdentityMemo
+	if memo == nil {
+		return
+	}
+	memo.mu.Lock()
+	defer memo.mu.Unlock()
+	memo.owner, memo.gen, memo.value = idx, generation, value
+}
+
 // CurrentSemanticIndexIdentity returns the exact currently available disk
 // generation. A stale workspace, changed tool, or incomplete provenance has
-// no replayable identity.
+// no replayable identity. Within one committed generation the identity is
+// memoized (round-23 OPT-2): the generation pin still opens the snapshot
+// lease every call, so a reindex serves a fresh identity and the per-response
+// observer hits the memo in O(1).
 func (s *Server) CurrentSemanticIndexIdentity(ctx context.Context) (SemanticIndexIdentity, error) {
 	idx, _, _ := s.indexState()
 	if idx == nil {
@@ -35,8 +84,12 @@ func (s *Server) CurrentSemanticIndexIdentity(ctx context.Context) (SemanticInde
 	if err != nil {
 		return SemanticIndexIdentity{}, err
 	}
-	defer lease.Close()
 	view := lease.Snapshot()
+	if cached, ok := s.cachedSemanticIndexIdentity(idx, view.ID); ok {
+		_ = lease.Close()
+		return cached, nil
+	}
+	defer lease.Close()
 	reader, err := semantic.OpenReader(ctx, view)
 	if err != nil {
 		return SemanticIndexIdentity{}, err
@@ -87,7 +140,9 @@ func (s *Server) CurrentSemanticIndexIdentity(ctx context.Context) (SemanticInde
 	for _, key := range keys {
 		tools = append(tools, toolsByKey[key])
 	}
-	return SemanticIndexIdentity{Generation: view.ID, IndexContentDigest: digest, BuildContexts: contexts, Tools: tools}, nil
+	identity := SemanticIndexIdentity{Generation: view.ID, IndexContentDigest: digest, BuildContexts: contexts, Tools: tools}
+	s.storeSemanticIndexIdentity(idx, view.ID, identity)
+	return identity, nil
 }
 
 func semanticGenerationContentDigest(ctx context.Context, view persistent.GenerationView) (string, error) {

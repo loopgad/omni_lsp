@@ -113,6 +113,7 @@ type Server struct {
 	// from the live backend when its documents are dirty.
 	explicitSemanticIndexes map[string]struct{}
 	overlayFacts            *goSnapshotSemanticFactsCache
+	semanticIdentityMemo    *semanticIndexIdentityMemo
 	queries                 *query.Engine    // §J memo engine for semantic read paths
 	diag                    *diagCoordinator // §C11/§I17 push/pull diagnostics
 	positionEncoding        string           // §C4 negotiated: utf-8|utf-16|utf-32
@@ -410,6 +411,7 @@ func New(cfg Config) *Server {
 		semanticIndexes:         make(map[string]semanticIndexBinding),
 		explicitSemanticIndexes: make(map[string]struct{}),
 		overlayFacts:            newGoSnapshotSemanticFactsCache(),
+		semanticIdentityMemo:    newSemanticIndexIdentityMemo(),
 		inflight:                make(map[string]*scheduler.Request),
 		metrics:                 newServerMetrics(),
 		queries:                 query.NewEngine(0),
