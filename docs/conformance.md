@@ -27,7 +27,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| J-WIRE | Semantic reads memoized by revision; transient/unknown failures retryable; bounded table (K0) | J engine production wiring | `TestJ_EngineMemoizesSemanticReads`, `TestB6_UnknownEnvelopeNotMemoizedAcrossRecovery`, `TestB6_UnavailableEnvelopeNotMemoizedAcrossRecovery`, `TestK0_QueryMemoBounded` | AUTO |
+| J-WIRE | Semantic reads memoized by revision; transient/unknown failures retryable; bounded table (K0) | J engine production wiring | `TestJ_EngineMemoizesSemanticReads`, `TestB6_UnknownEnvelopeNotMemoizedAcrossRecovery`, `TestB6_UnavailableEnvelopeNotMemoizedAcrossRecovery`, `TestCurrentSemanticIndexIdentityMemoizesPerGeneration`, `TestCurrentSemanticIndexIdentityNeverCachesErrors`, `TestSemanticDiskUnchangedSincePinsCapturedTree`, `TestToolPathStillMatchesCachesByStatAndExpected`, `TestK0_QueryMemoBounded` | AUTO |
 
 ### PERF
 
@@ -69,7 +69,7 @@
 | UX-C8 | $/progress begin/end reported for token-bearing long queries | C8 work-done progress | `TestC8_ProgressNotifications` | AUTO |
 | UX-I9 | Heuristic completion declared IsIncomplete for client re-query | I9 completion incompleteness | `TestI9_CompletionIsIncompleteNegotiation` | AUTO |
 | UX-Q2 | Failed queries project supervisor recovery guidance to clients | Q2 error projection | `TestQ2_ErrorProjectionCarriesSupervisorGuidance` | AUTO |
-| UX-I21TOK | Legend shared with emitters; flat data-array wire shape; no false incremental claim | I21/C10 semantic tokens wire contract | `TestI21_LegendMatchesEmittedTypes`, `TestHandleSemanticTokens` | AUTO |
+| UX-I21TOK | Legend shared with emitters; flat data-array wire shape; no false incremental claim | I21/C10 semantic tokens wire contract | `TestI21_LegendMatchesEmittedTypes`, `TestHandleSemanticTokens`, `TestSemanticTokensNoShadowOnDeclarationNames` | AUTO |
 | C3-CAPS | Every declared provider has a handler; every served feature is declared | C3 capability/handler bidirectional alignment | `TestC3_CapabilitiesDeclaredEqualsServed` | AUTO |
 | C12-META | Envelope metadata (status/completeness/evidence) and engine counters exposed via custom methods | C12/B5 resultMeta + queryTrace exits | `TestC12_ResultMetaAndQueryTrace` | AUTO |
 | B6-SIGHON | Syntax-layer signature results carry IncompleteKnownSubset, not zero-value Complete | B6 signature completeness honesty | `TestFeatures_GolangBridgeSyntaxTier` | AUTO |
@@ -78,7 +78,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| WS-D14 | External changes invalidate semantic state without overwriting editor buffers | D14 file watcher (polling) | `TestWatcherDetectsCreateModifyDelete`, `TestWatcherIgnoresVendoredAndBaselineSilence`, `TestWatcherRenameSurfacesAsDeletePlusCreate`, `TestWatcherDirectoryRenameSurfacesAsPerFileDeletePlusCreate`, `TestWatcherAtomicReplaceSurfacesAsModifyNotDeletePlusCreate`, `TestWatcherFullTransitionSequenceCreateModifyRenameDelete`, `TestWatchedExternalDependencyInvalidatesGoDefinitionCache`, `TestUnnotifiedExternalDependencyInvalidatesGoDefinitionCache`, `TestRunStartsPollerAfterInitializeAndStopsOnExit`, `TestExternalFileHintsValidateBeforeAdvancingRevision`, `TestExternalCreateModifyRenameDeleteTransitionsInvalidateSemanticsKeepBuffer`, `TestExternalDependencyCandidatesAcrossLocations` | AUTO |
+| WS-D14 | External changes invalidate semantic state without overwriting editor buffers | D14 file watcher (polling) | `TestWatcherDetectsCreateModifyDelete`, `TestWatcherIgnoresVendoredAndBaselineSilence`, `TestWatcherRenameSurfacesAsDeletePlusCreate`, `TestWatcherDirectoryRenameSurfacesAsPerFileDeletePlusCreate`, `TestWatcherAtomicReplaceSurfacesAsModifyNotDeletePlusCreate`, `TestWatcherFullTransitionSequenceCreateModifyRenameDelete`, `TestWatchedExternalDependencyInvalidatesGoDefinitionCache`, `TestUnnotifiedExternalDependencyInvalidatesGoDefinitionCache`, `TestRunStartsPollerAfterInitializeAndStopsOnExit`, `TestExternalFileHintsValidateBeforeAdvancingRevision`, `TestExternalCreateModifyRenameDeleteTransitionsInvalidateSemanticsKeepBuffer`, `TestExternalDependencyCandidatesAcrossLocations`, `TestARCH_CallMethodExternalChangeGated`, `TestFacadeExternalChangeCannotRegressPublishedSnapshot` | AUTO |
 
 ### Y0
 
@@ -93,14 +93,14 @@
 | Y0-7 | Workspace edits are preflight validated (fail-closed rename gates) | §C9/§I12 | `TestX3_RenameFailClosedWithoutCompileDb` | AUTO |
 | Y0-8 | Ambiguous build contexts fail closed for S3; macro advisory surfaced | §E6/H2/X3 | `TestX3_HeaderAmbiguitySurfaced`, `TestX3_MacroSuspectSurfaced` | AUTO |
 | Y0-9 | Generated/source-map gaps block unsafe edits | §D12/§I12 | `TestD12_UnmappedGeneratedBlocksEdit`, `TestSrcmapGate_RenameBlockedByUnmappedGenerated` | AUTO |
-| Y0-10 | Backend restart invalidates old-epoch results | INV-BACKEND-001 | `TestG2_CrashFailsPendingFastAndRestarts`, `TestG2_RepeatedCrashesQuarantine` | AUTO |
+| Y0-10 | Backend restart invalidates old-epoch results | INV-BACKEND-001 | `TestG2_CrashFailsPendingFastAndRestarts`, `TestG2_RepeatedCrashesQuarantine`, `TestProcessWaitsEntriesRemovedAfterFullReap` | AUTO |
 
 ### Y1
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
 | Y1-1 | Queues bounded | §F5/F6/C1 | `TestSchedulerAdmissionRejection` | AUTO |
-| Y1-2 | Caches bounded (pkgCache FIFO-evicted at 64 entries, persistent index disk-budgeted) | K0 cache bounds | `TestK0_PackageCacheHits`, `TestBudget_RejectsWhenFull` | AUTO |
+| Y1-2 | Caches bounded (pkgCache FIFO-evicted at 64 entries, persistent index disk-budgeted) | K0 cache bounds | `TestK0_PackageCacheHits`, `TestDigestCacheReuseScopedToToolchainRoots`, `TestDigestCacheReusesDigestUnderIdenticalStatInsideRoots`, `TestDigestCacheRememberRejectsFileChangedDuringRead`, `TestDigestCacheListingKeyMatchesDirectStat`, `TestBudget_RejectsWhenFull` | AUTO |
 | Y1-3 | Goroutines owned | §F15/S13 | `TestS13_HalfFrameDisconnect` | AUTO |
 | Y1-4 | Cancellation propagates end-to-end | §C7/F10/G7 | `TestSendRequest_TimeoutAndCancel` | AUTO |
 | Y1-5 | Backend crash isolated | §G2 | `TestMarkDegraded`, `TestQuarantineAfterMaxCrashes` | AUTO |
@@ -118,7 +118,7 @@
 | Y2-1 | LSP 3.17 baseline passes (golden scenarios frozen) | §S10/Y2 | `TestGoldenScenarios` | AUTO |
 | Y2-2 | Unknown future methods/notifications tolerated; params field-level tolerance tested; LSP 3.18 feature gating deferred (DEF-A7GATE) | §A7/Y2 | `TestUnknownNotificationSilentlyIgnored`, `TestMalformedJSONDoesNotPanic`, `TestY2_UnknownParamsFieldsTolerated` | AUTO |
 | Y2-3 | Position encoding negotiation tested | §C4 | `TestCJKCharacters`, `TestEmojiEncoding` | AUTO |
-| Y2-6a | Optional capabilities negotiated (signatureHelp/formatting/inlayHint) | I16/I20/I22 feature negotiation | `TestI16_SignatureHelpNegotiatedAndUnsupported`, `TestI20_FormattingFullDocumentEdit`, `TestFeatures_GolangBridgeSyntaxTier` | AUTO |
+| Y2-6a | Optional capabilities negotiated (signatureHelp/formatting/inlayHint) | I16/I20/I22 feature negotiation | `TestI16_SignatureHelpNegotiatedAndUnsupported`, `TestI20_FormattingFullDocumentEdit`, `TestOptionalCapabilitiesFollowSnapshotDiscipline`, `TestFeatures_GolangBridgeSyntaxTier` | AUTO |
 | Y2-4 | WorkspaceEdit capability differences tested (documentChanges negotiation + legacy form) | C9 workspace edits | `TestY24_WorkspaceEditCapabilityMatrix` | AUTO |
 | Y2-5 | Client profile documentation exists for all six required clients; the VS Code and Emacs/Eglot bindings are retired by user decision (2026-11-05) and complete native operation evidence remains pending for the rest | S11/X8 client matrix | `TestX8_ClientDocsPresent` | PARTIAL (Profiles are present (docs/editors/* and editors/vscode stay in the tree); the emacs and vscode bindings were retired on 2026-11-05 by user decision, so their cells are structurally not_applicable on this machine, while Helix, Zed and Sublime LSP still lack complete native acceptance and the remaining cells must be verified against the frozen candidate) |
 | Y2-6 | MCP revision pinned | A7/§C14 | `TestInitializePinsProtocolRevision`, `TestToolsListIsFiveReadOnly` | AUTO |
@@ -181,8 +181,8 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| X5-1 | Persistent storage primitives with atomic generation publish, corruption quarantine, and recovery | L4-L8 transactional persistence | `TestL4_CrashBeforePublishKeepsOldGeneration`, `TestL6_TXN002_HalfWrittenSegmentNotDiscoverable`, `TestCompact_ReducesSegmentsAndPreservesReads`, `TestL7_ChecksumMismatchQuarantines`, `TestL9_FutureSchemaQuarantinesAndFallsBack` | AUTO |
-| X5-7 | Typed semantic generations persist and serve fresh-only workspace-symbol/definition/reference queries | T5 semantic persistent-index content | `TestSemanticReindexStatsAndPersistentWorkspaceSymbols`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestPersistentLocationsAllowDiskEquivalentOpenOverlay`, `TestPersistentLocationsFallBackForOpenUnsavedDocument`, `TestPersistentLocationsFallBackWhenDiskOrBuildContextChanges`, `TestHandleDefinitionUsesDirtyGoOverlayBeforeLiveBackend`, `TestWorkspaceSymbolsQueriesAllUniqueBackends`, `TestPersistentWorkspaceSymbolResponseCarriesItsLeasedGeneration`, `TestRustSnapshotOverlayLocationsUseDirtySnapshot`, `TestCppSnapshotOverlayLocationsUseDirtySnapshot`, `TestTypescriptSnapshotOverlayLocationsUseDirtySnapshot`, `TestSnapshotOverlayFactsCacheSeparatesLanguages`, `TestSnapshotOverlayDirtyScreenStaysBoundedPerLanguage`, `TestTypedSemanticGenerationServesFreshQueriesAfterServerRestart`, `TestPersistentQueriesServeOnlyTheCurrentGenerationAfterRecommit`, `TestGenerationLeasePinsSegmentsDuringCompaction`, `TestCancellationRacingCommitHasOneTerminalOutcome`, `TestTypedSemanticGenerationIsolationAcrossRecommit`, `TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit`, `TestPersistentSemanticSCIPModelRoundTripAndDeclaredLoss`, `TestPersistedSemanticGenerationReplayServesFreshOnlyAcrossProcesses` | AUTO |
+| X5-1 | Persistent storage primitives with atomic generation publish, corruption quarantine, and recovery | L4-L8 transactional persistence | `TestL4_CrashBeforePublishKeepsOldGeneration`, `TestL6_TXN002_HalfWrittenSegmentNotDiscoverable`, `TestCompact_ReducesSegmentsAndPreservesReads`, `TestL7_ChecksumMismatchQuarantines`, `TestL9_FutureSchemaQuarantinesAndFallsBack`, `TestOrphanSweepThrottledByDirtyFlag` | AUTO |
+| X5-7 | Typed semantic generations persist and serve fresh-only workspace-symbol/definition/reference queries | T5 semantic persistent-index content | `TestSemanticReindexStatsAndPersistentWorkspaceSymbols`, `TestPersistentDefinitionAndReferencesUseCommittedSemanticRecords`, `TestPersistentLocationsAllowDiskEquivalentOpenOverlay`, `TestPersistentLocationsFallBackForOpenUnsavedDocument`, `TestPersistentLocationsFallBackWhenDiskOrBuildContextChanges`, `TestHandleDefinitionUsesDirtyGoOverlayBeforeLiveBackend`, `TestWorkspaceSymbolsQueriesAllUniqueBackends`, `TestPersistentWorkspaceSymbolResponseCarriesItsLeasedGeneration`, `TestRustSnapshotOverlayLocationsUseDirtySnapshot`, `TestCppSnapshotOverlayLocationsUseDirtySnapshot`, `TestTypescriptSnapshotOverlayLocationsUseDirtySnapshot`, `TestSnapshotOverlayFactsCacheSeparatesLanguages`, `TestSnapshotOverlayDirtyScreenStaysBoundedPerLanguage`, `TestTypedSemanticGenerationServesFreshQueriesAfterServerRestart`, `TestPersistentQueriesServeOnlyTheCurrentGenerationAfterRecommit`, `TestGenerationLeasePinsSegmentsDuringCompaction`, `TestCancellationRacingCommitHasOneTerminalOutcome`, `TestTypedSemanticGenerationIsolationAcrossRecommit`, `TestMultiLanguageTypedSemanticGenerationIsolationAcrossRecommit`, `TestLeaseViewServesVerifiedPayloadsWithoutRereadingDisk`, `TestPersistentSemanticSCIPModelRoundTripAndDeclaredLoss`, `TestPersistedSemanticGenerationReplayServesFreshOnlyAcrossProcesses` | AUTO |
 | X5-6 | Schema forward-compat reader + freshness tuple gates visibility | L9/L10 migration+freshness | `TestL9_FutureSchemaQuarantinesAndFallsBack`, `TestL10_FreshnessTupleGatesVisibility` | AUTO |
 
 ### INTEROP
@@ -331,7 +331,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| DEF-PLUGMOUNT | plugin-declared capabilities gate runtime API mount points | O2 capability-to-API mounting | `TestPluginsMount_TrustChainFailureNeverSpawns`, `TestPluginsMount_ZeroValueIsNoOp`, `TestEmit_DefaultDenyWithoutGrant`, `TestEmit_EndToEndWithDebounce` | AUTO |
+| DEF-PLUGMOUNT | plugin-declared capabilities gate runtime API mount points | O2 capability-to-API mounting | `TestPluginsMount_TrustChainFailureNeverSpawns`, `TestPluginsMount_ZeroValueIsNoOp`, `TestEmit_DefaultDenyWithoutGrant`, `TestEmit_EndToEndWithDebounce`, `TestInitializeRespondsBeforePluginLaunchCompletes` | AUTO |
 
 ### SECURITY
 
@@ -365,7 +365,7 @@
 
 | ID | Item | Clause | Tests / Gate | Status |
 |---|---|---|---|---|
-| DEF-NOTEBOOK | notebookDocument/* synchronization over the existing cell model | D13 notebook LSP sync | — | DEFERRED→post-X9 |
+| DEF-NOTEBOOK | notebookDocument/* synchronization over the existing cell model | D13 notebook LSP sync | `TestNotebooksDoNotSurviveCloseSession`, `TestUnregisterAllDropsNotebooksToo` | DEFERRED→post-X9 |
 
 ## Score dimensions
 
