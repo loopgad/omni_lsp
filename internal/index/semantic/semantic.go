@@ -269,6 +269,16 @@ func (s *Sink) WriteEdges(ctx context.Context, values []model.Edge) error {
 			!validString(string(v.Kind)) || !validPosition(v.Range) || !validString(v.SourceURI) {
 			return nil, fmt.Errorf("%w: invalid edge record", ErrMalformedPayload)
 		}
+		// Kind semantics are part of pre-validation: the generic string checks
+		// above accept any valid string, and rejecting an unsupported kind
+		// only in recordIDs would let the batch pass the "validate the
+		// complete caller batch before publishing" loop, get marshalled into
+		// a staging segment by WriteSegment, and only then fail — leaving
+		// invalid bytes staged on disk behind a failed sink. This is the same
+		// edgeFact check reader.validateBatch applies on the read side.
+		if _, ok := edgeFact(v.Kind); !ok {
+			return nil, fmt.Errorf("%w: unsupported edge kind %q", ErrMalformedPayload, v.Kind)
+		}
 		if err := s.validateBuildContext(v.ScopeID, v.BuildContext); err != nil {
 			return nil, err
 		}
