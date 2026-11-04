@@ -1405,3 +1405,46 @@ offset debt on file in `freeze-record.txt`):
   cache、internal/index/extractors/**）零触碰、写探针仅入目录即拒未
   留任何文件。
 - 提交：本节一笔 docs 提交（单文件单提交，无分批面）。
+
+## Evidence record — 2026-11-05 绑定退役轮（用户决策：emacs/VS Code 绑定结构性退役，台账剔除两项用户侧事项）
+
+- 决策行：2026-11-05 用户决策——emacs-30.2 锁定目录（外来属主空目录，无法重装，曾阻塞
+  X8-2）与 VS Code 锁定 exe SHA 自动更新漂移两项**用户侧事项不列入台账**，对应客户端绑定
+  **结构性退役**：本机 emacs/VS Code 格 not_applicable；Zed 本就无绑定，维持 not_verified
+  不变；X8-2/Y2-5/DEF-EDITORS 三条目仅更新 Text/Reason（Status 不变：三项均维持 PARTIAL）。
+- 取舍登记（矩阵 runner 契约行为对齐）：探测后择「**标 retired**」而非从契约集移除——
+  42 格不变量三处硬编码（`test/acceptance/clients/client_test.go` `!= 42`、
+  `scripts/test-acceptance-contract.ps1` `-ne 42`、registry 42-cell 文本）保持不动，
+  vscode/emacs-eglot 格并入 helix/zed/sublime-lsp 的 must-be-not_verified 契约集，
+  原生运行路径短路为 skip（skip 理由注明「binding retired 2026-11-05 by user decision」）。
+- 锁条目移除清单（test/acceptance/tools/tools.lock.json，共 5 条）：`observed.vscode`、
+  `resolvedBinaries.vscode`、`resolvedBinaries.emacs`、`acceptanceTools.emacs`、
+  `acceptanceTools.vscodeLanguageClient`；编辑后 JSON 解析校验通过。
+- 受影响测试处置：Go 侧 `readToolLock` 版本硬门放宽（只要求 go+neovim）、
+  `requiredResolvedBinaryNames()` 去 vscode/emacs、`verifyTools` 改出显式
+  `tool/emacs`/`tool/vscode` NotVerified retired 行、`clientMatrixClients` 增 Retired 标记、
+  `TestFormalEmacsClientMatrix` 改 `t.Skip`（理由同上）、公共矩阵契约反转
+  （`TestFormalEmacsContractAllowsOnlyEmacsNativeEvidence`：退役后公共契约不再接受 emacs
+  原生证据，测试断言随之倒置）；ps1 侧 `Get-RequiredResolvedBinaryNames`/`Get-ToolVersions`/
+  `Test-VersionLock` 去 vscode/emacs、`Assert-ClientMatrixContract` not_verified 集扩容、
+  clients-kind 校验器原生证据断言仅对 passed 格生效、Fast 段不再绑定
+  `OMNILSP_VSCODE_BIN`、contract fixture 缺文件条目 emacs→neovim、新增退役格
+  false-pass 必拒断言。纯函数（exactToolVersion/readVSCodePackageVersion/parseClientOnly/
+  clientToolName）与其 fixture 单测不依赖锁条目，保留。
+- 验证（全部本轮实跑）：`go vet -tags clients ./test/acceptance/clients/` EXIT 0；
+  定向 7 项单测 `go test -tags clients … ./test/acceptance/clients/` ok；
+  两份 ps1 语法 parse OK；`pwsh scripts/test-acceptance-contract.ps1` 四段契约全过
+  （tool-lock gate / 指纹跨进程重算 / 源稳定命名 / 报告校验器——pwsh 5.1 缺
+  `[IO.Path]::GetRelativePath` 为运行时差异，非本轮改动）；
+  `OMNISP_UPDATE_CONFORMANCE=1 go test ./test/conformance -run TestGenerateDocs` 再生
+  docs/conformance.md（3 行投影），复跑 drift 检查绿（ACL 允许，docs/ 写入正常）；
+  `internal/conformance` 定向 4 项（TestX8_ClientDocsPresent /
+  TestRegistry_ProbeSymbolsExist / TestPartialDetailReportsDriftWithoutRescoring /
+  TestGenerateDocs）绿。
+- ACL 现状：写探针 `internal/index/extractors/clang/.acl_write_probe` → Permission
+  denied（本轮一次，未再撞墙）；8 个 clang D 为既有环境损伤，本轮不提交、不还原。
+  `internal/conformance` 包级两失败（TestU2_InvariantHeadersPresent、TestPERF2 build
+  failed，后者 verified_rebuild.go 引用被删文件符号）均归因该损伤，非本轮引入。
+- 证据：`out/binding-retirement-20261105.md`（探针/移除清单/同步清单/验证命令实录）。
+- 提交：本节一笔 `chore(clients): retire the emacs and vscode tool bindings by user
+  decision`（lock/测试/registry/docs 逐路径点名 add，排除 8 clang D；未 push）。

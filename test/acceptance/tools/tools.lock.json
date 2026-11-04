@@ -5,7 +5,6 @@
   "observed": {
     "go": "go1.27.1",
     "gopls": "golang.org/x/tools/gopls v0.21.1",
-    "vscode": "1.143.1",
     "clangd": "22.1.5",
     "clang": "22.1.5",
     "clang++": "22.1.5",
@@ -29,7 +28,6 @@
     "rust-analyzer-semantic-helper": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\rust-analyzer-semantic-1.97.0.exe", "sha256": "3641e2323591c2f51c7e06ab713e0348f17590f30fa1dcd27b0ad0453a5ee933" },
     "go": { "path": "D:\\Program Files\\Go\\bin\\go.exe", "sha256": "d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490" },
     "gopls": { "path": "C:\\Users\\32806\\go\\bin\\gopls.exe", "sha256": "63feae64809f9ef57cbff79e09bb8aedfc6e891e2fdb24d0aae08f41b512dba3" },
-    "vscode": { "path": "C:\\Users\\32806\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe", "sha256": "325fb30ba28d17fa6ba4df58043727b2469aca9d641793a65e413721b2110ec6" },
     "clang": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\clang.exe", "sha256": "af4d3c9f07dbcaea5f008cfa6e7974a42a55ff482296bd36d2bd00dfb92e742d" },
     "clang++": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\clang++.exe", "sha256": "af4d3c9f07dbcaea5f008cfa6e7974a42a55ff482296bd36d2bd00dfb92e742d" },
     "clangd": { "path": "D:\\Program Files\\LLVM-22\\clang+llvm-22.1.5-x86_64-pc-windows-msvc\\bin\\clangd.exe", "sha256": "6b5e3a6dc685358e55c522af7984e24d9fef47799ed7de3d6426c8a7bba24b34" },
@@ -43,7 +41,6 @@
     "npm": { "path": "D:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js", "sha256": "3ce7cba6f5128dd5f54c98b6a5036b0f850496878cc2e21044b675fe3c594e3e" },
     "neovim": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\nvim-0.12.5\\nvim-win64\\bin\\nvim.exe", "sha256": "6f1fd849f6be3d0bff7bcf433ca91e0ba7481d3cc31b34601e4a29d8fad5bbdd" },
     "helix": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\helix-25.07.1\\hx.exe", "sha256": "2e1c9583b295f55c2bca55f1ee9793640f9af61accdbef6ea15e31679ea9ab76" },
-    "emacs": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\bin\\emacs-30.2\\bin\\emacs.exe", "sha256": "24848ae901463e3c56dac17031ddd45d58220723aa35102fc778458d17ff2f0b" },
     "pyright-langserver": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\pyright\\langserver.index.js", "sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1" },
     "pyright-internal": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\pyright\\dist\\pyright-internal.js", "sha256": "41fb260ad72f2a16c5657e1f2fe837104d7529255d0fcd955f48432b276e7cae" },
     "pyright-vendor": { "path": "D:\\Destop\\test\\my_lsp\\test\\acceptance\\tools\\node_modules\\pyright\\dist\\vendor.js", "sha256": "1c691bf9e3fa954dec751ace203beb5591b46a73e3848af5d1ee011d62540798" },
@@ -66,10 +63,6 @@
       "url": "https://rust.googlesource.com/rust-lang/rust/+archive/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/src/tools/rust-analyzer.tar.gz",
       "sha256": "032ebc1ca7f32c5f2bbe1cf2a84f41ff40972fc33b18ce6c3e26ecaff2df507c",
       "path": "bin/rust-analyzer-source-1.97.0"
-    },
-    "vscodeLanguageClient": {
-      "version": "9.0.1",
-      "lockfile": "../../editors/vscode/package-lock.json"
     },
     "pyright": {
       "version": "1.1.414",
@@ -98,12 +91,6 @@
       "sha256": "5c8325ced8bacd8418d62706f669e96d9c3578a9237526e34d546900cbc049b6",
       "runtimeTreeSha256": "ae4ba30b80da8d90b3016ed279d0b08e8ca19ece28f3d6ac13e761d9ffe3d54e",
       "checksumSource": "https://github.com/helix-editor/helix/releases/tag/25.07.1"
-    },
-    "emacs": {
-      "version": "30.2",
-      "url": "https://ftp.gnu.org/pub/gnu/emacs/windows/emacs-30/emacs-30.2.zip",
-      "sha256": "414d3a1a21147af257ebd98bdd15976fdcb5ed0563f6de89f76d4a4b5dad9c72",
-      "checksumSource": "https://ftp.gnu.org/pub/gnu/emacs/windows/emacs-30/emacs-30.2-sha256sum.txt"
     },
     "sublimeLspPythonDependencies": {
       "pythonVersion": "3.14",

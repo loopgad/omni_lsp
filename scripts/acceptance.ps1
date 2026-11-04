@@ -133,11 +133,11 @@ function Assert-ClientMatrixContract($Report) {
             throw "Client report is missing backward-compatible family summary '$id'."
         }
     }
-    foreach ($client in @('helix', 'zed', 'sublime-lsp')) {
+    foreach ($client in @('vscode', 'emacs-eglot', 'helix', 'zed', 'sublime-lsp')) {
         foreach ($language in $clientMatrixLanguages) {
             $id = "client/$client/$language"
             if ([string]$actual[$id].status -cne 'not_verified') {
-                throw "Client report '$id' must remain not_verified until its native driver exists."
+                throw "Client report '$id' must remain not_verified (unsupported client driver, or binding retired 2026-11-05 by user decision)."
             }
         }
     }
@@ -712,7 +712,6 @@ function Get-ResolvedExecutionFingerprint($ToolLock, $ResolvedPaths) {
         pyright_vendor_path = & $pathFor 'pyright-vendor' 'OMNILSP_SEMANTIC_PYRIGHT_VENDOR_PATH'
         semantic_python_path = & $pathFor 'python' 'OMNILSP_SEMANTIC_PYTHON_PATH'
         acceptance_node_path = & $pathFor 'node' 'OMNILSP_ACCEPTANCE_NODE'
-        vscode_path = & $pathFor 'vscode' 'OMNILSP_VSCODE_BIN'
         neovim_path = & $pathFor 'neovim' 'OMNILSP_NVIM_BIN'
         node_sha256 = & $shaFor 'node'
         typescript_sha256 = & $shaFor 'typescript'
@@ -1696,9 +1695,13 @@ function Assert-StructuredReportIdentity(
         Assert-S19ProcessTreeResourceEvidence $actualIds["$ExpectedRunId/S19/process-tree-resources"]
     }
     if ($Kind -eq 'clients') {
+        # The emacs and vscode bindings are retired (2026-11-05 user decision):
+        # their cells stay not_verified in the report, so native-evidence
+        # assertions only fire when a cell actually carries passed evidence
+        # (Neovim is the remaining native matrix client).
         foreach ($language in $clientMatrixLanguages) {
             $id = "client/emacs-eglot/$language"
-            if ($actualIds.ContainsKey($id)) { Assert-EmacsCellEvidence $actualIds[$id] $language }
+            if ($actualIds.ContainsKey($id) -and [string]$actualIds[$id].status -ceq 'passed') { Assert-EmacsCellEvidence $actualIds[$id] $language }
         }
         $expectedSubcases = @{
             'client/vscode/go' = @('go')
@@ -1713,7 +1716,7 @@ function Assert-StructuredReportIdentity(
             'client/neovim/typescript' = @('javascript', 'javascriptreact', 'typescript', 'typescriptreact')
         }
         foreach ($checkId in @(Get-ClientMatrixSummaryIds)) {
-            if (-not $actualIds.ContainsKey($checkId)) { continue }
+            if (-not $actualIds.ContainsKey($checkId) -or [string]$actualIds[$checkId].status -cne 'passed') { continue }
             if (-not $expectedSubcases.ContainsKey($checkId)) { throw "Client report validator has no fixed subcase contract for '$checkId'." }
             $actualSubcases = @($actualIds[$checkId].observed.subcase_names | ForEach-Object { [string]$_ })
             $expected = @($expectedSubcases[$checkId])
@@ -1997,7 +2000,6 @@ function Get-ToolVersions {
     $commands = @(
         @{ key = 'go'; args = @('version') },
         @{ key = 'gopls'; args = @('version') },
-        @{ key = 'vscode'; args = @('--version') },
         @{ key = 'clangd'; args = @('--version') },
         @{ key = 'clang'; args = @('--version') },
         @{ key = 'clang++'; args = @('--version') },
@@ -2011,23 +2013,6 @@ function Get-ToolVersions {
     foreach ($item in $commands) {
         $resolvedPath = Get-ResolvedBinaryPath $lock.resolvedBinaries $item.key
         if ($resolvedPath -and (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
-            if ($item.key -ceq 'vscode') {
-                $installRoot = [IO.Path]::GetDirectoryName($resolvedPath)
-                $packageCandidates = @(
-                    (Join-Path $installRoot 'resources/app/package.json')
-                )
-                $packageCandidates += @(
-                    Get-ChildItem -LiteralPath $installRoot -Directory -ErrorAction SilentlyContinue |
-                        ForEach-Object { Join-Path $_.FullName 'resources/app/package.json' }
-                )
-                $packagePaths = @($packageCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-                if ($packagePaths.Count -eq 1) {
-                    $versions[$item.key] = ([string](Get-Content -LiteralPath $packagePaths[0] -Raw | ConvertFrom-Json).version).Trim()
-                } else {
-                    $versions[$item.key] = 'MISSING'
-                }
-                continue
-            }
             $extension = [IO.Path]::GetExtension($resolvedPath).ToLowerInvariant()
             if ($extension -in @('.js', '.mjs')) {
                 $nodePath = Get-ResolvedBinaryPath $lock.resolvedBinaries 'node'
@@ -2050,20 +2035,12 @@ function Get-ToolVersions {
         $path = Join-Path $localTools $item.path
         if (Test-Path $path) { $versions[$item.key] = (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).version } else { $versions[$item.key] = 'MISSING' }
     }
-    $vscodeLanguageClient = Join-Path $repoRoot 'editors/vscode/node_modules/vscode-languageclient/package.json'
-    if (Test-Path -LiteralPath $vscodeLanguageClient) { $versions['vscode-languageclient'] = (Get-Content -LiteralPath $vscodeLanguageClient -Raw | ConvertFrom-Json).version } else { $versions['vscode-languageclient'] = 'MISSING' }
     $nvimExe = Get-ResolvedBinaryPath $lock.resolvedBinaries 'neovim'
     if ($nvimExe -and (Test-Path -LiteralPath $nvimExe -PathType Leaf)) {
         $versions['neovim'] = (& $nvimExe --version | Select-Object -First 1).Trim()
     } else {
         $versions['neovim'] = 'MISSING'
     }
-	$emacsExe = Get-ResolvedBinaryPath $lock.resolvedBinaries 'emacs'
-	if ($emacsExe -and (Test-Path -LiteralPath $emacsExe -PathType Leaf)) {
-		$versions['emacs'] = (& $emacsExe --version | Select-Object -First 1).Trim()
-	} else {
-		$versions['emacs'] = 'MISSING'
-	}
     return $versions
 }
 
@@ -2151,10 +2128,12 @@ function Test-ResolvedBinaryBinding($ResolvedBinaries, [string] $Name, [string] 
 }
 
 function Get-RequiredResolvedBinaryNames {
+    # vscode and emacs left the lock on 2026-11-05 (binding retired by user
+    # decision) and are no longer required resolved binaries.
     return @(
-        'go', 'gopls', 'vscode', 'clang', 'clang++', 'clangd',
+        'go', 'gopls', 'clang', 'clang++', 'clangd',
         'rust-analyzer', 'rust-analyzer-semantic-helper', 'rustc', 'cargo', 'rust-analyzer-proc-macro-srv',
-        'python', 'node', 'npm', 'neovim', 'helix', 'emacs',
+        'python', 'node', 'npm', 'neovim', 'helix',
         'pyright-langserver', 'pyright-internal', 'pyright-vendor',
         'typescript-language-server', 'typescript'
     )
@@ -2245,7 +2224,6 @@ function Test-VersionLock {
     $expected = [ordered]@{
         go = $lock.observed.go
         gopls = $lock.observed.gopls
-        vscode = $lock.observed.vscode
         clangd = $lock.observed.clangd
         clang = $lock.observed.clang
         'clang++' = $lock.observed.'clang++'
@@ -2258,9 +2236,7 @@ function Test-VersionLock {
         pyright = $lock.acceptanceTools.pyright.version
         'typescript-language-server' = $lock.acceptanceTools.typescriptLanguageServer.version
         typescript = $lock.acceptanceTools.typescript.version
-        'vscode-languageclient' = $lock.acceptanceTools.vscodeLanguageClient.version
         neovim = "NVIM v$($lock.acceptanceTools.neovim.version)"
-		emacs = "GNU Emacs $($lock.acceptanceTools.emacs.version)"
     }
     $missing = [Collections.Generic.List[string]]::new()
     $mismatches = [Collections.Generic.List[string]]::new()
@@ -2275,7 +2251,6 @@ function Test-VersionLock {
         switch ($key) {
             'go' { if ($value -cmatch '(?m)^go version (?<version>\S+)') { $match = $Matches.version -ceq $wanted } }
             'gopls' { if ($value -cmatch '(?m)^(?<version>golang.org/x/tools/gopls v\S+)') { $match = $Matches.version -ceq $wanted } }
-            'vscode' { $match = (($value -split "`r?`n")[0].Trim() -ceq $wanted) }
             'clangd' { if ($value -cmatch '(?m)^clangd version (?<version>\S+)') { $match = $Matches.version -ceq $wanted } }
             'clang' { if ($value -cmatch '(?m)^clang version (?<version>\S+)') { $match = $Matches.version -ceq $wanted } }
             'clang++' { if ($value -cmatch '(?m)^clang version (?<version>\S+)') { $match = $Matches.version -ceq $wanted } }
@@ -2288,9 +2263,7 @@ function Test-VersionLock {
             'pyright' { $match = ($value.Trim() -ceq $wanted) }
             'typescript-language-server' { $match = ($value.Trim() -ceq $wanted) }
             'typescript' { $match = ($value.Trim() -ceq $wanted) }
-            'vscode-languageclient' { $match = ($value.Trim() -ceq $wanted) }
             'neovim' { $match = (($value -split "`r?`n")[0].Trim() -ceq $wanted) }
-			'emacs' { $match = (($value -split "`r?`n")[0].Trim() -ceq $wanted) }
         }
         if (-not $match) {
             $mismatches.Add("$key expected '$($expected[$key])', observed '$($actual[$key])'")
@@ -3221,7 +3194,9 @@ switch ($Phase) {
             }
         }
         $env:OMNILSP_RUN_CLIENT_ACCEPTANCE = '1'
-        $env:OMNILSP_VSCODE_BIN = [string]$script:AcceptanceResolvedPaths.vscode
+        # OMNILSP_VSCODE_BIN is no longer bound here: the vscode binding was
+        # retired on 2026-11-05 by user decision, so no VS Code binary is
+        # resolved or pinned for the client matrix.
         $env:OMNILSP_NVIM_BIN = [string]$script:AcceptanceResolvedPaths.neovim
         $env:OMNILSP_ACCEPTANCE_REPORT = Join-Path $EvidenceDirectory 'clients.json'
         Remove-Item -LiteralPath $env:OMNILSP_ACCEPTANCE_REPORT -Force -ErrorAction SilentlyContinue

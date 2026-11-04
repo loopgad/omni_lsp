@@ -34,12 +34,14 @@ const (
 	maxClientOutputBytes   = 64 << 10
 )
 
+// The emacs and vscode client bindings were retired on 2026-11-05 by user
+// decision, so tools.lock.json no longer pins them and this mirror struct no
+// longer carries their fields.
 type toolLock struct {
 	ResolvedBinaries map[string]resolvedBinary `json:"resolvedBinaries"`
 	Observed         struct {
 		Go            string `json:"go"`
 		Gopls         string `json:"gopls"`
-		VSCode        string `json:"vscode"`
 		Clangd        string `json:"clangd"`
 		Clang         string `json:"clang"`
 		ClangPlusPlus string `json:"clang++"`
@@ -60,15 +62,9 @@ type toolLock struct {
 		TypeScript struct {
 			Version string `json:"version"`
 		} `json:"typescript"`
-		VSCodeLanguageClient struct {
-			Version string `json:"version"`
-		} `json:"vscodeLanguageClient"`
 		Neovim struct {
 			Version string `json:"version"`
 		} `json:"neovim"`
-		Emacs struct {
-			Version string `json:"version"`
-		} `json:"emacs"`
 	} `json:"acceptanceTools"`
 }
 
@@ -97,6 +93,10 @@ type clientMatrixClient struct {
 	ID          string
 	DisplayName string
 	Native      bool
+	// Retired marks a client whose binding was structurally retired by user
+	// decision (2026-11-05). Its matrix cells stay not_verified with the
+	// retirement reason; no native runner is launched for it anymore.
+	Retired bool
 }
 
 type clientMatrixLanguage struct {
@@ -105,9 +105,9 @@ type clientMatrixLanguage struct {
 }
 
 var clientMatrixClients = []clientMatrixClient{
-	{ID: "vscode", DisplayName: "VS Code", Native: true},
+	{ID: "vscode", DisplayName: "VS Code", Native: true, Retired: true},
 	{ID: "neovim", DisplayName: "Neovim", Native: true},
-	{ID: "emacs-eglot", DisplayName: "Emacs/Eglot", Native: true},
+	{ID: "emacs-eglot", DisplayName: "Emacs/Eglot", Native: true, Retired: true},
 	{ID: "helix", DisplayName: "Helix"},
 	{ID: "zed", DisplayName: "Zed"},
 	{ID: "sublime-lsp", DisplayName: "Sublime LSP"},
@@ -168,7 +168,11 @@ func TestRealClientMatrix(t *testing.T) {
 
 // TestFormalEmacsClientMatrix exercises Emacs through the same frozen-candidate,
 // corpus, tool-lock, and report pipeline as the public client matrix.
+//
+// Skipped since 2026-11-05: the emacs binding was retired by user decision,
+// so there is no locked emacs binary to drive.
 func TestFormalEmacsClientMatrix(t *testing.T) {
+	t.Skip("binding retired 2026-11-05 by user decision")
 	runClientMatrix(t, true)
 }
 
@@ -329,6 +333,12 @@ func runClientMatrix(t *testing.T, formalEmacs bool) {
 			r.Skips = append(r.Skips, report.Skip{ID: "client/" + client, Reason: reason})
 			continue
 		}
+		if clientSpec.Retired {
+			reason := client + " binding retired 2026-11-05 by user decision"
+			appendClientChecks(&r, client, cases, nil, report.NotVerified, reason)
+			r.Skips = append(r.Skips, report.Skip{ID: "client/" + client, Reason: reason})
+			continue
+		}
 		if !clientSpec.Native && !(formalEmacs && client == "emacs-eglot") {
 			reason := fmt.Sprintf("%s client driver is not implemented by this acceptance runner", clientSpec.DisplayName)
 			appendClientChecks(&r, client, cases, nil, report.NotVerified, reason)
@@ -457,24 +467,12 @@ func verifyTools(root string, lock toolLock) []report.Check {
 	checkVersion("go", "go", []string{"version"}, lock.Observed.Go)
 	checkVersion("gopls", "gopls", []string{"version"}, lock.Observed.Gopls)
 	checkVersion("node", "node", []string{"--version"}, lock.Observed.Node)
-	checkVersion("emacs", "emacs", []string{"--version"}, lock.AcceptanceTools.Emacs.Version)
-	codePath, codeErr := verifyLockedBinary(lock, "vscode")
-	if codeErr != nil {
-		checks = append(checks, report.Check{ID: "tool/vscode", Status: report.NotVerified, Summary: codeErr.Error()})
-	} else {
-		got, err := readVSCodePackageVersion(codePath)
-		status := report.Passed
-		if err != nil || !exactToolVersion("vscode", got, lock.Observed.VSCode) {
-			status = report.NotVerified
-		}
-		summary := fmt.Sprintf("VS Code version is %s; lock requires %s", got, lock.Observed.VSCode)
-		if err != nil {
-			summary = fmt.Sprintf("VS Code installation version could not be read: %v", err)
-		}
-		checks = append(checks, report.Check{ID: "tool/vscode", Status: status,
-			Summary:  summary,
-			Observed: map[string]any{"path": codePath, "version": got}, Threshold: map[string]any{"version": lock.Observed.VSCode}})
-	}
+	// The emacs and vscode bindings are retired (2026-11-05 user decision):
+	// their tool checks stay as explicit not_verified rows so the evidence
+	// records why no emacs/vscode binary is probed, and nothing downstream
+	// treats the missing pins as a lock failure.
+	checks = append(checks, report.Check{ID: "tool/emacs", Status: report.NotVerified, Summary: "emacs binding retired 2026-11-05 by user decision"})
+	checks = append(checks, report.Check{ID: "tool/vscode", Status: report.NotVerified, Summary: "vscode binding retired 2026-11-05 by user decision"})
 	checkVersion("clangd", "clangd", []string{"--version"}, lock.Observed.Clangd)
 	checkVersion("clang", "clang", []string{"--version"}, lock.Observed.Clang)
 	checkVersion("clang++", "clang++", []string{"--version"}, lock.Observed.ClangPlusPlus)
@@ -505,7 +503,6 @@ func verifyTools(root string, lock toolLock) []report.Check {
 	checkLocalPackage("pyright", filepath.Join(toolsRoot, "node_modules", "pyright", "package.json"), lock.AcceptanceTools.Pyright.Version)
 	checkLocalPackage("typescript-language-server-package", filepath.Join(toolsRoot, "node_modules", "typescript-language-server", "package.json"), lock.AcceptanceTools.TypeScriptLanguageServer.Version)
 	checkLocalPackage("typescript", filepath.Join(toolsRoot, "node_modules", "typescript", "package.json"), lock.AcceptanceTools.TypeScript.Version)
-	checkLocalPackage("vscode-languageclient", filepath.Join(root, "editors", "vscode", "node_modules", "vscode-languageclient", "package.json"), lock.AcceptanceTools.VSCodeLanguageClient.Version)
 	for _, name := range []string{"pyright-langserver", "typescript-language-server", "tsc"} {
 		sourcePath, sourceErr := verifyLockedBinary(lock, nameForResolvedTool(name))
 		path := filepath.Join(toolsRoot, "bin", executableName(name))
@@ -580,7 +577,9 @@ func readToolLock(root string) (toolLock, error) {
 	if err := json.Unmarshal(data, &lock); err != nil {
 		return lock, fmt.Errorf("parse pinned tool lock: %w", err)
 	}
-	if lock.Observed.Go == "" || lock.Observed.VSCode == "" || lock.AcceptanceTools.Neovim.Version == "" || lock.AcceptanceTools.Emacs.Version == "" || lock.AcceptanceTools.VSCodeLanguageClient.Version == "" {
+	// The emacs and vscode binding pins left the lock on 2026-11-05 (user
+	// decision), so only the still-bound tools are required here.
+	if lock.Observed.Go == "" || lock.AcceptanceTools.Neovim.Version == "" {
 		return lock, errors.New("pinned tool lock is missing required versions")
 	}
 	for _, name := range requiredResolvedBinaryNames() {
@@ -593,10 +592,12 @@ func readToolLock(root string) (toolLock, error) {
 }
 
 func requiredResolvedBinaryNames() []string {
+	// vscode and emacs left the lock on 2026-11-05 (binding retired by user
+	// decision) and are no longer required resolved binaries.
 	return []string{
-		"go", "gopls", "vscode", "clang", "clang++", "clangd",
+		"go", "gopls", "clang", "clang++", "clangd",
 		"rust-analyzer", "rustc", "cargo", "rust-analyzer-proc-macro-srv",
-		"python", "node", "npm", "neovim", "emacs",
+		"python", "node", "npm", "neovim",
 		"pyright-langserver", "pyright-internal", "pyright-vendor", "typescript-language-server", "typescript",
 	}
 }
@@ -1472,7 +1473,7 @@ func TestClientMatrixContractRequiresEveryCell(t *testing.T) {
 		t.Fatalf("assembled client matrix rejected: %v", err)
 	}
 	for _, client := range clientMatrixClients {
-		if client.Native {
+		if client.Native && !client.Retired {
 			continue
 		}
 		id := "client/" + client.ID + "/go"
@@ -1484,7 +1485,7 @@ func TestClientMatrixContractRequiresEveryCell(t *testing.T) {
 			}
 		}
 		if err := validateClientMatrixContract(passed); err == nil {
-			t.Fatalf("unsupported client cell %s was allowed to pass", id)
+			t.Fatalf("unsupported or retired client cell %s was allowed to pass", id)
 		}
 	}
 
@@ -1515,8 +1516,11 @@ func TestFormalEmacsContractAllowsOnlyEmacsNativeEvidence(t *testing.T) {
 	if err := validateFormalEmacsMatrixContract(checks); err != nil {
 		t.Fatalf("formal Emacs matrix rejected: %v", err)
 	}
-	if err := validateClientMatrixContract(checks); err != nil {
-		t.Fatalf("public matrix contract rejected reviewed Emacs native evidence: %v", err)
+	// Since the 2026-11-05 binding retirement the public matrix contract pins
+	// the emacs-eglot cells to not_verified, so native Emacs evidence is no
+	// longer admissible there.
+	if err := validateClientMatrixContract(checks); err == nil {
+		t.Fatal("public matrix contract accepted native Emacs evidence after the 2026-11-05 binding retirement")
 	}
 	if err := requireClientMatrixPassed(checks, "emacs-eglot"); err != nil {
 		t.Fatalf("all Emacs matrix cells should be required and passed: %v", err)
@@ -2998,12 +3002,15 @@ func validateClientMatrixContractExcept(checks []report.Check, nativeException s
 		}
 	}
 	for _, client := range clientMatrixClients {
-		if client.Native || client.ID == nativeException {
+		if (client.Native && !client.Retired) || client.ID == nativeException {
 			continue
 		}
 		for _, language := range clientMatrixLanguages {
 			id := "client/" + client.ID + "/" + language.ID
 			if actual[id].Status != report.NotVerified {
+				if client.Retired {
+					return fmt.Errorf("client matrix cell %q must remain not_verified: binding retired 2026-11-05 by user decision", id)
+				}
 				return fmt.Errorf("client matrix cell %q must remain not_verified until its native driver exists", id)
 			}
 		}

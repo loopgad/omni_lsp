@@ -107,7 +107,9 @@ try {
 # non-passed lock, which left no structured record at all.
 $gateToolLockFixture = Get-Content -LiteralPath (Join-Path $repoRoot 'test/acceptance/tools/tools.lock.json') -Raw | ConvertFrom-Json
 $gateToolLockFixture = $gateToolLockFixture | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-$gateToolLockFixture.resolvedBinaries.emacs.path = Join-Path ([IO.Path]::GetTempPath()) ('omnilsp-contract-missing\emacs-' + [guid]::NewGuid().ToString('N') + '.exe')
+# The emacs and vscode pins left the lock on 2026-11-05 (binding retired by
+# user decision), so the missing-resolved-file fixture now uses neovim.
+$gateToolLockFixture.resolvedBinaries.neovim.path = Join-Path ([IO.Path]::GetTempPath()) ('omnilsp-contract-missing\nvim-' + [guid]::NewGuid().ToString('N') + '.exe')
 $previousGateOriginalPath = $script:AcceptanceOriginalPath
 $previousGatePath = $env:PATH
 $previousGateToolLock = $script:AcceptanceToolLock
@@ -122,7 +124,7 @@ try {
     if ($null -eq $script:AcceptanceToolLock -or -not $script:go -or -not $script:AcceptanceResolvedPaths -or $script:AcceptanceResolvedPaths.Count -eq 0) {
         throw 'A not_verified tool lock must still bind the locked environment (script lock, resolved paths, go path) so Fast can proceed to its terminal record.'
     }
-    $gateNotVerified = Resolve-FastToolLockGate $gateBinding ([ordered]@{ id = 'tool-version-lock'; status = 'not_verified'; detail = 'emacs expected a version, observed MISSING' })
+    $gateNotVerified = Resolve-FastToolLockGate $gateBinding ([ordered]@{ id = 'tool-version-lock'; status = 'not_verified'; detail = 'neovim expected a version, observed MISSING' })
     if ($gateNotVerified.proceed -ne $true -or $gateNotVerified.status -cne 'not_verified') {
         throw 'Fast must proceed past a not_verified tool lock and let Get-OverallDecision close the gate.'
     }
@@ -274,12 +276,15 @@ $clientMatrixClients = @('vscode', 'neovim', 'emacs-eglot', 'helix', 'zed', 'sub
 $clientMatrixLanguages = @('go', 'c', 'cpp', 'rust', 'python', 'typescript', 'javascript')
 $clientMatrixChecks = [Collections.Generic.List[object]]::new()
 foreach ($id in @(Get-ClientMatrixRequiredCheckIds)) {
-    $status = if ($id -match '^client/(helix|zed|sublime-lsp)/') { 'not_verified' } else { 'passed' }
+    # vscode and emacs-eglot bindings are retired (2026-11-05 user decision):
+    # their cells stay not_verified, leaving Neovim as the only native matrix
+    # client, alongside the unsupported helix/zed/sublime-lsp clients.
+    $status = if ($id -match '^client/(vscode|emacs-eglot|helix|zed|sublime-lsp)/') { 'not_verified' } else { 'passed' }
     $clientMatrixChecks.Add([pscustomobject]@{ id = $id; status = $status })
 }
 $validClientMatrix = [pscustomobject]@{ checks = @($clientMatrixChecks) }
 if (@(Get-ClientMatrixRequiredCheckIds).Count -ne 42 -or -not (Assert-ClientMatrixContract $validClientMatrix)) {
-    throw 'The complete 42-cell client matrix must pass its structural contract while unsupported clients remain not_verified.'
+    throw 'The complete 42-cell client matrix must pass its structural contract while unsupported or retired clients remain not_verified.'
 }
 $missingClientMatrixChecks = [Collections.Generic.List[object]]::new()
 foreach ($check in $clientMatrixChecks) {
@@ -299,6 +304,17 @@ foreach ($check in $clientMatrixChecks) {
 $falsePassRejected = $false
 try { Assert-ClientMatrixContract ([pscustomobject]@{ checks = @($falselyPassedNativeClient) }) } catch { $falsePassRejected = $true }
 if (-not $falsePassRejected) { throw 'The client matrix contract accepted a false passed status for a client without a native driver.' }
+$falselyPassedRetiredClient = [Collections.Generic.List[object]]::new()
+foreach ($check in $clientMatrixChecks) {
+    if ($check.id -ceq 'client/vscode/go') {
+        $falselyPassedRetiredClient.Add([pscustomobject]@{ id = $check.id; status = 'passed' })
+    } else {
+        $falselyPassedRetiredClient.Add($check)
+    }
+}
+$retiredPassRejected = $false
+try { Assert-ClientMatrixContract ([pscustomobject]@{ checks = @($falselyPassedRetiredClient) }) } catch { $retiredPassRejected = $true }
+if (-not $retiredPassRejected) { throw 'The client matrix contract accepted a passed status for the retired vscode binding.' }
 
 $previousWorkspaceRoot = $repoRoot
 $previousEvidenceDirectory = $EvidenceDirectory
