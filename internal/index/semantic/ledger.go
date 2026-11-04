@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/omnilsp/omni/internal/index/model"
 )
@@ -490,9 +491,18 @@ func readIDRecord(r io.Reader) (idRecord, error) {
 	return idRecord{ID: string(id), ScopeID: string(scope), Kind: kind, Fact: model.FactKind(fact)}, nil
 }
 
+// shortID abbreviates a symbol ID for error messages. Truncation must land
+// on a rune boundary: validIdentifier accepts any valid UTF-8 (semantic.go),
+// so byte-splitting a multi-byte rune yields an invalid UTF-8 fragment whose
+// %q escaping reaches the user-visible ErrUnknownSymbol / ErrDuplicateSymbol
+// messages as literal \xe9 noise.
 func shortID(value string) string {
 	if len(value) > 80 {
-		return value[:77] + "..."
+		truncated := value[:77]
+		for len(truncated) > 0 && !utf8.ValidString(truncated) {
+			truncated = truncated[:len(truncated)-1]
+		}
+		return truncated + "..."
 	}
 	return value
 }
