@@ -1448,3 +1448,88 @@ offset debt on file in `freeze-record.txt`):
 - 证据：`out/binding-retirement-20261105.md`（探针/移除清单/同步清单/验证命令实录）。
 - 提交：本节一笔 `chore(clients): retire the emacs and vscode tool bindings by user
   decision`（lock/测试/registry/docs 逐路径点名 add，排除 8 clang D；未 push）。
+
+## Evidence record — 2026-11-05 第二十三轮（记账终审：绑定清理复核 + 修复 pin 入账 + DEF-EDITORS 勘误 + 分数门车道复证）
+
+- 性质：第二十三轮记账终审（记账员域）。零生产代码改动；改动仅三件套
+  internal/conformance/registry.go（修复 pin 入 Probe + DEF-EDITORS 勘误）、
+  docs/conformance.md（投影再生，TestGenerateDocs drift 检查绿）、
+  docs/acceptance.md（本节）；原始输出存 out/ledger-final-r23/raw-checks.txt
+  （out/ 不入 git）。
+- 集成账实（承接本轮集成合并员档案 out/merge_round23_opt{A,B,C}_*.md）：A 车道
+  7 项（3 bug + 4 opt）与 C 车道 6 项（5 bug + 1 opt）以 **13 笔 fix/perf 提交**
+  并入 main（`git log 6e05873..1546781 --no-merges` 实测：6bc2f3c/3d45f57/
+  8dbaeba/ed80106/e913686/34b623c/29df089/a877020/8f1a6c8/c80fdcd/6066fe4/
+  005694a/800e3f1）；B 车道 6 项修复在 round23/optB（5 提交），合并树验证红
+  （optA 的 TestOrphanSweepThrottledByDirtyFlag 宽回收域 × optB ebe8725
+  newestKnownGen 反销毁窄域，两个 pinned 不变量互斥）被回滚，被拒树钉 tag
+  `rejected/round23-optB-merge` = 41e3517（假设账不消失）。任务书状态行称
+  「狩猎 verified 18 条已并入 main」，与实测口径不同：main 实并入 13 笔
+  （A7+C6），B6 未并入——按实测登记，18 口径无法从在案证据复原。
+- 复核一（X8-2/Y2-5/DEF-EDITORS Text/Reason vs 实况）：
+  - **X8-2 全部成立**：tools.lock.json 无 emacs/vscode 条目（grep 零命中；
+    helix 25.07.1 与 neovim 0.12.5 钉在案）；`tool/emacs`/`tool/vscode`
+    NotVerified retired 行在案（client_test.go:474-475）；矩阵 runner Go/PS
+    两侧退役格钉 not_verified（client_test.go:108/110/336-337/3011-3012、
+    acceptance.ps1:136-140，理由串逐字一致）；Neovim 为唯一原生矩阵客户端
+    （Retired 标记 + `Native && !Retired` 门）；docs/editors/ 六页与
+    editors/vscode/ 仍在树内；wave-20261027 证据在案——sublime-go 结果 JSON
+    实读：go→passed、cleanExit=true、serverExitConfirmed=true（其余 8 语言
+    not_verified），helix-native 证据 JSON 在案；探针 TestX8_ClientDocsPresent
+    本轮实跑 PASS；42 格不变量三处在案（client_test.go:1451、contract ps1:286、
+    registry 42-cell 文本）。
+  - **Y2-5 成立**：档案在树 + 退役语义与 X8-2 一致；「Helix, Zed and Sublime
+    LSP still lack complete native acceptance」措辞成立（complete = 全语言
+    42 格级，两条 opt-in 垂直仅 Go 单语言）。
+  - **DEF-EDITORS 漂移一处 → 勘误**：原 Reason「…Helix … vertical re-passed
+    on 2026-10-27, while complete native operation evidence and **Zed/Sublime
+    native evidence remain unverified**」对 Sublime 记陈旧账——同句内 Helix
+    得记而 Sublime 无记，且与 X8-2 及 wave-20261027 实况（Sublime Go 垂直同日
+    re-pass）矛盾；该句系退役前旧文案残留，绑定清理员照抄放大了不对称。勘误后：
+    Helix 25.07.1 与 Sublime Text 4215 两条 opt-in Go 垂直并记 re-pass（注明
+    round-23 audit erratum 与出处），残余开口改为「complete **multi-language**
+    native operation evidence and **Zed** native evidence remain unverified」。
+    docs/conformance.md 的 DEF-EDITORS 行只投影 Text（Reason 仅无 Milestone 的
+    PARTIAL 条目上投影），故勘误只落在 registry 单一事实源。
+- 复核二（本轮新 pin 入 Probe，三件套）：13 笔修复/perf 提交新增测试函数
+  27 实例（19 唯一名）+ TestMain ×2；**18 实例入 Probe（10 条目）**，映射：
+  | 提交 | pin | 条目 |
+  |---|---|---|
+  | 6bc2f3c | TestARCH_CallMethodExternalChangeGated、TestFacadeExternalChangeCannotRegressPublishedSnapshot | WS-D14（server 组）|
+  | 3d45f57 | TestNotebooksDoNotSurviveCloseSession（server）、TestUnregisterAllDropsNotebooksToo（virtual）| DEF-NOTEBOOK（DEFERRED 不计分，补数据模型退役半；wire 半仍 deferred）|
+  | 8dbaeba | TestOptionalCapabilitiesFollowSnapshotDiscipline | Y2-6a（server 组）|
+  | ed80106 | TestSemanticDiskUnchangedSincePinsCapturedTree、TestToolPathStillMatchesCachesByStatAndExpected | J-WIRE（server 组）|
+  | e913686 | TestCurrentSemanticIndexIdentityMemoizesPerGeneration、TestCurrentSemanticIndexIdentityNeverCachesErrors | J-WIRE（server 组）|
+  | 34b623c | TestProcessWaitsEntriesRemovedAfterFullReap | Y0-10（nested 组）|
+  | 8f1a6c8 | TestSemanticTokensNoShadowOnDeclarationNames | UX-I21TOK（新增 golang 组）|
+  | c80fdcd | TestDigestCache×4 | Y1-2（golang 组；maxPackageDigestCacheEntries 有界实读在案）|
+  | 005694a | TestInitializeRespondsBeforePluginLaunchCompletes | DEF-PLUGMOUNT（server 组）|
+  | 800e3f1 | TestOrphanSweepThrottledByDirtyFlag | X5-1（persistent 组）|
+  | 800e3f1 | TestLeaseViewServesVerifiedPayloadsWithoutRereadingDisk | X5-7（persistent 组）|
+  未入账 9 实例：TestVersionProbeCannotHangRequestPath ×4 与
+  TestWorkspaceSymbolsDecodeFailureIsSurfaced ×4（两组修复面均无 scored 条目可挂，
+  不强行入账，留观）；TestReaderNextServesCachedBatchesWithoutRereadingDisk
+  （semantic/reader_cache_pin_test.go——ACL 锁定目录，主工作树该文件被删，
+  注册即 TestRegistry_ProbeSymbolsExist 红；测试本体在 HEAD，车道可跑，留待
+  ACL 恢复后补挂）。a877020 修改既有测试无新函数，无入账面。
+- 分数稳定性：baseline.json coreScore = 98.45959595959597 未动（`git diff HEAD`
+  零位移）；入账 AUTO 条目 Status 全部不变；新 pin 逐条实跑全 PASS——主工作树
+  TestRegistry_ProbeSymbolsExist/TestRegistry_DataShape/TestFastReport_
+  ScoreBoundsAndShape/TestPartialDetailReportsDriftWithoutRescoring ok，健康
+  HEAD 车道 out/wt-r23c-merge（@1546781，用后 checkout 还原，porcelain 空）
+  内逐包实跑 8+4+2+1+1+1 项全绿，fast-probe 分数门
+  `TestConformanceNoRegression` + `TestGenerateDocs` 双绿（188.5s）——即新
+  pin 不降任何条目，core ≥ 98.46。首次车道运行红（Y5 0.857<1.000）系车道只
+  放了 registry.go 未放再生投影所致，补齐后双绿，非新 pin 回退。
+- ACL 现状：写探针 `internal/index/extractors/clang/.acl_probe_r23_final` 一
+  次 → Permission denied（无残留文件，未撞第二次），沿 6e05873/4da61d1 的
+  acl-blocked 登记；主工作树 porcelain **10 D**（8 clang + semantic/reader.go +
+  semantic/reader_cache_pin_test.go）为 optA 就地合并失败遗留的 ACL 终态
+  （out/merge_round23_optA_evidence.md：merge 删除工作树副本后重建被拒），
+  较第二十二轮的 8 D 多 2 笔，本轮不提交、不还原。
+- 门禁（诚实归因）：主工作树包级 `go test` 全绿面未跑（acl-blocked，沿第二十
+  二轮口径）；分数门以车道实跑替代（车道 = HEAD 同树，主树 build 被 clang 损
+  伤阻断，已如实分层）；registry/docs 三文件逐路径点名 add、不 add -A、不
+  push；ACL 锁定区零触碰；车道验证用后还原（porcelain 0 行）。
+- 提交：两笔——`ledger(conformance)`（registry.go + docs/conformance.md）与
+  `docs(acceptance)`（本节）。
