@@ -1383,6 +1383,19 @@ func (c *Conn) processWaitState(cmd *exec.Cmd) *processWaitState {
 			}
 			state.err = cmd.Wait()
 			close(state.done)
+			// round23 C: a fully reaped generation must leave the map.
+			// Attach installs one entry per supervised child, and nothing
+			// else ever deleted them, so every crash/restart cycle leaked a
+			// processWaitState into processWaits for the life of the
+			// session. The waiter is the single point where a child is
+			// provably fully reaped (Wait returned, done closed), so it is
+			// the one safe place to retire the entry: waiters already
+			// holding the state pointer keep a valid struct, and a later
+			// stopProcessNow on the same cmd rebuilds a fresh state whose
+			// done closes as soon as its Wait observes the finished process.
+			c.processWaitMu.Lock()
+			delete(c.processWaits, cmd)
+			c.processWaitMu.Unlock()
 		}()
 	})
 	return state
