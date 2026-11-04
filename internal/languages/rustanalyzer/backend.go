@@ -460,14 +460,19 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 			} `json:"range"`
 		} `json:"location"`
 	}
-	if err := json.Unmarshal(result, &raw); err == nil {
-		for _, s := range raw {
-			syms = append(syms, languages.WorkspaceSymbol{
-				Name: s.Name, Kind: languages.SymbolKind(s.Kind),
-				URI:       s.Location.URI,
-				StartLine: s.Location.Range.Start.Line, StartCol: s.Location.Range.Start.Character,
-			})
-		}
+	// round23 C: a decode failure used to fall through to `return syms, nil`,
+	// presenting a broken child reply as a successful empty result — while the
+	// same bridge surfaces an explicit error one call over (document symbol
+	// decode). Fail loudly and consistently.
+	if err := json.Unmarshal(result, &raw); err != nil {
+		return nil, fmt.Errorf("workspace symbol decode: %w", err)
+	}
+	for _, s := range raw {
+		syms = append(syms, languages.WorkspaceSymbol{
+			Name: s.Name, Kind: languages.SymbolKind(s.Kind),
+			URI:       s.Location.URI,
+			StartLine: s.Location.Range.Start.Line, StartCol: s.Location.Range.Start.Character,
+		})
 	}
 	return syms, nil
 }
