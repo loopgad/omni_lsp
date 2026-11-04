@@ -188,6 +188,12 @@ func exportSCIPSemanticScope(ctx context.Context, reader *semantic.Reader, scope
 				role := int32(0)
 				switch occurrence.Role {
 				case "reference":
+				case "declaration":
+					// SCIP has no declaration role bit (SymbolRoles is
+					// Definition-or-nothing): a declaration exports as a
+					// plain non-definition occurrence, the same wire shape a
+					// reference takes. The lost declaration/reference
+					// distinction is registered in LossyNotes (§L14).
 				case "definition":
 					role = int32(scip.SymbolRole_Definition)
 					if previous, exists := definitionURI[occurrence.SymbolID]; !exists || relative < previous {
