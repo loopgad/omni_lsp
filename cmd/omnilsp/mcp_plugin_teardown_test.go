@@ -207,7 +207,20 @@ func TestMCPTransportShutsPluginsDownGracefully(t *testing.T) {
 	defer func() { os.Stdin, os.Stdout = previousStdin, previousStdout }()
 	defer func() { _ = inRead.Close(); _ = outRead.Close() }()
 
-	_ = inWrite.Close() // stdin 立即 EOF：MCP 会话即刻结束
+	// Round-23 OPT-3：插件 launch 已后台化——立即 EOF 会让会话拆除赢得对
+	// launch 的竞速，按已 pin 的关闭契约（ClosePlugins 置位后的起飞必须被
+	// 丢弃）插件根本不会启动，本测试的前提（优雅拆除一个运行中的插件）就
+	// 落空了。改为在插件真正进入协议循环（start marker 落盘）后再 EOF。
+	go func() {
+		startDeadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(startDeadline) {
+			if _, err := os.Stat(startMarker); err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		_ = inWrite.Close()
+	}()
 
 	cmdServe([]string{"--config", configPath, "--transport", "mcp", "--workspace", root, "--plugins", pluginRoot})
 

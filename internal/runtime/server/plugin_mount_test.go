@@ -229,10 +229,9 @@ func TestEmit_DefaultDenyWithoutGrant(t *testing.T) {
 	s.InitializeWorkspace(t.TempDir()) // 审计批 2：策略就绪后才 Launch
 	rt := attachRecordingTransport(t, s)
 
+	// Round-23 OPT-3: launch 是后台化的——等待起飞完成再断言。
+	waitUntil(t, func() bool { return mountedProc(t, s, "no-grant") != nil }, "document.read 插件未被 Launch")
 	proc := mountedProc(t, s, "no-grant")
-	if proc == nil {
-		t.Fatal("document.read 插件应正常装配运行")
-	}
 	// 插件能力声明缺 diagnostics.emit，Launch 前置门放行（声明⊆授予），
 	// 但宿主 emit 门必须拒绝这条敌意通知。
 	if _, err := proc.Call("emit/now", nil); err != nil {
@@ -270,10 +269,9 @@ func TestEmit_EndToEndWithDebounce(t *testing.T) {
 	// 并期望推送」是无守卫时代的钉法，随守卫落地一并替换。
 	s.vfs.Open("file:///p/main.go", "go", 1, []byte("package main"), vfs.SourceEditor)
 
+	// Round-23 OPT-3: launch 是后台化的——等待起飞完成再断言。
+	waitUntil(t, func() bool { return mountedProc(t, s, "diag-e2e") != nil }, "diagnostics.emit 插件未被 Launch")
 	proc := mountedProc(t, s, "diag-e2e")
-	if proc == nil {
-		t.Fatal("diagnostics.emit 插件应正常装配运行")
-	}
 	if st, err := s.pluginMgr.State("diag-e2e"); err != nil || st != plugin.StateRunning {
 		t.Fatalf("装配后状态 = %v (err %v), want running", st, err)
 	}
@@ -330,10 +328,9 @@ func TestEmit_CrashDuringEmitContained(t *testing.T) {
 	// TestEmit_EndToEndWithDebounce 同款注记）。
 	s.vfs.Open("file:///p/main.go", "go", 1, []byte("package main"), vfs.SourceEditor)
 
+	// Round-23 OPT-3: launch 是后台化的——等待起飞完成再断言。
+	waitUntil(t, func() bool { return mountedProc(t, s, "crasher") != nil }, "crasher 插件未被 Launch")
 	proc := mountedProc(t, s, "crasher")
-	if proc == nil {
-		t.Fatal("插件应正常装配运行")
-	}
 
 	exited := make(chan error, 1)
 	go func() {
@@ -468,10 +465,9 @@ func TestEmit_LanguageScopeEnforced(t *testing.T) {
 		rt := attachRecordingTransport(t, s)
 		s.vfs.Open("file:///p/main.py", "python", 1, []byte("print(1)"), vfs.SourceEditor)
 
+		// Round-23 OPT-3: launch 是后台化的——等待起飞完成再断言。
+		waitUntil(t, func() bool { return mountedProc(t, s, "langscope") != nil }, "languages:[go] 插件未被 Launch")
 		proc := mountedProc(t, s, "langscope")
-		if proc == nil {
-			t.Fatal("languages:[go] 插件应正常装配运行")
-		}
 		if _, err := proc.Call("emit/now", nil); err != nil {
 			t.Fatalf("Call: %v", err)
 		}
@@ -492,10 +488,9 @@ func TestEmit_LanguageScopeEnforced(t *testing.T) {
 		rt := attachRecordingTransport(t, s)
 		s.vfs.Open("file:///p/main.go", "go", 1, []byte("package main"), vfs.SourceEditor)
 
+		// Round-23 OPT-3: launch 是后台化的——等待起飞完成再断言。
+		waitUntil(t, func() bool { return mountedProc(t, s, "langscope") != nil }, "languages:[go] 插件未被 Launch")
 		proc := mountedProc(t, s, "langscope")
-		if proc == nil {
-			t.Fatal("languages:[go] 插件应正常装配运行")
-		}
 		if _, err := proc.Call("emit/now", nil); err != nil {
 			t.Fatalf("Call: %v", err)
 		}

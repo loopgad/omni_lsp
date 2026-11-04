@@ -42,10 +42,9 @@ func TestPluginAndBackendDiagnosticsPublishMergedForSameURI(t *testing.T) {
 	s.publishSnapshot()
 	s.InitializeWorkspace(t.TempDir()) // 策略就绪 → 装配期待命的插件 Launch
 
+	// Round-23 OPT-3: launch 是后台化的——等待起飞完成再断言。
+	waitUntil(t, func() bool { return mountedProc(t, s, "merger") != nil }, "merger 插件未被 Launch")
 	proc := mountedProc(t, s, "merger")
-	if proc == nil {
-		t.Fatal("diagnostics.emit 插件应正常装配运行")
-	}
 
 	// 同一 uri、两个来源、各自一次去抖推送：后端 compute 车道 + 插件 emit 车道。
 	s.diag.request(uri)
