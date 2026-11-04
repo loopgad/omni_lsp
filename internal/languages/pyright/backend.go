@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/omnilsp/omni/internal/identity"
 	"github.com/omnilsp/omni/internal/languages"
@@ -94,14 +95,31 @@ func spawnServer(c *nested.Conn) error {
 	return nil
 }
 
+// versionProbeTimeout bounds the interpreter probes the build-context
+// identity depends on. The probe runs on the request path behind
+// buildCtxOnce (nested Conn.BuildContextID), so a hung interpreter binary —
+// a shimmed PATH entry, a stalled network mount — would park the first
+// request forever and queue every later one on the Once. A one-shot
+// derivation can tolerate failure (the "<lang>:sha256:unavailable" fallback
+// exists for exactly that), never a hang. Var so a test can shorten it
+// against a fake hung interpreter.
+var versionProbeTimeout = 10 * time.Second
+
+func probeInterpreterVersion(name string) (string, error) {
+	probeCtx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, name, "--version").CombinedOutput()
+	return string(out), err
+}
+
 // probePythonVersion prefers python; some distros ship only python3. The
 // build-context identity comes from the interpreter (§E0).
 func probePythonVersion() (string, error) {
-	if out, err := exec.Command("python", "--version").CombinedOutput(); err == nil {
-		return string(out), nil
+	if out, err := probeInterpreterVersion("python"); err == nil {
+		return out, nil
 	}
-	out, err := exec.Command("python3", "--version").CombinedOutput()
-	return string(out), err
+	out, err := probeInterpreterVersion("python3")
+	return out, err
 }
 
 // parsePythonVersion extracts the version token from "Python 3.12.1".

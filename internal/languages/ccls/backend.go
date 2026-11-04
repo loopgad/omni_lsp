@@ -83,8 +83,20 @@ func parseClangdVersion(output string, err error) (string, error) {
 	return "", fmt.Errorf("clangd --version: unparseable output")
 }
 
+// versionProbeTimeout bounds the --version probe the build-context identity
+// depends on. The probe runs on the request path behind buildCtxOnce
+// (nested Conn.BuildContextID), so a hung clangd binary — a shimmed PATH
+// entry, a stalled network mount — would park the first request forever and
+// queue every later one on the Once. A one-shot derivation can tolerate
+// failure (the "<lang>:sha256:unavailable" fallback exists for exactly
+// that), never a hang. Var so a test can shorten it against a fake hung
+// clangd.
+var versionProbeTimeout = 10 * time.Second
+
 func probeClangdVersion() (string, error) {
-	out, err := exec.Command("clangd", "--version").Output()
+	probeCtx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, "clangd", "--version").Output()
 	return string(out), err
 }
 

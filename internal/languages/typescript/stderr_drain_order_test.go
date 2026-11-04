@@ -39,6 +39,13 @@ func TestMain(m *testing.M) {
 		time.Sleep(50 * time.Millisecond)
 		os.Exit(7)
 	}
+	// round23 C：版本探针 pin 的挂起模式——同一测试二进制被拷成假 tsc 后睡
+	// 20s，供 version_probe_deadline_test.go 在缩短的 deadline 处被
+	// CommandContext 杀掉（见该文件的孙进程句柄继承说明）。
+	if os.Getenv("OMNILSP_FAKE_TSC_HANG") != "" {
+		time.Sleep(20 * time.Second)
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
 }
 

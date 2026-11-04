@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	ierrors "github.com/omnilsp/omni/internal/errors"
 	"github.com/omnilsp/omni/internal/identity"
@@ -99,8 +100,19 @@ func spawnServer(c *nested.Conn) error {
 	return nil
 }
 
+// versionProbeTimeout bounds the --version probe the build-context identity
+// depends on. The probe runs on the request path behind buildCtxOnce
+// (nested Conn.BuildContextID), so a hung tsc binary — a shimmed PATH entry,
+// a stalled network mount — would park the first request forever and queue
+// every later one on the Once. A one-shot derivation can tolerate failure
+// (the "<lang>:sha256:unavailable" fallback exists for exactly that), never
+// a hang. Var so a test can shorten it against a fake hung tsc.
+var versionProbeTimeout = 10 * time.Second
+
 func probeTscVersion() (string, error) {
-	out, err := exec.Command("tsc", "--version").CombinedOutput()
+	probeCtx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, "tsc", "--version").CombinedOutput()
 	return string(out), err
 }
 
