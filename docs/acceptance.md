@@ -1340,3 +1340,68 @@ offset debt on file in `freeze-record.txt`):
 - 提交：本节与 spec 勘误一笔 docs 提交；未 push、未 git add -A、未触碰
   ACL 锁定区（test/acceptance/evidence/**、tools/.npm-cache、
   internal/index/extractors/**）。
+
+## Evidence record — 2026-11-05 第二十二轮（终局闭环：ACL 终态 + 不变式 + 载体双跑核验 + 债务终清 + soak 终态）
+
+- 性质：第二十二轮终局记账（记账员域）。零代码改动；改动仅
+  docs/acceptance.md（本节）与 out/ledger-final-r22/ 证据（out/ 不入
+  git）。internal/conformance/registry.go、docs/conformance.md、
+  testdata/baseline.json 本轮**零触碰**——载体核验结果为 blocked 而非
+  推翻，promote 无新增，账面保持 round-20 promote（`26b133e`）后的形态。
+- 终局闭环五项（本轮实跑，原始输出见 out/ledger-final-r22/raw-checks
+  .txt）：① **ACL 终态 = blocked 维持**（aclFixed=false）：icacls 勘验
+  `internal/index/extractors/clang` 仍无 `Authenticated Users:(M)`（三
+  个 (M) 均绑定具体 SID），写探针 `echo probe > …/.acl_probe_22` 单次
+  即 Permission denied，按纪律登记 acl-blocked 不再撞墙第二次；② **不
+  变式 = true**：`test/conformance/testdata/baseline.json` coreScore
+  98.45959595959597 与不变式逐位相符、对 HEAD `git diff` 零位移（静态
+  物证核验；动态 `go run ./cmd/omnilsp verify` 因 cmd/omnilsp 拉入
+  clang 包编译阻断 EXIT=1 未跑，如实分层登记）；registry 四态计数
+  AUTO 93 / PARTIAL 4 / DEFERRED 26 / GATE 2 = 125 闭合（StatusAuto
+  grep=93，与已知态一致）；三分支合并实证 `git log --merges`——
+  1196b88（bugB 13 笔）/ f09f857（bugC 13 笔）/ 1b40cc7（bugA 15 笔）
+  在案；③ **DEF-IDXWIRE 载体测试主树双跑核验 = blocked（不推翻账
+  面）**：两载体测试均实跑至 build failed——`go test ./internal/index/
+  persistent/ -run TestSevenLanguageTypedFactExportPersistsWithStable
+  Identity` 与 `go test ./internal/replay/ -run TestSevenLanguageTyped
+  GenerationsReplayFreshOnlyAcrossStoreReopen` 同为 `[build failed]`，
+  依赖链 grep 实证：载体测试 → test/harness/sevenlang → internal/
+  languages/ccls/semantic_index.go（clang 包唯一非测试导入方）→
+  clang 包 8 文件工作树缺失（undefined: maxHelperHeaders/canonical
+  Path/maxHelperHeaderBytes/ExtractorName/captureCompilerEnvironment/
+  toolPair，全部为被删文件内符号）。「若 compiled」前提在非测试包层
+  成立（persistent/replay 非测试面 `go build` EXIT=0）而在测试构建层
+  不成立；blocked 根因是 ACL 环境而非测试失败，`26b133e` 的 AUTO 立
+  于 round-20 合并树（`1196b88`）的 worktree 全绿实跑，本轮核验性重
+  跑受阻不构成推翻——按任务书「只核验不改账」执行，账面零位移；
+  ④ **债务终清**：工作树在制品 29→8——闭环核对轮（2026-11-04）时点
+  14 M + 15 D，本轮 porcelain 实测 8 D（全部 internal/index/extractors
+  /clang/，`git diff HEAD --stat` = 8 files, 4230 deletions）；收缩不
+  入库可归因（`git log --all --since=2026-11-04` 仅 d62422e/45d01ce/
+  83486e4 三笔且不触碰这些文件、`git stash list` 空），判读为会话间
+  工作树恢复/放弃——7 笔可写区 pin_test D 与 14 M 消失、3 笔核心 D
+  与 5 笔 clang 内 pin_test D 因 ACL 锁定仍存，与 ACL 边界自洽，非本
+  轮动作；gofmt 全树 flagged 仅 out/** 与 test/acceptance/evidence/**
+  （`git ls-files` 实证均未跟踪）→ 入树 gofmt 债务 0；⑤ **soak 终态
+  = blocked 维持**：BLOCKED.md 在 out/soak1h-final-20261103T164204Z-
+  blocked/（decision=blocked，1h soak 未启动，根因 clang ACL、非候选
+  缺陷），§4 补跑前提「两文件已恢复 + 树上无未暂存改动」本轮均不成
+  立，且候选冻结件不可构建（`go build ./cmd/omnilsp/` EXIT=1）——本
+  轮不补跑，配方留待 ACL 提权后照抄执行。
+- 账面-实况漂移扫描：**无漂移，无勘误**。已知态五项逐一比对实况——
+  aclFixed=false ↔ 写探针 DENIED；score 不变式 ↔ baseline 物证相符；
+  三分支已合并 ↔ 三 merge commit 在案；AUTO=93 ↔ StatusAuto=93；树态
+  8 D ↔ porcelain 8 D 全 clang——全部相符。
+- 闭环四态（本轮扫描面内零静默）：fixed+verified = 不变式/四态计数/
+  三分支合并（静态实跑核验）；deferred+reason 3 = 载体测试主树重跑、
+  动态 verify、1h soak 补跑（根因同为 clang 8 文件 ACL 待恢复，恢复后
+  按在案配方自会闭合）；user-action 1 = internal/index/extractors/**
+  的 Authenticated Users:(M) 管理员提权 + 主会话 restore 8 文件（唯一
+  真阻塞）；disproven 0。
+- 门禁（诚实归因）：本轮全部为静态读码 + 读探针 + 两次失败的测试构
+  建尝试（build failed 即证据，非静默）；docs-only、零 Go 改动；包级
+  `go test` 全绿面未跑（acl-blocked，沿第二十一轮口径）；未 push、未
+  git add -A、ACL 锁定区（test/acceptance/evidence/**、tools/.npm-
+  cache、internal/index/extractors/**）零触碰、写探针仅入目录即拒未
+  留任何文件。
+- 提交：本节一笔 docs 提交（单文件单提交，无分批面）。
