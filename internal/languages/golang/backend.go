@@ -66,10 +66,16 @@ type Backend struct {
 	workDir    string
 	pkgCache   map[string]packageCacheEntry
 	pkgOrder   []string // FIFO eviction order for pkgCache
+	digests    *packageDigestCache // per-file (path,size,mtime)→SHA-256 memo backing the hit-path fingerprint
 	fset       *token.FileSet
 	fsetBase   int // token.FileSet position at the beginning of this cache generation
 	goFlags    string
 	goWorkPath string
+	// Toolchain roots captured from the same one-shot `go env` probe, used
+	// only to scope the fingerprint's digest memo
+	// (packageDigestCache.reusable).
+	goRoot     string
+	goModCache string
 
 	// Build context identity (§E0): derived lazily once from `go env`.
 	buildCtxOnce sync.Once
@@ -85,6 +91,7 @@ func New(workDir string) *Backend {
 		gate:     make(chan struct{}, 1),
 		workDir:  workDir,
 		pkgCache: make(map[string]packageCacheEntry),
+		digests:  newPackageDigestCache(),
 		fset:     token.NewFileSet(),
 	}
 	b.fsetBase = b.fset.Base()
@@ -160,7 +167,7 @@ func (b *Backend) deriveBuildContext() {
 
 	probeCtx, cancel := context.WithTimeout(context.Background(), buildContextProbeTimeout)
 	defer cancel()
-	command := exec.CommandContext(probeCtx, "go", "env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS", "GOWORK")
+	command := exec.CommandContext(probeCtx, "go", "env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS", "GOWORK", "GOROOT", "GOMODCACHE")
 	command.Dir = b.workDir
 	out, err := command.Output()
 	if err != nil {
@@ -182,6 +189,16 @@ func (b *Backend) deriveBuildContext() {
 		b.goWorkPath = v
 		env["GOWORK"] = v
 	}
+	// round23 C: GOROOT/GOMODCACHE scope the fingerprint digest memo only —
+	// deliberately not added to env, so the derived build-context identity is
+	// unchanged.
+	if v := get(5); v != "" {
+		b.goRoot = filepath.Clean(v)
+	}
+	if v := get(6); v != "" && v != "off" {
+		b.goModCache = filepath.Clean(v)
+	}
+	b.digests.setToolchainRoots(b.goRoot, b.goModCache)
 	ctx, derr := buildctx.DeriveGo(b.workDir, get(0), get(1)+"/"+get(2), env, nil)
 	if derr != nil {
 		return
@@ -228,7 +245,7 @@ func (b *Backend) loadPackageWithOverlays(ctx context.Context, uri string, conte
 	buildContext := b.BuildContextID()
 	key := packageCacheKey(filePath, snapshotRev, content, overlays, buildContext)
 	if entry, ok := b.pkgCache[key]; ok && entry.pkg != nil {
-		fingerprint, complete, checkErr := packageInputFingerprint(ctx, entry.pkg, filePath, overlays, buildContext, b.goWorkPath, b.goFlags)
+		fingerprint, complete, checkErr := packageInputFingerprint(ctx, entry.pkg, filePath, overlays, buildContext, b.goWorkPath, b.goFlags, b.digests)
 		if checkErr == nil && complete && fingerprint == entry.inputFingerprint {
 			b.cacheHits.Add(1)
 			return entry.pkg, nil
@@ -265,7 +282,7 @@ func (b *Backend) loadPackageWithOverlays(ctx context.Context, uri string, conte
 	if len(pkgs) == 0 {
 		return nil, fmt.Errorf("no packages found for %s", filePath)
 	}
-	fingerprint, complete, fingerprintErr := packageInputFingerprint(ctx, pkgs[0], filePath, overlays, buildContext, b.goWorkPath, b.goFlags)
+	fingerprint, complete, fingerprintErr := packageInputFingerprint(ctx, pkgs[0], filePath, overlays, buildContext, b.goWorkPath, b.goFlags, b.digests)
 	if fingerprintErr == nil && complete {
 		b.cachePackage(key, pkgs[0], fingerprint)
 	}
@@ -1333,6 +1350,17 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 	// lands every token at the wrong extent.
 	enc := requestEncoding(encoding, true)
 	idx := position.NewIndex(content, enc)
+	// round23 C: declaration names used to carry two tokens on the same span.
+	// The FuncDecl/TypeSpec branches emit TokFunction/TokType on the name and
+	// then let the walker descend, so the name ident hit the Ident branch and
+	// emitted a second TokVariable at the identical position. LSP token
+	// streams must be ordered and non-overlapping, and clients that honor the
+	// later same-span writer rendered function and type names in variable
+	// color. Inspect visits pre-order, so the FuncDecl/TypeSpec visit has
+	// registered the name in declNames before its ident is reached; the
+	// Ident branch skips those positions and the declaration branches keep
+	// sole ownership of the name span.
+	declNames := make(map[token.Pos]bool)
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -1344,17 +1372,22 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 		)
 		switch v := n.(type) {
 		case *ast.Ident:
+			if declNames[v.Pos()] {
+				return true
+			}
 			p = v.Pos()
 			end = v.End()
 			tt = languages.TokVariable
 		case *ast.FuncDecl:
 			if v.Name != nil {
+				declNames[v.Name.Pos()] = true
 				p = v.Name.Pos()
 				end = v.Name.End()
 				tt = languages.TokFunction
 			}
 		case *ast.TypeSpec:
 			if v.Name != nil {
+				declNames[v.Name.Pos()] = true
 				p = v.Name.Pos()
 				end = v.Name.End()
 				tt = languages.TokType

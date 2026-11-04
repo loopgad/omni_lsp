@@ -312,6 +312,30 @@ func TestRenameClassifiedNonFunctionAndNullResponse(t *testing.T) {
 			t.Fatalf("null rename diagnostics = %v, want explicit upstream refusal", response.result.InternalDiagnostics)
 		}
 	})
+
+	// round23 C: a non-null but edit-free WorkspaceEdit must fail closed like
+	// the null one — the empty changes map decodes fine and used to be
+	// certified ResultExact+Complete with a zero-edit set (SEM-SAFE-001).
+	t.Run("empty changes map is unavailable", func(t *testing.T) {
+		_, stdin, child, got, _ := startCclsRenameProtocolTest(t, languages.SymbolVariable)
+		replyToCclsRequest(t, stdin.frames, child, "textDocument/rename", map[string]any{"changes": map[string]any{}})
+		response := awaitCclsRenameResult(t, got)
+		if response.err != nil {
+			t.Fatalf("empty-changes rename returned Go error: %v", response.err)
+		}
+		if response.result.Status != identity.ResultUnavailable || response.result.Value.Complete || len(response.result.Value.Edits) != 0 {
+			t.Fatalf("empty-changes rename result = %+v, want unavailable and incomplete with no edits", response.result)
+		}
+		if response.result.Completeness != identity.CompletenessUnknown {
+			t.Fatalf("completeness = %v, want unknown", response.result.Completeness)
+		}
+		if len(response.result.Evidence) != 1 || response.result.Evidence[0].DetailCode != "clangd-empty-edit" {
+			t.Fatalf("empty-changes rename evidence = %+v, want clangd-empty-edit refusal evidence", response.result.Evidence)
+		}
+		if len(response.result.InternalDiagnostics) != 1 || !strings.Contains(response.result.InternalDiagnostics[0], "SEM-SAFE-001") {
+			t.Fatalf("diagnostics = %v, want typed SEM-SAFE-001 refusal", response.result.InternalDiagnostics)
+		}
+	})
 }
 
 func TestX4_CompletionAcceptsArrayAndCompletionList(t *testing.T) {

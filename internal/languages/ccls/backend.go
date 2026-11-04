@@ -83,8 +83,20 @@ func parseClangdVersion(output string, err error) (string, error) {
 	return "", fmt.Errorf("clangd --version: unparseable output")
 }
 
+// versionProbeTimeout bounds the --version probe the build-context identity
+// depends on. The probe runs on the request path behind buildCtxOnce
+// (nested Conn.BuildContextID), so a hung clangd binary — a shimmed PATH
+// entry, a stalled network mount — would park the first request forever and
+// queue every later one on the Once. A one-shot derivation can tolerate
+// failure (the "<lang>:sha256:unavailable" fallback exists for exactly
+// that), never a hang. Var so a test can shorten it against a fake hung
+// clangd.
+var versionProbeTimeout = 10 * time.Second
+
 func probeClangdVersion() (string, error) {
-	out, err := exec.Command("clangd", "--version").Output()
+	probeCtx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, "clangd", "--version").Output()
 	return string(out), err
 }
 
@@ -613,14 +625,19 @@ func (b *Backend) WorkspaceSymbols(ctx context.Context, req languages.WorkspaceS
 			} `json:"range"`
 		} `json:"location"`
 	}
-	if err := json.Unmarshal(result, &raw); err == nil {
-		for _, s := range raw {
-			syms = append(syms, languages.WorkspaceSymbol{
-				Name: s.Name, Kind: languages.SymbolKind(s.Kind),
-				URI:       s.Location.URI,
-				StartLine: s.Location.Range.Start.Line, StartCol: s.Location.Range.Start.Character,
-			})
-		}
+	// round23 C: a decode failure used to fall through to `return syms, nil`,
+	// presenting a broken child reply as a successful empty result — while the
+	// same bridge surfaces an explicit error one call over (document symbol
+	// decode). Fail loudly and consistently.
+	if err := json.Unmarshal(result, &raw); err != nil {
+		return nil, fmt.Errorf("workspace symbol decode: %w", err)
+	}
+	for _, s := range raw {
+		syms = append(syms, languages.WorkspaceSymbol{
+			Name: s.Name, Kind: languages.SymbolKind(s.Kind),
+			URI:       s.Location.URI,
+			StartLine: s.Location.Range.Start.Line, StartCol: s.Location.Range.Start.Character,
+		})
 	}
 	return syms, nil
 }
@@ -762,6 +779,14 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (enve
 				NewText: c.NewText,
 			})
 		}
+	}
+	// round23 C: a non-null but edit-free WorkspaceEdit ({"changes":{}})
+	// decodes fine and yields zero edits — publishing it as an exact,
+	// complete rename would certify an empty edit set (SEM-SAFE-001). Fail
+	// closed on the same detail the other nested bridges use (-empty-edit).
+	if len(edits) == 0 {
+		return unavailableCclsRename(req, "clangd-empty-edit",
+			"rename refused: upstream language service returned no edits; safety and completeness are not proven (SEM-SAFE-001)"), nil
 	}
 	// clangd's edit is accepted only after the target classification gate above;
 	// function-like targets are refused because clangd does not prove overload-
