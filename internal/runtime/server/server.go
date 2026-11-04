@@ -1722,10 +1722,14 @@ func (s *Server) State() State {
 // lifecycle gate would admit them over LSP — otherwise an MCP/HTTP adapter
 // could mutate the VFS from any goroutine, bypassing lifecycle ordering.
 var facadeMutatingMethods = map[string]bool{
-	"textDocument/didOpen":   true,
-	"textDocument/didChange": true,
-	"textDocument/didSave":   true,
-	"textDocument/didClose":  true,
+	"textDocument/didOpen":            true,
+	"textDocument/didChange":          true,
+	"textDocument/didSave":            true,
+	"textDocument/didClose":           true,
+	"workspace/didChangeWatchedFiles": true,
+	"workspace/didCreateFiles":        true,
+	"workspace/didRenameFiles":        true,
+	"workspace/didDeleteFiles":        true,
 }
 
 // CallMethod is the canonical read-only facade for non-LSP protocol adapters
