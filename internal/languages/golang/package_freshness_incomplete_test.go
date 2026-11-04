@@ -76,7 +76,7 @@ func TestLayoutListErrorPackageWithCGOIsCachedAndRevalidates(t *testing.T) {
 		t.Fatalf("cache stats after first load = %d hits / %d misses, want 0/1", hits, misses)
 	}
 
-	fingerprint, complete, err := packageInputFingerprint(ctx, pkg, uriToPath(mainURI), packageOverlays{}, b.BuildContextID(), b.goWorkPath, b.goFlags)
+	fingerprint, complete, err := packageInputFingerprint(ctx, pkg, uriToPath(mainURI), packageOverlays{}, b.BuildContextID(), b.goWorkPath, b.goFlags, b.digests)
 	if err != nil {
 		t.Fatalf("packageInputFingerprint: %v", err)
 	}
@@ -135,7 +135,7 @@ func assertRealErrorPackageStaysUncacheable(t *testing.T, content []byte, want p
 	if len(pkg.Errors) == 0 || !hasWant {
 		t.Fatalf("fixture errors = %+v, want an error of kind %v (fixture drifted)", pkg.Errors, want)
 	}
-	fingerprint, complete, err := packageInputFingerprint(ctx, pkg, uriToPath(mainURI), packageOverlays{}, b.BuildContextID(), b.goWorkPath, b.goFlags)
+	fingerprint, complete, err := packageInputFingerprint(ctx, pkg, uriToPath(mainURI), packageOverlays{}, b.BuildContextID(), b.goWorkPath, b.goFlags, b.digests)
 	if err != nil {
 		t.Fatalf("packageInputFingerprint: %v", err)
 	}

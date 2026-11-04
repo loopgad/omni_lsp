@@ -28,6 +28,201 @@ type packageCacheEntry struct {
 
 type workspaceOverlayContextKey struct{}
 
+// round23 C: the package-cache hit path recomputes the whole input-closure
+// fingerprint on every request (loadPackage's hit branch), and the measured
+// cost is dominated by re-opening and SHA-256-ing every input file — for a
+// single `import "fmt"` main with a 65-package / 529-file closure, one
+// fingerprint scan costs ~160ms, which is essentially the entire hit-path
+// cost. The digest cache memoizes per-file digests keyed by
+// (path, size, mtime): an unchanged file costs one directory-listing stat
+// instead of a full read+hash, and only changed files are re-hashed.
+//
+// Scope decision (round23 C, measured): reuse is restricted to
+// toolchain-managed roots (GOROOT, GOMODCACHE). The package fingerprint is
+// pinned by TestPackageCacheRevalidatesSameSizeSameModTimeDependencyEdit to
+// catch workspace dependency edits that preserve BOTH size and mtime — a
+// stat-keyed memo cannot see those, so user-editable workspace files always
+// re-hash at full strength. GOROOT and the module cache are owned by the
+// toolchain (module-cache files are read-only, go.sum-verified on download),
+// and they are essentially the whole measured closure cost: the fmt closure
+// is 528 GOROOT files plus one workspace file. Residual, disclosed trade: a
+// deliberate same-size-same-mtime rewrite inside those roots would reuse the
+// old digest where today's full hash would catch it.
+type packageDigestCache struct {
+	mu    sync.Mutex
+	roots []string // pathKey'd toolchain roots; empty = memo inert
+	byKey map[digestCacheKey]identity.ContentHash
+}
+
+type digestCacheKey struct {
+	path   string // pathKey-normalized
+	size   int64
+	mtimeN int64 // ModTime().UnixNano()
+}
+
+// maxPackageDigestCacheEntries bounds the memo. Overflow drops the whole
+// map: correctness is unaffected (a miss re-hashes the file) and the next
+// scan repopulates.
+const maxPackageDigestCacheEntries = 65536
+
+func newPackageDigestCache() *packageDigestCache {
+	return &packageDigestCache{byKey: make(map[digestCacheKey]identity.ContentHash)}
+}
+
+// setToolchainRoots scopes the memo to toolchain-managed file roots. Called
+// once from deriveBuildContext inside buildCtxOnce, before any fingerprint
+// can run — both fingerprint callers derive the build context first, and a
+// fingerprint with an unavailable build context never reaches the file loop.
+func (c *packageDigestCache) setToolchainRoots(goroot, goModCache string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.roots = c.roots[:0]
+	for _, root := range []string{goroot, goModCache} {
+		if root == "" || root == "off" {
+			continue
+		}
+		c.roots = append(c.roots, pathKey(filepath.Clean(root)))
+	}
+}
+
+// reusable reports whether the memo may serve a stat-validated digest for
+// this path. See the packageDigestCache doc for the scope decision.
+func (c *packageDigestCache) reusable(path string) bool {
+	c.mu.Lock()
+	roots := c.roots
+	c.mu.Unlock()
+	if len(roots) == 0 {
+		return false
+	}
+	key := pathKey(path)
+	for _, root := range roots {
+		if key == root {
+			return true
+		}
+		if len(key) > len(root) && strings.HasPrefix(key, root) {
+			if sep := key[len(root)]; sep == '\\' || sep == '/' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reuse returns the memoized digest when the file still stats exactly as the
+// remembered (size, mtime).
+func (c *packageDigestCache) reuse(path string) (identity.ContentHash, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	return c.reuseStat(digestCacheKey{path: pathKey(path), size: info.Size(), mtimeN: info.ModTime().UnixNano()})
+}
+
+// reuseStat is reuse against a pre-computed stat key — the normal path when
+// a directory listing already supplied the (size, mtime) proof.
+func (c *packageDigestCache) reuseStat(key digestCacheKey) (identity.ContentHash, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	digest, ok := c.byKey[key]
+	return digest, ok
+}
+
+// remember pins a digest under the stat taken before the read, only when a
+// post-read stat still matches it: a file rewritten between the two stats
+// has content that matches neither, and pinning either stat would risk a
+// stale digest on a later (size, mtime) match.
+func (c *packageDigestCache) remember(path string, before os.FileInfo, digest identity.ContentHash) {
+	after, err := os.Stat(path)
+	if err != nil || !sameFileStat(before, after) {
+		return
+	}
+	key := digestCacheKey{path: pathKey(path), size: after.Size(), mtimeN: after.ModTime().UnixNano()}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.byKey) >= maxPackageDigestCacheEntries {
+		c.byKey = make(map[digestCacheKey]identity.ContentHash)
+	}
+	c.byKey[key] = digest
+}
+
+func sameFileStat(a, b os.FileInfo) bool {
+	return a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
+}
+
+// directoryListings captures, with one os.ReadDir per package directory, the
+// (name → type) state hashPackageDirectory hashes and the (name → size,
+// mtime) state that validates memoized file digests. Measured on this
+// codepath, the first cut of the digest cache still spent ~90ms of a warm
+// fingerprint on ~1800 per-file os.Stat calls; one listing per directory
+// (which the directory hash already paid for) replaces them — on Windows
+// DirEntry.Info is satisfied from the FindFirstFile buffer, so the per-file
+// metadata costs nothing beyond the single ReadDir.
+type directoryListings struct {
+	byDir map[string]*directoryListing // pathKey(dir) → listing
+}
+
+type directoryListing struct {
+	types map[string]string      // name → entry type string, pre-overlay
+	stats map[string]os.FileInfo // name → info for regular entries only
+}
+
+// readDirectoryListings never fails hard: a directory it cannot read simply
+// contributes no listing, and every consumer falls back to per-file
+// behavior (the directory hash re-reads and reports; file stats fall back to
+// os.Stat).
+func readDirectoryListings(ctx context.Context, directories map[string]string) *directoryListings {
+	listings := &directoryListings{byDir: make(map[string]*directoryListing, len(directories))}
+	for _, dir := range directories {
+		if err := ctx.Err(); err != nil {
+			return listings
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		listing := &directoryListing{
+			types: make(map[string]string, len(entries)),
+			stats: make(map[string]os.FileInfo, len(entries)),
+		}
+		for _, entry := range entries {
+			typeStr := entry.Type().String()
+			if entry.IsDir() {
+				typeStr = "directory"
+			}
+			listing.types[entry.Name()] = typeStr
+			// Regular entries only: a symlink's own listing stat does not
+			// reflect the target's changes, and os.Stat (which follows
+			// links, matching OpenReadShared) must validate those.
+			if entry.Type().IsRegular() {
+				if info, infoErr := entry.Info(); infoErr == nil {
+					listing.stats[entry.Name()] = info
+				}
+			}
+		}
+		listings.byDir[pathKey(dir)] = listing
+	}
+	return listings
+}
+
+func (l *directoryListings) listingFor(directory string) *directoryListing {
+	if l == nil {
+		return nil
+	}
+	return l.byDir[pathKey(directory)]
+}
+
+func (l *directoryListings) digestKey(path string) (digestCacheKey, bool) {
+	listing := l.listingFor(filepath.Dir(path))
+	if listing == nil {
+		return digestCacheKey{}, false
+	}
+	info, ok := listing.stats[filepath.Base(path)]
+	if !ok {
+		return digestCacheKey{}, false
+	}
+	return digestCacheKey{path: pathKey(path), size: info.Size(), mtimeN: info.ModTime().UnixNano()}, true
+}
+
 type packageOverlays struct {
 	byPath map[string]workspaceOverlayFile
 }
@@ -205,7 +400,7 @@ func (b *Backend) SemanticInputFingerprint(ctx context.Context, captured *snapsh
 	if !ok || entry.pkg == nil {
 		return "", nil
 	}
-	fingerprint, complete, err := packageInputFingerprint(ctx, entry.pkg, filePath, overlays, buildContext, b.goWorkPath, b.goFlags)
+	fingerprint, complete, err := packageInputFingerprint(ctx, entry.pkg, filePath, overlays, buildContext, b.goWorkPath, b.goFlags, b.digests)
 	if err != nil {
 		return "", err
 	}
@@ -252,7 +447,7 @@ type packageInputFile struct {
 	optional bool
 }
 
-func packageInputFingerprint(ctx context.Context, root *packages.Package, targetPath string, overlays packageOverlays, buildContext identity.BuildContextID, goWorkPath, goFlags string) (identity.ContentHash, bool, error) {
+func packageInputFingerprint(ctx context.Context, root *packages.Package, targetPath string, overlays packageOverlays, buildContext identity.BuildContextID, goWorkPath, goFlags string, digests *packageDigestCache) (identity.ContentHash, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -386,6 +581,9 @@ func packageInputFingerprint(ctx context.Context, root *packages.Package, target
 	inputHash := sha256.New()
 	writeHashField(inputHash, string(buildContext))
 	writeHashField(inputHash, pathKey(targetPath))
+	// One listing per package directory serves both the per-file digest
+	// validation and the directory hash below.
+	listings := readDirectoryListings(ctx, directories)
 	fileKeys := make([]string, 0, len(inputFiles))
 	for key := range inputFiles {
 		fileKeys = append(fileKeys, key)
@@ -396,7 +594,7 @@ func packageInputFingerprint(ctx context.Context, root *packages.Package, target
 			return "", false, err
 		}
 		file := inputFiles[key]
-		digest, exists, err := hashPackageInputFile(ctx, file, overlays)
+		digest, exists, err := hashPackageInputFile(ctx, file, overlays, digests, listings)
 		if err != nil {
 			return "", false, err
 		}
@@ -415,7 +613,7 @@ func packageInputFingerprint(ctx context.Context, root *packages.Package, target
 		if err := ctx.Err(); err != nil {
 			return "", false, err
 		}
-		digest, exists, err := hashPackageDirectory(ctx, directories[key], overlays)
+		digest, exists, err := hashPackageDirectory(ctx, directories[key], overlays, listings.listingFor(directories[key]))
 		if err != nil {
 			return "", false, err
 		}
@@ -518,7 +716,7 @@ func addPackageInputDirectory(directories map[string]string, directory string) e
 	return nil
 }
 
-func hashPackageInputFile(ctx context.Context, file packageInputFile, overlays packageOverlays) (identity.ContentHash, bool, error) {
+func hashPackageInputFile(ctx context.Context, file packageInputFile, overlays packageOverlays, digests *packageDigestCache, listings *directoryListings) (identity.ContentHash, bool, error) {
 	path, err := filepath.Abs(file.path)
 	if err != nil {
 		return "", false, err
@@ -527,6 +725,19 @@ func hashPackageInputFile(ctx context.Context, file packageInputFile, overlays p
 	if overlay, ok := overlays.byPath[key]; ok {
 		return hashContent(overlay.content), true, nil
 	}
+	if digests != nil && digests.reusable(path) {
+		// A directory listing is the cheap (size, mtime) proof when the
+		// file's directory was listed for the directory hash anyway;
+		// otherwise fall back to a direct stat.
+		if statKey, ok := listings.digestKey(path); ok {
+			if digest, hit := digests.reuseStat(statKey); hit {
+				return digest, true, nil
+			}
+		} else if digest, hit := digests.reuse(path); hit {
+			return digest, true, nil
+		}
+	}
+	before, statErr := os.Stat(path)
 	input, err := fileio.OpenReadShared(path)
 	if err != nil {
 		if file.optional && os.IsNotExist(err) {
@@ -542,22 +753,34 @@ func hashPackageInputFile(ctx context.Context, file packageInputFile, overlays p
 	if _, err := io.Copy(hash, &contextReader{ctx: ctx, r: input}); err != nil {
 		return "", false, fmt.Errorf("hash Go package input %q: %w", path, err)
 	}
-	return contentHashFromBytes(hash.Sum(nil)), true, nil
+	digest := contentHashFromBytes(hash.Sum(nil))
+	if digests != nil && digests.reusable(path) && statErr == nil {
+		digests.remember(path, before, digest)
+	}
+	return digest, true, nil
 }
 
-func hashPackageDirectory(ctx context.Context, directory string, overlays packageOverlays) (identity.ContentHash, bool, error) {
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", false, nil
+func hashPackageDirectory(ctx context.Context, directory string, overlays packageOverlays, listing *directoryListing) (identity.ContentHash, bool, error) {
+	var types map[string]string
+	if listing != nil {
+		types = make(map[string]string, len(listing.types)+len(overlays.byPath))
+		for name, typeStr := range listing.types {
+			types[name] = typeStr
 		}
-		return "", false, fmt.Errorf("read Go package directory %q: %w", directory, err)
-	}
-	types := make(map[string]string, len(entries)+len(overlays.byPath))
-	for _, entry := range entries {
-		types[entry.Name()] = entry.Type().String()
-		if entry.IsDir() {
-			types[entry.Name()] = "directory"
+	} else {
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", false, nil
+			}
+			return "", false, fmt.Errorf("read Go package directory %q: %w", directory, err)
+		}
+		types = make(map[string]string, len(entries)+len(overlays.byPath))
+		for _, entry := range entries {
+			types[entry.Name()] = entry.Type().String()
+			if entry.IsDir() {
+				types[entry.Name()] = "directory"
+			}
 		}
 	}
 	for _, file := range overlays.byPath {
