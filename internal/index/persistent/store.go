@@ -80,6 +80,14 @@ type Generation struct {
 type GenerationView struct {
 	Generation
 	dir string // generation payload directory (root for v1 layout)
+	// verified retains the payload bytes already read and CRC-verified during
+	// the lease-open verification pass (round-23 OPT-4). A view opened through
+	// OpenSnapshot/OpenSnapshotLease carries the whole verified generation in
+	// memory so downstream readers do not re-read and re-verify every segment
+	// from disk. Views constructed without the verification pass leave it nil
+	// and ReadSegment reads from disk as before. Cached payloads are immutable
+	// and shared; callers must not modify them.
+	verified map[SegmentID][]byte
 }
 
 // ReadSegment returns the verified payload bytes of a segment. The decoder
@@ -87,6 +95,9 @@ type GenerationView struct {
 func (v GenerationView) ReadSegment(id SegmentID) ([]byte, error) {
 	if !validSegmentID(id) {
 		return nil, fmt.Errorf("persistent: invalid segment ID %q", id)
+	}
+	if payload, ok := v.verified[id]; ok {
+		return payload, nil
 	}
 	var ref *SegmentRef
 	for i := range v.Segments {
@@ -153,6 +164,13 @@ type FileStore struct {
 	history     []*Generation // newest first, capped at KeepGenerations
 	quarantined []SegmentID
 	nextGenID   uint64
+	// orphanDirty records that files may have appeared on disk whose cleanup
+	// only cleanupOrphanSegments can judge (committed generations, aborted or
+	// rolled-back builds, quarantined segments). Seeded true at construction —
+	// a fresh store always sweeps once, covering residues left by a crashed
+	// process (round-23 OPT-4: the per-open sweep is otherwise skipped until
+	// something dirty happens).
+	orphanDirty bool
 }
 
 // NewFileStore opens (creating if needed) a store at root and recovers the
@@ -181,11 +199,11 @@ func NewFileStoreContext(ctx context.Context, root string, cfg Config) (*FileSto
 	if cfg.KeepGenerations <= 0 {
 		cfg.KeepGenerations = historyK
 	}
-	s := &FileStore{root: root, cfg: cfg}
+	s := &FileStore{root: root, cfg: cfg, orphanDirty: true}
 	if err := s.recover(); err != nil && !errors.Is(err, ErrNoGeneration) {
 		return nil, err
 	}
-	s.cleanupOrphanSegments()
+	s.cleanupOrphanSegmentsIfDirty()
 	return s, nil
 }
 
@@ -232,7 +250,7 @@ func (s *FileStore) OpenSnapshot(ctx context.Context) (GenerationView, error) {
 	if err != nil {
 		return GenerationView{}, err
 	}
-	s.cleanupOrphanSegments()
+	s.cleanupOrphanSegmentsIfDirty()
 	return s.openSnapshotWithWriterLock(ctx)
 }
 
@@ -251,7 +269,7 @@ func (s *FileStore) OpenSnapshotLease(ctx context.Context) (*GenerationLease, er
 	if err != nil {
 		return nil, err
 	}
-	s.cleanupOrphanSegments()
+	s.cleanupOrphanSegmentsIfDirty()
 	view, err := s.openSnapshotWithWriterLock(ctx)
 	if err != nil {
 		return nil, err
@@ -276,16 +294,24 @@ func (s *FileStore) openSnapshotWithWriterLock(ctx context.Context) (GenerationV
 		}
 
 		view := GenerationView{Generation: *cur, dir: s.root}
+		// Round-23 OPT-4: the verification pass already reads and CRC-checks
+		// every segment under the writer lock; retain the verified payloads in
+		// the view so downstream readers (semantic.OpenReader, digests) serve
+		// from memory instead of re-reading the whole generation from disk.
+		verified := make(map[SegmentID][]byte, len(cur.Segments))
 		var bad []SegmentID
 		var ioErr error
 		for _, seg := range cur.Segments {
-			if _, err := view.readSegmentWithIORetry(seg.ID); err != nil {
+			payload, err := view.readSegmentWithIORetry(seg.ID)
+			if err != nil {
 				if isSegmentIOError(err) {
 					ioErr = err
 				} else {
 					bad = append(bad, seg.ID) // integrity failure only (L7)
 				}
+				continue
 			}
+			verified[seg.ID] = payload
 		}
 		if ioErr != nil {
 			// Transient I/O survived the retry budget (whether or not
@@ -296,6 +322,7 @@ func (s *FileStore) openSnapshotWithWriterLock(ctx context.Context) (GenerationV
 			return GenerationView{}, ioErr
 		}
 		if len(bad) == 0 {
+			view.verified = verified
 			return view, nil
 		}
 
@@ -386,6 +413,9 @@ func (s *FileStore) quarantineSegsLocked(segs []SegmentID) error {
 		}
 		s.quarantined = append(s.quarantined, seg)
 	}
+	// round-23 OPT-4: quarantine 目录内容变了，容量上限的回收在孤儿清扫里——
+	// 标记 dirty 让下一次 open 执行。
+	s.orphanDirty = true
 	// If any quarantined segment belonged to the current generation, drop it.
 	if s.current != nil {
 		bad := map[SegmentID]bool{}

@@ -225,6 +225,30 @@ func stagingHighWater(root string) (uint64, error) {
 	return high, nil
 }
 
+// markOrphanDirty records that files may have appeared whose reclamation only
+// the orphan sweep can judge; the next store open will sweep. Round-23 OPT-4:
+// the per-open sweep (three ReadDir passes on root/staging/quarantine) ran on
+// EVERY OpenSnapshot/OpenSnapshotLease although nothing had changed between
+// opens; it now runs only when something dirty happened since the last sweep.
+func (s *FileStore) markOrphanDirty() {
+	s.mu.Lock()
+	s.orphanDirty = true
+	s.mu.Unlock()
+}
+
+// cleanupOrphanSegmentsIfDirty consumes the dirty flag and sweeps once. A
+// flag set concurrently with the sweep stays set (read-and-clear at entry),
+// so the next open sweeps again — the flag is conservative in both directions.
+func (s *FileStore) cleanupOrphanSegmentsIfDirty() {
+	s.mu.Lock()
+	dirty := s.orphanDirty
+	s.orphanDirty = false
+	s.mu.Unlock()
+	if dirty {
+		s.cleanupOrphanSegments()
+	}
+}
+
 func (s *FileStore) cleanupOrphanSegments() {
 	s.mu.Lock()
 	referenced := make(map[SegmentID]bool)

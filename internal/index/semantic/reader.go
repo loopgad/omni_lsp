@@ -18,16 +18,25 @@ import (
 // Reader iterates a verified generation one typed segment at a time. OpenReader
 // performs a bounded validation pass, including external-sort symbol checks,
 // before returning any batch to a query caller.
+//
+// Round-23 OPT-4: the validation pass RETAINS the decoded batches and Next
+// serves from that cache, so a generation is read and decoded once per reader
+// instead of twice (the old Next re-read, re-decoded and re-validated every
+// segment the open pass had just processed). The reader is per-request and
+// closed by its caller; the retained batches live no longer than the query
+// that would have materialized them anyway.
 type Reader struct {
 	view     persistent.GenerationView
 	metadata Metadata
 	scopes   map[string]model.Scope
+	batches  []Batch // decoded + validated during open; served by Next
 	index    int
 	closed   bool
 }
 
-// OpenReader validates metadata and all typed segments without retaining fact
-// batches, then returns an iterator over the immutable generation.
+// OpenReader validates metadata and all typed segments, retains the decoded
+// batches for the iterator, and returns the reader over the immutable
+// generation.
 func OpenReader(ctx context.Context, view persistent.GenerationView) (*Reader, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -67,7 +76,10 @@ func OpenReader(ctx context.Context, view persistent.GenerationView) (*Reader, e
 	}
 	defer ledger.Close()
 
-	reader := &Reader{view: view, metadata: cloneMetadata(metadata), scopes: scopes}
+	reader := &Reader{
+		view: view, metadata: cloneMetadata(metadata), scopes: scopes,
+		batches: make([]Batch, 0, len(segments)-1),
+	}
 	for i := 0; i < len(segments)-1; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -79,6 +91,7 @@ func OpenReader(ctx context.Context, view persistent.GenerationView) (*Reader, e
 		if err := addBatchIDs(ledger, batch); err != nil {
 			return nil, err
 		}
+		reader.batches = append(reader.batches, batch)
 	}
 	if err := ledger.Validate(ctx, metadata.Coverage); err != nil {
 		return nil, err
@@ -96,8 +109,10 @@ func (r *Reader) Metadata() Metadata {
 	return cloneMetadata(r.metadata)
 }
 
-// Next returns one decoded typed batch. It returns io.EOF after the final data
-// segment; the terminal metadata segment is available through Metadata().
+// Next returns one decoded typed batch from the batches retained by the open
+// validation pass (round-23 OPT-4: no re-read, re-decode or re-validate). It
+// returns io.EOF after the final data segment; the terminal metadata segment
+// is available through Metadata().
 func (r *Reader) Next(ctx context.Context) (Batch, error) {
 	if r == nil || r.closed {
 		return Batch{}, errors.New("semantic: reader is closed")
@@ -105,13 +120,10 @@ func (r *Reader) Next(ctx context.Context) (Batch, error) {
 	if err := ctx.Err(); err != nil {
 		return Batch{}, err
 	}
-	if r.index >= len(r.view.Segments)-1 {
+	if r.index >= len(r.batches) {
 		return Batch{}, io.EOF
 	}
-	batch, err := r.readBatch(ctx, r.index)
-	if err != nil {
-		return Batch{}, err
-	}
+	batch := r.batches[r.index]
 	r.index++
 	return batch, nil
 }
