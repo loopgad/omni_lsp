@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/omnilsp/omni/internal/identity"
@@ -225,8 +226,11 @@ func (s *Server) persistentWorkspaceSymbols(ctx context.Context, query string, r
 	if len(out) > maxPersistentWorkspaceSymbols {
 		out = out[:maxPersistentWorkspaceSymbols]
 	}
-	digest, err := semanticDiskDigest(ctx, idx.root, idx.dir)
-	if err != nil || digest != metadata.DiskDigest {
+	// Round-23 OPT-1: the diskView captured above already matched
+	// metadata.DiskDigest at capture time; this recheck only has to prove the
+	// tree did not change under the request, so a (path,size,mtime) stat pass
+	// replaces the second full read+hash walk.
+	if !semanticDiskUnchangedSince(ctx, diskView) {
 		return nil, false
 	}
 	currentIndex, _, _ := s.indexState()
@@ -286,6 +290,42 @@ func toolHashesByPath(provenance map[string]model.Provenance) map[string][]strin
 	return result
 }
 
+// toolHashVerdict remembers one full-file SHA-256 reading of a pinned tool,
+// keyed by the file's stat signature and the expected-hash fingerprint.
+// semanticGenerationToolsStillMatch and the persistent/workspace-symbol gates
+// re-verify the same tool binaries several times per request and on every
+// request; re-hashing a 17MB toolchain binary costs ~16ms per call (round 23
+// OPT-1 measurement), so a (path,size,mtime,expected) hit reuses the observed
+// hash without touching the file. The expected-hash fingerprint in the key is
+// the generation binding: expected hashes come from a committed generation's
+// provenance, so a new generation whose provenance hashes differ re-hashes.
+// A same-size same-mtime content swap is invisible to stat; that residual
+// window is the tradeoff registered with round 23 OPT-1.
+type toolHashVerdict struct {
+	size       int64
+	mtimeNanos int64
+	expected   string // fingerprint of the expected hash set the hash was read under
+	observed   string // bare-hex sha256 observed when the entry was created
+}
+
+var toolHashVerdicts = struct {
+	sync.Mutex
+	entries map[string]toolHashVerdict
+}{entries: make(map[string]toolHashVerdict)}
+
+// toolHashVerdictLimit bounds the cache; on overflow the whole map resets and
+// the next verification round re-hashes (correct, just slower).
+const toolHashVerdictLimit = 256
+
+func toolExpectedFingerprint(expectedHashes []string) string {
+	canonical := make([]string, len(expectedHashes))
+	for i, expected := range expectedHashes {
+		canonical[i] = strings.ToLower(expected)
+	}
+	sort.Strings(canonical)
+	return strings.Join(canonical, "\x00")
+}
+
 func toolPathStillMatches(ctx context.Context, path string, expectedHashes []string) bool {
 	if err := ctx.Err(); err != nil || path == "" || len(expectedHashes) == 0 {
 		return false
@@ -294,6 +334,23 @@ func toolPathStillMatches(ctx context.Context, path string, expectedHashes []str
 		if expected == "" {
 			return false
 		}
+	}
+	fingerprint := toolExpectedFingerprint(expectedHashes)
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	mtimeNanos := info.ModTime().UnixNano()
+	toolHashVerdicts.Lock()
+	entry, cached := toolHashVerdicts.entries[path]
+	toolHashVerdicts.Unlock()
+	if cached && entry.size == info.Size() && entry.mtimeNanos == mtimeNanos && entry.expected == fingerprint {
+		for _, expected := range expectedHashes {
+			if !strings.EqualFold(entry.observed, expected) {
+				return false
+			}
+		}
+		return true
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -306,12 +363,22 @@ func toolPathStillMatches(ctx context.Context, path string, expectedHashes []str
 		return false
 	}
 	actual := hex.EncodeToString(h.Sum(nil))
+	match := true
 	for _, expected := range expectedHashes {
 		if !strings.EqualFold(actual, expected) {
-			return false
+			match = false
+			break
 		}
 	}
-	return true
+	toolHashVerdicts.Lock()
+	if len(toolHashVerdicts.entries) >= toolHashVerdictLimit {
+		toolHashVerdicts.entries = make(map[string]toolHashVerdict)
+	}
+	toolHashVerdicts.entries[path] = toolHashVerdict{
+		size: info.Size(), mtimeNanos: mtimeNanos, expected: fingerprint, observed: actual,
+	}
+	toolHashVerdicts.Unlock()
+	return match
 }
 
 type contextReader struct {

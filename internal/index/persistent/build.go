@@ -306,6 +306,10 @@ func (b *fileBuild) commitWithWriterLock(ctx context.Context) (retErr error) {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove staging directory: %w", err))
 		}
 		if err := errors.Join(cleanupErrs...); err != nil {
+			// 回滚自身的文件操作失败会留下孤儿（段文件、临时 manifest、staging
+			// 目录）——标记 dirty 让下一次 open 的孤儿清扫兜底（round-23 OPT-4
+			// 节流后只有 dirty 才扫）。
+			b.store.markOrphanDirty()
 			retErr = errors.Join(retErr, fmt.Errorf("persistent: rollback uncommitted generation %d: %w", b.genID, err))
 		}
 	}()
@@ -377,6 +381,7 @@ func (b *fileBuild) commitWithWriterLock(ctx context.Context) (retErr error) {
 	b.store.history = nextHistory
 	b.store.current = &gen
 	b.store.mu.Unlock()
+	b.store.markOrphanDirty() // round-23 OPT-4: retired generations may leave reclaimable files
 	for _, old := range retired {
 		_ = b.store.removeGenerationSegments(old)
 	}
@@ -398,6 +403,9 @@ func (b *fileBuild) Abort() error {
 	b.result = ErrBuildAborted
 	b.releaseOwner()
 	if err := os.RemoveAll(b.stageDir); err != nil {
+		// staging 目录删除失败可能留下孤儿——下一次 open 的孤儿清扫兜底
+		// （round-23 OPT-4 节流后只有 dirty 才扫）。
+		b.store.markOrphanDirty()
 		b.result = errors.Join(b.result, err)
 		return err
 	}
@@ -409,6 +417,8 @@ func (b *fileBuild) finishAbort(err error) error {
 	b.result = err
 	b.releaseOwner()
 	if cleanupErr := os.RemoveAll(b.stageDir); cleanupErr != nil {
+		// round-23 OPT-4: 残留 staging 由下一次 open 的孤儿清扫兜底。
+		b.store.markOrphanDirty()
 		b.result = errors.Join(b.result, fmt.Errorf("persistent: remove staging directory: %w", cleanupErr))
 	}
 	return b.result

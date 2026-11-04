@@ -35,6 +35,16 @@ type semanticFileRecord struct {
 	SHA256 string `json:"sha256"`
 }
 
+// semanticFileStatSignature is the lightweight per-file identity of the
+// round-23 OPT-1 in-request disk recheck: a second full read+hash pass per
+// request costs ~100ms on a 7MB workspace, so the recheck verifies
+// (path, size, mtime) signatures instead and only the initial capture hashes.
+type semanticFileStatSignature struct {
+	Path       string
+	Size       int64
+	MTimeNanos int64
+}
+
 // diskSemanticView captures a path/hash manifest. Reads and materialization
 // verify the captured hash, so a concurrent edit becomes an error instead of
 // leaking mutable workspace bytes into an extraction run.
@@ -46,6 +56,10 @@ type diskSemanticView struct {
 	files    []model.File
 	byURI    map[string]model.File
 	byPath   map[string]model.File
+	// stats is the (path,size,mtime) signature of every captured file, sorted
+	// by Path — the baseline semanticDiskUnchangedSince rechecks in-request.
+	stats       []semanticFileStatSignature
+	excludedDir string
 }
 
 func captureSemanticView(ctx context.Context, rootPath string, workspace identity.WorkspaceID, revision uint64, excludedDir string) (*diskSemanticView, error) {
@@ -87,6 +101,7 @@ func captureSemanticView(ctx context.Context, rootPath string, workspace identit
 	files := make([]model.File, 0, 1024)
 	byURI := make(map[string]model.File)
 	byPath := make(map[string]model.File)
+	stats := make([]semanticFileStatSignature, 0, 1024)
 	var total int64
 	err = filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
@@ -183,6 +198,7 @@ func captureSemanticView(ctx context.Context, rootPath string, workspace identit
 		records = append(records, semanticFileRecord{Path: rel, Size: n, SHA256: sum})
 		files = append(files, file)
 		byURI[fileURI], byPath[rel] = file, file
+		stats = append(stats, semanticFileStatSignature{Path: rel, Size: n, MTimeNanos: info.ModTime().UnixNano()})
 		total += n
 		return nil
 	})
@@ -194,6 +210,7 @@ func captureSemanticView(ctx context.Context, rootPath string, workspace identit
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Path < records[j].Path })
 	sort.Slice(files, func(i, j int) bool { return files[i].URI < files[j].URI })
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Path < stats[j].Path })
 	digest, err := semanticRecordsDigest(records)
 	if err != nil {
 		return nil, err
@@ -204,6 +221,7 @@ func captureSemanticView(ctx context.Context, rootPath string, workspace identit
 		snapshot: snapshot,
 		identity: model.Identity{Workspace: workspace, DiskDigest: digest, SnapshotRev: revision},
 		files:    files, byURI: byURI, byPath: byPath,
+		stats: stats, excludedDir: excludedDir,
 	}
 	keepSnapshot = true
 	return view, nil
@@ -323,6 +341,131 @@ func semanticDiskDigest(ctx context.Context, rootPath string, excludedDir string
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Path < records[j].Path })
 	return semanticRecordsDigest(records)
+}
+
+// semanticDiskStatSignatures re-walks the workspace collecting only
+// (path, size, mtime) signatures — no file is opened or hashed. It applies the
+// exact same fail-closed file rules as semanticDiskDigest (same directory and
+// generated-file skips, symlink and non-regular rejection, size and depth
+// limits), so the two walks observe the same file set; keep them in sync.
+func semanticDiskStatSignatures(ctx context.Context, rootPath string, excludedDir string) ([]semanticFileStatSignature, error) {
+	rootPath, err := filepath.Abs(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	rootInfo, err := os.Stat(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	if !rootInfo.IsDir() {
+		return nil, fmt.Errorf("semantic index: workspace root is not a directory: %s", rootPath)
+	}
+	var excludedInfo fs.FileInfo
+	if excludedDir != "" {
+		excludedInfo, _ = os.Stat(excludedDir)
+	}
+	signatures := make([]semanticFileStatSignature, 0, 1024)
+	var total int64
+	err = filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == rootPath {
+			return nil
+		}
+		if entry.IsDir() {
+			if excludedInfo != nil {
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					return infoErr
+				}
+				if os.SameFile(info, excludedInfo) {
+					return filepath.SkipDir
+				}
+			}
+			if skipSemanticDirectory(rootPath, path, entry.Name()) {
+				return filepath.SkipDir
+			}
+			rel, relErr := filepath.Rel(rootPath, path)
+			if relErr != nil {
+				return relErr
+			}
+			if strings.Count(filepath.ToSlash(rel), "/") >= semanticViewMaxDepth {
+				return fmt.Errorf("%w: directory depth exceeds %d at %s", errSemanticViewIncomplete, semanticViewMaxDepth, rel)
+			}
+			return nil
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%w: symlink requires an explicit immutable source mapping: %s", errSemanticViewIncomplete, path)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("%w: non-regular workspace entry: %s", errSemanticViewIncomplete, path)
+		}
+		relPath, relErr := filepath.Rel(rootPath, path)
+		if relErr != nil {
+			return relErr
+		}
+		if skipSemanticGeneratedFile(relPath) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() < 0 || info.Size() > semanticViewMaxFileBytes {
+			return fmt.Errorf("%w: file size %d exceeds supported limit at %s", errSemanticViewIncomplete, info.Size(), path)
+		}
+		if total > semanticViewMaxBytes-info.Size() {
+			return fmt.Errorf("%w: workspace exceeds %d bytes", errSemanticViewIncomplete, semanticViewMaxBytes)
+		}
+		rel, err := filepath.Rel(rootPath, path)
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		signatures = append(signatures, semanticFileStatSignature{
+			Path: filepath.ToSlash(rel), Size: info.Size(), MTimeNanos: info.ModTime().UnixNano(),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(signatures, func(i, j int) bool { return signatures[i].Path < signatures[j].Path })
+	return signatures, nil
+}
+
+// semanticDiskUnchangedSince is the round-23 OPT-1 in-request recheck that
+// replaces the per-request second full read+hash pass (semanticDiskDigest):
+// the captured view's digest was already verified against the committed
+// metadata at capture time, so the recheck only needs to prove the tree did
+// not change UNDER the request. It re-stats the tree with the same fail-closed
+// rules and requires every (path, size, mtime) signature to match the capture.
+// Fail-closed: any walk error — including a same-mtime mtime granularity edge
+// or a file merely touched without content change — reports changed. A
+// same-size same-mtime content swap is invisible to a stat pass; that residual
+// window is bounded by the request's own lifetime and is the tradeoff
+// registered with round 23 OPT-1.
+func semanticDiskUnchangedSince(ctx context.Context, view *diskSemanticView) bool {
+	if view == nil {
+		return false
+	}
+	current, err := semanticDiskStatSignatures(ctx, view.rootPath, view.excludedDir)
+	if err != nil {
+		return false
+	}
+	if len(current) != len(view.stats) {
+		return false
+	}
+	for i := range view.stats {
+		if current[i] != view.stats[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (v *diskSemanticView) Identity() model.Identity { return v.identity }

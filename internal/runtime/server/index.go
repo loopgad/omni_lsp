@@ -175,7 +175,16 @@ func (s *Server) initIndex(rootURI string) {
 	}
 	// 工作区信任策略此刻已建立（审计批 2）：推进装配期延后的插件 Launch
 	// （mountPlugins 只装配到 Enabled，launchReadyPlugins 过 plugin.load 门）。
-	s.launchReadyPlugins()
+	//
+	// Round-23 OPT-3：launch 后台化。launchReadyPlugins 逐插件做 entrypoint
+	// 整文件 sha256 复核（launchChecksumBudget 预算 30s）+ 子进程 spawn，此前
+	// 同步运行在 dispatchInline 持有的 mutationMu 临界区内，initialize 应答被
+	// 校验/launch 全程阻塞（实测 4 插件 × 32MB entrypoint ≈ 194ms）。就绪门
+	// 语义不变：未 launch 的插件 emit 仍走既有拒绝/丢弃计数，信任裁决、关闭
+	// 交错（pluginClosing 的起飞丢弃与起飞后 kill+Disable 拆除）、pending 幂等
+	// 全部由 launchReadyPlugins 自身维持；ClosePlugins 置位后的后台起飞按
+	// 已关闭处理，不会泄漏进程。
+	go s.launchReadyPlugins()
 }
 
 // newIndexBudgetLadder builds the §F13 ladder for the index service when

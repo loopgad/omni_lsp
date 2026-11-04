@@ -433,8 +433,11 @@ func (s *Server) persistentSemanticLocations(
 	if err := ctx.Err(); err != nil || !semanticOverlayStillCurrent(s, ctx, revision, overlay) {
 		return zero, false
 	}
-	currentDigest, err := semanticDiskDigest(ctx, idx.root, idx.dir)
-	if err != nil || currentDigest != metadata.DiskDigest {
+	// Round-23 OPT-1: the captured view's digest was already checked against
+	// metadata.DiskDigest when it was captured above; this recheck only has to
+	// prove the tree did not change under the request, so a (path,size,mtime)
+	// stat pass replaces the second full read+hash walk.
+	if !semanticDiskUnchangedSince(ctx, diskView) {
 		return zero, false
 	}
 	currentIndex, _, _ := s.indexState()
