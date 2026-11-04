@@ -1333,6 +1333,17 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 	// lands every token at the wrong extent.
 	enc := requestEncoding(encoding, true)
 	idx := position.NewIndex(content, enc)
+	// round23 C: declaration names used to carry two tokens on the same span.
+	// The FuncDecl/TypeSpec branches emit TokFunction/TokType on the name and
+	// then let the walker descend, so the name ident hit the Ident branch and
+	// emitted a second TokVariable at the identical position. LSP token
+	// streams must be ordered and non-overlapping, and clients that honor the
+	// later same-span writer rendered function and type names in variable
+	// color. Inspect visits pre-order, so the FuncDecl/TypeSpec visit has
+	// registered the name in declNames before its ident is reached; the
+	// Ident branch skips those positions and the declaration branches keep
+	// sole ownership of the name span.
+	declNames := make(map[token.Pos]bool)
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -1344,17 +1355,22 @@ func (b *Backend) SemanticTokensWithEncoding(ctx context.Context, uri string, co
 		)
 		switch v := n.(type) {
 		case *ast.Ident:
+			if declNames[v.Pos()] {
+				return true
+			}
 			p = v.Pos()
 			end = v.End()
 			tt = languages.TokVariable
 		case *ast.FuncDecl:
 			if v.Name != nil {
+				declNames[v.Name.Pos()] = true
 				p = v.Name.Pos()
 				end = v.Name.End()
 				tt = languages.TokFunction
 			}
 		case *ast.TypeSpec:
 			if v.Name != nil {
+				declNames[v.Name.Pos()] = true
 				p = v.Name.Pos()
 				end = v.Name.End()
 				tt = languages.TokType
