@@ -775,6 +775,14 @@ func (b *Backend) Rename(ctx context.Context, req languages.RenameRequest) (enve
 			})
 		}
 	}
+	// round23 C: a non-null but edit-free WorkspaceEdit ({"changes":{}})
+	// decodes fine and yields zero edits — publishing it as an exact,
+	// complete rename would certify an empty edit set (SEM-SAFE-001). Fail
+	// closed on the same detail the other nested bridges use (-empty-edit).
+	if len(edits) == 0 {
+		return unavailableCclsRename(req, "clangd-empty-edit",
+			"rename refused: upstream language service returned no edits; safety and completeness are not proven (SEM-SAFE-001)"), nil
+	}
 	// clangd's edit is accepted only after the target classification gate above;
 	// function-like targets are refused because clangd does not prove overload-
 	// set collision safety for this bridge.
