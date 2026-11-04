@@ -24,63 +24,64 @@ func errNotSupported(method, backend string) *jsonrpc.ResponseError {
 	}
 }
 
-// handleSignatureHelp dispatches textDocument/signatureHelp (§I16).
+// handleSignatureHelp dispatches textDocument/signatureHelp (§I16) through
+// dispatchSemanticRequest, like every other semantic feature: the content and
+// revision it hands the backend come from ONE captured snapshot
+// (INV-SNAPSHOT-002), after the queued external-source batch was flushed and
+// a workspace snapshot lease was taken.
 func (s *Server) handleSignatureHelp(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params HoverParams // same position-only shape
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid signatureHelp params: %w", err)
 	}
-	be, err := s.resolveBackend(params.TextDocument.URI)
-	if err != nil {
-		s.metrics.BackendFails.Inc(1)
-		return nil, err
-	}
-	helper, ok := be.(languages.SignatureHelper)
-	if !ok {
-		return nil, errNotSupported("signatureHelp", be.LanguageID())
-	}
-	src := s.vfs.Content(params.TextDocument.URI)
-	if src == nil {
-		src = []byte{}
-	}
-	result, err := helper.SignatureHelp(ctx, languages.SignatureHelpRequest{
-		URI:          params.TextDocument.URI,
-		Content:      src,
-		SnapshotRev:  s.currentRevision(),
-		BuildContext: backendBuildContext(be),
-		Line:         params.Position.Line,
-		Column:       params.Position.Character,
-	})
-	if err != nil {
-		return nil, err
-	}
-	s.recordEvidence(ctx, "textDocument/signatureHelp", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
-	if result.Value == nil {
-		return json.RawMessage("null"), nil
-	}
-	type param struct {
-		Label string `json:"label"`
-	}
-	type sig struct {
-		Label           string  `json:"label"`
-		Parameters      []param `json:"parameters,omitempty"`
-		ActiveParameter int     `json:"activeParameter,omitempty"`
-	}
-	resp := struct {
-		Signatures      []sig `json:"signatures"`
-		ActiveSignature int   `json:"activeSignature"`
-	}{ActiveSignature: result.Value.ActiveSignature}
-	for _, si := range result.Value.Signatures {
-		out := sig{Label: si.Label, ActiveParameter: si.ActiveParameter}
-		for _, p := range si.Parameters {
-			out.Parameters = append(out.Parameters, param{Label: p})
-		}
-		resp.Signatures = append(resp.Signatures, out)
-	}
-	return json.Marshal(resp)
+	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Position.Line, params.Position.Character,
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+			helper, ok := be.(languages.SignatureHelper)
+			if !ok {
+				return nil, errNotSupported("signatureHelp", be.LanguageID())
+			}
+			result, err := helper.SignatureHelp(ctx, languages.SignatureHelpRequest{
+				URI:          params.TextDocument.URI,
+				Content:      src,
+				SnapshotRev:  snapRev,
+				BuildContext: bc,
+				Line:         params.Position.Line,
+				Column:       params.Position.Character,
+			})
+			if err != nil {
+				return nil, err
+			}
+			s.recordEvidence(ctx, "textDocument/signatureHelp", params.TextDocument.URI, result.Status, result.Completeness, result.Evidence, result.InternalDiagnostics)
+			if result.Value == nil {
+				return json.RawMessage("null"), nil
+			}
+			type param struct {
+				Label string `json:"label"`
+			}
+			type sig struct {
+				Label           string  `json:"label"`
+				Parameters      []param `json:"parameters,omitempty"`
+				ActiveParameter int     `json:"activeParameter,omitempty"`
+			}
+			resp := struct {
+				Signatures      []sig `json:"signatures"`
+				ActiveSignature int   `json:"activeSignature"`
+			}{ActiveSignature: result.Value.ActiveSignature}
+			for _, si := range result.Value.Signatures {
+				out := sig{Label: si.Label, ActiveParameter: si.ActiveParameter}
+				for _, p := range si.Parameters {
+					out.Parameters = append(out.Parameters, param{Label: p})
+				}
+				resp.Signatures = append(resp.Signatures, out)
+			}
+			return json.Marshal(resp)
+		})
 }
 
-// handleFormatting dispatches textDocument/formatting (§I20).
+// handleFormatting dispatches textDocument/formatting (§I20) through
+// dispatchSemanticRequest: the formatted text is the captured snapshot's
+// content for this request, never a live VFS read racing the publish
+// (INV-SNAPSHOT-002).
 func (s *Server) handleFormatting(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params struct {
 		TextDocument lspTextDocumentIdentifier `json:"textDocument"`
@@ -92,50 +93,49 @@ func (s *Server) handleFormatting(ctx context.Context, msg *jsonrpc.Message) (js
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid formatting params: %w", err)
 	}
-	be, err := s.resolveBackend(params.TextDocument.URI)
-	if err != nil {
-		s.metrics.BackendFails.Inc(1)
-		return nil, err
-	}
-	formatter, ok := be.(languages.Formatter)
-	if !ok {
-		return nil, errNotSupported("formatting", be.LanguageID())
-	}
-	src := s.vfs.Content(params.TextDocument.URI)
-	edits, err := formatter.Formatting(ctx, languages.FormattingRequest{
-		URI:          params.TextDocument.URI,
-		Content:      src,
-		TabSize:      params.Options.TabSize,
-		InsertSpaces: params.Options.InsertSpaces,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(edits) == 0 {
-		return json.RawMessage("null"), nil // already canonical (LSP null = no-op)
-	}
-	type rng struct {
-		Start lspPosition `json:"start"`
-		End   lspPosition `json:"end"`
-	}
-	type editJSON struct {
-		Range   rng    `json:"range"`
-		NewText string `json:"newText"`
-	}
-	out := make([]editJSON, 0, len(edits))
-	for _, e := range edits {
-		out = append(out, editJSON{
-			Range: rng{
-				Start: lspPosition{Line: e.StartLine, Character: e.StartChar},
-				End:   lspPosition{Line: e.EndLine, Character: e.EndChar},
-			},
-			NewText: e.NewText,
+	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, 0, 0,
+		func(ctx context.Context, be languages.Backend, src []byte, _ uint64, _ identity.BuildContextID) (json.RawMessage, error) {
+			formatter, ok := be.(languages.Formatter)
+			if !ok {
+				return nil, errNotSupported("formatting", be.LanguageID())
+			}
+			edits, err := formatter.Formatting(ctx, languages.FormattingRequest{
+				URI:          params.TextDocument.URI,
+				Content:      src,
+				TabSize:      params.Options.TabSize,
+				InsertSpaces: params.Options.InsertSpaces,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(edits) == 0 {
+				return json.RawMessage("null"), nil // already canonical (LSP null = no-op)
+			}
+			type rng struct {
+				Start lspPosition `json:"start"`
+				End   lspPosition `json:"end"`
+			}
+			type editJSON struct {
+				Range   rng    `json:"range"`
+				NewText string `json:"newText"`
+			}
+			out := make([]editJSON, 0, len(edits))
+			for _, e := range edits {
+				out = append(out, editJSON{
+					Range: rng{
+						Start: lspPosition{Line: e.StartLine, Character: e.StartChar},
+						End:   lspPosition{Line: e.EndLine, Character: e.EndChar},
+					},
+					NewText: e.NewText,
+				})
+			}
+			return json.Marshal(out)
 		})
-	}
-	return json.Marshal(out)
 }
 
-// handleInlayHints dispatches textDocument/inlayHints (§I22).
+// handleInlayHints dispatches textDocument/inlayHints (§I22) through
+// dispatchSemanticRequest: hints are computed against the captured snapshot's
+// content and revision pair, not two independent reads (INV-SNAPSHOT-002).
 func (s *Server) handleInlayHints(ctx context.Context, msg *jsonrpc.Message) (json.RawMessage, error) {
 	var params struct {
 		TextDocument lspTextDocumentIdentifier `json:"textDocument"`
@@ -147,48 +147,45 @@ func (s *Server) handleInlayHints(ctx context.Context, msg *jsonrpc.Message) (js
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return nil, fmt.Errorf("invalid inlayHint params: %w", err)
 	}
-	be, err := s.resolveBackend(params.TextDocument.URI)
-	if err != nil {
-		s.metrics.BackendFails.Inc(1)
-		return nil, err
-	}
-	provider, ok := be.(languages.InlayHintProvider)
-	if !ok {
-		return nil, errNotSupported("inlayHint", be.LanguageID())
-	}
-	src := s.vfs.Content(params.TextDocument.URI)
-	hints, err := provider.InlayHints(ctx, languages.InlayHintRequest{
-		URI:          params.TextDocument.URI,
-		Content:      src,
-		SnapshotRev:  s.currentRevision(),
-		BuildContext: backendBuildContext(be),
-		StartLine:    params.Range.Start.Line,
-		EndLine:      params.Range.End.Line,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(hints) == 0 {
-		return json.RawMessage("[]"), nil
-	}
-	type pos struct {
-		Line      uint32 `json:"line"`
-		Character uint32 `json:"character"`
-	}
-	type hintJSON struct {
-		Position pos    `json:"position"`
-		Label    string `json:"label"`
-		Kind     string `json:"kind,omitempty"`
-	}
-	out := make([]hintJSON, 0, len(hints))
-	for _, h := range hints {
-		out = append(out, hintJSON{
-			Position: pos{Line: h.Line, Character: h.Column},
-			Label:    h.Label,
-			Kind:     h.Kind,
+	return s.dispatchSemanticRequest(ctx, msg, params.TextDocument.URI, params.Range.Start.Line, params.Range.End.Line,
+		func(ctx context.Context, be languages.Backend, src []byte, snapRev uint64, bc identity.BuildContextID) (json.RawMessage, error) {
+			provider, ok := be.(languages.InlayHintProvider)
+			if !ok {
+				return nil, errNotSupported("inlayHint", be.LanguageID())
+			}
+			hints, err := provider.InlayHints(ctx, languages.InlayHintRequest{
+				URI:          params.TextDocument.URI,
+				Content:      src,
+				SnapshotRev:  snapRev,
+				BuildContext: bc,
+				StartLine:    params.Range.Start.Line,
+				EndLine:      params.Range.End.Line,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(hints) == 0 {
+				return json.RawMessage("[]"), nil
+			}
+			type pos struct {
+				Line      uint32 `json:"line"`
+				Character uint32 `json:"character"`
+			}
+			type hintJSON struct {
+				Position pos    `json:"position"`
+				Label    string `json:"label"`
+				Kind     string `json:"kind,omitempty"`
+			}
+			out := make([]hintJSON, 0, len(hints))
+			for _, h := range hints {
+				out = append(out, hintJSON{
+					Position: pos{Line: h.Line, Character: h.Column},
+					Label:    h.Label,
+					Kind:     h.Kind,
+				})
+			}
+			return json.Marshal(out)
 		})
-	}
-	return json.Marshal(out)
 }
 
 // currentRevision reports the latest snapshot revision (0 if none yet).
