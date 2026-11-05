@@ -269,6 +269,16 @@ func (s *Sink) WriteEdges(ctx context.Context, values []model.Edge) error {
 			!validString(string(v.Kind)) || !validPosition(v.Range) || !validString(v.SourceURI) {
 			return nil, fmt.Errorf("%w: invalid edge record", ErrMalformedPayload)
 		}
+		// Kind semantics are part of pre-validation: the generic string checks
+		// above accept any valid string, and rejecting an unsupported kind
+		// only in recordIDs would let the batch pass the "validate the
+		// complete caller batch before publishing" loop, get marshalled into
+		// a staging segment by WriteSegment, and only then fail — leaving
+		// invalid bytes staged on disk behind a failed sink. This is the same
+		// edgeFact check reader.validateBatch applies on the read side.
+		if _, ok := edgeFact(v.Kind); !ok {
+			return nil, fmt.Errorf("%w: unsupported edge kind %q", ErrMalformedPayload, v.Kind)
+		}
 		if err := s.validateBuildContext(v.ScopeID, v.BuildContext); err != nil {
 			return nil, err
 		}
@@ -369,7 +379,17 @@ func (s *Sink) writeRecords(ctx context.Context, kind BatchKind, count int, reco
 	if err := ctx.Err(); err != nil {
 		return s.fail(err)
 	}
-	// Validate the complete caller batch before publishing any of its pieces.
+	// Validate the complete caller batch before publishing any of its pieces,
+	// keeping each record's validated value and encoded bytes: the batching
+	// pass and recordIDs used to re-invoke the record closure and re-marshal
+	// every record although neither can change between the passes (the record
+	// closures only read sink state that is fixed after NewSink). One record
+	// closure invocation and one Marshal per record, all under s.mu. The cache
+	// holds the whole caller batch's encodings — the caller's value slice is
+	// already fully in memory, so this roughly doubles the batch's transient
+	// footprint in exchange for the removed redundant work.
+	values := make([]any, 0, count)
+	raws := make([]json.RawMessage, 0, count)
 	for i := 0; i < count; i++ {
 		if err := ctx.Err(); err != nil {
 			return s.fail(err)
@@ -385,6 +405,8 @@ func (s *Sink) writeRecords(ctx context.Context, kind BatchKind, count int, reco
 		if len(encoded) > MaxRecordBytes {
 			return s.fail(fmt.Errorf("%w: %s record is %d bytes (limit %d)", ErrBounds, kind, len(encoded), MaxRecordBytes))
 		}
+		values = append(values, v)
+		raws = append(raws, json.RawMessage(encoded))
 	}
 	for start := 0; start < count; {
 		if err := ctx.Err(); err != nil {
@@ -394,14 +416,7 @@ func (s *Sink) writeRecords(ctx context.Context, kind BatchKind, count int, reco
 		used := 0
 		end := start
 		for end < count {
-			v, err := record(end)
-			if err != nil {
-				return s.fail(err)
-			}
-			raw, err := json.Marshal(v)
-			if err != nil {
-				return s.fail(err)
-			}
+			raw := raws[end]
 			estimated := used + len(raw)
 			if len(rawRecords) != 0 {
 				estimated++ // comma
@@ -427,7 +442,7 @@ func (s *Sink) writeRecords(ctx context.Context, kind BatchKind, count int, reco
 		if _, err := s.build.WriteSegment(data); err != nil {
 			return s.fail(err)
 		}
-		if err := s.recordIDs(kind, start, end, record); err != nil {
+		if err := s.recordIDs(kind, values[start:end]); err != nil {
 			return s.fail(err)
 		}
 		start = end
@@ -435,12 +450,11 @@ func (s *Sink) writeRecords(ctx context.Context, kind BatchKind, count int, reco
 	return nil
 }
 
-func (s *Sink) recordIDs(kind BatchKind, start, end int, record func(int) (any, error)) error {
-	for i := start; i < end; i++ {
-		value, err := record(i)
-		if err != nil {
-			return err
-		}
+// recordIDs registers one already-validated batch window with the cross-
+// reference ledger. The values are the cache writeRecords built during its
+// pre-validation pass.
+func (s *Sink) recordIDs(kind BatchKind, values []any) error {
+	for _, value := range values {
 		switch kind {
 		case BatchSymbols:
 			v := value.(model.Symbol)

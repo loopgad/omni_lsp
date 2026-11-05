@@ -322,6 +322,12 @@ func exportLSIFSemanticScope(ctx context.Context, reader *semantic.Reader, scope
 				defined := false
 				switch occurrence.Role {
 				case "reference":
+				case "declaration":
+					// The omnilsp LSIF subset only distinguishes definitions
+					// from references: a declaration exports as a
+					// referenceResults item, the same wire shape a reference
+					// takes. The lost declaration/reference distinction is
+					// registered in LossyNotes (§L14).
 				case "definition":
 					defined = true
 				default:

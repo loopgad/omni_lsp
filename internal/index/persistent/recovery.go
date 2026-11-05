@@ -96,11 +96,19 @@ func (s *FileStore) recover() error {
 
 	if s.current == nil {
 		// Fall back through history until one generation verifies fully.
-		// Integrity failures corrupt a candidate for good; a transient
-		// I/O failure (errSegmentIO) only hides the candidate for this
-		// open — the retry budget below absorbs AV locks and sharing
-		// violations, and the on-disk history is left untouched so the
-		// next recover reconsiders it (nothing is quarantined here).
+		// A transient I/O failure (errSegmentIO) only hides the candidate
+		// for this open — the retry budget below absorbs AV locks and
+		// sharing violations, and the on-disk history is left untouched so
+		// the next recover reconsiders it. An integrity failure corrupts a
+		// candidate for good: its failing segment is quarantined here
+		// (forensic residue, TXN-004), and the candidate itself stays in
+		// the in-memory history — both branches keep the candidate
+		// referenced, because cleanupOrphanSegments derives its
+		// "referenced" set from this very list and runs right after this
+		// recover: dropping the candidate would let the sweep physically
+		// delete every segment of the generation (corrupt and healthy
+		// alike) with no quarantine and no residue, destroying data the
+		// on-disk history still lists.
 		var promoted *Generation
 		kept := make([]*Generation, 0, len(s.history))
 		for _, cand := range s.history {
@@ -111,10 +119,12 @@ func (s *FileStore) recover() error {
 			view := GenerationView{Generation: *cand, dir: s.root}
 			ok := true
 			transient := false
+			var failing SegmentID
 			for _, seg := range cand.Segments {
 				if _, err := view.readSegmentWithIORetry(seg.ID); err != nil {
 					ok = false
 					transient = isSegmentIOError(err)
+					failing = seg.ID
 					break
 				}
 			}
@@ -123,19 +133,28 @@ func (s *FileStore) recover() error {
 				continue
 			}
 			if !transient {
-				// Integrity failure: the candidate is corrupt for good,
-				// hide it for this open (unchanged semantics).
-				continue
+				// Integrity failure: the candidate is corrupt for good.
+				// Quarantine the failing segment so the corrupt bytes leave
+				// forensic residue instead of being orphan-swept, exactly
+				// like the current-generation path (quarantineSegsLocked).
+				// A previously quarantined segment is already gone from the
+				// root, so the stat guard keeps the quarantine list free of
+				// duplicates across opens. A blocked move fails the recover
+				// loudly — the next open retries rather than continuing
+				// with the diagnostic destroyed (same contract as
+				// quarantineCorruptManifest).
+				if _, statErr := os.Stat(filepath.Join(s.root, segFileName(failing))); statErr == nil {
+					if err := s.quarantineSegsLocked([]SegmentID{failing}); err != nil {
+						return err
+					}
+				}
 			}
-			// Transient I/O failure: the retry budget is spent, but the
-			// failure is the filesystem's, not the content's. Keep the
-			// candidate in the in-memory history — the on-disk history was
-			// never rewritten, and cleanupOrphanSegments derives its
-			// "referenced" set from this very list, so dropping the
-			// candidate here would let the sweep delete its healthy
-			// segments as orphans within this same open, permanently
-			// destroying a generation the next recover would otherwise
-			// reconsider.
+			// Kept for this open (integrity: corrupt but still listed by the
+			// on-disk history; transient: the filesystem's failure, not the
+			// content's). Either way the candidate's segments — corrupt
+			// residue and healthy siblings — must stay referenced for the
+			// orphan sweep, and the next recover reconsiders the candidate
+			// from the untouched on-disk history.
 			kept = append(kept, cand)
 		}
 		s.history = kept
@@ -252,12 +271,29 @@ func (s *FileStore) cleanupOrphanSegmentsIfDirty() {
 func (s *FileStore) cleanupOrphanSegments() {
 	s.mu.Lock()
 	referenced := make(map[SegmentID]bool)
+	// newestKnownGen is the highest generation any pointer still names
+	// (current manifest, recovery history). Root segments of generations
+	// NEWER than it must never be swept: a committed generation is pointed
+	// at by either the manifest or history.json, so a root segment above
+	// every known pointer belongs to a generation whose pointer was lost —
+	// most commonly the current generation behind a manifest that this
+	// recover just quarantined as corrupt. Its bytes may be entirely
+	// healthy; destroying them would corrupt-on-recovery data the store
+	// served moments ago. The residue is bounded: the next commit that
+	// publishes a newer pointer lets the sweep retire it again.
+	newestKnownGen := uint64(0)
 	if s.current != nil {
+		if s.current.ID > newestKnownGen {
+			newestKnownGen = s.current.ID
+		}
 		for _, seg := range s.current.Segments {
 			referenced[seg.ID] = true
 		}
 	}
 	for _, gen := range s.history {
+		if gen.ID > newestKnownGen {
+			newestKnownGen = gen.ID
+		}
 		for _, seg := range gen.Segments {
 			referenced[seg.ID] = true
 		}
@@ -281,6 +317,9 @@ func (s *FileStore) cleanupOrphanSegments() {
 		// parses as a canonical uint64 (format.go), so the error is ignored.
 		separator := strings.IndexByte(string(id), '-')
 		genID, _ := strconv.ParseUint(string(id[:separator]), 10, 64)
+		if genID > newestKnownGen {
+			continue
+		}
 		gen := retired[genID]
 		if gen == nil {
 			gen = &Generation{ID: genID}
